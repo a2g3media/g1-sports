@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback, useMemo } from "react";
+import { useEffect, useState, useCallback, useMemo, useRef } from "react";
 import { useDemoAuth } from "@/react-app/contexts/DemoAuthContext";
 import { AdminPageHeader } from "@/react-app/components/admin/AdminPageHeader";
 import { AdminStatusBadge } from "@/react-app/components/admin/AdminStatusBadge";
@@ -207,6 +207,29 @@ export function AdminPoolTypes() {
     description: "",
     allowed_settings: [] as string[],
   });
+
+  const searchInputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement | null;
+      const isTyping = target?.tagName === "INPUT" || target?.tagName === "TEXTAREA" || target?.isContentEditable;
+
+      if (e.key === "/" && !isTyping) {
+        e.preventDefault();
+        searchInputRef.current?.focus();
+      }
+      if (e.key === "Escape" && document.activeElement === searchInputRef.current) {
+        if (catalogSearch) {
+          setCatalogSearch("");
+        } else {
+          searchInputRef.current?.blur();
+        }
+      }
+    };
+    document.addEventListener("keydown", handler);
+    return () => document.removeEventListener("keydown", handler);
+  }, [catalogSearch]);
 
   const fetchPoolTypes = useCallback(async () => {
     try {
@@ -760,7 +783,7 @@ export function AdminPoolTypes() {
             {loadError}
           </div>
         )}
-        {!isLoading && poolTypes.length > 0 && (
+        {!isLoading && (catalog.length > 0 || poolTypes.length > 0) && (
           <div className="mb-4">
             <div className="mb-4 rounded-xl border border-primary/20 bg-primary/5 p-3">
               <div className="flex flex-col gap-2 md:flex-row md:items-end md:justify-between">
@@ -787,23 +810,29 @@ export function AdminPoolTypes() {
               <div className="mt-3 relative">
                 <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground pointer-events-none" />
                 <Input
+                  ref={searchInputRef}
                   value={catalogSearch}
                   onChange={(e) => setCatalogSearch(e.target.value)}
-                  placeholder="Search 81+ pool types by name, sport, template, keyword..."
-                  className="h-11 pl-10 pr-24 text-sm"
+                  placeholder="Search pool types by name, sport, template, keyword…"
+                  className="h-11 pl-10 pr-32 text-sm"
                 />
-                {catalogSearch && (
-                  <button
-                    type="button"
-                    onClick={() => setCatalogSearch("")}
-                    className="absolute right-20 top-1/2 -translate-y-1/2 rounded p-0.5 text-muted-foreground hover:text-foreground"
-                  >
-                    <X className="h-4 w-4" />
-                  </button>
-                )}
-                <span className="absolute right-3 top-1/2 -translate-y-1/2 text-xs text-muted-foreground tabular-nums">
-                  {filteredCatalog.length} result{filteredCatalog.length !== 1 ? "s" : ""}
-                </span>
+                <div className="absolute right-3 top-1/2 -translate-y-1/2 flex items-center gap-2">
+                  {catalogSearch && (
+                    <button
+                      type="button"
+                      onClick={() => setCatalogSearch("")}
+                      className="rounded p-0.5 text-muted-foreground hover:text-foreground"
+                    >
+                      <X className="h-4 w-4" />
+                    </button>
+                  )}
+                  <span className="text-xs text-muted-foreground tabular-nums">
+                    {filteredCatalog.length} result{filteredCatalog.length !== 1 ? "s" : ""}
+                  </span>
+                  <kbd className="hidden sm:inline-flex h-5 items-center rounded border border-border bg-muted px-1.5 text-[10px] font-mono text-muted-foreground">
+                    {catalogSearch ? "esc" : "/"}
+                  </kbd>
+                </div>
               </div>
               <div className="mt-3 grid grid-cols-1 gap-2 sm:grid-cols-3">
                 <div className="rounded-lg border border-border/70 bg-card/70 px-3 py-2">
@@ -1188,52 +1217,56 @@ export function AdminPoolTypes() {
                 </div>
               </div>
             </div>
-            <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between mb-2">
-              <p className="text-xs uppercase tracking-wide text-muted-foreground">Template Gallery</p>
-              <div className="flex flex-wrap items-center gap-2">
-                <Button
-                  variant="outline"
-                  size="sm"
-                  className="h-9"
-                  onClick={() => setShowTable((prev) => !prev)}
-                >
-                  {showTable ? "Hide Table View" : "Show Table View"}
-                </Button>
-                <Button asChild variant="ghost" size="sm" className="h-9">
-                  <Link to="/create-league?sport=nfl&format=pickem&tour=1">Open Create Flow</Link>
-                </Button>
-              </div>
-            </div>
-            <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
-              {poolTypes.map((poolType) => {
-                const params = toCreateRoutePoolTypeParams(poolType);
-                const createHref = `/create-league?sport=${encodeURIComponent(params.sport)}&format=${encodeURIComponent(params.format)}&poolTypeKey=${encodeURIComponent(poolType.format_key)}`;
-                return (
-                  <div key={`card-${poolType.id}`} className="rounded-xl border border-border bg-card p-3 shadow-sm hover:shadow-md transition-shadow">
-                    <div className="flex items-center gap-3">
-                      <PoolTypeBadgeIcon
-                        formatKey={poolType.format_key}
-                        poolTypeKey={poolType.format_key}
-                        sportKey={poolType.sport_key}
-                        size="sm"
-                      />
-                      <div className="min-w-0">
-                        <p className="text-sm font-semibold truncate">{poolType.name}</p>
-                        <p className="text-xs text-muted-foreground truncate">
-                          {getSportLabel(poolType.sport_key)} • {getFormatLabel(poolType.format_key)}
-                        </p>
-                      </div>
-                    </div>
-                    <div className="mt-2 flex flex-col items-start gap-2 sm:flex-row sm:items-center sm:justify-between">
-                      <AdminStatusBadge status={poolType.status} />
-                      <Button asChild size="sm" variant="outline" className="h-9 w-full sm:w-auto">
-                        <Link to={createHref}>Create Pool</Link>
-                      </Button>
-                    </div>
+            {poolTypes.length > 0 && (
+              <>
+                <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between mb-2">
+                  <p className="text-xs uppercase tracking-wide text-muted-foreground">Template Gallery</p>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="h-9"
+                      onClick={() => setShowTable((prev) => !prev)}
+                    >
+                      {showTable ? "Hide Table View" : "Show Table View"}
+                    </Button>
+                    <Button asChild variant="ghost" size="sm" className="h-9">
+                      <Link to="/create-league?sport=nfl&format=pickem&tour=1">Open Create Flow</Link>
+                    </Button>
                   </div>
-                );
-              })}
-            </div>
+                </div>
+                <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
+                  {poolTypes.map((poolType) => {
+                    const params = toCreateRoutePoolTypeParams(poolType);
+                    const createHref = `/create-league?sport=${encodeURIComponent(params.sport)}&format=${encodeURIComponent(params.format)}&poolTypeKey=${encodeURIComponent(poolType.format_key)}`;
+                    return (
+                      <div key={`card-${poolType.id}`} className="rounded-xl border border-border bg-card p-3 shadow-sm hover:shadow-md transition-shadow">
+                        <div className="flex items-center gap-3">
+                          <PoolTypeBadgeIcon
+                            formatKey={poolType.format_key}
+                            poolTypeKey={poolType.format_key}
+                            sportKey={poolType.sport_key}
+                            size="sm"
+                          />
+                          <div className="min-w-0">
+                            <p className="text-sm font-semibold truncate">{poolType.name}</p>
+                            <p className="text-xs text-muted-foreground truncate">
+                              {getSportLabel(poolType.sport_key)} • {getFormatLabel(poolType.format_key)}
+                            </p>
+                          </div>
+                        </div>
+                        <div className="mt-2 flex flex-col items-start gap-2 sm:flex-row sm:items-center sm:justify-between">
+                          <AdminStatusBadge status={poolType.status} />
+                          <Button asChild size="sm" variant="outline" className="h-9 w-full sm:w-auto">
+                            <Link to={createHref}>Create Pool</Link>
+                          </Button>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </>
+            )}
           </div>
         )}
         {/* Pool Types Table */}
