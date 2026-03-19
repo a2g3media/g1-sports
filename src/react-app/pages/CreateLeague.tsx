@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useState } from "react";
-import { Link, useNavigate, useSearchParams } from "react-router-dom";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import { useDemoAuth } from "@/react-app/contexts/DemoAuthContext";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/react-app/components/ui/card";
 import { Button } from "@/react-app/components/ui/button";
@@ -9,14 +9,18 @@ import { Switch } from "@/react-app/components/ui/switch";
 import { RadioGroup, RadioGroupItem } from "@/react-app/components/ui/radio-group";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/react-app/components/ui/select";
 import { Badge } from "@/react-app/components/ui/badge";
-import { ArrowLeft, ArrowRight, Check, Trophy, Loader2, AlertCircle, Heart, Skull, TrendingUp, RefreshCw, Shield, Sparkles, SlidersHorizontal, Library } from "lucide-react";
+import {
+  ArrowLeft, ArrowRight, Check, Trophy, Loader2, AlertCircle,
+  Heart, Skull, TrendingUp, RefreshCw, Shield, Sparkles, SlidersHorizontal,
+  Search, X, Star, Users,
+} from "lucide-react";
 import { Alert, AlertDescription } from "@/react-app/components/ui/alert";
 import { SPORTS, POOL_FORMATS, DEFAULT_RULES, type LeagueRules } from "@/react-app/data/sports";
 import { cn } from "@/react-app/lib/utils";
 import { PoolAccessGate } from "@/react-app/components/PoolAccessGate";
 import { PoolTypeBadgeIcon } from "@/react-app/components/pools/PoolTypeBadgeIcon";
 import { RuleEnginePreviewCard } from "@/react-app/components/pools/RuleEnginePreviewCard";
-import { getPoolTypeByKey, getTemplateForPoolType } from "@/shared/poolTypeCatalog";
+import { getPoolTypeByKey, getTemplateForPoolType, POOL_TYPE_CATALOG } from "@/shared/poolTypeCatalog";
 import { generatePoolRuleEngineOutput } from "@/shared/poolRuleEngine";
 
 type Step = "sport" | "format" | "variant" | "details" | "rules" | "review";
@@ -30,62 +34,45 @@ interface LeagueData {
   season: string;
   entryFeeCents: number;
   isPaymentRequired: boolean;
+  allowMultipleEntries: boolean;
+  maxEntriesPerUser: number;
   rules: LeagueRules;
 }
 
-interface QuickPreset {
-  id: string;
-  title: string;
-  subtitle: string;
-  sportKey: string;
-  formatKey: string;
-  variantKey?: string;
-  entryFeeCents?: number;
-  isPaymentRequired?: boolean;
-}
+const CATALOG_SPORT_LABELS: Record<string, string> = {
+  nfl: "NFL",
+  ncaaf: "College Football",
+  nba: "NBA",
+  ncaab: "College Basketball",
+  mlb: "MLB",
+  nhl: "NHL",
+  soccer: "Soccer",
+  golf: "Golf",
+  mma: "UFC/MMA",
+  nascar: "NASCAR",
+  multi_sport: "Multi-Sport",
+};
 
-const QUICK_PRESETS: QuickPreset[] = [
-  {
-    id: "nfl-pickem",
-    title: "NFL Pick'em Classic",
-    subtitle: "Best for office/friends weekly competition",
-    sportKey: "nfl",
-    formatKey: "pickem",
-    entryFeeCents: 2500,
-    isPaymentRequired: true,
-  },
-  {
-    id: "nfl-survivor",
-    title: "NFL Survivor",
-    subtitle: "Simple elimination format, high engagement",
-    sportKey: "nfl",
-    formatKey: "survivor",
-    variantKey: "winner",
-    entryFeeCents: 2000,
-    isPaymentRequired: true,
-  },
-  {
-    id: "march-bracket",
-    title: "March Madness Bracket",
-    subtitle: "Tournament-style pool for big events",
-    sportKey: "ncaab",
-    formatKey: "bracket",
-    entryFeeCents: 1000,
-    isPaymentRequired: true,
-  },
-  {
-    id: "nba-confidence",
-    title: "NBA Confidence",
-    subtitle: "Rank picks by confidence for deeper strategy",
-    sportKey: "nba",
-    formatKey: "confidence",
-  },
-];
+const TEMPLATE_LABELS: Record<string, string> = {
+  pickem: "Pick'em",
+  ats_pickem: "ATS Pick'em",
+  confidence: "Confidence",
+  ats_confidence: "ATS Confidence",
+  survivor: "Survivor",
+  squares: "Squares",
+  bracket: "Bracket",
+  prop: "Prop",
+  streak: "Streak",
+  upset_underdog: "Upset / Underdog",
+  stat_performance: "Stat / Performance",
+  last_man_standing: "Last Man Standing",
+  bundle_pool: "Bundle Pool",
+};
 
 const STEP_HELP: Record<Step, { title: string; hint: string }> = {
   sport: {
-    title: "Pick a launch path",
-    hint: "Start with a quick template or choose a sport manually.",
+    title: "Choose a pool type",
+    hint: "Search, filter, or pick from favorites to start.",
   },
   format: {
     title: "Choose competition style",
@@ -108,6 +95,37 @@ const STEP_HELP: Record<Step, { title: string; hint: string }> = {
     hint: "Confirm everything before creating your pool.",
   },
 };
+
+const CATALOG_FAVORITES_KEY = "create-pool:favorites";
+
+function normalizeCatalogSportToAppSport(catalogSport: string): string {
+  const map: Record<string, string> = {
+    americanfootball_nfl: "nfl",
+    americanfootball_ncaaf: "ncaaf",
+    basketball_nba: "nba",
+    basketball_ncaab: "ncaab",
+    baseball_mlb: "mlb",
+    icehockey_nhl: "nhl",
+    soccer_epl: "soccer",
+    soccer_mls: "soccer",
+    golf_pga: "golf",
+    mma_ufc: "mma",
+  };
+  return map[catalogSport] || catalogSport;
+}
+
+function catalogTemplateToFormatKey(template: string): string {
+  const map: Record<string, string> = {
+    ats_pickem: "ats",
+    ats_confidence: "confidence",
+    prop: "props",
+    upset_underdog: "pickem",
+    stat_performance: "pickem",
+    last_man_standing: "survivor",
+    bundle_pool: "pickem",
+  };
+  return map[template] || template;
+}
 
 function buildRecommendedRules(
   formatKey: string,
@@ -196,8 +214,115 @@ export function CreateLeague() {
     season: "",
     entryFeeCents: 0,
     isPaymentRequired: false,
+    allowMultipleEntries: false,
+    maxEntriesPerUser: 1,
     rules: DEFAULT_RULES,
   });
+
+  // Catalog browser state
+  const [catalogSearch, setCatalogSearch] = useState("");
+  const [catalogSportFilter, setCatalogSportFilter] = useState("all");
+  const [favoriteKeys, setFavoriteKeys] = useState<string[]>([]);
+  const searchRef = useRef<HTMLInputElement>(null);
+
+  // Load favorites from localStorage
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(CATALOG_FAVORITES_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw) as unknown;
+        if (Array.isArray(parsed)) {
+          setFavoriteKeys(parsed.filter((v): v is string => typeof v === "string"));
+        }
+      }
+    } catch {
+      setFavoriteKeys([]);
+    }
+  }, []);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(CATALOG_FAVORITES_KEY, JSON.stringify(favoriteKeys));
+    } catch { /* non-fatal */ }
+  }, [favoriteKeys]);
+
+  // Keyboard shortcuts: / to focus, Esc to clear
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement | null;
+      const isTyping = target?.tagName === "INPUT" || target?.tagName === "TEXTAREA" || target?.isContentEditable;
+      if (e.key === "/" && !isTyping && currentStep === "sport") {
+        e.preventDefault();
+        searchRef.current?.focus();
+      }
+      if (e.key === "Escape" && document.activeElement === searchRef.current) {
+        if (catalogSearch) {
+          setCatalogSearch("");
+        } else {
+          searchRef.current?.blur();
+        }
+      }
+    };
+    document.addEventListener("keydown", handler);
+    return () => document.removeEventListener("keydown", handler);
+  }, [catalogSearch, currentStep]);
+
+  const catalog = POOL_TYPE_CATALOG;
+
+  const catalogSportOptions = useMemo(() => {
+    return Array.from(new Set(catalog.map((item) => item.sport))).sort();
+  }, [catalog]);
+
+  const filteredCatalog = useMemo(() => {
+    const q = catalogSearch.trim().toLowerCase();
+    return catalog.filter((item) => {
+      if (catalogSportFilter !== "all" && item.sport !== catalogSportFilter) return false;
+      if (q) {
+        const haystack = [
+          item.name, item.key, item.sport, item.template, item.description,
+          ...item.rule_variants.map((v) => `${v.key} ${v.label}`),
+        ].join(" ").toLowerCase();
+        if (!haystack.includes(q)) return false;
+      }
+      return true;
+    });
+  }, [catalog, catalogSportFilter, catalogSearch]);
+
+  const favoriteCatalogItems = useMemo(() => {
+    const index = new Map(catalog.map((item) => [item.key, item]));
+    return favoriteKeys
+      .map((key) => index.get(key))
+      .filter((item): item is typeof catalog[number] => Boolean(item));
+  }, [catalog, favoriteKeys]);
+
+  const toggleFavorite = (key: string) => {
+    setFavoriteKeys((prev) =>
+      prev.includes(key) ? prev.filter((k) => k !== key) : [key, ...prev]
+    );
+  };
+
+  const selectCatalogItem = (item: typeof catalog[number]) => {
+    const appSport = normalizeCatalogSportToAppSport(item.sport);
+    const sport = SPORTS.find((s) => s.key === appSport);
+    const formatKey = catalogTemplateToFormatKey(item.template);
+    const format = POOL_FORMATS.find((f) => f.key === formatKey);
+    const variantKey = item.rule_variants[0]?.key || format?.variants?.[0]?.key || "";
+    const season = sport?.seasons?.[0] || "";
+
+    setLeague((prev) => ({
+      ...prev,
+      sportKey: appSport,
+      formatKey,
+      poolTypeKey: item.key,
+      variantKey,
+      season,
+      name: prev.name || `${sport?.name || item.sport} ${item.name}`,
+      rules: buildRecommendedRules(formatKey, variantKey, prev.rules),
+    }));
+
+    const hasVariants = format?.variants && format.variants.length > 1;
+    setCurrentStep(hasVariants ? "variant" : "details");
+  };
 
   const selectedSport = SPORTS.find((s) => s.key === league.sportKey);
   const selectedFormat = POOL_FORMATS.find((f) => f.key === league.formatKey);
@@ -205,23 +330,19 @@ export function CreateLeague() {
   const availableFormats = POOL_FORMATS.filter((f) => f.supportedSports.includes(league.sportKey));
   const hasVariants = selectedFormat?.variants && selectedFormat.variants.length > 0;
 
-  // Dynamic steps based on whether format has variants
   const getSteps = (): { key: Step; label: string }[] => {
     const baseSteps: { key: Step; label: string }[] = [
-      { key: "sport", label: "Sport" },
+      { key: "sport", label: "Pool Type" },
       { key: "format", label: "Format" },
     ];
-    
     if (hasVariants) {
       baseSteps.push({ key: "variant", label: "Type" });
     }
-    
     baseSteps.push(
       { key: "details", label: "Details" },
       { key: "rules", label: "Rules" },
       { key: "review", label: "Review" }
     );
-    
     return baseSteps;
   };
 
@@ -233,7 +354,7 @@ export function CreateLeague() {
   const canProceed = () => {
     switch (currentStep) {
       case "sport":
-        return !!league.sportKey;
+        return !!league.sportKey && !!league.formatKey;
       case "format":
         return !!league.formatKey;
       case "variant":
@@ -300,37 +421,15 @@ export function CreateLeague() {
     });
   }, [league]);
 
-  // Keep core details auto-populated so the wizard never feels blocked.
   useEffect(() => {
     if (!selectedSport) return;
     setLeague((prev) => {
       const nextSeason = prev.season || selectedSport.seasons?.[0] || "";
       const nextName = prev.name || `${selectedSport.name}${selectedFormat ? ` ${selectedFormat.name}` : ""} Pool`;
       if (nextSeason === prev.season && nextName === prev.name) return prev;
-      return {
-        ...prev,
-        season: nextSeason,
-        name: nextName,
-      };
+      return { ...prev, season: nextSeason, name: nextName };
     });
   }, [selectedSport, selectedFormat]);
-
-  const normalizeSportKeyFromTemplate = (sportKey: string): string => {
-    const key = String(sportKey || "").toLowerCase().trim();
-    const map: Record<string, string> = {
-      americanfootball_nfl: "nfl",
-      americanfootball_ncaaf: "ncaaf",
-      basketball_nba: "nba",
-      basketball_ncaab: "ncaab",
-      baseball_mlb: "mlb",
-      icehockey_nhl: "nhl",
-      soccer_epl: "soccer",
-      soccer_mls: "soccer",
-      golf_pga: "golf",
-      mma_ufc: "mma",
-    };
-    return map[key] || key;
-  };
 
   useEffect(() => {
     const sportParam = searchParams.get("sport");
@@ -339,7 +438,7 @@ export function CreateLeague() {
     const variantParam = searchParams.get("variant");
     if (!sportParam && !formatParam) return;
 
-    const sportKey = sportParam ? normalizeSportKeyFromTemplate(sportParam) : "";
+    const sportKey = normalizeCatalogSportToAppSport(sportParam || "");
     const sport = SPORTS.find((s) => s.key === sportKey);
     const format = POOL_FORMATS.find((f) => f.key === formatParam);
     const variantKey = variantParam || format?.variants?.[0]?.key || "";
@@ -352,64 +451,23 @@ export function CreateLeague() {
       variantKey: format ? variantKey : prev.variantKey,
       season: sport?.seasons?.[0] || prev.season,
       name: prev.name || `${sport?.name || "Sports"} ${format?.name || "Pool"}`,
-      // Guided tour mode should feel instant and production-ready.
-      rules: format
-        ? buildRecommendedRules(format.key, variantKey, prev.rules)
-        : prev.rules,
+      rules: format ? buildRecommendedRules(format.key, variantKey, prev.rules) : prev.rules,
       entryFeeCents: isTourMode && prev.entryFeeCents === 0 ? 2500 : prev.entryFeeCents,
       isPaymentRequired: isTourMode ? true : prev.isPaymentRequired,
     }));
     setCurrentStep(isTourMode ? "review" : "details");
   }, [searchParams, isTourMode]);
 
-  const applyQuickSetup = () => {
-    const season = selectedSport?.seasons?.[0] || league.season;
-    const generatedName = selectedFormat
-      ? `${selectedSport?.name || "Sports"} ${selectedFormat.name} Pool`
-      : `${selectedSport?.name || "Sports"} Pool`;
-    setLeague((prev) => ({
-      ...prev,
-      name: prev.name || generatedName,
-      season,
-      rules: {
-        ...buildRecommendedRules(prev.formatKey, prev.variantKey, prev.rules),
-      },
-      isPaymentRequired: prev.entryFeeCents > 0 ? true : prev.isPaymentRequired,
-    }));
-    setCurrentStep("review");
-  };
-
-  const applyQuickPreset = (preset: QuickPreset) => {
-    const sport = SPORTS.find((s) => s.key === preset.sportKey);
-    const format = POOL_FORMATS.find((f) => f.key === preset.formatKey);
-    const variantKey = preset.variantKey || format?.variants?.[0]?.key || "";
-    const season = sport?.seasons?.[0] || "";
-    setLeague({
-      name: `${sport?.name || "Sports"} ${format?.name || "Pool"}`,
-      sportKey: preset.sportKey,
-      formatKey: preset.formatKey,
-      poolTypeKey: preset.formatKey,
-      variantKey,
-      season,
-      entryFeeCents: preset.entryFeeCents || 0,
-      isPaymentRequired: preset.isPaymentRequired || false,
-      rules: {
-        ...buildRecommendedRules(preset.formatKey, variantKey, DEFAULT_RULES),
-      },
-    });
-    setCurrentStep("details");
-  };
-
   const handleCreate = async () => {
     setIsCreating(true);
     setError(null);
-    
+
     try {
       const headers: HeadersInit = { "Content-Type": "application/json" };
       if (isDemoMode) {
         headers["X-Demo-Mode"] = "true";
       }
-      
+
       const response = await fetch("/api/leagues", {
         method: "POST",
         headers,
@@ -422,6 +480,8 @@ export function CreateLeague() {
           season: league.season,
           entryFeeCents: league.entryFeeCents,
           isPaymentRequired: league.isPaymentRequired,
+          allowMultipleEntries: league.allowMultipleEntries,
+          maxEntriesPerUser: league.maxEntriesPerUser,
           rules: league.rules,
         }),
       });
@@ -431,9 +491,10 @@ export function CreateLeague() {
         throw new Error(data.error || "Failed to create league");
       }
 
-      const data = await response.json();
-      navigate(isTourMode ? "/pool-admin/pools" : "/", {
-        state: { newLeagueId: data.id, inviteCode: data.inviteCode, fromTour: isTourMode },
+      const data = await response.json() as { id: number; inviteCode: string };
+
+      navigate(`/pool-admin/pools`, {
+        state: { newLeagueId: data.id, inviteCode: data.inviteCode },
       });
     } catch (err) {
       setError(err instanceof Error ? err.message : "Something went wrong");
@@ -442,56 +503,37 @@ export function CreateLeague() {
     }
   };
 
-  // Get variant icon for survivor types
   const getVariantIcon = (variantKey: string) => {
     switch (variantKey) {
-      case "winner":
-        return Heart;
-      case "loser":
-        return Skull;
-      case "ats":
-        return TrendingUp;
-      case "two_life":
-        return Shield;
-      case "reentry":
-        return RefreshCw;
-      default:
-        return null;
+      case "winner": return Heart;
+      case "loser": return Skull;
+      case "ats": return TrendingUp;
+      case "two_life": return Shield;
+      case "reentry": return RefreshCw;
+      default: return null;
     }
   };
 
-  // Get variant color for survivor types
   const getVariantColor = (variantKey: string) => {
     switch (variantKey) {
-      case "winner":
-        return "text-emerald-500 bg-emerald-500/10 border-emerald-500/30";
-      case "loser":
-        return "text-red-500 bg-red-500/10 border-red-500/30";
-      case "ats":
-        return "text-blue-500 bg-blue-500/10 border-blue-500/30";
-      case "two_life":
-        return "text-purple-500 bg-purple-500/10 border-purple-500/30";
-      case "reentry":
-        return "text-amber-500 bg-amber-500/10 border-amber-500/30";
-      default:
-        return "";
+      case "winner": return "text-emerald-500 bg-emerald-500/10 border-emerald-500/30";
+      case "loser": return "text-red-500 bg-red-500/10 border-red-500/30";
+      case "ats": return "text-blue-500 bg-blue-500/10 border-blue-500/30";
+      case "two_life": return "text-purple-500 bg-purple-500/10 border-purple-500/30";
+      case "reentry": return "text-amber-500 bg-amber-500/10 border-amber-500/30";
+      default: return "";
     }
   };
 
   return (
     <PoolAccessGate action="create" variant="replace">
-      <div className="max-w-3xl mx-auto space-y-6 px-4 pb-6 sm:px-0 sm:space-y-8">
+      <div className="max-w-4xl mx-auto space-y-6 px-4 pb-6 sm:px-0 sm:space-y-8">
       <div className="flex items-start gap-3 sm:items-center sm:gap-4">
         <Button variant="ghost" size="icon" onClick={goBack} className="h-10 w-10 shrink-0">
           <ArrowLeft className="h-5 w-5" />
         </Button>
         <div className="min-w-0">
           <h1 className="text-xl sm:text-2xl font-bold tracking-tight">Create Pool</h1>
-          <div className="mt-1">
-            <Badge variant="secondary" className="text-[11px] uppercase tracking-wide">
-              Demo Walkthrough - Step 2 of 3
-            </Badge>
-          </div>
           <p className="text-muted-foreground">Step {currentStepIndex + 1} of {STEPS.length}: {STEPS[currentStepIndex].label}</p>
           <p className="text-xs sm:text-sm text-muted-foreground/90 mt-1">{stepHelp.title} - {stepHelp.hint}</p>
         </div>
@@ -536,64 +578,136 @@ export function CreateLeague() {
         })}
       </div>
 
-      {/* Step: Sport Selection */}
+      {/* Step 1: Pool Type Selection - Full Catalog Browser */}
       {currentStep === "sport" && (
-        <Card className="border-border/60 shadow-sm lg:shadow-md animate-in fade-in-50 slide-in-from-bottom-2 duration-300">
-          <CardHeader>
-            <CardTitle className="flex items-center gap-2">
-              <Sparkles className="h-5 w-5 text-amber-500" />
-              Start Fast
-            </CardTitle>
-            <CardDescription>Pick a quick template or build from scratch.</CardDescription>
-          </CardHeader>
-          <CardContent>
-            <Link
-              to="/admin/pool-types"
-              className="mb-4 flex items-center gap-3 rounded-lg border border-primary/30 bg-primary/5 px-4 py-3 transition-colors hover:bg-primary/10 hover:border-primary/50"
+        <div className="space-y-4 animate-in fade-in-50 slide-in-from-bottom-2 duration-300">
+          {/* Search Bar */}
+          <div className="relative">
+            <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground pointer-events-none" />
+            <Input
+              ref={searchRef}
+              value={catalogSearch}
+              onChange={(e) => setCatalogSearch(e.target.value)}
+              placeholder="Search pool types by name, sport, template, keyword…"
+              className="h-12 pl-10 pr-28 text-sm"
+            />
+            <div className="absolute right-3 top-1/2 -translate-y-1/2 flex items-center gap-2">
+              {catalogSearch && (
+                <button type="button" onClick={() => setCatalogSearch("")} className="rounded p-0.5 text-muted-foreground hover:text-foreground">
+                  <X className="h-4 w-4" />
+                </button>
+              )}
+              <span className="text-xs text-muted-foreground tabular-nums">
+                {filteredCatalog.length} pool{filteredCatalog.length !== 1 ? "s" : ""}
+              </span>
+              <kbd className="hidden sm:inline-flex h-5 items-center rounded border border-border bg-muted px-1.5 text-[10px] font-mono text-muted-foreground">
+                {catalogSearch ? "esc" : "/"}
+              </kbd>
+            </div>
+          </div>
+
+          {/* Sport Filter Chips */}
+          <div className="flex flex-wrap items-center gap-2">
+            <Button
+              size="sm"
+              variant={catalogSportFilter === "all" ? "default" : "outline"}
+              className="h-8"
+              onClick={() => setCatalogSportFilter("all")}
             >
-              <Library className="h-5 w-5 text-primary shrink-0" />
-              <div className="min-w-0">
-                <p className="text-sm font-semibold">Browse Full Pool Catalog</p>
-                <p className="text-xs text-muted-foreground">Search 81+ pool types with filters, favorites, and one-click launch.</p>
+              All Sports
+            </Button>
+            {catalogSportOptions.map((sport) => (
+              <Button
+                key={`chip-${sport}`}
+                size="sm"
+                variant={catalogSportFilter === sport ? "default" : "outline"}
+                className="h-8"
+                onClick={() => setCatalogSportFilter(sport)}
+              >
+                {CATALOG_SPORT_LABELS[sport] || sport}
+              </Button>
+            ))}
+          </div>
+
+          {/* Favorites Row */}
+          {favoriteCatalogItems.length > 0 && (
+            <div className="rounded-lg border border-border/70 bg-card/70 px-3 py-2">
+              <p className="text-[11px] uppercase tracking-wide text-muted-foreground mb-2 flex items-center gap-1">
+                <Star className="h-3.5 w-3.5" /> Your Favorites
+              </p>
+              <div className="flex flex-wrap gap-2">
+                {favoriteCatalogItems.slice(0, 8).map((item) => (
+                  <Button
+                    key={`fav-${item.key}`}
+                    size="sm"
+                    variant="outline"
+                    className="h-8"
+                    onClick={() => selectCatalogItem(item)}
+                  >
+                    {item.name}
+                  </Button>
+                ))}
               </div>
-              <ArrowRight className="h-4 w-4 text-muted-foreground shrink-0 ml-auto" />
-            </Link>
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mb-5">
-              {QUICK_PRESETS.map((preset) => (
-                <button
-                  key={preset.id}
-                  onClick={() => applyQuickPreset(preset)}
-                  className="min-h-24 rounded-lg border border-primary/20 bg-primary/5 p-4 text-left hover:border-primary/50 hover:bg-primary/10 transition-colors"
-                >
-                  <div className="flex items-center justify-between gap-3">
-                    <p className="font-semibold">{preset.title}</p>
-                    <Badge variant="secondary">Quick</Badge>
+            </div>
+          )}
+
+          {/* Catalog Grid */}
+          <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3">
+            {filteredCatalog.map((item) => (
+              <button
+                key={item.key}
+                type="button"
+                onClick={() => selectCatalogItem(item)}
+                className="rounded-xl border border-border/70 bg-card p-3 text-left shadow-sm transition-all hover:border-primary/40 hover:shadow-lg focus:outline-none focus:ring-2 focus:ring-primary/40"
+              >
+                <div className="flex items-center gap-3">
+                  <PoolTypeBadgeIcon
+                    formatKey={item.template}
+                    poolTypeKey={item.key}
+                    sportKey={item.sport}
+                    size="lg"
+                  />
+                  <div className="min-w-0 flex-1">
+                    <p className="text-sm font-semibold leading-tight">{item.name}</p>
+                    <p className="text-xs text-muted-foreground truncate mt-0.5">
+                      {CATALOG_SPORT_LABELS[item.sport] || item.sport} • {TEMPLATE_LABELS[item.template] || item.template}
+                    </p>
                   </div>
-                  <p className="text-xs text-muted-foreground mt-1">{preset.subtitle}</p>
-                </button>
-              ))}
+                  <button
+                    type="button"
+                    onClick={(e) => { e.stopPropagation(); toggleFavorite(item.key); }}
+                    className="shrink-0 p-1 rounded hover:bg-accent"
+                    title={favoriteKeys.includes(item.key) ? "Remove favorite" : "Add favorite"}
+                  >
+                    <Star className={cn("h-4 w-4", favoriteKeys.includes(item.key) ? "fill-primary text-primary" : "text-muted-foreground")} />
+                  </button>
+                </div>
+                <p className="mt-2 text-xs text-muted-foreground line-clamp-2 min-h-[2rem]">{item.description}</p>
+                {item.rule_variants.length > 0 && (
+                  <div className="mt-2 flex flex-wrap items-center gap-1">
+                    {item.rule_variants.slice(0, 3).map((v) => (
+                      <span key={`${item.key}-${v.key}`} className="rounded-full border border-primary/20 bg-primary/5 px-2 py-0.5 text-[10px] text-muted-foreground">
+                        {v.label}
+                      </span>
+                    ))}
+                    {item.rule_variants.length > 3 && (
+                      <span className="text-[10px] text-muted-foreground">+{item.rule_variants.length - 3}</span>
+                    )}
+                  </div>
+                )}
+              </button>
+            ))}
+          </div>
+
+          {filteredCatalog.length === 0 && (
+            <div className="rounded-lg border border-border bg-card p-8 text-center">
+              <p className="text-sm text-muted-foreground">No pool types match your search.</p>
+              <Button size="sm" variant="outline" className="mt-3" onClick={() => { setCatalogSearch(""); setCatalogSportFilter("all"); }}>
+                Clear Filters
+              </Button>
             </div>
-            <div className="mb-3 text-xs uppercase tracking-wide text-muted-foreground">
-              Or build from scratch
-            </div>
-            <div className="grid grid-cols-2 gap-3">
-              {SPORTS.map((sport) => (
-                <button
-                  key={sport.key}
-                  onClick={() => setLeague({ ...league, sportKey: sport.key, formatKey: "", poolTypeKey: "", variantKey: "", season: sport.seasons[0] })}
-                  className={`min-h-24 p-4 rounded-lg border-2 text-left transition-all hover:border-primary ${
-                    league.sportKey === sport.key
-                      ? "border-primary bg-primary/5"
-                      : "border-border hover:bg-accent/50"
-                  }`}
-                >
-                  <span className="mb-2 block"><sport.icon className="h-8 w-8 mx-auto" /></span>
-                  <span className="font-medium">{sport.name}</span>
-                </button>
-              ))}
-            </div>
-          </CardContent>
-        </Card>
+          )}
+        </div>
       )}
 
       {/* Step: Format Selection */}
@@ -606,12 +720,6 @@ export function CreateLeague() {
             </CardDescription>
           </CardHeader>
           <CardContent>
-            <div className="mb-3 rounded-lg border border-primary/20 bg-primary/5 p-3">
-              <p className="text-sm font-medium">Quick setup tip</p>
-              <p className="text-xs text-muted-foreground">
-                Pick a format now, then use "Quick Setup to Review" to prefill defaults and finish in under a minute.
-              </p>
-            </div>
             <div className="space-y-3">
               {availableFormats.map((format) => (
                 <button
@@ -667,7 +775,7 @@ export function CreateLeague() {
               {selectedFormat.variants.map((variant) => {
                 const VariantIcon = getVariantIcon(variant.key);
                 const colorClass = getVariantColor(variant.key);
-                
+
                 return (
                   <button
                     key={variant.key}
@@ -713,25 +821,12 @@ export function CreateLeague() {
       {currentStep === "details" && (
         <Card className="border-border/60 shadow-sm lg:shadow-md animate-in fade-in-50 slide-in-from-bottom-2 duration-300">
           <CardHeader>
-            <CardTitle>League Details</CardTitle>
-            <CardDescription>Name your league and set the entry fee</CardDescription>
+            <CardTitle>Pool Details</CardTitle>
+            <CardDescription>Name your pool and configure entry settings</CardDescription>
           </CardHeader>
           <CardContent className="space-y-6">
-            <div className="rounded-lg border border-border bg-muted/30 p-3">
-              <div className="flex flex-col items-start justify-between gap-3 sm:flex-row sm:items-center sm:gap-2">
-                <div>
-                  <p className="text-sm font-medium">Fast path</p>
-                  <p className="text-xs text-muted-foreground">
-                    Auto-fill recommended defaults and jump to review.
-                  </p>
-                </div>
-                <Button type="button" variant="outline" onClick={applyQuickSetup} className="h-10 w-full sm:w-auto">
-                  Quick Setup to Review
-                </Button>
-              </div>
-            </div>
             <div className="space-y-2">
-              <Label htmlFor="name">League Name</Label>
+              <Label htmlFor="name">Pool Name</Label>
               <Input
                 id="name"
                 placeholder="e.g., Office NFL Pool 2024"
@@ -794,6 +889,55 @@ export function CreateLeague() {
                 />
               </div>
             )}
+
+            {/* Multi-Entry Settings */}
+            <div className="rounded-lg border border-border p-4 space-y-4">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <Users className="h-4 w-4 text-muted-foreground" />
+                  <div>
+                    <Label>Allow Multiple Entries</Label>
+                    <p className="text-xs text-muted-foreground">
+                      Let members submit more than one entry per pool
+                    </p>
+                  </div>
+                </div>
+                <Switch
+                  checked={league.allowMultipleEntries}
+                  onCheckedChange={(checked) => setLeague({
+                    ...league,
+                    allowMultipleEntries: checked,
+                    maxEntriesPerUser: checked ? Math.max(league.maxEntriesPerUser, 2) : 1,
+                  })}
+                />
+              </div>
+
+              {league.allowMultipleEntries && (
+                <div className="space-y-2 pl-6 border-l-2 border-primary/20">
+                  <Label htmlFor="maxEntries">Max Entries Per User</Label>
+                  <div className="flex items-center gap-3">
+                    <Input
+                      id="maxEntries"
+                      type="number"
+                      min="2"
+                      max="25"
+                      value={league.maxEntriesPerUser}
+                      onChange={(e) =>
+                        setLeague({
+                          ...league,
+                          maxEntriesPerUser: Math.max(2, Math.min(25, parseInt(e.target.value || "2", 10))),
+                        })
+                      }
+                      className="w-20"
+                    />
+                    <span className="text-sm text-muted-foreground">entries max</span>
+                  </div>
+                  <p className="text-xs text-muted-foreground">
+                    Each entry acts as an independent ticket with its own picks, score, and leaderboard position.
+                  </p>
+                </div>
+              )}
+            </div>
           </CardContent>
         </Card>
       )}
@@ -807,38 +951,12 @@ export function CreateLeague() {
           </CardHeader>
           <CardContent className="space-y-6">
             <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
-              <Button
-                type="button"
-                variant="outline"
-                onClick={() =>
-                  setLeague({
-                    ...league,
-                    rules: {
-                      ...league.rules,
-                      lockType: "game_start",
-                      visibilityType: "after_lock",
-                    },
-                  })
-                }
-              >
-                Recommended
-              </Button>
-              <Button
-                type="button"
-                variant="outline"
-                onClick={() =>
-                  setLeague({
-                    ...league,
-                    rules: {
-                      ...league.rules,
-                      lockType: "first_game",
-                      visibilityType: "after_period",
-                    },
-                  })
-                }
-              >
-                Competitive
-              </Button>
+              <Button type="button" variant="outline" onClick={() =>
+                setLeague({ ...league, rules: { ...league.rules, lockType: "game_start", visibilityType: "after_lock" } })
+              }>Recommended</Button>
+              <Button type="button" variant="outline" onClick={() =>
+                setLeague({ ...league, rules: { ...league.rules, lockType: "first_game", visibilityType: "after_period" } })
+              }>Competitive</Button>
               <Button
                 type="button"
                 variant={showAdvancedRules ? "default" : "outline"}
@@ -849,17 +967,11 @@ export function CreateLeague() {
                 {showAdvancedRules ? "Hide Advanced" : "Show Advanced"}
               </Button>
             </div>
-            {/* Survivor-specific info */}
+
             {league.formatKey === "survivor" && selectedVariant && (
-              <div className={cn(
-                "p-4 rounded-lg border",
-                getVariantColor(league.variantKey)
-              )}>
+              <div className={cn("p-4 rounded-lg border", getVariantColor(league.variantKey))}>
                 <div className="flex items-center gap-2 mb-2">
-                  {(() => {
-                    const Icon = getVariantIcon(league.variantKey);
-                    return Icon ? <Icon className="h-5 w-5" /> : null;
-                  })()}
+                  {(() => { const Icon = getVariantIcon(league.variantKey); return Icon ? <Icon className="h-5 w-5" /> : null; })()}
                   <span className="font-semibold">{selectedVariant.name} Rules</span>
                 </div>
                 <p className="text-sm opacity-80">{selectedVariant.description}</p>
@@ -909,23 +1021,16 @@ export function CreateLeague() {
                 <RadioGroup
                   value={league.rules.scoringType}
                   onValueChange={(value) =>
-                    setLeague({
-                      ...league,
-                      rules: { ...league.rules, scoringType: value as LeagueRules["scoringType"] },
-                    })
+                    setLeague({ ...league, rules: { ...league.rules, scoringType: value as LeagueRules["scoringType"] } })
                   }
                 >
                   <div className="flex items-center space-x-2">
                     <RadioGroupItem value="straight" id="straight" />
-                    <Label htmlFor="straight" className="font-normal">
-                      Straight Up (pick winners)
-                    </Label>
+                    <Label htmlFor="straight" className="font-normal">Straight Up (pick winners)</Label>
                   </div>
                   <div className="flex items-center space-x-2">
                     <RadioGroupItem value="spread" id="spread" />
-                    <Label htmlFor="spread" className="font-normal">
-                      Against the Spread
-                    </Label>
+                    <Label htmlFor="spread" className="font-normal">Against the Spread</Label>
                   </div>
                 </RadioGroup>
               </div>
@@ -936,23 +1041,16 @@ export function CreateLeague() {
               <RadioGroup
                 value={league.rules.lockType}
                 onValueChange={(value) =>
-                  setLeague({
-                    ...league,
-                    rules: { ...league.rules, lockType: value as LeagueRules["lockType"] },
-                  })
+                  setLeague({ ...league, rules: { ...league.rules, lockType: value as LeagueRules["lockType"] } })
                 }
               >
                 <div className="flex items-center space-x-2">
                   <RadioGroupItem value="game_start" id="game_start" />
-                  <Label htmlFor="game_start" className="font-normal">
-                    At each game's start time
-                  </Label>
+                  <Label htmlFor="game_start" className="font-normal">At each game's start time</Label>
                 </div>
                 <div className="flex items-center space-x-2">
                   <RadioGroupItem value="first_game" id="first_game" />
-                  <Label htmlFor="first_game" className="font-normal">
-                    When first game of the week starts
-                  </Label>
+                  <Label htmlFor="first_game" className="font-normal">When first game of the week starts</Label>
                 </div>
               </RadioGroup>
             </div>
@@ -962,29 +1060,20 @@ export function CreateLeague() {
               <RadioGroup
                 value={league.rules.visibilityType}
                 onValueChange={(value) =>
-                  setLeague({
-                    ...league,
-                    rules: { ...league.rules, visibilityType: value as LeagueRules["visibilityType"] },
-                  })
+                  setLeague({ ...league, rules: { ...league.rules, visibilityType: value as LeagueRules["visibilityType"] } })
                 }
               >
                 <div className="flex items-center space-x-2">
                   <RadioGroupItem value="immediate" id="immediate" />
-                  <Label htmlFor="immediate" className="font-normal">
-                    Show picks immediately
-                  </Label>
+                  <Label htmlFor="immediate" className="font-normal">Show picks immediately</Label>
                 </div>
                 <div className="flex items-center space-x-2">
                   <RadioGroupItem value="after_lock" id="after_lock" />
-                  <Label htmlFor="after_lock" className="font-normal">
-                    Show after picks lock
-                  </Label>
+                  <Label htmlFor="after_lock" className="font-normal">Show after picks lock</Label>
                 </div>
                 <div className="flex items-center space-x-2">
                   <RadioGroupItem value="after_period" id="after_period" />
-                  <Label htmlFor="after_period" className="font-normal">
-                    Show after week ends
-                  </Label>
+                  <Label htmlFor="after_period" className="font-normal">Show after week ends</Label>
                 </div>
               </RadioGroup>
             </div>
@@ -995,29 +1084,20 @@ export function CreateLeague() {
                 <RadioGroup
                   value={league.rules.tiebreakerType}
                   onValueChange={(value) =>
-                    setLeague({
-                      ...league,
-                      rules: { ...league.rules, tiebreakerType: value as LeagueRules["tiebreakerType"] },
-                    })
+                    setLeague({ ...league, rules: { ...league.rules, tiebreakerType: value as LeagueRules["tiebreakerType"] } })
                   }
                 >
                   <div className="flex items-center space-x-2">
                     <RadioGroupItem value="total_points" id="total_points" />
-                    <Label htmlFor="total_points" className="font-normal">
-                      Total points prediction
-                    </Label>
+                    <Label htmlFor="total_points" className="font-normal">Total points prediction</Label>
                   </div>
                   <div className="flex items-center space-x-2">
                     <RadioGroupItem value="monday_night" id="monday_night" />
-                    <Label htmlFor="monday_night" className="font-normal">
-                      Monday Night score prediction
-                    </Label>
+                    <Label htmlFor="monday_night" className="font-normal">Monday Night score prediction</Label>
                   </div>
                   <div className="flex items-center space-x-2">
                     <RadioGroupItem value="none" id="none" />
-                    <Label htmlFor="none" className="font-normal">
-                      No tiebreaker (split prizes)
-                    </Label>
+                    <Label htmlFor="none" className="font-normal">No tiebreaker (split prizes)</Label>
                   </div>
                 </RadioGroup>
               </div>
@@ -1034,14 +1114,14 @@ export function CreateLeague() {
           <CardHeader>
             <CardTitle className="flex items-center gap-2">
               <Trophy className="h-5 w-5" />
-              Review Your League
+              Review Your Pool
             </CardTitle>
             <CardDescription>Confirm your settings before creating</CardDescription>
           </CardHeader>
           <CardContent className="space-y-4">
             <div className="grid gap-4">
               <div className="flex justify-between py-2 border-b">
-                <span className="text-muted-foreground">League Name</span>
+                <span className="text-muted-foreground">Pool Name</span>
                 <span className="font-medium">{league.name}</span>
               </div>
               <div className="flex justify-between py-2 border-b">
@@ -1059,10 +1139,7 @@ export function CreateLeague() {
                 <div className="flex justify-between py-2 border-b">
                   <span className="text-muted-foreground">Type</span>
                   <span className="font-medium flex items-center gap-2">
-                    {(() => {
-                      const Icon = getVariantIcon(league.variantKey);
-                      return Icon ? <Icon className="h-4 w-4" /> : null;
-                    })()}
+                    {(() => { const Icon = getVariantIcon(league.variantKey); return Icon ? <Icon className="h-4 w-4" /> : null; })()}
                     {selectedVariant.name}
                   </span>
                 </div>
@@ -1075,6 +1152,12 @@ export function CreateLeague() {
                 <span className="text-muted-foreground">Entry Fee</span>
                 <span className="font-medium">
                   {league.entryFeeCents > 0 ? `$${(league.entryFeeCents / 100).toFixed(2)}` : "Free"}
+                </span>
+              </div>
+              <div className="flex justify-between py-2 border-b">
+                <span className="text-muted-foreground">Multiple Entries</span>
+                <span className="font-medium">
+                  {league.allowMultipleEntries ? `Up to ${league.maxEntriesPerUser} entries` : "Single entry"}
                 </span>
               </div>
               {league.formatKey !== "survivor" && (
@@ -1133,7 +1216,7 @@ export function CreateLeague() {
               </>
             )}
           </Button>
-        ) : (
+        ) : currentStep === "sport" ? null : (
           <Button onClick={goNext} disabled={!canProceed()} className="h-10 w-full sm:w-auto">
             {nextStep ? `Continue to ${nextStep.label}` : "Continue"}
             <ArrowRight className="h-4 w-4 ml-2" />
@@ -1142,7 +1225,7 @@ export function CreateLeague() {
       </div>
       {currentStep === "details" && !canProceed() && (
         <p className="text-xs text-muted-foreground mt-1">
-          Add a league name and season to continue.
+          Add a pool name and season to continue.
         </p>
       )}
       </div>

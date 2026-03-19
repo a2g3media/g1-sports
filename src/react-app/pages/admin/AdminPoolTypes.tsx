@@ -1218,54 +1218,22 @@ export function AdminPoolTypes() {
               </div>
             </div>
             {poolTypes.length > 0 && (
-              <>
-                <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between mb-2">
-                  <p className="text-xs uppercase tracking-wide text-muted-foreground">Template Gallery</p>
-                  <div className="flex flex-wrap items-center gap-2">
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      className="h-9"
-                      onClick={() => setShowTable((prev) => !prev)}
-                    >
-                      {showTable ? "Hide Table View" : "Show Table View"}
-                    </Button>
-                    <Button asChild variant="ghost" size="sm" className="h-9">
-                      <Link to="/create-league?sport=nfl&format=pickem&tour=1">Open Create Flow</Link>
-                    </Button>
-                  </div>
+              <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                <p className="text-xs text-muted-foreground">{poolTypes.length} database-registered template(s)</p>
+                <div className="flex flex-wrap items-center gap-2">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-9"
+                    onClick={() => setShowTable((prev) => !prev)}
+                  >
+                    {showTable ? "Hide Table View" : "Show Table View"}
+                  </Button>
+                  <Button asChild size="sm" className="h-9">
+                    <Link to="/create-league">Open Create Flow</Link>
+                  </Button>
                 </div>
-                <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
-                  {poolTypes.map((poolType) => {
-                    const params = toCreateRoutePoolTypeParams(poolType);
-                    const createHref = `/create-league?sport=${encodeURIComponent(params.sport)}&format=${encodeURIComponent(params.format)}&poolTypeKey=${encodeURIComponent(poolType.format_key)}`;
-                    return (
-                      <div key={`card-${poolType.id}`} className="rounded-xl border border-border bg-card p-3 shadow-sm hover:shadow-md transition-shadow">
-                        <div className="flex items-center gap-3">
-                          <PoolTypeBadgeIcon
-                            formatKey={poolType.format_key}
-                            poolTypeKey={poolType.format_key}
-                            sportKey={poolType.sport_key}
-                            size="sm"
-                          />
-                          <div className="min-w-0">
-                            <p className="text-sm font-semibold truncate">{poolType.name}</p>
-                            <p className="text-xs text-muted-foreground truncate">
-                              {getSportLabel(poolType.sport_key)} • {getFormatLabel(poolType.format_key)}
-                            </p>
-                          </div>
-                        </div>
-                        <div className="mt-2 flex flex-col items-start gap-2 sm:flex-row sm:items-center sm:justify-between">
-                          <AdminStatusBadge status={poolType.status} />
-                          <Button asChild size="sm" variant="outline" className="h-9 w-full sm:w-auto">
-                            <Link to={createHref}>Create Pool</Link>
-                          </Button>
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-              </>
+              </div>
             )}
           </div>
         )}
