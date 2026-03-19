@@ -34,8 +34,9 @@ interface LeagueData {
   season: string;
   entryFeeCents: number;
   isPaymentRequired: boolean;
-  allowMultipleEntries: boolean;
+  entryMode: "single" | "optional" | "required";
   maxEntriesPerUser: number;
+  requiredEntries: number;
   rules: LeagueRules;
 }
 
@@ -214,8 +215,9 @@ export function CreateLeague() {
     season: "",
     entryFeeCents: 0,
     isPaymentRequired: false,
-    allowMultipleEntries: false,
+    entryMode: "single",
     maxEntriesPerUser: 1,
+    requiredEntries: 3,
     rules: DEFAULT_RULES,
   });
 
@@ -480,8 +482,10 @@ export function CreateLeague() {
           season: league.season,
           entryFeeCents: league.entryFeeCents,
           isPaymentRequired: league.isPaymentRequired,
-          allowMultipleEntries: league.allowMultipleEntries,
-          maxEntriesPerUser: league.maxEntriesPerUser,
+          entryMode: league.entryMode,
+          allowMultipleEntries: league.entryMode !== "single",
+          maxEntriesPerUser: league.entryMode === "optional" ? league.maxEntriesPerUser : league.entryMode === "required" ? league.requiredEntries : 1,
+          requiredEntries: league.entryMode === "required" ? league.requiredEntries : null,
           rules: league.rules,
         }),
       });
@@ -890,29 +894,44 @@ export function CreateLeague() {
               </div>
             )}
 
-            {/* Multi-Entry Settings */}
+            {/* Entry Mode Settings */}
             <div className="rounded-lg border border-border p-4 space-y-4">
-              <div className="flex items-center justify-between">
-                <div className="flex items-center gap-2">
-                  <Users className="h-4 w-4 text-muted-foreground" />
+              <div className="flex items-center gap-2 mb-1">
+                <Users className="h-4 w-4 text-muted-foreground" />
+                <Label>Entry Mode</Label>
+              </div>
+              <RadioGroup
+                value={league.entryMode}
+                onValueChange={(value) => setLeague({
+                  ...league,
+                  entryMode: value as LeagueData["entryMode"],
+                  maxEntriesPerUser: value === "optional" ? Math.max(league.maxEntriesPerUser, 2) : value === "required" ? league.requiredEntries : 1,
+                })}
+              >
+                <div className="flex items-start space-x-2">
+                  <RadioGroupItem value="single" id="entry-single" className="mt-0.5" />
                   <div>
-                    <Label>Allow Multiple Entries</Label>
-                    <p className="text-xs text-muted-foreground">
-                      Let members submit more than one entry per pool
-                    </p>
+                    <Label htmlFor="entry-single" className="font-normal">Single Entry</Label>
+                    <p className="text-xs text-muted-foreground">Each member gets one entry (default).</p>
                   </div>
                 </div>
-                <Switch
-                  checked={league.allowMultipleEntries}
-                  onCheckedChange={(checked) => setLeague({
-                    ...league,
-                    allowMultipleEntries: checked,
-                    maxEntriesPerUser: checked ? Math.max(league.maxEntriesPerUser, 2) : 1,
-                  })}
-                />
-              </div>
+                <div className="flex items-start space-x-2">
+                  <RadioGroupItem value="optional" id="entry-optional" className="mt-0.5" />
+                  <div>
+                    <Label htmlFor="entry-optional" className="font-normal">Optional Multiple Entries</Label>
+                    <p className="text-xs text-muted-foreground">Members choose how many entries to submit, up to a max you set.</p>
+                  </div>
+                </div>
+                <div className="flex items-start space-x-2">
+                  <RadioGroupItem value="required" id="entry-required" className="mt-0.5" />
+                  <div>
+                    <Label htmlFor="entry-required" className="font-normal">Mandatory Multiple Entries</Label>
+                    <p className="text-xs text-muted-foreground">Every member must submit exactly a fixed number of entries to participate.</p>
+                  </div>
+                </div>
+              </RadioGroup>
 
-              {league.allowMultipleEntries && (
+              {league.entryMode === "optional" && (
                 <div className="space-y-2 pl-6 border-l-2 border-primary/20">
                   <Label htmlFor="maxEntries">Max Entries Per User</Label>
                   <div className="flex items-center gap-3">
@@ -934,6 +953,32 @@ export function CreateLeague() {
                   </div>
                   <p className="text-xs text-muted-foreground">
                     Each entry acts as an independent ticket with its own picks, score, and leaderboard position.
+                  </p>
+                </div>
+              )}
+
+              {league.entryMode === "required" && (
+                <div className="space-y-2 pl-6 border-l-2 border-amber-500/30">
+                  <Label htmlFor="requiredEntries">Required Entries Per User</Label>
+                  <div className="flex items-center gap-3">
+                    <Input
+                      id="requiredEntries"
+                      type="number"
+                      min="2"
+                      max="25"
+                      value={league.requiredEntries}
+                      onChange={(e) =>
+                        setLeague({
+                          ...league,
+                          requiredEntries: Math.max(2, Math.min(25, parseInt(e.target.value || "3", 10))),
+                        })
+                      }
+                      className="w-20"
+                    />
+                    <span className="text-sm text-muted-foreground">entries required</span>
+                  </div>
+                  <p className="text-xs text-muted-foreground">
+                    Every member must submit exactly this many entries. Members who don't complete all entries won't be eligible for prizes.
                   </p>
                 </div>
               )}
@@ -1155,9 +1200,11 @@ export function CreateLeague() {
                 </span>
               </div>
               <div className="flex justify-between py-2 border-b">
-                <span className="text-muted-foreground">Multiple Entries</span>
+                <span className="text-muted-foreground">Entry Mode</span>
                 <span className="font-medium">
-                  {league.allowMultipleEntries ? `Up to ${league.maxEntriesPerUser} entries` : "Single entry"}
+                  {league.entryMode === "single" && "Single entry"}
+                  {league.entryMode === "optional" && `Optional, up to ${league.maxEntriesPerUser} entries`}
+                  {league.entryMode === "required" && `Mandatory ${league.requiredEntries} entries`}
                 </span>
               </div>
               {league.formatKey !== "survivor" && (
