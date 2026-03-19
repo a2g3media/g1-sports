@@ -8,10 +8,8 @@ import { Label } from "@/react-app/components/ui/label";
 import { Switch } from "@/react-app/components/ui/switch";
 import { RadioGroup, RadioGroupItem } from "@/react-app/components/ui/radio-group";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/react-app/components/ui/select";
-import { Badge } from "@/react-app/components/ui/badge";
 import {
   ArrowLeft, ArrowRight, Check, Trophy, Loader2, AlertCircle,
-  Heart, Skull, TrendingUp, RefreshCw, Shield, Sparkles, SlidersHorizontal,
   Search, X, Star, Users,
 } from "lucide-react";
 import { Alert, AlertDescription } from "@/react-app/components/ui/alert";
@@ -20,16 +18,23 @@ import { cn } from "@/react-app/lib/utils";
 import { PoolAccessGate } from "@/react-app/components/PoolAccessGate";
 import { PoolTypeBadgeIcon } from "@/react-app/components/pools/PoolTypeBadgeIcon";
 import { RuleEnginePreviewCard } from "@/react-app/components/pools/RuleEnginePreviewCard";
-import { getPoolTypeByKey, getTemplateForPoolType, POOL_TYPE_CATALOG } from "@/shared/poolTypeCatalog";
+import { getPoolTypeByKey, getTemplateForPoolType, POOL_TYPE_CATALOG, type PoolTypeDefinition } from "@/shared/poolTypeCatalog";
 import { generatePoolRuleEngineOutput } from "@/shared/poolRuleEngine";
 
-type Step = "sport" | "format" | "variant" | "details" | "rules" | "review";
+type Step = "catalog" | "details" | "rules" | "review";
+
+const STEPS: { key: Step; label: string }[] = [
+  { key: "catalog", label: "Pool Type" },
+  { key: "details", label: "Details" },
+  { key: "rules", label: "Rules" },
+  { key: "review", label: "Review" },
+];
 
 interface LeagueData {
   name: string;
   sportKey: string;
   formatKey: string;
-  poolTypeKey?: string;
+  poolTypeKey: string;
   variantKey: string;
   season: string;
   entryFeeCents: number;
@@ -38,166 +43,67 @@ interface LeagueData {
   maxEntriesPerUser: number;
   requiredEntries: number;
   rules: LeagueRules;
+  missedPickPolicy: "loss" | "no_pick" | "auto_worst";
+  allowLateJoins: boolean;
+  allowLatePicks: boolean;
+  picksPerPeriod: "all" | "custom";
+  customPickCount: number;
+  hidePicksUntilLock: boolean;
+  selectedPoolTypeDef: PoolTypeDefinition | null;
 }
 
 const CATALOG_SPORT_LABELS: Record<string, string> = {
-  nfl: "NFL",
-  ncaaf: "College Football",
-  nba: "NBA",
-  ncaab: "College Basketball",
-  mlb: "MLB",
-  nhl: "NHL",
-  soccer: "Soccer",
-  golf: "Golf",
-  mma: "UFC/MMA",
-  nascar: "NASCAR",
-  multi_sport: "Multi-Sport",
+  nfl: "NFL", ncaaf: "College Football", nba: "NBA", ncaab: "College Basketball",
+  mlb: "MLB", nhl: "NHL", soccer: "Soccer", golf: "Golf",
+  mma: "UFC/MMA", nascar: "NASCAR", multi_sport: "Multi-Sport",
 };
 
 const TEMPLATE_LABELS: Record<string, string> = {
-  pickem: "Pick'em",
-  ats_pickem: "ATS Pick'em",
-  confidence: "Confidence",
-  ats_confidence: "ATS Confidence",
-  survivor: "Survivor",
-  squares: "Squares",
-  bracket: "Bracket",
-  prop: "Prop",
-  streak: "Streak",
-  upset_underdog: "Upset / Underdog",
-  stat_performance: "Stat / Performance",
-  last_man_standing: "Last Man Standing",
-  bundle_pool: "Bundle Pool",
+  pickem: "Pick'em", ats_pickem: "ATS Pick'em", confidence: "Confidence",
+  ats_confidence: "ATS Confidence", survivor: "Survivor", squares: "Squares",
+  bracket: "Bracket", prop: "Prop", streak: "Streak",
+  upset_underdog: "Upset / Underdog", stat_performance: "Stat / Performance",
+  last_man_standing: "Last Man Standing", bundle_pool: "Bundle Pool",
 };
 
 const STEP_HELP: Record<Step, { title: string; hint: string }> = {
-  sport: {
-    title: "Choose a pool type",
-    hint: "Search, filter, or pick from favorites to start.",
-  },
-  format: {
-    title: "Choose competition style",
-    hint: "Formats control how picks are made and scored.",
-  },
-  variant: {
-    title: "Select variant",
-    hint: "Variants fine-tune format behavior for your audience.",
-  },
-  details: {
-    title: "Name and configure basics",
-    hint: "Set season, entry, and core setup details.",
-  },
-  rules: {
-    title: "Apply rules",
-    hint: "Use presets first, then advanced options only if needed.",
-  },
-  review: {
-    title: "Final review",
-    hint: "Confirm everything before creating your pool.",
-  },
+  catalog: { title: "Choose a pool type", hint: "Search, filter, or pick from favorites to start." },
+  details: { title: "Name and configure basics", hint: "Set season, entries, and core setup details." },
+  rules: { title: "Customize pool rules", hint: "Strong defaults are set. Adjust anything you need." },
+  review: { title: "Final review", hint: "Confirm everything before creating your pool." },
 };
 
 const CATALOG_FAVORITES_KEY = "create-pool:favorites";
 
-function normalizeCatalogSportToAppSport(catalogSport: string): string {
-  const map: Record<string, string> = {
-    americanfootball_nfl: "nfl",
-    americanfootball_ncaaf: "ncaaf",
-    basketball_nba: "nba",
-    basketball_ncaab: "ncaab",
-    baseball_mlb: "mlb",
-    icehockey_nhl: "nhl",
-    soccer_epl: "soccer",
-    soccer_mls: "soccer",
-    golf_pga: "golf",
-    mma_ufc: "mma",
+function normalizeSport(s: string): string {
+  const m: Record<string, string> = {
+    americanfootball_nfl: "nfl", americanfootball_ncaaf: "ncaaf",
+    basketball_nba: "nba", basketball_ncaab: "ncaab",
+    baseball_mlb: "mlb", icehockey_nhl: "nhl",
+    soccer_epl: "soccer", soccer_mls: "soccer",
+    golf_pga: "golf", mma_ufc: "mma",
   };
-  return map[catalogSport] || catalogSport;
+  return m[s] || s;
 }
 
-function catalogTemplateToFormatKey(template: string): string {
-  const map: Record<string, string> = {
-    ats_pickem: "ats",
-    ats_confidence: "confidence",
-    prop: "props",
-    upset_underdog: "pickem",
-    stat_performance: "pickem",
-    last_man_standing: "survivor",
-    bundle_pool: "pickem",
+function templateToFormat(t: string): string {
+  const m: Record<string, string> = {
+    ats_pickem: "ats", ats_confidence: "confidence", prop: "props",
+    upset_underdog: "pickem", stat_performance: "pickem",
+    last_man_standing: "survivor", bundle_pool: "pickem",
   };
-  return map[template] || template;
+  return m[t] || t;
 }
 
-function buildRecommendedRules(
-  formatKey: string,
-  variantKey: string,
-  baseRules: LeagueRules = DEFAULT_RULES,
-): LeagueRules {
-  const recommended: LeagueRules = {
-    ...baseRules,
-    lockType: "game_start",
-    visibilityType: "after_lock",
-    tiebreakerType: "total_points",
-    allowLateJoins: true,
-    useSpread: false,
-    survivorType: undefined,
-    survivorVariant: undefined,
-    survivorLives: undefined,
-    survivorReentryFeeCents: undefined,
-  };
-
-  if (formatKey === "survivor") {
-    recommended.lockType = "first_game";
-    recommended.visibilityType = "after_lock";
-    recommended.tiebreakerType = "none";
-    recommended.survivorType =
-      variantKey === "loser" ? "loser" : variantKey === "ats" ? "ats" : "winner";
-    recommended.survivorVariant =
-      variantKey === "two_life" ? "two_life" : variantKey === "reentry" ? "reentry" : "standard";
-    recommended.survivorLives = variantKey === "two_life" ? 2 : 1;
-    recommended.survivorReentryFeeCents = variantKey === "reentry" ? 2500 : undefined;
-    return recommended;
-  }
-
-  if (formatKey === "bracket") {
-    recommended.scoringType = "points";
-    recommended.pointsPerWin = 2;
-    recommended.lockType = "first_game";
-    recommended.visibilityType = "after_lock";
-    return recommended;
-  }
-
-  if (formatKey === "squares") {
-    recommended.scoringType = "points";
-    recommended.pointsPerWin = 1;
-    recommended.lockType = "first_game";
-    recommended.visibilityType = "after_period";
-    return recommended;
-  }
-
-  if (formatKey === "props") {
-    recommended.scoringType = "points";
-    recommended.pointsPerWin = 1;
-    recommended.lockType = "game_start";
-    recommended.visibilityType = "after_lock";
-    recommended.tiebreakerType = "none";
-    return recommended;
-  }
-
-  if (formatKey === "confidence") {
-    recommended.scoringType = "points";
-    recommended.pointsPerWin = 1;
-    recommended.useSpread = variantKey === "ats";
-    return recommended;
-  }
-
-  if (formatKey === "ats") {
-    recommended.scoringType = "spread";
-    recommended.useSpread = true;
-    return recommended;
-  }
-
-  return recommended;
+function buildRecommendedRules(formatKey: string, variantKey: string, base: LeagueRules = DEFAULT_RULES): LeagueRules {
+  const r: LeagueRules = { ...base, lockType: "game_start", visibilityType: "after_lock", tiebreakerType: "total_points", allowLateJoins: true, useSpread: false, survivorType: undefined, survivorVariant: undefined, survivorLives: undefined, survivorReentryFeeCents: undefined };
+  if (formatKey === "survivor") { r.lockType = "first_game"; r.tiebreakerType = "none"; r.survivorType = variantKey === "loser" ? "loser" : variantKey === "ats" ? "ats" : "winner"; r.survivorVariant = variantKey === "two_life" ? "two_life" : variantKey === "reentry" ? "reentry" : "standard"; r.survivorLives = variantKey === "two_life" ? 2 : 1; r.survivorReentryFeeCents = variantKey === "reentry" ? 2500 : undefined; }
+  if (formatKey === "bracket") { r.scoringType = "points"; r.pointsPerWin = 2; r.lockType = "first_game"; }
+  if (formatKey === "squares") { r.scoringType = "points"; r.pointsPerWin = 1; r.lockType = "first_game"; r.visibilityType = "after_period"; }
+  if (formatKey === "props") { r.scoringType = "points"; r.pointsPerWin = 1; r.tiebreakerType = "none"; }
+  if (formatKey === "confidence") { r.scoringType = "points"; r.pointsPerWin = 1; r.useSpread = variantKey === "ats"; }
+  if (formatKey === "ats") { r.scoringType = "spread"; r.useSpread = true; }
+  return r;
 }
 
 export function CreateLeague() {
@@ -205,333 +111,177 @@ export function CreateLeague() {
   const [searchParams] = useSearchParams();
   const isTourMode = searchParams.get("tour") === "1";
   const { isDemoMode } = useDemoAuth();
-  const [currentStep, setCurrentStep] = useState<Step>("sport");
+  const [currentStep, setCurrentStep] = useState<Step>("catalog");
   const [league, setLeague] = useState<LeagueData>({
-    name: "",
-    sportKey: "",
-    formatKey: "",
-    poolTypeKey: "",
-    variantKey: "",
-    season: "",
-    entryFeeCents: 0,
-    isPaymentRequired: false,
-    entryMode: "single",
-    maxEntriesPerUser: 1,
-    requiredEntries: 3,
+    name: "", sportKey: "", formatKey: "", poolTypeKey: "", variantKey: "",
+    season: "", entryFeeCents: 0, isPaymentRequired: false,
+    entryMode: "single", maxEntriesPerUser: 1, requiredEntries: 3,
     rules: DEFAULT_RULES,
+    missedPickPolicy: "loss", allowLateJoins: true, allowLatePicks: false,
+    picksPerPeriod: "all", customPickCount: 5, hidePicksUntilLock: true,
+    selectedPoolTypeDef: null,
   });
 
-  // Catalog browser state
   const [catalogSearch, setCatalogSearch] = useState("");
   const [catalogSportFilter, setCatalogSportFilter] = useState("all");
   const [favoriteKeys, setFavoriteKeys] = useState<string[]>([]);
   const searchRef = useRef<HTMLInputElement>(null);
+  const [isCreating, setIsCreating] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
-  // Load favorites from localStorage
-  useEffect(() => {
-    try {
-      const raw = localStorage.getItem(CATALOG_FAVORITES_KEY);
-      if (raw) {
-        const parsed = JSON.parse(raw) as unknown;
-        if (Array.isArray(parsed)) {
-          setFavoriteKeys(parsed.filter((v): v is string => typeof v === "string"));
-        }
-      }
-    } catch {
-      setFavoriteKeys([]);
-    }
-  }, []);
+  useEffect(() => { try { const r = localStorage.getItem(CATALOG_FAVORITES_KEY); if (r) { const p = JSON.parse(r) as unknown; if (Array.isArray(p)) setFavoriteKeys(p.filter((v): v is string => typeof v === "string")); } } catch { setFavoriteKeys([]); } }, []);
+  useEffect(() => { try { localStorage.setItem(CATALOG_FAVORITES_KEY, JSON.stringify(favoriteKeys)); } catch { /* ok */ } }, [favoriteKeys]);
 
-  useEffect(() => {
-    try {
-      localStorage.setItem(CATALOG_FAVORITES_KEY, JSON.stringify(favoriteKeys));
-    } catch { /* non-fatal */ }
-  }, [favoriteKeys]);
-
-  // Keyboard shortcuts: / to focus, Esc to clear
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
-      const target = e.target as HTMLElement | null;
-      const isTyping = target?.tagName === "INPUT" || target?.tagName === "TEXTAREA" || target?.isContentEditable;
-      if (e.key === "/" && !isTyping && currentStep === "sport") {
-        e.preventDefault();
-        searchRef.current?.focus();
-      }
-      if (e.key === "Escape" && document.activeElement === searchRef.current) {
-        if (catalogSearch) {
-          setCatalogSearch("");
-        } else {
-          searchRef.current?.blur();
-        }
-      }
+      const t = e.target as HTMLElement | null;
+      if (e.key === "/" && !(t?.tagName === "INPUT" || t?.tagName === "TEXTAREA" || t?.isContentEditable) && currentStep === "catalog") { e.preventDefault(); searchRef.current?.focus(); }
+      if (e.key === "Escape" && document.activeElement === searchRef.current) { if (catalogSearch) { setCatalogSearch(""); } else { searchRef.current?.blur(); } }
     };
     document.addEventListener("keydown", handler);
     return () => document.removeEventListener("keydown", handler);
   }, [catalogSearch, currentStep]);
 
   const catalog = POOL_TYPE_CATALOG;
-
-  const catalogSportOptions = useMemo(() => {
-    return Array.from(new Set(catalog.map((item) => item.sport))).sort();
-  }, [catalog]);
+  const catalogSportOptions = useMemo(() => Array.from(new Set(catalog.map((i) => i.sport))).sort(), [catalog]);
 
   const filteredCatalog = useMemo(() => {
     const q = catalogSearch.trim().toLowerCase();
     return catalog.filter((item) => {
       if (catalogSportFilter !== "all" && item.sport !== catalogSportFilter) return false;
       if (q) {
-        const haystack = [
-          item.name, item.key, item.sport, item.template, item.description,
-          ...item.rule_variants.map((v) => `${v.key} ${v.label}`),
-        ].join(" ").toLowerCase();
-        if (!haystack.includes(q)) return false;
+        const h = [item.name, item.key, item.sport, item.template, item.description, ...item.rule_variants.map((v) => `${v.key} ${v.label}`)].join(" ").toLowerCase();
+        if (!h.includes(q)) return false;
       }
       return true;
     });
   }, [catalog, catalogSportFilter, catalogSearch]);
 
   const favoriteCatalogItems = useMemo(() => {
-    const index = new Map(catalog.map((item) => [item.key, item]));
-    return favoriteKeys
-      .map((key) => index.get(key))
-      .filter((item): item is typeof catalog[number] => Boolean(item));
+    const idx = new Map(catalog.map((i) => [i.key, i]));
+    return favoriteKeys.map((k) => idx.get(k)).filter((i): i is PoolTypeDefinition => Boolean(i));
   }, [catalog, favoriteKeys]);
 
-  const toggleFavorite = (key: string) => {
-    setFavoriteKeys((prev) =>
-      prev.includes(key) ? prev.filter((k) => k !== key) : [key, ...prev]
-    );
-  };
+  const toggleFavorite = (key: string) => setFavoriteKeys((p) => p.includes(key) ? p.filter((k) => k !== key) : [key, ...p]);
 
-  const selectCatalogItem = (item: typeof catalog[number]) => {
-    const appSport = normalizeCatalogSportToAppSport(item.sport);
+  const selectCatalogItem = (item: PoolTypeDefinition) => {
+    const appSport = normalizeSport(item.sport);
     const sport = SPORTS.find((s) => s.key === appSport);
-    const formatKey = catalogTemplateToFormatKey(item.template);
-    const format = POOL_FORMATS.find((f) => f.key === formatKey);
-    const variantKey = item.rule_variants[0]?.key || format?.variants?.[0]?.key || "";
-    const season = sport?.seasons?.[0] || "";
-
+    const fk = templateToFormat(item.template);
+    const format = POOL_FORMATS.find((f) => f.key === fk);
+    const vk = item.rule_variants[0]?.key || format?.variants?.[0]?.key || "";
     setLeague((prev) => ({
       ...prev,
-      sportKey: appSport,
-      formatKey,
-      poolTypeKey: item.key,
-      variantKey,
-      season,
+      sportKey: appSport, formatKey: fk, poolTypeKey: item.key, variantKey: vk,
+      season: sport?.seasons?.[0] || prev.season,
       name: prev.name || `${sport?.name || item.sport} ${item.name}`,
-      rules: buildRecommendedRules(formatKey, variantKey, prev.rules),
+      rules: buildRecommendedRules(fk, vk, prev.rules),
+      selectedPoolTypeDef: item,
+      hidePicksUntilLock: true,
+      missedPickPolicy: fk === "survivor" ? "loss" : "loss",
+      allowLateJoins: true,
+      allowLatePicks: false,
     }));
-
-    const hasVariants = format?.variants && format.variants.length > 1;
-    setCurrentStep(hasVariants ? "variant" : "details");
+    setCurrentStep("details");
   };
+
+  // URL param deep-link support
+  useEffect(() => {
+    const sp = searchParams.get("sport"), fp = searchParams.get("format"), pk = searchParams.get("poolTypeKey");
+    if (!sp && !fp) return;
+    const sk = normalizeSport(sp || "");
+    const sport = SPORTS.find((s) => s.key === sk);
+    const format = POOL_FORMATS.find((f) => f.key === fp);
+    const vk = searchParams.get("variant") || format?.variants?.[0]?.key || "";
+    const catItem = pk ? catalog.find((c) => c.key === pk) : null;
+    setLeague((prev) => ({
+      ...prev, sportKey: sport ? sport.key : prev.sportKey, formatKey: format ? format.key : prev.formatKey,
+      poolTypeKey: pk || prev.poolTypeKey, variantKey: format ? vk : prev.variantKey,
+      season: sport?.seasons?.[0] || prev.season, name: prev.name || `${sport?.name || "Sports"} ${format?.name || "Pool"}`,
+      rules: format ? buildRecommendedRules(format.key, vk, prev.rules) : prev.rules,
+      entryFeeCents: isTourMode && prev.entryFeeCents === 0 ? 2500 : prev.entryFeeCents,
+      isPaymentRequired: isTourMode ? true : prev.isPaymentRequired,
+      selectedPoolTypeDef: catItem || prev.selectedPoolTypeDef,
+    }));
+    setCurrentStep(isTourMode ? "review" : "details");
+  }, [searchParams, isTourMode, catalog]);
 
   const selectedSport = SPORTS.find((s) => s.key === league.sportKey);
   const selectedFormat = POOL_FORMATS.find((f) => f.key === league.formatKey);
-  const selectedVariant = selectedFormat?.variants?.find((v) => v.key === league.variantKey);
-  const availableFormats = POOL_FORMATS.filter((f) => f.supportedSports.includes(league.sportKey));
-  const hasVariants = selectedFormat?.variants && selectedFormat.variants.length > 0;
 
-  const getSteps = (): { key: Step; label: string }[] => {
-    const baseSteps: { key: Step; label: string }[] = [
-      { key: "sport", label: "Pool Type" },
-      { key: "format", label: "Format" },
-    ];
-    if (hasVariants) {
-      baseSteps.push({ key: "variant", label: "Type" });
-    }
-    baseSteps.push(
-      { key: "details", label: "Details" },
-      { key: "rules", label: "Rules" },
-      { key: "review", label: "Review" }
-    );
-    return baseSteps;
-  };
-
-  const STEPS = getSteps();
   const currentStepIndex = STEPS.findIndex((s) => s.key === currentStep);
   const nextStep = currentStepIndex + 1 < STEPS.length ? STEPS[currentStepIndex + 1] : null;
   const stepHelp = STEP_HELP[currentStep];
 
   const canProceed = () => {
-    switch (currentStep) {
-      case "sport":
-        return !!league.sportKey && !!league.formatKey;
-      case "format":
-        return !!league.formatKey;
-      case "variant":
-        return !!league.variantKey;
-      case "details":
-        return !!league.name && !!league.season;
-      case "rules":
-        return true;
-      case "review":
-        return true;
-      default:
-        return false;
-    }
+    if (currentStep === "catalog") return !!league.sportKey && !!league.formatKey;
+    if (currentStep === "details") return !!league.name && !!league.season;
+    return true;
   };
 
-  const goNext = () => {
-    const nextIndex = currentStepIndex + 1;
-    if (nextIndex < STEPS.length) {
-      setCurrentStep(STEPS[nextIndex].key);
-    }
-  };
-
-  const goBack = () => {
-    const prevIndex = currentStepIndex - 1;
-    if (prevIndex >= 0) {
-      setCurrentStep(STEPS[prevIndex].key);
-    } else {
-      navigate("/");
-    }
-  };
-
-  const [isCreating, setIsCreating] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [showAdvancedRules, setShowAdvancedRules] = useState(false);
+  const goNext = () => { const ni = currentStepIndex + 1; if (ni < STEPS.length) setCurrentStep(STEPS[ni].key); };
+  const goBack = () => { const pi = currentStepIndex - 1; if (pi >= 0) setCurrentStep(STEPS[pi].key); else navigate("/"); };
 
   const createFlowRulePreview = useMemo(() => {
     const typeDef = getPoolTypeByKey(league.poolTypeKey || league.formatKey || "");
     const template = getTemplateForPoolType(league.poolTypeKey || league.formatKey || "");
     const scheduleType = typeDef?.schedule_type || ["weekly"];
-    const inferredTieHandling = league.rules.tiebreakerType === "none" ? "split" : "push";
-    const settings: Record<string, unknown> = {
-      ...league.rules,
-      tieHandling: inferredTieHandling,
-      pointsPerWin: league.rules.scoringType === "points" ? 2 : 1,
-      allowLateJoins: true,
-      visibilityType: league.rules.visibilityType,
-      lockType: league.rules.lockType,
-      survivorLives: league.variantKey === "two_life" ? 2 : 1,
-      reuse: false,
-      buybackStartWeek: league.variantKey === "reentry" ? 1 : 0,
-      buybackEndWeek: league.variantKey === "reentry" ? 4 : 0,
-    };
     return generatePoolRuleEngineOutput({
-      template,
-      scheduleType,
-      settings,
-      userState: {
-        picksSubmittedCount: 0,
-        eligibleEventsCount: 0,
-        missedPicksCount: 0,
-        invalidSelectionCount: 0,
-        lateEntry: false,
-      },
+      template, scheduleType,
+      settings: { ...league.rules, tieHandling: league.rules.tiebreakerType === "none" ? "split" : "push", pointsPerWin: league.rules.scoringType === "points" ? 2 : 1, allowLateJoins: league.allowLateJoins, visibilityType: league.rules.visibilityType, lockType: league.rules.lockType, survivorLives: league.variantKey === "two_life" ? 2 : 1, reuse: false },
+      userState: { picksSubmittedCount: 0, eligibleEventsCount: 0, missedPicksCount: 0, invalidSelectionCount: 0, lateEntry: false },
     });
   }, [league]);
 
   useEffect(() => {
     if (!selectedSport) return;
     setLeague((prev) => {
-      const nextSeason = prev.season || selectedSport.seasons?.[0] || "";
-      const nextName = prev.name || `${selectedSport.name}${selectedFormat ? ` ${selectedFormat.name}` : ""} Pool`;
-      if (nextSeason === prev.season && nextName === prev.name) return prev;
-      return { ...prev, season: nextSeason, name: nextName };
+      const ns = prev.season || selectedSport.seasons?.[0] || "";
+      const nn = prev.name || `${selectedSport.name}${selectedFormat ? ` ${selectedFormat.name}` : ""} Pool`;
+      if (ns === prev.season && nn === prev.name) return prev;
+      return { ...prev, season: ns, name: nn };
     });
   }, [selectedSport, selectedFormat]);
 
-  useEffect(() => {
-    const sportParam = searchParams.get("sport");
-    const formatParam = searchParams.get("format");
-    const poolTypeParam = searchParams.get("poolTypeKey");
-    const variantParam = searchParams.get("variant");
-    if (!sportParam && !formatParam) return;
-
-    const sportKey = normalizeCatalogSportToAppSport(sportParam || "");
-    const sport = SPORTS.find((s) => s.key === sportKey);
-    const format = POOL_FORMATS.find((f) => f.key === formatParam);
-    const variantKey = variantParam || format?.variants?.[0]?.key || "";
-
-    setLeague((prev) => ({
-      ...prev,
-      sportKey: sport ? sport.key : prev.sportKey,
-      formatKey: format ? format.key : prev.formatKey,
-      poolTypeKey: poolTypeParam || prev.poolTypeKey,
-      variantKey: format ? variantKey : prev.variantKey,
-      season: sport?.seasons?.[0] || prev.season,
-      name: prev.name || `${sport?.name || "Sports"} ${format?.name || "Pool"}`,
-      rules: format ? buildRecommendedRules(format.key, variantKey, prev.rules) : prev.rules,
-      entryFeeCents: isTourMode && prev.entryFeeCents === 0 ? 2500 : prev.entryFeeCents,
-      isPaymentRequired: isTourMode ? true : prev.isPaymentRequired,
-    }));
-    setCurrentStep(isTourMode ? "review" : "details");
-  }, [searchParams, isTourMode]);
-
   const handleCreate = async () => {
-    setIsCreating(true);
-    setError(null);
-
+    setIsCreating(true); setError(null);
     try {
       const headers: HeadersInit = { "Content-Type": "application/json" };
-      if (isDemoMode) {
-        headers["X-Demo-Mode"] = "true";
-      }
-
+      if (isDemoMode) headers["X-Demo-Mode"] = "true";
       const response = await fetch("/api/leagues", {
-        method: "POST",
-        headers,
+        method: "POST", headers,
         body: JSON.stringify({
-          name: league.name,
-          sportKey: league.sportKey,
-          formatKey: league.formatKey,
-          poolTypeKey: league.poolTypeKey || league.formatKey,
-          variantKey: league.variantKey,
-          season: league.season,
-          entryFeeCents: league.entryFeeCents,
-          isPaymentRequired: league.isPaymentRequired,
-          entryMode: league.entryMode,
+          name: league.name, sportKey: league.sportKey, formatKey: league.formatKey,
+          poolTypeKey: league.poolTypeKey || league.formatKey, variantKey: league.variantKey,
+          season: league.season, entryFeeCents: league.entryFeeCents,
+          isPaymentRequired: league.isPaymentRequired, entryMode: league.entryMode,
           allowMultipleEntries: league.entryMode !== "single",
           maxEntriesPerUser: league.entryMode === "optional" ? league.maxEntriesPerUser : league.entryMode === "required" ? league.requiredEntries : 1,
           requiredEntries: league.entryMode === "required" ? league.requiredEntries : null,
+          missedPickPolicy: league.missedPickPolicy,
+          allowLateJoins: league.allowLateJoins, allowLatePicks: league.allowLatePicks,
+          picksPerPeriod: league.picksPerPeriod === "custom" ? league.customPickCount : null,
+          hidePicksUntilLock: league.hidePicksUntilLock,
           rules: league.rules,
         }),
       });
-
-      if (!response.ok) {
-        const data = await response.json();
-        throw new Error(data.error || "Failed to create league");
-      }
-
+      if (!response.ok) { const d = await response.json(); throw new Error(d.error || "Failed to create league"); }
       const data = await response.json() as { id: number; inviteCode: string };
-
-      navigate(`/pool-admin/pools`, {
-        state: { newLeagueId: data.id, inviteCode: data.inviteCode },
-      });
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Something went wrong");
-    } finally {
-      setIsCreating(false);
-    }
+      navigate(`/pool-admin/pools`, { state: { newLeagueId: data.id, inviteCode: data.inviteCode } });
+    } catch (err) { setError(err instanceof Error ? err.message : "Something went wrong"); }
+    finally { setIsCreating(false); }
   };
 
-  const getVariantIcon = (variantKey: string) => {
-    switch (variantKey) {
-      case "winner": return Heart;
-      case "loser": return Skull;
-      case "ats": return TrendingUp;
-      case "two_life": return Shield;
-      case "reentry": return RefreshCw;
-      default: return null;
-    }
-  };
-
-  const getVariantColor = (variantKey: string) => {
-    switch (variantKey) {
-      case "winner": return "text-emerald-500 bg-emerald-500/10 border-emerald-500/30";
-      case "loser": return "text-red-500 bg-red-500/10 border-red-500/30";
-      case "ats": return "text-blue-500 bg-blue-500/10 border-blue-500/30";
-      case "two_life": return "text-purple-500 bg-purple-500/10 border-purple-500/30";
-      case "reentry": return "text-amber-500 bg-amber-500/10 border-amber-500/30";
-      default: return "";
-    }
-  };
+  const poolTypeDef = league.selectedPoolTypeDef;
+  const isSurvivor = league.formatKey === "survivor";
+  const isConfidence = league.formatKey === "confidence";
+  const isBracket = league.formatKey === "bracket";
+  const isSquares = league.formatKey === "squares";
 
   return (
     <PoolAccessGate action="create" variant="replace">
       <div className="max-w-4xl mx-auto space-y-6 px-4 pb-6 sm:px-0 sm:space-y-8">
+      {/* Header */}
       <div className="flex items-start gap-3 sm:items-center sm:gap-4">
         <Button variant="ghost" size="icon" onClick={goBack} className="h-10 w-10 shrink-0">
           <ArrowLeft className="h-5 w-5" />
@@ -542,444 +292,135 @@ export function CreateLeague() {
           <p className="text-xs sm:text-sm text-muted-foreground/90 mt-1">{stepHelp.title} - {stepHelp.hint}</p>
         </div>
       </div>
-      {isTourMode && (
-        <Alert className="border-primary/30 bg-primary/5">
-          <Sparkles className="h-4 w-4 text-primary" />
-          <AlertDescription className="text-sm">
-            Guided tour mode is active. This pool is prefilled with launch-ready defaults so you can create and preview instantly.
-          </AlertDescription>
-        </Alert>
-      )}
 
-      {/* Progress bar */}
+      {/* Progress */}
       <div className="flex gap-2">
-        {STEPS.map((step, index) => (
-          <div
-            key={step.key}
-            className={`h-2.5 flex-1 rounded-full transition-colors ${
-              index <= currentStepIndex ? "bg-primary" : "bg-muted"
-            }`}
-          />
+        {STEPS.map((step, i) => (
+          <div key={step.key} className={`h-2.5 flex-1 rounded-full transition-colors ${i <= currentStepIndex ? "bg-primary" : "bg-muted"}`} />
         ))}
       </div>
       <div className="flex flex-nowrap overflow-x-auto pb-1 gap-2 [-ms-overflow-style:none] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
-        {STEPS.map((step, index) => {
-          const isDone = index < currentStepIndex;
-          const isCurrent = index === currentStepIndex;
-          return (
-            <div
-              key={`label-${step.key}`}
-              className={cn(
-                "shrink-0 text-xs px-3 py-1.5 rounded-full border whitespace-nowrap",
-                isCurrent && "border-primary/50 bg-primary/10 text-primary",
-                isDone && "border-emerald-500/30 bg-emerald-500/10 text-emerald-400",
-                !isDone && !isCurrent && "border-border bg-muted/40 text-muted-foreground"
-              )}
-            >
-              {isDone ? "✓ " : ""}{step.label}
-            </div>
-          );
-        })}
+        {STEPS.map((step, i) => (
+          <div key={`l-${step.key}`} className={cn("shrink-0 text-xs px-3 py-1.5 rounded-full border whitespace-nowrap", i === currentStepIndex && "border-primary/50 bg-primary/10 text-primary", i < currentStepIndex && "border-emerald-500/30 bg-emerald-500/10 text-emerald-400", i > currentStepIndex && "border-border bg-muted/40 text-muted-foreground")}>
+            {i < currentStepIndex ? "✓ " : ""}{step.label}
+          </div>
+        ))}
       </div>
 
-      {/* Step 1: Pool Type Selection - Full Catalog Browser */}
-      {currentStep === "sport" && (
+      {/* ─── Step 1: Catalog ─── */}
+      {currentStep === "catalog" && (
         <div className="space-y-4 animate-in fade-in-50 slide-in-from-bottom-2 duration-300">
-          {/* Search Bar */}
           <div className="relative">
             <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground pointer-events-none" />
-            <Input
-              ref={searchRef}
-              value={catalogSearch}
-              onChange={(e) => setCatalogSearch(e.target.value)}
-              placeholder="Search pool types by name, sport, template, keyword…"
-              className="h-12 pl-10 pr-28 text-sm"
-            />
+            <Input ref={searchRef} value={catalogSearch} onChange={(e) => setCatalogSearch(e.target.value)} placeholder="Search pool types by name, sport, template, keyword…" className="h-12 pl-10 pr-28 text-sm" />
             <div className="absolute right-3 top-1/2 -translate-y-1/2 flex items-center gap-2">
-              {catalogSearch && (
-                <button type="button" onClick={() => setCatalogSearch("")} className="rounded p-0.5 text-muted-foreground hover:text-foreground">
-                  <X className="h-4 w-4" />
-                </button>
-              )}
-              <span className="text-xs text-muted-foreground tabular-nums">
-                {filteredCatalog.length} pool{filteredCatalog.length !== 1 ? "s" : ""}
-              </span>
-              <kbd className="hidden sm:inline-flex h-5 items-center rounded border border-border bg-muted px-1.5 text-[10px] font-mono text-muted-foreground">
-                {catalogSearch ? "esc" : "/"}
-              </kbd>
+              {catalogSearch && <button type="button" onClick={() => setCatalogSearch("")} className="rounded p-0.5 text-muted-foreground hover:text-foreground"><X className="h-4 w-4" /></button>}
+              <span className="text-xs text-muted-foreground tabular-nums">{filteredCatalog.length} pool{filteredCatalog.length !== 1 ? "s" : ""}</span>
+              <kbd className="hidden sm:inline-flex h-5 items-center rounded border border-border bg-muted px-1.5 text-[10px] font-mono text-muted-foreground">{catalogSearch ? "esc" : "/"}</kbd>
             </div>
           </div>
-
-          {/* Sport Filter Chips */}
           <div className="flex flex-wrap items-center gap-2">
-            <Button
-              size="sm"
-              variant={catalogSportFilter === "all" ? "default" : "outline"}
-              className="h-8"
-              onClick={() => setCatalogSportFilter("all")}
-            >
-              All Sports
-            </Button>
-            {catalogSportOptions.map((sport) => (
-              <Button
-                key={`chip-${sport}`}
-                size="sm"
-                variant={catalogSportFilter === sport ? "default" : "outline"}
-                className="h-8"
-                onClick={() => setCatalogSportFilter(sport)}
-              >
-                {CATALOG_SPORT_LABELS[sport] || sport}
-              </Button>
+            <Button size="sm" variant={catalogSportFilter === "all" ? "default" : "outline"} className="h-8" onClick={() => setCatalogSportFilter("all")}>All Sports</Button>
+            {catalogSportOptions.map((s) => (
+              <Button key={`c-${s}`} size="sm" variant={catalogSportFilter === s ? "default" : "outline"} className="h-8" onClick={() => setCatalogSportFilter(s)}>{CATALOG_SPORT_LABELS[s] || s}</Button>
             ))}
           </div>
-
-          {/* Favorites Row */}
           {favoriteCatalogItems.length > 0 && (
             <div className="rounded-lg border border-border/70 bg-card/70 px-3 py-2">
-              <p className="text-[11px] uppercase tracking-wide text-muted-foreground mb-2 flex items-center gap-1">
-                <Star className="h-3.5 w-3.5" /> Your Favorites
-              </p>
+              <p className="text-[11px] uppercase tracking-wide text-muted-foreground mb-2 flex items-center gap-1"><Star className="h-3.5 w-3.5" /> Your Favorites</p>
               <div className="flex flex-wrap gap-2">
                 {favoriteCatalogItems.slice(0, 8).map((item) => (
-                  <Button
-                    key={`fav-${item.key}`}
-                    size="sm"
-                    variant="outline"
-                    className="h-8"
-                    onClick={() => selectCatalogItem(item)}
-                  >
-                    {item.name}
-                  </Button>
+                  <Button key={`fav-${item.key}`} size="sm" variant="outline" className="h-8" onClick={() => selectCatalogItem(item)}>{item.name}</Button>
                 ))}
               </div>
             </div>
           )}
-
-          {/* Catalog Grid */}
           <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3">
             {filteredCatalog.map((item) => (
-              <button
-                key={item.key}
-                type="button"
-                onClick={() => selectCatalogItem(item)}
-                className="rounded-xl border border-border/70 bg-card p-3 text-left shadow-sm transition-all hover:border-primary/40 hover:shadow-lg focus:outline-none focus:ring-2 focus:ring-primary/40"
-              >
+              <button key={item.key} type="button" onClick={() => selectCatalogItem(item)} className="rounded-xl border border-border/70 bg-card p-3 text-left shadow-sm transition-all hover:border-primary/40 hover:shadow-lg focus:outline-none focus:ring-2 focus:ring-primary/40">
                 <div className="flex items-center gap-3">
-                  <PoolTypeBadgeIcon
-                    formatKey={item.template}
-                    poolTypeKey={item.key}
-                    sportKey={item.sport}
-                    size="lg"
-                  />
+                  <PoolTypeBadgeIcon formatKey={item.template} poolTypeKey={item.key} sportKey={item.sport} size="lg" />
                   <div className="min-w-0 flex-1">
                     <p className="text-sm font-semibold leading-tight">{item.name}</p>
-                    <p className="text-xs text-muted-foreground truncate mt-0.5">
-                      {CATALOG_SPORT_LABELS[item.sport] || item.sport} • {TEMPLATE_LABELS[item.template] || item.template}
-                    </p>
+                    <p className="text-xs text-muted-foreground truncate mt-0.5">{CATALOG_SPORT_LABELS[item.sport] || item.sport} • {TEMPLATE_LABELS[item.template] || item.template}</p>
                   </div>
-                  <button
-                    type="button"
-                    onClick={(e) => { e.stopPropagation(); toggleFavorite(item.key); }}
-                    className="shrink-0 p-1 rounded hover:bg-accent"
-                    title={favoriteKeys.includes(item.key) ? "Remove favorite" : "Add favorite"}
-                  >
+                  <button type="button" onClick={(e) => { e.stopPropagation(); toggleFavorite(item.key); }} className="shrink-0 p-1 rounded hover:bg-accent" title={favoriteKeys.includes(item.key) ? "Remove favorite" : "Add favorite"}>
                     <Star className={cn("h-4 w-4", favoriteKeys.includes(item.key) ? "fill-primary text-primary" : "text-muted-foreground")} />
                   </button>
                 </div>
                 <p className="mt-2 text-xs text-muted-foreground line-clamp-2 min-h-[2rem]">{item.description}</p>
                 {item.rule_variants.length > 0 && (
                   <div className="mt-2 flex flex-wrap items-center gap-1">
-                    {item.rule_variants.slice(0, 3).map((v) => (
-                      <span key={`${item.key}-${v.key}`} className="rounded-full border border-primary/20 bg-primary/5 px-2 py-0.5 text-[10px] text-muted-foreground">
-                        {v.label}
-                      </span>
-                    ))}
-                    {item.rule_variants.length > 3 && (
-                      <span className="text-[10px] text-muted-foreground">+{item.rule_variants.length - 3}</span>
-                    )}
+                    {item.rule_variants.slice(0, 3).map((v) => <span key={`${item.key}-${v.key}`} className="rounded-full border border-primary/20 bg-primary/5 px-2 py-0.5 text-[10px] text-muted-foreground">{v.label}</span>)}
+                    {item.rule_variants.length > 3 && <span className="text-[10px] text-muted-foreground">+{item.rule_variants.length - 3}</span>}
                   </div>
                 )}
               </button>
             ))}
           </div>
-
           {filteredCatalog.length === 0 && (
             <div className="rounded-lg border border-border bg-card p-8 text-center">
               <p className="text-sm text-muted-foreground">No pool types match your search.</p>
-              <Button size="sm" variant="outline" className="mt-3" onClick={() => { setCatalogSearch(""); setCatalogSportFilter("all"); }}>
-                Clear Filters
-              </Button>
+              <Button size="sm" variant="outline" className="mt-3" onClick={() => { setCatalogSearch(""); setCatalogSportFilter("all"); }}>Clear Filters</Button>
             </div>
           )}
         </div>
       )}
 
-      {/* Step: Format Selection */}
-      {currentStep === "format" && (
-        <Card className="border-border/60 shadow-sm lg:shadow-md animate-in fade-in-50 slide-in-from-bottom-2 duration-300">
-          <CardHeader>
-            <CardTitle>Choose Pool Format</CardTitle>
-            <CardDescription>
-              Available formats for {selectedSport?.name}
-            </CardDescription>
-          </CardHeader>
-          <CardContent>
-            <div className="space-y-3">
-              {availableFormats.map((format) => (
-                <button
-                  key={format.key}
-                  onClick={() => {
-                    const nextVariantKey = format.variants?.[0]?.key || "";
-                    setLeague({
-                      ...league,
-                      formatKey: format.key,
-                      poolTypeKey: format.key,
-                      variantKey: nextVariantKey,
-                      rules: buildRecommendedRules(format.key, nextVariantKey, league.rules),
-                    });
-                  }}
-                  className={`w-full p-4 rounded-lg border-2 text-left transition-all hover:border-primary ${
-                    league.formatKey === format.key
-                      ? "border-primary bg-primary/5"
-                      : "border-border hover:bg-accent/50"
-                  }`}
-                >
-                  <div className="flex items-center justify-between">
-                    <div className="flex items-center gap-3">
-                      <PoolTypeBadgeIcon formatKey={format.key} size="sm" />
-                      <div className="font-medium">{format.name}</div>
-                    </div>
-                    {format.variants && format.variants.length > 0 && (
-                      <Badge variant="secondary" className="text-xs">
-                        {format.variants.length} types
-                      </Badge>
-                    )}
-                  </div>
-                  <div className="text-sm text-muted-foreground mt-1">
-                    {format.description}
-                  </div>
-                </button>
-              ))}
-            </div>
-          </CardContent>
-        </Card>
-      )}
-
-      {/* Step: Variant Selection */}
-      {currentStep === "variant" && selectedFormat?.variants && (
-        <Card className="border-border/60 shadow-sm lg:shadow-md animate-in fade-in-50 slide-in-from-bottom-2 duration-300">
-          <CardHeader>
-            <CardTitle>Choose {selectedFormat.name} Type</CardTitle>
-            <CardDescription>
-              Select the specific variant of {selectedFormat.name} pool
-            </CardDescription>
-          </CardHeader>
-          <CardContent>
-            <div className="space-y-3">
-              {selectedFormat.variants.map((variant) => {
-                const VariantIcon = getVariantIcon(variant.key);
-                const colorClass = getVariantColor(variant.key);
-
-                return (
-                  <button
-                    key={variant.key}
-                    onClick={() =>
-                      setLeague({
-                        ...league,
-                        variantKey: variant.key,
-                        rules: buildRecommendedRules(league.formatKey, variant.key, league.rules),
-                      })
-                    }
-                    className={cn(
-                      "w-full p-4 rounded-lg border-2 text-left transition-all hover:border-primary",
-                      league.variantKey === variant.key
-                        ? "border-primary bg-primary/5"
-                        : "border-border hover:bg-accent/50"
-                    )}
-                  >
-                    <div className="flex items-center gap-3">
-                      {VariantIcon && (
-                        <div className={cn("p-2 rounded-lg border", colorClass)}>
-                          <VariantIcon className="h-5 w-5" />
-                        </div>
-                      )}
-                      <div className="flex-1">
-                        <div className="font-medium">{variant.name}</div>
-                        <div className="text-sm text-muted-foreground mt-0.5">
-                          {variant.description}
-                        </div>
-                      </div>
-                      {league.variantKey === variant.key && (
-                        <Check className="h-5 w-5 text-primary" />
-                      )}
-                    </div>
-                  </button>
-                );
-              })}
-            </div>
-          </CardContent>
-        </Card>
-      )}
-
-      {/* Step: League Details */}
+      {/* ─── Step 2: Details ─── */}
       {currentStep === "details" && (
         <Card className="border-border/60 shadow-sm lg:shadow-md animate-in fade-in-50 slide-in-from-bottom-2 duration-300">
           <CardHeader>
             <CardTitle>Pool Details</CardTitle>
-            <CardDescription>Name your pool and configure entry settings</CardDescription>
+            <CardDescription>
+              {poolTypeDef ? <><span className="font-medium text-foreground">{poolTypeDef.name}</span> — {poolTypeDef.description}</> : "Name your pool and configure entry settings"}
+            </CardDescription>
           </CardHeader>
           <CardContent className="space-y-6">
             <div className="space-y-2">
               <Label htmlFor="name">Pool Name</Label>
-              <Input
-                id="name"
-                placeholder="e.g., Office NFL Pool 2024"
-                value={league.name}
-                onChange={(e) => setLeague({ ...league, name: e.target.value })}
-              />
+              <Input id="name" placeholder="e.g., Office NFL Pool 2024" value={league.name} onChange={(e) => setLeague({ ...league, name: e.target.value })} />
             </div>
-
             <div className="space-y-2">
               <Label>Season</Label>
-              <Select
-                value={league.season}
-                onValueChange={(value) => setLeague({ ...league, season: value })}
-              >
-                <SelectTrigger>
-                  <SelectValue />
-                </SelectTrigger>
+              <Select value={league.season} onValueChange={(v) => setLeague({ ...league, season: v })}>
+                <SelectTrigger><SelectValue /></SelectTrigger>
                 <SelectContent>
-                  {selectedSport?.seasons.map((season) => (
-                    <SelectItem key={season} value={season}>
-                      {season}
-                    </SelectItem>
-                  ))}
+                  {selectedSport?.seasons.map((s) => <SelectItem key={s} value={s}>{s}</SelectItem>)}
                 </SelectContent>
               </Select>
             </div>
-
             <div className="space-y-2">
               <Label htmlFor="entryFee">Entry Fee (optional)</Label>
               <div className="flex items-center gap-2">
                 <span className="text-muted-foreground">$</span>
-                <Input
-                  id="entryFee"
-                  type="number"
-                  min="0"
-                  placeholder="0"
-                  value={league.entryFeeCents / 100 || ""}
-                  onChange={(e) =>
-                    setLeague({ ...league, entryFeeCents: Math.round(parseFloat(e.target.value || "0") * 100) })
-                  }
-                  className="w-32"
-                />
+                <Input id="entryFee" type="number" min="0" placeholder="0" value={league.entryFeeCents / 100 || ""} onChange={(e) => setLeague({ ...league, entryFeeCents: Math.round(parseFloat(e.target.value || "0") * 100) })} className="w-32" />
               </div>
-              <p className="text-xs text-muted-foreground">
-                Entry fees are tracked for prize eligibility. G1 Sports does not hold funds.
-              </p>
             </div>
-
             {league.entryFeeCents > 0 && (
               <div className="flex items-center justify-between p-4 rounded-lg bg-accent/50">
-                <div>
-                  <Label>Require Payment for Prizes</Label>
-                  <p className="text-sm text-muted-foreground">
-                    Only paid members can win prizes
-                  </p>
-                </div>
-                <Switch
-                  checked={league.isPaymentRequired}
-                  onCheckedChange={(checked) => setLeague({ ...league, isPaymentRequired: checked })}
-                />
+                <div><Label>Require Payment for Prizes</Label><p className="text-sm text-muted-foreground">Only paid members can win prizes</p></div>
+                <Switch checked={league.isPaymentRequired} onCheckedChange={(c) => setLeague({ ...league, isPaymentRequired: c })} />
               </div>
             )}
-
-            {/* Entry Mode Settings */}
+            {/* Entry Mode */}
             <div className="rounded-lg border border-border p-4 space-y-4">
-              <div className="flex items-center gap-2 mb-1">
-                <Users className="h-4 w-4 text-muted-foreground" />
-                <Label>Entry Mode</Label>
-              </div>
-              <RadioGroup
-                value={league.entryMode}
-                onValueChange={(value) => setLeague({
-                  ...league,
-                  entryMode: value as LeagueData["entryMode"],
-                  maxEntriesPerUser: value === "optional" ? Math.max(league.maxEntriesPerUser, 2) : value === "required" ? league.requiredEntries : 1,
-                })}
-              >
-                <div className="flex items-start space-x-2">
-                  <RadioGroupItem value="single" id="entry-single" className="mt-0.5" />
-                  <div>
-                    <Label htmlFor="entry-single" className="font-normal">Single Entry</Label>
-                    <p className="text-xs text-muted-foreground">Each member gets one entry (default).</p>
-                  </div>
-                </div>
-                <div className="flex items-start space-x-2">
-                  <RadioGroupItem value="optional" id="entry-optional" className="mt-0.5" />
-                  <div>
-                    <Label htmlFor="entry-optional" className="font-normal">Optional Multiple Entries</Label>
-                    <p className="text-xs text-muted-foreground">Members choose how many entries to submit, up to a max you set.</p>
-                  </div>
-                </div>
-                <div className="flex items-start space-x-2">
-                  <RadioGroupItem value="required" id="entry-required" className="mt-0.5" />
-                  <div>
-                    <Label htmlFor="entry-required" className="font-normal">Mandatory Multiple Entries</Label>
-                    <p className="text-xs text-muted-foreground">Every member must submit exactly a fixed number of entries to participate.</p>
-                  </div>
-                </div>
+              <div className="flex items-center gap-2 mb-1"><Users className="h-4 w-4 text-muted-foreground" /><Label>Entry Mode</Label></div>
+              <RadioGroup value={league.entryMode} onValueChange={(v) => setLeague({ ...league, entryMode: v as LeagueData["entryMode"], maxEntriesPerUser: v === "optional" ? Math.max(league.maxEntriesPerUser, 2) : v === "required" ? league.requiredEntries : 1 })}>
+                <div className="flex items-start space-x-2"><RadioGroupItem value="single" id="es" className="mt-0.5" /><div><Label htmlFor="es" className="font-normal">Single Entry</Label><p className="text-xs text-muted-foreground">One entry per member (default).</p></div></div>
+                <div className="flex items-start space-x-2"><RadioGroupItem value="optional" id="eo" className="mt-0.5" /><div><Label htmlFor="eo" className="font-normal">Optional Multiple Entries</Label><p className="text-xs text-muted-foreground">Members choose how many entries to submit, up to a max.</p></div></div>
+                <div className="flex items-start space-x-2"><RadioGroupItem value="required" id="er" className="mt-0.5" /><div><Label htmlFor="er" className="font-normal">Mandatory Multiple Entries</Label><p className="text-xs text-muted-foreground">Every member must submit exactly N entries.</p></div></div>
               </RadioGroup>
-
               {league.entryMode === "optional" && (
                 <div className="space-y-2 pl-6 border-l-2 border-primary/20">
-                  <Label htmlFor="maxEntries">Max Entries Per User</Label>
-                  <div className="flex items-center gap-3">
-                    <Input
-                      id="maxEntries"
-                      type="number"
-                      min="2"
-                      max="25"
-                      value={league.maxEntriesPerUser}
-                      onChange={(e) =>
-                        setLeague({
-                          ...league,
-                          maxEntriesPerUser: Math.max(2, Math.min(25, parseInt(e.target.value || "2", 10))),
-                        })
-                      }
-                      className="w-20"
-                    />
-                    <span className="text-sm text-muted-foreground">entries max</span>
-                  </div>
-                  <p className="text-xs text-muted-foreground">
-                    Each entry acts as an independent ticket with its own picks, score, and leaderboard position.
-                  </p>
+                  <Label>Max Entries Per User</Label>
+                  <div className="flex items-center gap-3"><Input type="number" min="2" max="25" value={league.maxEntriesPerUser} onChange={(e) => setLeague({ ...league, maxEntriesPerUser: Math.max(2, Math.min(25, parseInt(e.target.value || "2", 10))) })} className="w-20" /><span className="text-sm text-muted-foreground">entries max</span></div>
                 </div>
               )}
-
               {league.entryMode === "required" && (
                 <div className="space-y-2 pl-6 border-l-2 border-amber-500/30">
-                  <Label htmlFor="requiredEntries">Required Entries Per User</Label>
-                  <div className="flex items-center gap-3">
-                    <Input
-                      id="requiredEntries"
-                      type="number"
-                      min="2"
-                      max="25"
-                      value={league.requiredEntries}
-                      onChange={(e) =>
-                        setLeague({
-                          ...league,
-                          requiredEntries: Math.max(2, Math.min(25, parseInt(e.target.value || "3", 10))),
-                        })
-                      }
-                      className="w-20"
-                    />
-                    <span className="text-sm text-muted-foreground">entries required</span>
-                  </div>
-                  <p className="text-xs text-muted-foreground">
-                    Every member must submit exactly this many entries. Members who don't complete all entries won't be eligible for prizes.
-                  </p>
+                  <Label>Required Entries Per User</Label>
+                  <div className="flex items-center gap-3"><Input type="number" min="2" max="25" value={league.requiredEntries} onChange={(e) => setLeague({ ...league, requiredEntries: Math.max(2, Math.min(25, parseInt(e.target.value || "3", 10))) })} className="w-20" /><span className="text-sm text-muted-foreground">entries required</span></div>
                 </div>
               )}
             </div>
@@ -987,164 +428,111 @@ export function CreateLeague() {
         </Card>
       )}
 
-      {/* Step: Rules Configuration */}
+      {/* ─── Step 3: Rules ─── */}
       {currentStep === "rules" && (
         <Card className="border-border/60 shadow-sm lg:shadow-md animate-in fade-in-50 slide-in-from-bottom-2 duration-300">
           <CardHeader>
-            <CardTitle>Rules Setup</CardTitle>
-            <CardDescription>Choose a preset, then tweak advanced options only if needed.</CardDescription>
+            <CardTitle>Pool Rules</CardTitle>
+            <CardDescription>Strong defaults are pre-set for {poolTypeDef?.name || "this pool type"}. Adjust anything you need.</CardDescription>
           </CardHeader>
           <CardContent className="space-y-6">
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
-              <Button type="button" variant="outline" onClick={() =>
-                setLeague({ ...league, rules: { ...league.rules, lockType: "game_start", visibilityType: "after_lock" } })
-              }>Recommended</Button>
-              <Button type="button" variant="outline" onClick={() =>
-                setLeague({ ...league, rules: { ...league.rules, lockType: "first_game", visibilityType: "after_period" } })
-              }>Competitive</Button>
-              <Button
-                type="button"
-                variant={showAdvancedRules ? "default" : "outline"}
-                onClick={() => setShowAdvancedRules((prev) => !prev)}
-                className="gap-2"
-              >
-                <SlidersHorizontal className="h-4 w-4" />
-                {showAdvancedRules ? "Hide Advanced" : "Show Advanced"}
-              </Button>
-            </div>
 
-            {league.formatKey === "survivor" && selectedVariant && (
-              <div className={cn("p-4 rounded-lg border", getVariantColor(league.variantKey))}>
-                <div className="flex items-center gap-2 mb-2">
-                  {(() => { const Icon = getVariantIcon(league.variantKey); return Icon ? <Icon className="h-5 w-5" /> : null; })()}
-                  <span className="font-semibold">{selectedVariant.name} Rules</span>
-                </div>
-                <p className="text-sm opacity-80">{selectedVariant.description}</p>
-                {league.variantKey === "winner" && (
-                  <ul className="text-sm mt-2 space-y-1 opacity-80">
-                    <li>• Pick one team to WIN each week</li>
-                    <li>• If your team loses, you're eliminated</li>
-                    <li>• Cannot pick the same team twice</li>
-                  </ul>
-                )}
-                {league.variantKey === "loser" && (
-                  <ul className="text-sm mt-2 space-y-1 opacity-80">
-                    <li>• Pick one team to LOSE each week</li>
-                    <li>• If your team wins, you're eliminated</li>
-                    <li>• Cannot pick the same team twice</li>
-                  </ul>
-                )}
-                {league.variantKey === "ats" && (
-                  <ul className="text-sm mt-2 space-y-1 opacity-80">
-                    <li>• Pick one team to COVER THE SPREAD each week</li>
-                    <li>• If your team fails to cover, you're eliminated</li>
-                    <li>• Cannot pick the same team twice</li>
-                  </ul>
-                )}
-                {league.variantKey === "two_life" && (
-                  <ul className="text-sm mt-2 space-y-1 opacity-80">
-                    <li>• Pick one team to WIN each week</li>
-                    <li>• You get 2 lives - survive your first loss!</li>
-                    <li>• Second loss eliminates you for good</li>
-                    <li>• Cannot pick the same team twice</li>
-                  </ul>
-                )}
-                {league.variantKey === "reentry" && (
-                  <ul className="text-sm mt-2 space-y-1 opacity-80">
-                    <li>• Pick one team to WIN each week</li>
-                    <li>• If eliminated, pay entry fee again to re-enter</li>
-                    <li>• Re-entries start fresh with full team selection</li>
-                    <li>• Multiple entries can win separate prizes</li>
-                  </ul>
-                )}
-              </div>
-            )}
-
-            {showAdvancedRules && (league.formatKey === "pickem" || league.formatKey === "confidence") && (
-              <div className="space-y-3">
-                <Label>Scoring Type</Label>
-                <RadioGroup
-                  value={league.rules.scoringType}
-                  onValueChange={(value) =>
-                    setLeague({ ...league, rules: { ...league.rules, scoringType: value as LeagueRules["scoringType"] } })
-                  }
-                >
-                  <div className="flex items-center space-x-2">
-                    <RadioGroupItem value="straight" id="straight" />
-                    <Label htmlFor="straight" className="font-normal">Straight Up (pick winners)</Label>
-                  </div>
-                  <div className="flex items-center space-x-2">
-                    <RadioGroupItem value="spread" id="spread" />
-                    <Label htmlFor="spread" className="font-normal">Against the Spread</Label>
-                  </div>
-                </RadioGroup>
-              </div>
-            )}
-
+            {/* Pick Lock Time */}
             <div className="space-y-3">
               <Label>Pick Lock Time</Label>
-              <RadioGroup
-                value={league.rules.lockType}
-                onValueChange={(value) =>
-                  setLeague({ ...league, rules: { ...league.rules, lockType: value as LeagueRules["lockType"] } })
-                }
-              >
-                <div className="flex items-center space-x-2">
-                  <RadioGroupItem value="game_start" id="game_start" />
-                  <Label htmlFor="game_start" className="font-normal">At each game's start time</Label>
-                </div>
-                <div className="flex items-center space-x-2">
-                  <RadioGroupItem value="first_game" id="first_game" />
-                  <Label htmlFor="first_game" className="font-normal">When first game of the week starts</Label>
-                </div>
+              <p className="text-xs text-muted-foreground -mt-1">When are picks locked and can no longer be changed?</p>
+              <RadioGroup value={league.rules.lockType} onValueChange={(v) => setLeague({ ...league, rules: { ...league.rules, lockType: v as LeagueRules["lockType"] } })}>
+                <div className="flex items-center space-x-2"><RadioGroupItem value="game_start" id="gs" /><Label htmlFor="gs" className="font-normal">At each game's start time</Label></div>
+                <div className="flex items-center space-x-2"><RadioGroupItem value="first_game" id="fg" /><Label htmlFor="fg" className="font-normal">When first game of the week starts</Label></div>
               </RadioGroup>
             </div>
 
+            {/* Pick Visibility */}
             <div className="space-y-3">
               <Label>Pick Visibility</Label>
-              <RadioGroup
-                value={league.rules.visibilityType}
-                onValueChange={(value) =>
-                  setLeague({ ...league, rules: { ...league.rules, visibilityType: value as LeagueRules["visibilityType"] } })
-                }
-              >
-                <div className="flex items-center space-x-2">
-                  <RadioGroupItem value="immediate" id="immediate" />
-                  <Label htmlFor="immediate" className="font-normal">Show picks immediately</Label>
-                </div>
-                <div className="flex items-center space-x-2">
-                  <RadioGroupItem value="after_lock" id="after_lock" />
-                  <Label htmlFor="after_lock" className="font-normal">Show after picks lock</Label>
-                </div>
-                <div className="flex items-center space-x-2">
-                  <RadioGroupItem value="after_period" id="after_period" />
-                  <Label htmlFor="after_period" className="font-normal">Show after week ends</Label>
-                </div>
+              <p className="text-xs text-muted-foreground -mt-1">When can other members see each other's picks?</p>
+              <RadioGroup value={league.rules.visibilityType} onValueChange={(v) => setLeague({ ...league, rules: { ...league.rules, visibilityType: v as LeagueRules["visibilityType"] } })}>
+                <div className="flex items-center space-x-2"><RadioGroupItem value="immediate" id="vi" /><Label htmlFor="vi" className="font-normal">Show picks immediately</Label></div>
+                <div className="flex items-center space-x-2"><RadioGroupItem value="after_lock" id="val" /><Label htmlFor="val" className="font-normal">Show after picks lock</Label></div>
+                <div className="flex items-center space-x-2"><RadioGroupItem value="after_period" id="vap" /><Label htmlFor="vap" className="font-normal">Show after week/period ends</Label></div>
               </RadioGroup>
             </div>
 
-            {showAdvancedRules && league.formatKey !== "survivor" && (
+            {/* Missed Pick Policy */}
+            <div className="space-y-3">
+              <Label>Missed Pick Policy</Label>
+              <p className="text-xs text-muted-foreground -mt-1">What happens when a member doesn't submit picks on time?</p>
+              <RadioGroup value={league.missedPickPolicy} onValueChange={(v) => setLeague({ ...league, missedPickPolicy: v as LeagueData["missedPickPolicy"] })}>
+                <div className="flex items-center space-x-2"><RadioGroupItem value="loss" id="mpl" /><Label htmlFor="mpl" className="font-normal">Count as loss{isSurvivor ? " (eliminated)" : ""}</Label></div>
+                <div className="flex items-center space-x-2"><RadioGroupItem value="no_pick" id="mpn" /><Label htmlFor="mpn" className="font-normal">No score for that period (0 points)</Label></div>
+                {!isSurvivor && <div className="flex items-center space-x-2"><RadioGroupItem value="auto_worst" id="mpa" /><Label htmlFor="mpa" className="font-normal">Auto-assign worst available pick</Label></div>}
+              </RadioGroup>
+            </div>
+
+            {/* Late Joins */}
+            <div className="flex items-center justify-between p-4 rounded-lg border border-border">
+              <div><Label>Allow Late Joins</Label><p className="text-xs text-muted-foreground">Let new members join after the pool has started.</p></div>
+              <Switch checked={league.allowLateJoins} onCheckedChange={(c) => setLeague({ ...league, allowLateJoins: c })} />
+            </div>
+
+            {/* Late Picks */}
+            <div className="flex items-center justify-between p-4 rounded-lg border border-border">
+              <div><Label>Allow Late Picks</Label><p className="text-xs text-muted-foreground">Let members submit picks for games that haven't started, even after the lock time.</p></div>
+              <Switch checked={league.allowLatePicks} onCheckedChange={(c) => setLeague({ ...league, allowLatePicks: c })} />
+            </div>
+
+            {/* Picks Per Period (not for survivor/bracket/squares) */}
+            {!isSurvivor && !isBracket && !isSquares && (
+              <div className="space-y-3">
+                <Label>Picks Per Week/Period</Label>
+                <p className="text-xs text-muted-foreground -mt-1">How many games must each member pick per period?</p>
+                <RadioGroup value={league.picksPerPeriod} onValueChange={(v) => setLeague({ ...league, picksPerPeriod: v as LeagueData["picksPerPeriod"] })}>
+                  <div className="flex items-center space-x-2"><RadioGroupItem value="all" id="pa" /><Label htmlFor="pa" className="font-normal">All games (full slate)</Label></div>
+                  <div className="flex items-center space-x-2"><RadioGroupItem value="custom" id="pc" /><Label htmlFor="pc" className="font-normal">Custom number of picks</Label></div>
+                </RadioGroup>
+                {league.picksPerPeriod === "custom" && (
+                  <div className="flex items-center gap-3 pl-6 border-l-2 border-primary/20">
+                    <Input type="number" min="1" max="20" value={league.customPickCount} onChange={(e) => setLeague({ ...league, customPickCount: Math.max(1, Math.min(20, parseInt(e.target.value || "5", 10))) })} className="w-20" />
+                    <span className="text-sm text-muted-foreground">picks per period</span>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Scoring Type (pickem / confidence) */}
+            {(league.formatKey === "pickem" || isConfidence) && (
+              <div className="space-y-3">
+                <Label>Scoring Type</Label>
+                <RadioGroup value={league.rules.scoringType} onValueChange={(v) => setLeague({ ...league, rules: { ...league.rules, scoringType: v as LeagueRules["scoringType"] } })}>
+                  <div className="flex items-center space-x-2"><RadioGroupItem value="straight" id="ss" /><Label htmlFor="ss" className="font-normal">Straight Up (pick winners)</Label></div>
+                  <div className="flex items-center space-x-2"><RadioGroupItem value="spread" id="ssp" /><Label htmlFor="ssp" className="font-normal">Against the Spread</Label></div>
+                  {isConfidence && <div className="flex items-center space-x-2"><RadioGroupItem value="points" id="sp" /><Label htmlFor="sp" className="font-normal">Confidence Points (rank your picks)</Label></div>}
+                </RadioGroup>
+              </div>
+            )}
+
+            {/* Tiebreaker (not for survivor) */}
+            {!isSurvivor && (
               <div className="space-y-3">
                 <Label>Tiebreaker</Label>
-                <RadioGroup
-                  value={league.rules.tiebreakerType}
-                  onValueChange={(value) =>
-                    setLeague({ ...league, rules: { ...league.rules, tiebreakerType: value as LeagueRules["tiebreakerType"] } })
-                  }
-                >
-                  <div className="flex items-center space-x-2">
-                    <RadioGroupItem value="total_points" id="total_points" />
-                    <Label htmlFor="total_points" className="font-normal">Total points prediction</Label>
-                  </div>
-                  <div className="flex items-center space-x-2">
-                    <RadioGroupItem value="monday_night" id="monday_night" />
-                    <Label htmlFor="monday_night" className="font-normal">Monday Night score prediction</Label>
-                  </div>
-                  <div className="flex items-center space-x-2">
-                    <RadioGroupItem value="none" id="none" />
-                    <Label htmlFor="none" className="font-normal">No tiebreaker (split prizes)</Label>
-                  </div>
+                <RadioGroup value={league.rules.tiebreakerType} onValueChange={(v) => setLeague({ ...league, rules: { ...league.rules, tiebreakerType: v as LeagueRules["tiebreakerType"] } })}>
+                  <div className="flex items-center space-x-2"><RadioGroupItem value="total_points" id="tp" /><Label htmlFor="tp" className="font-normal">Total points prediction</Label></div>
+                  <div className="flex items-center space-x-2"><RadioGroupItem value="monday_night" id="mn" /><Label htmlFor="mn" className="font-normal">Monday Night score prediction</Label></div>
+                  <div className="flex items-center space-x-2"><RadioGroupItem value="none" id="tn" /><Label htmlFor="tn" className="font-normal">No tiebreaker (split prizes)</Label></div>
                 </RadioGroup>
+              </div>
+            )}
+
+            {/* Survivor-specific */}
+            {isSurvivor && (
+              <div className="rounded-lg border border-emerald-500/30 bg-emerald-500/5 p-4 space-y-3">
+                <Label className="text-emerald-400">Survivor Rules</Label>
+                <div className="space-y-2 text-sm text-muted-foreground">
+                  <p>• Pick one team per week — if they lose, you're out.</p>
+                  <p>• Each team can only be used once per season.</p>
+                  {league.rules.survivorLives && league.rules.survivorLives > 1 && <p>• {league.rules.survivorLives} lives — survive your first {league.rules.survivorLives - 1} loss(es).</p>}
+                  {league.rules.survivorVariant === "reentry" && <p>• Re-entry allowed — pay again to restart.</p>}
+                </div>
               </div>
             )}
 
@@ -1153,128 +541,59 @@ export function CreateLeague() {
         </Card>
       )}
 
-      {/* Step: Review */}
+      {/* ─── Step 4: Review ─── */}
       {currentStep === "review" && (
         <Card className="border-border/60 shadow-sm lg:shadow-md animate-in fade-in-50 slide-in-from-bottom-2 duration-300">
           <CardHeader>
-            <CardTitle className="flex items-center gap-2">
-              <Trophy className="h-5 w-5" />
-              Review Your Pool
-            </CardTitle>
+            <CardTitle className="flex items-center gap-2"><Trophy className="h-5 w-5" /> Review Your Pool</CardTitle>
             <CardDescription>Confirm your settings before creating</CardDescription>
           </CardHeader>
           <CardContent className="space-y-4">
-            <div className="grid gap-4">
-              <div className="flex justify-between py-2 border-b">
-                <span className="text-muted-foreground">Pool Name</span>
-                <span className="font-medium">{league.name}</span>
-              </div>
-              <div className="flex justify-between py-2 border-b">
-                <span className="text-muted-foreground">Sport</span>
-                <span className="font-medium flex items-center gap-2">
-                  {selectedSport && <selectedSport.icon className="h-4 w-4" />}
-                  {selectedSport?.name}
-                </span>
-              </div>
-              <div className="flex justify-between py-2 border-b">
-                <span className="text-muted-foreground">Format</span>
-                <span className="font-medium">{selectedFormat?.name}</span>
-              </div>
-              {selectedVariant && (
-                <div className="flex justify-between py-2 border-b">
-                  <span className="text-muted-foreground">Type</span>
-                  <span className="font-medium flex items-center gap-2">
-                    {(() => { const Icon = getVariantIcon(league.variantKey); return Icon ? <Icon className="h-4 w-4" /> : null; })()}
-                    {selectedVariant.name}
-                  </span>
+            <div className="grid gap-3">
+              {[
+                ["Pool Name", league.name],
+                ["Pool Type", poolTypeDef?.name || league.poolTypeKey],
+                ["Sport", selectedSport?.name || league.sportKey],
+                ["Format", TEMPLATE_LABELS[league.selectedPoolTypeDef?.template || ""] || selectedFormat?.name || league.formatKey],
+                ["Season", league.season],
+                ["Entry Fee", league.entryFeeCents > 0 ? `$${(league.entryFeeCents / 100).toFixed(2)}` : "Free"],
+                ["Entry Mode", league.entryMode === "single" ? "Single entry" : league.entryMode === "optional" ? `Optional, up to ${league.maxEntriesPerUser}` : `Mandatory ${league.requiredEntries} entries`],
+                ["Lock Time", league.rules.lockType === "game_start" ? "Each game start" : "First game"],
+                ["Visibility", league.rules.visibilityType.replace(/_/g, " ")],
+                ["Missed Pick", league.missedPickPolicy === "loss" ? "Count as loss" : league.missedPickPolicy === "no_pick" ? "0 points" : "Auto worst pick"],
+                ["Late Joins", league.allowLateJoins ? "Allowed" : "Not allowed"],
+                ["Late Picks", league.allowLatePicks ? "Allowed" : "Not allowed"],
+                ...(!isSurvivor && !isBracket && !isSquares ? [["Picks Per Period", league.picksPerPeriod === "all" ? "All games" : `${league.customPickCount} picks`]] : []),
+                ...(!isSurvivor ? [["Tiebreaker", league.rules.tiebreakerType === "none" ? "Split prizes" : league.rules.tiebreakerType?.replace(/_/g, " ") || "—"]] : []),
+              ].map(([label, value], i, arr) => (
+                <div key={label} className={cn("flex justify-between py-2", i < arr.length - 1 && "border-b border-border/50")}>
+                  <span className="text-muted-foreground text-sm">{label}</span>
+                  <span className="font-medium text-sm capitalize">{value}</span>
                 </div>
-              )}
-              <div className="flex justify-between py-2 border-b">
-                <span className="text-muted-foreground">Season</span>
-                <span className="font-medium">{league.season}</span>
-              </div>
-              <div className="flex justify-between py-2 border-b">
-                <span className="text-muted-foreground">Entry Fee</span>
-                <span className="font-medium">
-                  {league.entryFeeCents > 0 ? `$${(league.entryFeeCents / 100).toFixed(2)}` : "Free"}
-                </span>
-              </div>
-              <div className="flex justify-between py-2 border-b">
-                <span className="text-muted-foreground">Entry Mode</span>
-                <span className="font-medium">
-                  {league.entryMode === "single" && "Single entry"}
-                  {league.entryMode === "optional" && `Optional, up to ${league.maxEntriesPerUser} entries`}
-                  {league.entryMode === "required" && `Mandatory ${league.requiredEntries} entries`}
-                </span>
-              </div>
-              {league.formatKey !== "survivor" && (
-                <div className="flex justify-between py-2 border-b">
-                  <span className="text-muted-foreground">Scoring</span>
-                  <span className="font-medium capitalize">{league.rules.scoringType}</span>
-                </div>
-              )}
-              <div className="flex justify-between py-2 border-b">
-                <span className="text-muted-foreground">Lock Time</span>
-                <span className="font-medium">
-                  {league.rules.lockType === "game_start" ? "Each game start" : "First game"}
-                </span>
-              </div>
-              <div className="flex justify-between py-2">
-                <span className="text-muted-foreground">Pick Visibility</span>
-                <span className="font-medium capitalize">
-                  {league.rules.visibilityType.replace("_", " ")}
-                </span>
-              </div>
+              ))}
             </div>
-            <RuleEnginePreviewCard
-              output={createFlowRulePreview}
-              title="Final Rule Engine Output"
-              description="This is the exact rule payload shape your pool will start with."
-            />
+            <RuleEnginePreviewCard output={createFlowRulePreview} title="Final Rule Engine Output" description="Exact rule payload your pool starts with." />
           </CardContent>
         </Card>
       )}
 
-      {/* Error display */}
-      {error && (
-        <Alert variant="destructive">
-          <AlertCircle className="h-4 w-4" />
-          <AlertDescription>{error}</AlertDescription>
-        </Alert>
-      )}
+      {/* Error */}
+      {error && <Alert variant="destructive"><AlertCircle className="h-4 w-4" /><AlertDescription>{error}</AlertDescription></Alert>}
 
-      {/* Navigation buttons */}
+      {/* Nav buttons */}
       <div className="flex flex-col-reverse gap-2 sm:flex-row sm:justify-between">
-        <Button variant="outline" onClick={goBack} disabled={isCreating} className="h-10 w-full sm:w-auto">
-          <ArrowLeft className="h-4 w-4 mr-2" />
-          Back
-        </Button>
+        <Button variant="outline" onClick={goBack} disabled={isCreating} className="h-10 w-full sm:w-auto"><ArrowLeft className="h-4 w-4 mr-2" />Back</Button>
         {currentStep === "review" ? (
           <Button onClick={handleCreate} disabled={isCreating} className="h-10 gap-2 w-full sm:w-auto">
-            {isCreating ? (
-              <>
-                <Loader2 className="h-4 w-4 animate-spin" />
-                Creating...
-              </>
-            ) : (
-              <>
-                <Check className="h-4 w-4" />
-                Create Pool Now
-              </>
-            )}
+            {isCreating ? <><Loader2 className="h-4 w-4 animate-spin" />Creating...</> : <><Check className="h-4 w-4" />Create Pool Now</>}
           </Button>
-        ) : currentStep === "sport" ? null : (
+        ) : currentStep === "catalog" ? null : (
           <Button onClick={goNext} disabled={!canProceed()} className="h-10 w-full sm:w-auto">
-            {nextStep ? `Continue to ${nextStep.label}` : "Continue"}
-            <ArrowRight className="h-4 w-4 ml-2" />
+            {nextStep ? `Continue to ${nextStep.label}` : "Continue"}<ArrowRight className="h-4 w-4 ml-2" />
           </Button>
         )}
       </div>
-      {currentStep === "details" && !canProceed() && (
-        <p className="text-xs text-muted-foreground mt-1">
-          Add a pool name and season to continue.
-        </p>
-      )}
+      {currentStep === "details" && !canProceed() && <p className="text-xs text-muted-foreground mt-1">Add a pool name and season to continue.</p>}
       </div>
     </PoolAccessGate>
   );
