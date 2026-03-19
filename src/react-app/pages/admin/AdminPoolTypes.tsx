@@ -42,6 +42,10 @@ import {
   Star,
   History,
   Sparkles,
+  Clock3,
+  RotateCcw,
+  Search,
+  X,
 } from "lucide-react";
 import {
   DropdownMenu,
@@ -124,6 +128,7 @@ const TEMPLATE_LABELS: Record<string, string> = {
 const REQUIRED_POOL_TARGET = 60;
 const POOL_FAVORITES_STORAGE_KEY = "pool-launcher:favorites";
 const POOL_USAGE_STORAGE_KEY = "pool-launcher:usage";
+const POOL_RECENT_STORAGE_KEY = "pool-launcher:recent";
 
 function toCreateRoutePoolTypeParams(poolType: PoolType): { sport: string; format: string } {
   const sportMap: Record<string, string> = {
@@ -192,6 +197,7 @@ export function AdminPoolTypes() {
   const [catalogPageSize, setCatalogPageSize] = useState(96);
   const [favoritePoolKeys, setFavoritePoolKeys] = useState<string[]>([]);
   const [poolLaunchUsage, setPoolLaunchUsage] = useState<Record<string, number>>({});
+  const [recentPoolKeys, setRecentPoolKeys] = useState<string[]>([]);
 
   // Form state
   const [formData, setFormData] = useState({
@@ -266,10 +272,18 @@ export function AdminPoolTypes() {
           setPoolLaunchUsage(usageMap);
         }
       }
+      const recentRaw = localStorage.getItem(POOL_RECENT_STORAGE_KEY);
+      if (recentRaw) {
+        const parsed = JSON.parse(recentRaw) as unknown;
+        if (Array.isArray(parsed)) {
+          setRecentPoolKeys(parsed.filter((value): value is string => typeof value === "string"));
+        }
+      }
     } catch {
       // Keep launcher usable even if local storage payload is corrupted.
       setFavoritePoolKeys([]);
       setPoolLaunchUsage({});
+      setRecentPoolKeys([]);
     }
   }, []);
 
@@ -288,6 +302,14 @@ export function AdminPoolTypes() {
       // Ignore localStorage write failures (private browsing, quota).
     }
   }, [poolLaunchUsage]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(POOL_RECENT_STORAGE_KEY, JSON.stringify(recentPoolKeys));
+    } catch {
+      // Ignore localStorage write failures (private browsing, quota).
+    }
+  }, [recentPoolKeys]);
 
   const handleCreate = async () => {
     if (!formData.name || !formData.sport_key || !formData.format_key) return;
@@ -511,6 +533,14 @@ export function AdminPoolTypes() {
       .filter((item): item is PoolTypeCatalogItem => Boolean(item));
   }, [catalog, poolLaunchUsage]);
 
+  const recentCatalogItems = useMemo(() => {
+    const index = new Map(catalog.map((item) => [item.key, item]));
+    return recentPoolKeys
+      .map((key) => index.get(key))
+      .filter((item): item is PoolTypeCatalogItem => Boolean(item))
+      .slice(0, 8);
+  }, [catalog, recentPoolKeys]);
+
   const recommendedCatalogItems = useMemo(() => {
     const now = new Date();
     const month = now.getMonth() + 1; // 1..12
@@ -568,6 +598,23 @@ export function AdminPoolTypes() {
       ...prev,
       [poolTypeKey]: Number(prev[poolTypeKey] || 0) + 1,
     }));
+    setRecentPoolKeys((prev) => {
+      const next = [poolTypeKey, ...prev.filter((key) => key !== poolTypeKey)];
+      return next.slice(0, 20);
+    });
+  };
+
+  const clearLauncherPersonalization = () => {
+    setFavoritePoolKeys([]);
+    setPoolLaunchUsage({});
+    setRecentPoolKeys([]);
+    try {
+      localStorage.removeItem(POOL_FAVORITES_STORAGE_KEY);
+      localStorage.removeItem(POOL_USAGE_STORAGE_KEY);
+      localStorage.removeItem(POOL_RECENT_STORAGE_KEY);
+    } catch {
+      // Non-fatal if storage clear fails.
+    }
   };
 
   const catalogCoverage = useMemo(() => {
@@ -737,6 +784,27 @@ export function AdminPoolTypes() {
                   </p>
                 </div>
               </div>
+              <div className="mt-3 relative">
+                <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground pointer-events-none" />
+                <Input
+                  value={catalogSearch}
+                  onChange={(e) => setCatalogSearch(e.target.value)}
+                  placeholder="Search 81+ pool types by name, sport, template, keyword..."
+                  className="h-11 pl-10 pr-24 text-sm"
+                />
+                {catalogSearch && (
+                  <button
+                    type="button"
+                    onClick={() => setCatalogSearch("")}
+                    className="absolute right-20 top-1/2 -translate-y-1/2 rounded p-0.5 text-muted-foreground hover:text-foreground"
+                  >
+                    <X className="h-4 w-4" />
+                  </button>
+                )}
+                <span className="absolute right-3 top-1/2 -translate-y-1/2 text-xs text-muted-foreground tabular-nums">
+                  {filteredCatalog.length} result{filteredCatalog.length !== 1 ? "s" : ""}
+                </span>
+              </div>
               <div className="mt-3 grid grid-cols-1 gap-2 sm:grid-cols-3">
                 <div className="rounded-lg border border-border/70 bg-card/70 px-3 py-2">
                   <p className="text-[11px] uppercase tracking-wide text-muted-foreground">Catalog templates</p>
@@ -751,13 +819,7 @@ export function AdminPoolTypes() {
                   <p className="text-base font-semibold">{catalogCoverage.templatesCovered}</p>
                 </div>
               </div>
-              <div className="mt-3 grid grid-cols-1 gap-2 md:grid-cols-3">
-                <Input
-                  value={catalogSearch}
-                  onChange={(e) => setCatalogSearch(e.target.value)}
-                  placeholder="Search by name, key, variant..."
-                  className="h-9"
-                />
+              <div className="mt-3 grid grid-cols-1 gap-2 sm:grid-cols-3">
                 <Select value={catalogSportFilter} onValueChange={setCatalogSportFilter}>
                   <SelectTrigger className="h-9">
                     <SelectValue placeholder="Filter by sport" />
@@ -843,6 +905,15 @@ export function AdminPoolTypes() {
                     <p className="text-[11px] uppercase tracking-wide text-muted-foreground">Quick Launch</p>
                     <p className="text-xs text-muted-foreground">Pin favorites and jump from most-used pool types.</p>
                   </div>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    className="h-8 text-xs"
+                    onClick={clearLauncherPersonalization}
+                  >
+                    <RotateCcw className="h-3.5 w-3.5 mr-1" />
+                    Reset launcher history
+                  </Button>
                 </div>
                 <div className="mt-2 space-y-2">
                   <div className="flex flex-wrap items-center gap-2">
@@ -907,6 +978,43 @@ export function AdminPoolTypes() {
                         return (
                           <Button
                             key={`fav-${item.key}`}
+                            asChild
+                            size="sm"
+                            variant="outline"
+                            className="h-8"
+                            onClick={() => trackCatalogLaunch(item.key)}
+                          >
+                            <Link to={createHref}>{item.name}</Link>
+                          </Button>
+                        );
+                      })
+                    )}
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="inline-flex items-center gap-1 text-[11px] font-medium text-muted-foreground">
+                      <Clock3 className="h-3.5 w-3.5" /> Recently Launched
+                    </span>
+                    {recentCatalogItems.length === 0 ? (
+                      <span className="text-xs text-muted-foreground">No recent launches yet.</span>
+                    ) : (
+                      recentCatalogItems.map((item) => {
+                        const createParams = toCreateRoutePoolTypeParams({
+                          id: 0,
+                          name: item.name,
+                          sport_key: item.sport,
+                          format_key: item.key,
+                          version: "v1",
+                          status: "active",
+                          description: item.description,
+                          allowed_settings_json: null,
+                          allowedSettings: null,
+                          created_at: "",
+                          updated_at: "",
+                        });
+                        const createHref = `/create-league?sport=${encodeURIComponent(createParams.sport)}&format=${encodeURIComponent(createParams.format)}&poolTypeKey=${encodeURIComponent(item.key)}`;
+                        return (
+                          <Button
+                            key={`recent-${item.key}`}
                             asChild
                             size="sm"
                             variant="outline"
