@@ -39,6 +39,9 @@ import {
   Archive,
   CheckCircle,
   AlertTriangle,
+  Star,
+  History,
+  Sparkles,
 } from "lucide-react";
 import {
   DropdownMenu,
@@ -118,6 +121,10 @@ const TEMPLATE_LABELS: Record<string, string> = {
   bundle_pool: "Bundle Pool",
 };
 
+const REQUIRED_POOL_TARGET = 60;
+const POOL_FAVORITES_STORAGE_KEY = "pool-launcher:favorites";
+const POOL_USAGE_STORAGE_KEY = "pool-launcher:usage";
+
 function toCreateRoutePoolTypeParams(poolType: PoolType): { sport: string; format: string } {
   const sportMap: Record<string, string> = {
     americanfootball_nfl: "nfl",
@@ -182,7 +189,9 @@ export function AdminPoolTypes() {
   const [catalogVariantFilter, setCatalogVariantFilter] = useState("all");
   const [catalogSearch, setCatalogSearch] = useState("");
   const [catalogPage, setCatalogPage] = useState(1);
-  const [catalogPageSize, setCatalogPageSize] = useState(24);
+  const [catalogPageSize, setCatalogPageSize] = useState(96);
+  const [favoritePoolKeys, setFavoritePoolKeys] = useState<string[]>([]);
+  const [poolLaunchUsage, setPoolLaunchUsage] = useState<Record<string, number>>({});
 
   // Form state
   const [formData, setFormData] = useState({
@@ -236,6 +245,49 @@ export function AdminPoolTypes() {
   useEffect(() => {
     fetchPoolTypes();
   }, [fetchPoolTypes]);
+
+  useEffect(() => {
+    try {
+      const favoritesRaw = localStorage.getItem(POOL_FAVORITES_STORAGE_KEY);
+      if (favoritesRaw) {
+        const parsed = JSON.parse(favoritesRaw) as unknown;
+        if (Array.isArray(parsed)) {
+          setFavoritePoolKeys(parsed.filter((value): value is string => typeof value === "string"));
+        }
+      }
+      const usageRaw = localStorage.getItem(POOL_USAGE_STORAGE_KEY);
+      if (usageRaw) {
+        const parsed = JSON.parse(usageRaw) as unknown;
+        if (parsed && typeof parsed === "object") {
+          const usageMap = Object.fromEntries(
+            Object.entries(parsed as Record<string, unknown>)
+              .filter(([, value]) => Number.isFinite(Number(value))),
+          ) as Record<string, number>;
+          setPoolLaunchUsage(usageMap);
+        }
+      }
+    } catch {
+      // Keep launcher usable even if local storage payload is corrupted.
+      setFavoritePoolKeys([]);
+      setPoolLaunchUsage({});
+    }
+  }, []);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(POOL_FAVORITES_STORAGE_KEY, JSON.stringify(favoritePoolKeys));
+    } catch {
+      // Ignore localStorage write failures (private browsing, quota).
+    }
+  }, [favoritePoolKeys]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(POOL_USAGE_STORAGE_KEY, JSON.stringify(poolLaunchUsage));
+    } catch {
+      // Ignore localStorage write failures (private browsing, quota).
+    }
+  }, [poolLaunchUsage]);
 
   const handleCreate = async () => {
     if (!formData.name || !formData.sport_key || !formData.format_key) return;
@@ -441,6 +493,105 @@ export function AdminPoolTypes() {
     return Array.from(all).sort();
   }, [catalog]);
 
+  const sportLauncherChips = useMemo(() => {
+    return catalogSportOptions.slice(0, 12);
+  }, [catalogSportOptions]);
+
+  const favoriteCatalogItems = useMemo(() => {
+    const index = new Map(catalog.map((item) => [item.key, item]));
+    return favoritePoolKeys.map((key) => index.get(key)).filter((item): item is PoolTypeCatalogItem => Boolean(item));
+  }, [catalog, favoritePoolKeys]);
+
+  const mostUsedCatalogItems = useMemo(() => {
+    const index = new Map(catalog.map((item) => [item.key, item]));
+    return Object.entries(poolLaunchUsage)
+      .sort((a, b) => Number(b[1] || 0) - Number(a[1] || 0))
+      .slice(0, 8)
+      .map(([key]) => index.get(key))
+      .filter((item): item is PoolTypeCatalogItem => Boolean(item));
+  }, [catalog, poolLaunchUsage]);
+
+  const recommendedCatalogItems = useMemo(() => {
+    const now = new Date();
+    const month = now.getMonth() + 1; // 1..12
+
+    const isInRange = (start: number, end: number): boolean => (
+      start <= end ? (month >= start && month <= end) : (month >= start || month <= end)
+    );
+
+    const sportSeasonBoost = (sport: string): number => {
+      const key = sport.toLowerCase();
+      if (key === "americanfootball_nfl") return isInRange(8, 2) ? 12 : 2;
+      if (key === "americanfootball_ncaaf") return isInRange(8, 1) ? 10 : 2;
+      if (key === "basketball_ncaab") return isInRange(11, 4) ? 10 : 3;
+      if (key === "basketball_nba") return isInRange(10, 6) ? 9 : 4;
+      if (key === "icehockey_nhl") return isInRange(10, 6) ? 8 : 4;
+      if (key === "baseball_mlb") return isInRange(3, 10) ? 9 : 2;
+      if (key.startsWith("soccer_")) return isInRange(2, 11) ? 7 : 5;
+      if (key === "golf_pga") return isInRange(1, 9) ? 7 : 3;
+      if (key === "mma_ufc") return 6;
+      if (key.startsWith("nascar_")) return isInRange(2, 11) ? 7 : 3;
+      return 3;
+    };
+
+    const templateBoost = (template: string): number => {
+      const t = template.toLowerCase();
+      if (t === "survivor") return 8;
+      if (t === "pickem" || t === "ats_pickem") return 7;
+      if (t === "confidence" || t === "ats_confidence") return 6;
+      if (t === "props") return 4;
+      if (t === "streak") return 4;
+      if (t === "squares") return 5;
+      if (t === "bracket") return isInRange(2, 4) ? 14 : 3;
+      return 3;
+    };
+
+    return [...catalog]
+      .map((item) => {
+        const usageBoost = Math.min(10, Number(poolLaunchUsage[item.key] || 0));
+        const score = sportSeasonBoost(item.sport) + templateBoost(item.template) + usageBoost;
+        return { item, score };
+      })
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 8)
+      .map((entry) => entry.item);
+  }, [catalog, poolLaunchUsage]);
+
+  const toggleFavoritePoolKey = (poolTypeKey: string) => {
+    setFavoritePoolKeys((prev) => (
+      prev.includes(poolTypeKey) ? prev.filter((key) => key !== poolTypeKey) : [poolTypeKey, ...prev]
+    ));
+  };
+
+  const trackCatalogLaunch = (poolTypeKey: string) => {
+    setPoolLaunchUsage((prev) => ({
+      ...prev,
+      [poolTypeKey]: Number(prev[poolTypeKey] || 0) + 1,
+    }));
+  };
+
+  const catalogCoverage = useMemo(() => {
+    const sportsCovered = new Set(catalog.map((item) => item.sport)).size;
+    const templatesCovered = new Set(catalog.map((item) => item.template)).size;
+    const requirementMet = catalog.length >= REQUIRED_POOL_TARGET;
+    return {
+      sportsCovered,
+      templatesCovered,
+      requirementMet,
+      statusText: requirementMet
+        ? `Requirement met (${catalog.length}/${REQUIRED_POOL_TARGET}+ templates)`
+        : `Requirement short (${catalog.length}/${REQUIRED_POOL_TARGET}+ templates)`,
+    };
+  }, [catalog]);
+
+  const clearCatalogFilters = () => {
+    setCatalogSportFilter("all");
+    setCatalogTemplateFilter("all");
+    setCatalogVariantFilter("all");
+    setCatalogSearch("");
+    setCatalogPage(1);
+  };
+
   const handleExitDemoMode = async () => {
     await exitDemoMode();
     try {
@@ -572,9 +723,33 @@ export function AdminPoolTypes() {
                     Browse exact approved pool types and launch create flow with pinned pool type key.
                   </p>
                 </div>
-                <p className="text-xs text-muted-foreground">
-                  Showing {filteredCatalog.length} of {catalog.length} catalog types
-                </p>
+                <div className="text-right">
+                  <p className="text-xs text-muted-foreground">
+                    Showing {filteredCatalog.length} of {catalog.length} catalog types
+                  </p>
+                  <p
+                    className={cn(
+                      "text-xs font-medium",
+                      catalogCoverage.requirementMet ? "text-emerald-600 dark:text-emerald-400" : "text-amber-600 dark:text-amber-400",
+                    )}
+                  >
+                    {catalogCoverage.statusText}
+                  </p>
+                </div>
+              </div>
+              <div className="mt-3 grid grid-cols-1 gap-2 sm:grid-cols-3">
+                <div className="rounded-lg border border-border/70 bg-card/70 px-3 py-2">
+                  <p className="text-[11px] uppercase tracking-wide text-muted-foreground">Catalog templates</p>
+                  <p className="text-base font-semibold">{catalog.length}</p>
+                </div>
+                <div className="rounded-lg border border-border/70 bg-card/70 px-3 py-2">
+                  <p className="text-[11px] uppercase tracking-wide text-muted-foreground">Sports covered</p>
+                  <p className="text-base font-semibold">{catalogCoverage.sportsCovered}</p>
+                </div>
+                <div className="rounded-lg border border-border/70 bg-card/70 px-3 py-2">
+                  <p className="text-[11px] uppercase tracking-wide text-muted-foreground">Templates covered</p>
+                  <p className="text-base font-semibold">{catalogCoverage.templatesCovered}</p>
+                </div>
               </div>
               <div className="mt-3 grid grid-cols-1 gap-2 md:grid-cols-3">
                 <Input
@@ -619,7 +794,174 @@ export function AdminPoolTypes() {
                   </SelectContent>
                 </Select>
               </div>
-              <div className="mt-3 grid grid-cols-1 gap-2 lg:grid-cols-2">
+              <div className="mt-2 flex flex-wrap items-center gap-2">
+                <span className="text-[11px] uppercase tracking-wide text-muted-foreground">Quick Sports</span>
+                <Button
+                  size="sm"
+                  variant={catalogSportFilter === "all" ? "default" : "outline"}
+                  className="h-8"
+                  onClick={() => setCatalogSportFilter("all")}
+                >
+                  All
+                </Button>
+                {sportLauncherChips.map((sport) => (
+                  <Button
+                    key={`sport-chip-${sport}`}
+                    size="sm"
+                    variant={catalogSportFilter === sport ? "default" : "outline"}
+                    className="h-8"
+                    onClick={() => setCatalogSportFilter(sport)}
+                  >
+                    {getCatalogSportLabel(sport)}
+                  </Button>
+                ))}
+              </div>
+              <div className="mt-2 flex flex-wrap items-center gap-2">
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="h-8"
+                  onClick={clearCatalogFilters}
+                >
+                  Reset Filters
+                </Button>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="h-8"
+                  onClick={() => {
+                    clearCatalogFilters();
+                    setCatalogPageSize(Math.max(96, catalog.length || 96));
+                  }}
+                >
+                  Show All Templates
+                </Button>
+              </div>
+              <div className="mt-3 rounded-lg border border-border/70 bg-card/70 px-3 py-2">
+                <div className="flex flex-col gap-2 lg:flex-row lg:items-center lg:justify-between">
+                  <div>
+                    <p className="text-[11px] uppercase tracking-wide text-muted-foreground">Quick Launch</p>
+                    <p className="text-xs text-muted-foreground">Pin favorites and jump from most-used pool types.</p>
+                  </div>
+                </div>
+                <div className="mt-2 space-y-2">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="inline-flex items-center gap-1 text-[11px] font-medium text-muted-foreground">
+                      <Sparkles className="h-3.5 w-3.5" /> Trending / Recommended
+                    </span>
+                    {recommendedCatalogItems.length === 0 ? (
+                      <span className="text-xs text-muted-foreground">Loading recommendations...</span>
+                    ) : (
+                      recommendedCatalogItems.map((item) => {
+                        const createParams = toCreateRoutePoolTypeParams({
+                          id: 0,
+                          name: item.name,
+                          sport_key: item.sport,
+                          format_key: item.key,
+                          version: "v1",
+                          status: "active",
+                          description: item.description,
+                          allowed_settings_json: null,
+                          allowedSettings: null,
+                          created_at: "",
+                          updated_at: "",
+                        });
+                        const createHref = `/create-league?sport=${encodeURIComponent(createParams.sport)}&format=${encodeURIComponent(createParams.format)}&poolTypeKey=${encodeURIComponent(item.key)}`;
+                        return (
+                          <Button
+                            key={`recommended-${item.key}`}
+                            asChild
+                            size="sm"
+                            variant="outline"
+                            className="h-8"
+                            onClick={() => trackCatalogLaunch(item.key)}
+                          >
+                            <Link to={createHref}>{item.name}</Link>
+                          </Button>
+                        );
+                      })
+                    )}
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="inline-flex items-center gap-1 text-[11px] font-medium text-muted-foreground">
+                      <Star className="h-3.5 w-3.5" /> Favorites
+                    </span>
+                    {favoriteCatalogItems.length === 0 ? (
+                      <span className="text-xs text-muted-foreground">No favorites yet. Tap the star on any card.</span>
+                    ) : (
+                      favoriteCatalogItems.slice(0, 8).map((item) => {
+                        const createParams = toCreateRoutePoolTypeParams({
+                          id: 0,
+                          name: item.name,
+                          sport_key: item.sport,
+                          format_key: item.key,
+                          version: "v1",
+                          status: "active",
+                          description: item.description,
+                          allowed_settings_json: null,
+                          allowedSettings: null,
+                          created_at: "",
+                          updated_at: "",
+                        });
+                        const createHref = `/create-league?sport=${encodeURIComponent(createParams.sport)}&format=${encodeURIComponent(createParams.format)}&poolTypeKey=${encodeURIComponent(item.key)}`;
+                        return (
+                          <Button
+                            key={`fav-${item.key}`}
+                            asChild
+                            size="sm"
+                            variant="outline"
+                            className="h-8"
+                            onClick={() => trackCatalogLaunch(item.key)}
+                          >
+                            <Link to={createHref}>{item.name}</Link>
+                          </Button>
+                        );
+                      })
+                    )}
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="inline-flex items-center gap-1 text-[11px] font-medium text-muted-foreground">
+                      <History className="h-3.5 w-3.5" /> Most Used
+                    </span>
+                    {mostUsedCatalogItems.length === 0 ? (
+                      <span className="text-xs text-muted-foreground">Launch a pool type to build quick history.</span>
+                    ) : (
+                      mostUsedCatalogItems.map((item) => {
+                        const createParams = toCreateRoutePoolTypeParams({
+                          id: 0,
+                          name: item.name,
+                          sport_key: item.sport,
+                          format_key: item.key,
+                          version: "v1",
+                          status: "active",
+                          description: item.description,
+                          allowed_settings_json: null,
+                          allowedSettings: null,
+                          created_at: "",
+                          updated_at: "",
+                        });
+                        const createHref = `/create-league?sport=${encodeURIComponent(createParams.sport)}&format=${encodeURIComponent(createParams.format)}&poolTypeKey=${encodeURIComponent(item.key)}`;
+                        return (
+                          <Button
+                            key={`used-${item.key}`}
+                            asChild
+                            size="sm"
+                            variant="outline"
+                            className="h-8"
+                            onClick={() => trackCatalogLaunch(item.key)}
+                          >
+                            <Link to={createHref}>
+                              {item.name}
+                              <span className="ml-1 text-[10px] text-muted-foreground">({Number(poolLaunchUsage[item.key] || 0)})</span>
+                            </Link>
+                          </Button>
+                        );
+                      })
+                    )}
+                  </div>
+                </div>
+              </div>
+              <div className="mt-3 grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3">
                 {pagedCatalog.map((item) => {
                   const createParams = toCreateRoutePoolTypeParams({
                     id: 0,
@@ -636,20 +978,31 @@ export function AdminPoolTypes() {
                   });
                   const createHref = `/create-league?sport=${encodeURIComponent(createParams.sport)}&format=${encodeURIComponent(createParams.format)}&poolTypeKey=${encodeURIComponent(item.key)}`;
                   return (
-                    <div key={item.key} className="rounded-lg border border-border/70 bg-card p-3">
+                    <div
+                      key={item.key}
+                      className="rounded-xl border border-border/70 bg-card p-3 shadow-sm transition-all hover:border-primary/40 hover:shadow-lg"
+                    >
                       <div className="flex items-center gap-3">
-                        <PoolTypeBadgeIcon formatKey={item.template} size="sm" />
+                        <PoolTypeBadgeIcon
+                          formatKey={item.template}
+                          poolTypeKey={item.key}
+                          sportKey={item.sport}
+                          size="lg"
+                        />
                         <div className="min-w-0">
-                          <p className="text-sm font-semibold truncate">{item.name}</p>
-                          <p className="text-xs text-muted-foreground truncate">
-                            {getCatalogSportLabel(item.sport)} - {TEMPLATE_LABELS[item.template] || item.template}
+                          <p className="text-sm font-semibold leading-tight">{item.name}</p>
+                          <p className="text-xs text-muted-foreground truncate mt-0.5">
+                            {getCatalogSportLabel(item.sport)} • {TEMPLATE_LABELS[item.template] || item.template}
                           </p>
                         </div>
                       </div>
-                      <p className="mt-2 text-xs text-muted-foreground line-clamp-2">{item.description}</p>
-                      <div className="mt-2 flex flex-wrap items-center gap-1">
+                      <p className="mt-3 text-xs text-muted-foreground line-clamp-2 min-h-[2.2rem]">{item.description}</p>
+                      <div className="mt-2 flex flex-wrap items-center gap-1.5">
                         {item.rule_variants.slice(0, 3).map((variant) => (
-                          <span key={`${item.key}-${variant.key}`} className="rounded-full border px-2 py-0.5 text-[10px] text-muted-foreground">
+                          <span
+                            key={`${item.key}-${variant.key}`}
+                            className="rounded-full border border-primary/20 bg-primary/5 px-2 py-0.5 text-[10px] text-muted-foreground"
+                          >
                             {variant.label}
                           </span>
                         ))}
@@ -657,11 +1010,23 @@ export function AdminPoolTypes() {
                           <span className="text-[10px] text-muted-foreground">+{item.rule_variants.length - 3} more</span>
                         )}
                       </div>
-                      <div className="mt-3 flex items-center justify-between">
-                        <span className="text-[10px] text-muted-foreground">Key: {item.key}</span>
-                        <Button asChild size="sm" variant="outline" className="h-8">
-                          <Link to={createHref}>Create Exact Type</Link>
-                        </Button>
+                      <div className="mt-3 flex items-center justify-between gap-2">
+                        <span className="text-[10px] text-muted-foreground truncate">Key: {item.key}</span>
+                        <div className="flex items-center gap-2">
+                          <Button
+                            size="icon"
+                            variant={favoritePoolKeys.includes(item.key) ? "default" : "outline"}
+                            className="h-8 w-8"
+                            onClick={() => toggleFavoritePoolKey(item.key)}
+                            aria-label={favoritePoolKeys.includes(item.key) ? "Remove from favorites" : "Add to favorites"}
+                            title={favoritePoolKeys.includes(item.key) ? "Remove favorite" : "Add favorite"}
+                          >
+                            <Star className="h-4 w-4" />
+                          </Button>
+                          <Button asChild size="sm" className="h-8">
+                            <Link to={createHref} onClick={() => trackCatalogLaunch(item.key)}>Start This Pool</Link>
+                          </Button>
+                        </div>
                       </div>
                     </div>
                   );
@@ -738,7 +1103,12 @@ export function AdminPoolTypes() {
                 return (
                   <div key={`card-${poolType.id}`} className="rounded-xl border border-border bg-card p-3 shadow-sm hover:shadow-md transition-shadow">
                     <div className="flex items-center gap-3">
-                      <PoolTypeBadgeIcon formatKey={poolType.format_key} size="sm" />
+                      <PoolTypeBadgeIcon
+                        formatKey={poolType.format_key}
+                        poolTypeKey={poolType.format_key}
+                        sportKey={poolType.sport_key}
+                        size="sm"
+                      />
                       <div className="min-w-0">
                         <p className="text-sm font-semibold truncate">{poolType.name}</p>
                         <p className="text-xs text-muted-foreground truncate">

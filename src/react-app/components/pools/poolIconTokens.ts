@@ -11,6 +11,18 @@ import {
   Medal,
   Zap,
   GitBranch,
+  Crosshair,
+  Crown,
+  ShieldAlert,
+  Swords,
+  Dice5,
+  Goal,
+  Volleyball,
+  Dumbbell,
+  CarFront,
+  CircleDollarSign,
+  Sigma,
+  Sparkles,
   type LucideProps,
   type LucideIcon,
 } from "lucide-react";
@@ -25,6 +37,11 @@ export interface PoolIconToken {
   glyphClass: string;
   glowClass: string;
 }
+
+type PoolIconContext = {
+  poolTypeKey?: string;
+  sportKey?: string;
+};
 
 const DEFAULT_TOKEN: PoolIconToken = {
   key: "default",
@@ -138,13 +155,108 @@ const TOKENS: Record<string, PoolIconToken> = {
   },
 };
 
-export function getPoolIconToken(formatKey: string): PoolIconToken {
+const SPORT_PANEL_CLASSES: Array<{ match: string; panelClass: string; frameClass: string; glyphClass: string }> = [
+  {
+    match: "americanfootball_",
+    panelClass: "from-red-500 via-rose-700 to-black",
+    frameClass: "from-red-300 via-white to-amber-500",
+    glyphClass: "text-red-100",
+  },
+  {
+    match: "basketball_",
+    panelClass: "from-orange-500 via-amber-700 to-black",
+    frameClass: "from-orange-300 via-white to-yellow-500",
+    glyphClass: "text-orange-100",
+  },
+  {
+    match: "baseball_",
+    panelClass: "from-sky-500 via-blue-700 to-black",
+    frameClass: "from-sky-300 via-white to-red-400",
+    glyphClass: "text-sky-100",
+  },
+  {
+    match: "icehockey_",
+    panelClass: "from-cyan-500 via-blue-700 to-black",
+    frameClass: "from-cyan-200 via-white to-indigo-400",
+    glyphClass: "text-cyan-100",
+  },
+  {
+    match: "soccer_",
+    panelClass: "from-emerald-500 via-green-700 to-black",
+    frameClass: "from-emerald-300 via-white to-lime-400",
+    glyphClass: "text-emerald-100",
+  },
+  {
+    match: "golf_",
+    panelClass: "from-lime-500 via-emerald-700 to-black",
+    frameClass: "from-lime-300 via-white to-yellow-400",
+    glyphClass: "text-lime-100",
+  },
+  {
+    match: "mma_",
+    panelClass: "from-rose-500 via-red-700 to-black",
+    frameClass: "from-rose-300 via-white to-orange-400",
+    glyphClass: "text-rose-100",
+  },
+  {
+    match: "nascar_",
+    panelClass: "from-yellow-500 via-orange-700 to-black",
+    frameClass: "from-yellow-300 via-white to-red-400",
+    glyphClass: "text-yellow-100",
+  },
+];
+
+const ICON_VARIANTS_BY_TEMPLATE: Record<string, Array<LucideIcon | FC<LucideProps>>> = {
+  pickem: [Ticket, Crosshair, CircleDollarSign],
+  ats: [TrendingUp, Sigma, Swords],
+  confidence: [Medal, Crown, Trophy],
+  survivor: [Shield, ShieldAlert, Flame],
+  bracket: [GitBranch, Sparkles, Trophy],
+  squares: [Grid3X3, Dice5, CircleDollarSign],
+  props: [ListChecks, Dumbbell, Goal],
+  streak: [Flame, Zap, Volleyball],
+  upset: [Siren, Swords, Zap],
+  stat: [BarChart3, Sigma, TrendingUp],
+  special: [Zap, Sparkles, CarFront],
+};
+
+function hashString(input: string): number {
+  let hash = 0;
+  for (let i = 0; i < input.length; i += 1) {
+    hash = (hash << 5) - hash + input.charCodeAt(i);
+    hash |= 0;
+  }
+  return Math.abs(hash);
+}
+
+export function getPoolIconToken(formatKey: string, context?: PoolIconContext): PoolIconToken {
   const normalized = String(formatKey || "").toLowerCase();
-  if (TOKENS[normalized]) return TOKENS[normalized];
-  if (normalized.includes("survivor")) return TOKENS.survivor;
-  if (normalized.includes("pick")) return TOKENS.pickem;
-  if (normalized.includes("confidence")) return TOKENS.confidence;
-  if (normalized.includes("streak")) return TOKENS.streak;
-  if (normalized.includes("upset") || normalized.includes("underdog")) return TOKENS.upset;
-  return DEFAULT_TOKEN;
+  const baseToken = TOKENS[normalized]
+    || (normalized.includes("survivor")
+      ? TOKENS.survivor
+      : normalized.includes("pick")
+      ? TOKENS.pickem
+      : normalized.includes("confidence")
+      ? TOKENS.confidence
+      : normalized.includes("streak")
+      ? TOKENS.streak
+      : (normalized.includes("upset") || normalized.includes("underdog"))
+      ? TOKENS.upset
+      : DEFAULT_TOKEN);
+
+  const keySeed = `${context?.poolTypeKey || ""}|${context?.sportKey || ""}|${normalized}`;
+  const poolHash = hashString(keySeed);
+  const iconPool = ICON_VARIANTS_BY_TEMPLATE[baseToken.key] || [baseToken.icon];
+  const icon = iconPool[poolHash % iconPool.length] || baseToken.icon;
+
+  const sportKey = String(context?.sportKey || "").toLowerCase();
+  const sportPalette = SPORT_PANEL_CLASSES.find((entry) => sportKey.startsWith(entry.match));
+
+  return {
+    ...baseToken,
+    icon,
+    panelClass: sportPalette?.panelClass || baseToken.panelClass,
+    frameClass: sportPalette?.frameClass || baseToken.frameClass,
+    glyphClass: sportPalette?.glyphClass || baseToken.glyphClass,
+  };
 }

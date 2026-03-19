@@ -3,15 +3,21 @@ import { getPoolIconToken } from "./poolIconTokens";
 
 export function PoolTypeBadgeIcon({
   formatKey,
+  poolTypeKey,
+  sportKey,
   size = "md",
 }: {
   formatKey: string;
-  size?: "sm" | "md" | "lg";
+  poolTypeKey?: string;
+  sportKey?: string;
+  size?: "sm" | "md" | "lg" | "xl";
 }) {
-  const token = getPoolIconToken(formatKey);
+  const token = getPoolIconToken(formatKey, { poolTypeKey, sportKey });
   const Icon = token.icon;
-  const sizeClass = size === "sm" ? "w-9 h-9" : size === "lg" ? "w-14 h-14" : "w-11 h-11";
-  const iconSizeClass = size === "sm" ? "w-4.5 h-4.5" : size === "lg" ? "w-7 h-7" : "w-5.5 h-5.5";
+  const sizeClass =
+    size === "sm" ? "w-9 h-9" : size === "lg" ? "w-14 h-14" : size === "xl" ? "w-16 h-16" : "w-11 h-11";
+  const iconSizeClass =
+    size === "sm" ? "w-4.5 h-4.5" : size === "lg" ? "w-7 h-7" : size === "xl" ? "w-8 h-8" : "w-5.5 h-5.5";
 
   return (
     <div
