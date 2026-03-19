@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { useNavigate, useSearchParams } from "react-router-dom";
+import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { useDemoAuth } from "@/react-app/contexts/DemoAuthContext";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/react-app/components/ui/card";
 import { Button } from "@/react-app/components/ui/button";
@@ -9,7 +9,7 @@ import { Switch } from "@/react-app/components/ui/switch";
 import { RadioGroup, RadioGroupItem } from "@/react-app/components/ui/radio-group";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/react-app/components/ui/select";
 import { Badge } from "@/react-app/components/ui/badge";
-import { ArrowLeft, ArrowRight, Check, Trophy, Loader2, AlertCircle, Heart, Skull, TrendingUp, RefreshCw, Shield, Sparkles, SlidersHorizontal } from "lucide-react";
+import { ArrowLeft, ArrowRight, Check, Trophy, Loader2, AlertCircle, Heart, Skull, TrendingUp, RefreshCw, Shield, Sparkles, SlidersHorizontal, Library } from "lucide-react";
 import { Alert, AlertDescription } from "@/react-app/components/ui/alert";
 import { SPORTS, POOL_FORMATS, DEFAULT_RULES, type LeagueRules } from "@/react-app/data/sports";
 import { cn } from "@/react-app/lib/utils";
@@ -547,6 +547,17 @@ export function CreateLeague() {
             <CardDescription>Pick a quick template or build from scratch.</CardDescription>
           </CardHeader>
           <CardContent>
+            <Link
+              to="/admin/pool-types"
+              className="mb-4 flex items-center gap-3 rounded-lg border border-primary/30 bg-primary/5 px-4 py-3 transition-colors hover:bg-primary/10 hover:border-primary/50"
+            >
+              <Library className="h-5 w-5 text-primary shrink-0" />
+              <div className="min-w-0">
+                <p className="text-sm font-semibold">Browse Full Pool Catalog</p>
+                <p className="text-xs text-muted-foreground">Search 81+ pool types with filters, favorites, and one-click launch.</p>
+              </div>
+              <ArrowRight className="h-4 w-4 text-muted-foreground shrink-0 ml-auto" />
+            </Link>
             <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mb-5">
               {QUICK_PRESETS.map((preset) => (
                 <button

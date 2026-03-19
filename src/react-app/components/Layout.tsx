@@ -484,7 +484,14 @@ export function Layout({ children, hideFooter: _hideFooter }: LayoutProps) {
           mounted && "animate-page-enter"
         )}
       >
-        {!isHomePage && location.pathname !== '/games' && <CoachGIntelligenceLayer />}
+        {!isHomePage
+          && !location.pathname.startsWith('/create-league')
+          && !location.pathname.startsWith('/admin')
+          && !location.pathname.startsWith('/pool-admin')
+          && !location.pathname.startsWith('/settings')
+          && !location.pathname.startsWith('/join')
+          && location.pathname !== '/games'
+          && <CoachGIntelligenceLayer />}
         {children}
       </main>
 
