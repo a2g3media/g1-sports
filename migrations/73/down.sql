@@ -1,0 +1,1 @@
+ALTER TABLE parse_jobs DROP COLUMN ticket_name;

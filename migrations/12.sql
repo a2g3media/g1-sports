@@ -1,0 +1,4 @@
+ALTER TABLE events ADD COLUMN venue TEXT;
+ALTER TABLE events ADD COLUMN broadcast TEXT;
+ALTER TABLE events ADD COLUMN weather TEXT;
+ALTER TABLE events ADD COLUMN winner TEXT;

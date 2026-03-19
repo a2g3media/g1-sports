@@ -1,0 +1,161 @@
+<html lang="en">
+  <head>
+    <meta charset="UTF-8"/>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"/>
+    <!-- App Meta -->    <meta name="description" content="Live scores, pools, and AI-powered sports insights."/>
+    <meta name="keywords" content="sports scores, live scores, NFL, NBA, MLB, NHL, sports betting, picks, pools, survivor pools, AI sports analysis, Scout AI, fantasy sports, sports intelligence"/>
+    <meta name="application-name" content="G1 Sports"/>
+    <meta name="author" content="G1 Sports"/>
+    <meta name="robots" content="index, follow"/>
+    <link rel="canonical" href="https://g1sports.com/"/>
+    <!-- Theme Colors -->    <meta name="theme-color" content="#0a0a0a" media="(prefers-color-scheme: dark)"/>
+    <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)"/>
+    <meta name="color-scheme" content="dark light"/>
+    <!-- iOS PWA Meta Tags -->    <meta name="apple-mobile-web-app-capable" content="yes"/>
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"/>
+    <meta name="apple-mobile-web-app-title" content="G1 Sports"/>
+    <meta name="format-detection" content="telephone=no"/>
+    <!-- Android PWA Meta Tags -->    <meta name="mobile-web-app-capable" content="yes"/>
+    <!-- Open Graph -->    <meta property="og:title" content="G1 Sports"/>
+    <meta property="og:description" content="Live scores, pools, and AI-powered sports insights"/>
+    <meta property="og:image" content="/g1-logo.png"/>
+    <meta property="og:image:width" content="1200"/>
+    <meta property="og:image:height" content="630"/>
+    <meta property="og:image:alt" content="G1 Sports - Live Scores &amp; AI Sports Intelligence"/>
+    <meta property="og:url" content="https://g1sports.com"/>
+    <meta property="og:type" content="website"/>
+    <meta property="og:site_name" content="G1 Sports"/>
+    <meta property="og:locale" content="en_US"/>
+    <!-- Twitter Card -->    <meta name="twitter:card" content="summary_large_image"/>
+    <meta name="twitter:title" content="G1 Sports"/>
+    <meta name="twitter:description" content="Live scores, pools, and AI-powered sports insights."/>
+    <meta name="twitter:image" content="/g1-logo.png"/>
+    <meta name="twitter:image:alt" content="G1 Sports - Live Scores &amp; AI Sports Intelligence"/>
+    <!-- Manifest & Icons -->    <link rel="manifest" href="/manifest.json"/>
+    <link rel="shortcut icon" href="/assets/g1-sports-logo-clean.png" type="image/png"/>
+    <link rel="apple-touch-icon" sizes="180x180" href="/assets/g1-sports-logo-clean.png"/>
+    <link rel="icon" type="image/png" sizes="32x32" href="/assets/g1-sports-logo-clean.png"/>
+    <link rel="icon" type="image/png" sizes="16x16" href="/assets/g1-sports-logo-clean.png"/>
+    <!-- Splash Screens for iOS -->    <link rel="apple-touch-startup-image" href="https://019c4e67-936a-785b-b7d9-4779ded1f51c.mochausercontent.com/gz-sports-logo.png"/>
+    <title>
+      G1 Sports
+    </title>
+    <!-- JSON-LD Structured Data -->    <script type="application/ld+json">
+      {
+      "@context": "https://schema.org",
+      "@type": "Organization",
+      "name": "G1 Sports",
+      "url": "https://g1sports.com",
+      "logo": "https://019c4e67-936a-785b-b7d9-4779ded1f51c.mochausercontent.com/gz-sports-icon.png",
+      "description": "Live scores, pools, and AI-powered sports insights.",
+      "sameAs": []
+    }
+    </script>
+    <script type="application/ld+json">
+      {
+      "@context": "https://schema.org",
+      "@type": "SoftwareApplication",
+      "name": "G1 Sports",
+      "operatingSystem": "Web, iOS, Android",
+      "applicationCategory": "SportsApplication",
+      "offers": {
+        "@type": "Offer",
+        "price": "0",
+        "priceCurrency": "USD"
+      },
+      "aggregateRating": {
+        "@type": "AggregateRating",
+        "ratingValue": "4.8",
+        "ratingCount": "150"
+      },
+      "description": "Live sports scores, AI-powered analysis with Scout, and competitive pool management for NFL, NBA, MLB, NHL and more."
+    }
+    </script>
+  </head>
+  <body>
+    <div id="root">
+      <!-- Inline loading state - G1 Sports branding, giant rotating logo -->
+      <div id="initial-loader" style="
+        position: fixed;
+        inset: 0;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        background: linear-gradient(180deg, #05060a 0%, #0f172a 50%, #0a0f1a 100%);
+        color: white;
+        font-family: system-ui, -apple-system, sans-serif;
+        z-index: 9999;
+      ">
+        <div style="
+          width: min(380px, 82vw);
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          margin-bottom: 48px;
+          filter: drop-shadow(0 0 40px rgba(96, 165, 250, 0.4)) drop-shadow(0 0 80px rgba(96, 165, 250, 0.2));
+        ">
+          <img
+            src="/assets/g1-sports-logo-clean.png"
+            alt="G1 Sports"
+            style="
+              width: 100%;
+              height: auto;
+              object-fit: contain;
+              animation: loader-logo-spin 4s ease-in-out infinite;
+            "
+            onerror="this.onerror=null;this.src='/assets/g1-sports-logo.png';"
+          />
+        </div>
+        <div style="
+          width: 40px;
+          height: 40px;
+          border: 3px solid rgba(96, 165, 250, 0.25);
+          border-top-color: #60a5fa;
+          border-radius: 50%;
+          animation: spin 0.9s linear infinite;
+        "></div>
+        <p style="margin-top: 24px; font-size: 15px; font-weight: 500; color: #94a3b8; letter-spacing: 0.02em;">
+          Loading G1 Sports...
+        </p>
+        <style>
+          @keyframes spin { to { transform: rotate(360deg); } }
+          @keyframes loader-logo-spin {
+            0%, 100% { transform: rotate(0deg) scale(1); opacity: 1; }
+            50% { transform: rotate(180deg) scale(1.02); opacity: 0.95; }
+          }
+        </style>
+      </div>
+    </div>
+    <script type="module" src="/src/react-app/main.tsx">
+    </script>
+    <script>
+      // Service worker is production-only. In local dev, unregister to avoid stale chunk caching.
+      const isLocalhost = ["localhost", "127.0.0.1", "::1"].includes(window.location.hostname);
+
+      if ("serviceWorker" in navigator) {
+        window.addEventListener("load", () => {
+          if (isLocalhost) {
+            navigator.serviceWorker.getRegistrations().then((registrations) => {
+              registrations.forEach((registration) => registration.unregister());
+            });
+            if ("caches" in window) {
+              caches.keys().then((names) => {
+                names.forEach((name) => caches.delete(name));
+              });
+            }
+            return;
+          }
+
+          navigator.serviceWorker.register("/sw.js")
+            .then((registration) => {
+              console.log("SW registered:", registration.scope);
+            })
+            .catch((error) => {
+              console.log("SW registration failed:", error);
+            });
+        });
+      }
+    </script>
+  </body>
+</html>

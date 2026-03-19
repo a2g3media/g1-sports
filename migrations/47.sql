@@ -1,0 +1,1 @@
+ALTER TABLE push_delivery_log ADD COLUMN period TEXT;

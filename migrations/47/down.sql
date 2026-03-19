@@ -1,0 +1,1 @@
+ALTER TABLE push_delivery_log DROP COLUMN period;

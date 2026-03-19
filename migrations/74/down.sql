@@ -1,0 +1,11 @@
+DROP INDEX idx_alert_throttle_user_event;
+DROP TABLE alert_throttle;
+DROP INDEX idx_alert_state_updated;
+DROP INDEX idx_alert_state_user_event;
+DROP INDEX idx_alert_state_user_leg;
+DROP TABLE alert_state_tracker;
+DROP INDEX idx_ticket_alerts_created;
+DROP INDEX idx_ticket_alerts_ticket;
+DROP INDEX idx_ticket_alerts_user_unread;
+DROP INDEX idx_ticket_alerts_user;
+DROP TABLE ticket_alerts;

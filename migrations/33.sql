@@ -1,0 +1,1 @@
+ALTER TABLE leagues ADD COLUMN is_chat_enabled BOOLEAN DEFAULT 1;

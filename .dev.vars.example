@@ -1,0 +1,46 @@
+# Local development secrets template (placeholder values only)
+# Copy to .dev.vars and replace values locally.
+
+# =========================
+# Core Auth (required for auth-protected flows)
+# =========================
+MOCHA_USERS_SERVICE_API_URL=REPLACE_ME
+MOCHA_USERS_SERVICE_API_KEY=REPLACE_ME
+
+# =========================
+# SportsRadar (primary provider)
+# =========================
+# Required for live sports data routes
+SPORTSRADAR_API_KEY=REPLACE_ME
+
+# Optional specialized SportsRadar keys (fallbacks exist)
+SPORTSRADAR_ODDS_KEY=
+SPORTSRADAR_GOLF_KEY=
+SPORTSRADAR_PLAYER_PROPS_KEY=
+SPORTSRADAR_PROPS_KEY=
+
+# Optional ticket/handle split feed for real bet%/money%
+TICKET_HANDLE_FEED_URL=
+TICKET_HANDLE_FEED_API_KEY=
+
+# Optional multi-model router credentials
+ANTHROPIC_API_KEY=
+GEMINI_API_KEY=
+
+# =========================
+# AI / Enrichment (optional by feature)
+# =========================
+OPENAI_API_KEY=
+FIRECRAWL_API_KEY=
+
+# =========================
+# Push Notifications (optional for local unless testing push)
+# =========================
+VAPID_PUBLIC_KEY=
+VAPID_PRIVATE_KEY=
+
+# =========================
+# Legacy SportsDataIO (deprecated migration support)
+# =========================
+SPORTSDATAIO_API_KEY=
+SPORTSDATAIO_SPORTSBOOK_GROUP_ID=

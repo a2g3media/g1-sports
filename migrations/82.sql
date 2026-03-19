@@ -1,0 +1,1 @@
+ALTER TABLE scout_alerts ADD COLUMN saved_at DATETIME;

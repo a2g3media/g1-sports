@@ -1,0 +1,1 @@
+ALTER TABLE sdio_games DROP COLUMN channel;

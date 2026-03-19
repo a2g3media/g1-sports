@@ -1,0 +1,13 @@
+{
+  "name": "019ce56b-b0ff-7056-a2d5-613f9cde7650",
+  "main": "./src/worker/index.ts",
+  "compatibility_date": "2025-06-17",
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "019ce56b-b0ff-7056-a2d5-613f9cde7650",
+      "database_id": "b2f7c787-7992-492b-a709-7edc6f1d9966"
+    }
+  ],
+  "migrations_dir": "./migrations"
+}

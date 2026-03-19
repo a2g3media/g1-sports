@@ -1,0 +1,1 @@
+ALTER TABLE leagues ADD COLUMN is_public BOOLEAN DEFAULT 0;

@@ -1,0 +1,4 @@
+ALTER TABLE events DROP COLUMN winner;
+ALTER TABLE events DROP COLUMN weather;
+ALTER TABLE events DROP COLUMN broadcast;
+ALTER TABLE events DROP COLUMN venue;

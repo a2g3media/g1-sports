@@ -1,0 +1,1 @@
+ALTER TABLE leagues DROP COLUMN is_chat_enabled;

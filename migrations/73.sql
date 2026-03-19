@@ -1,0 +1,1 @@
+ALTER TABLE parse_jobs ADD COLUMN ticket_name TEXT;

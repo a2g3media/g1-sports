@@ -1,0 +1,17 @@
+dist/
+node_modules/
+.wrangler/
+.dev.vars
+worker-configuration.d.ts
+
+# Test/build artifacts
+test-results/
+tmp/
+tmp-tab-test/
+.playwright-browsers/
+
+# Local screenshots and scratch verification assets
+*-5173.png
+ui-check-*.png
+*verify*.png
+games-verify.png

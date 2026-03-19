@@ -1,0 +1,1402 @@
+/**
+ * PlayerPropsPage - Premium Player Props Experience
+ * 
+ * Route: /props
+ * ESPN-style player prop cards with sportsbook comparison,
+ * search/filters, and Coach G integration.
+ */
+
+import { useState, useEffect, useMemo, useCallback, useRef } from "react";
+import { useNavigate } from "react-router-dom";
+import { 
+  ArrowLeft, Search, X, ChevronDown, ChevronUp,
+  TrendingUp, TrendingDown, Target, Lock, Plus, Star,
+  Send, Sparkles, Check
+} from "lucide-react";
+import { cn } from "@/react-app/lib/utils";
+import { useProviderCapabilities } from "@/react-app/hooks/useProviderCapabilities";
+import { useDemoAuth } from "@/react-app/contexts/DemoAuthContext";
+import { useWatchboards } from "@/react-app/hooks/useWatchboards";
+import { AddPropToWatchboardModal } from "@/react-app/components/AddPropToWatchboardModal";
+import { PlayerPhoto } from "@/react-app/components/PlayerPhoto";
+import { useFavoriteSports } from "@/react-app/components/FavoriteSportsSelector";
+
+// ============================================
+// TYPES
+// ============================================
+
+interface PlayerProp {
+  id: number;
+  game_id: string;
+  player_name: string;
+  player_id?: string;
+  team: string | null;
+  sport: string;
+  prop_type: string;
+  line_value: number;
+  open_line_value: number | null;
+  movement: number | null;
+  last_updated: string | null;
+  home_team?: string;
+  away_team?: string;
+  sportsbook?: string;
+  odds_american?: number | null;
+}
+
+interface GroupedProp {
+  playerName: string;
+  playerId?: string;
+  team: string;
+  sport: string;
+  props: PlayerProp[];
+}
+
+// ============================================
+// CONSTANTS
+// ============================================
+
+const SPORTS = [
+  { key: 'ALL', label: 'All', icon: '🏆' },
+  { key: 'NBA', label: 'NBA', icon: '🏀' },
+  { key: 'NFL', label: 'NFL', icon: '🏈' },
+  { key: 'MLB', label: 'MLB', icon: '⚾' },
+  { key: 'NHL', label: 'NHL', icon: '🏒' },
+  { key: 'NCAAB', label: 'NCAAB', icon: '🏀' },
+] as const;
+
+const PROP_CATEGORIES = {
+  NBA: ['POINTS', 'REBOUNDS', 'ASSISTS', 'THREES', 'PRA', 'STEALS', 'BLOCKS'],
+  NFL: ['PASSING_YARDS', 'RUSHING_YARDS', 'RECEIVING_YARDS', 'PASSING_TDS', 'RECEPTIONS'],
+  MLB: ['HITS', 'RUNS', 'RBIS', 'STRIKEOUTS', 'HOME_RUNS', 'TOTAL_BASES'],
+  NHL: ['GOALS', 'ASSISTS', 'SHOTS', 'SAVES', 'POINTS_NHL'],
+  NCAAB: ['POINTS', 'REBOUNDS', 'ASSISTS', 'THREES'],
+  ALL: ['POINTS', 'REBOUNDS', 'ASSISTS', 'THREES', 'PRA', 'PASSING_YARDS', 'RUSHING_YARDS']
+} as const;
+
+const PROP_TYPE_LABELS: Record<string, string> = {
+  POINTS: 'Points',
+  REBOUNDS: 'Rebounds',
+  ASSISTS: 'Assists',
+  STEALS: 'Steals',
+  BLOCKS: 'Blocks',
+  THREES: '3-Pointers',
+  PRA: 'PTS+REB+AST',
+  PR: 'PTS+REB',
+  PA: 'PTS+AST',
+  RA: 'REB+AST',
+  SB: 'STL+BLK',
+  TURNOVERS: 'Turnovers',
+  DOUBLE_DOUBLE: 'Double-Double',
+  TRIPLE_DOUBLE: 'Triple-Double',
+  PASSING_YARDS: 'Pass Yards',
+  PASSING_TDS: 'Pass TDs',
+  RUSHING_YARDS: 'Rush Yards',
+  RECEIVING_YARDS: 'Rec Yards',
+  RECEPTIONS: 'Receptions',
+  INTERCEPTIONS: 'INTs',
+  HITS: 'Hits',
+  RUNS: 'Runs',
+  RBIS: 'RBIs',
+  STRIKEOUTS: 'Strikeouts',
+  HOME_RUNS: 'Home Runs',
+  TOTAL_BASES: 'Total Bases',
+  GOALS: 'Goals',
+  SHOTS: 'Shots',
+  SAVES: 'Saves',
+  POINTS_NHL: 'Points',
+  OTHER: 'Other'
+};
+
+const SPORTSBOOK_COLORS: Record<string, string> = {
+  'DraftKings': 'bg-emerald-500/20 text-emerald-400 border-emerald-500/30',
+  'FanDuel': 'bg-blue-500/20 text-blue-400 border-blue-500/30',
+  'BetMGM': 'bg-amber-500/20 text-amber-400 border-amber-500/30',
+  'Caesars': 'bg-red-500/20 text-red-400 border-red-500/30',
+  'PointsBet': 'bg-purple-500/20 text-purple-400 border-purple-500/30',
+  'BetRivers': 'bg-cyan-500/20 text-cyan-400 border-cyan-500/30',
+  'WilliamHill': 'bg-indigo-500/20 text-indigo-400 border-indigo-500/30',
+  'default': 'bg-white/10 text-white/70 border-white/20'
+};
+
+// Team colors for accents
+const TEAM_COLORS: Record<string, string> = {
+  // NBA Teams
+  'Lakers': '#552583', 'Celtics': '#007A33', 'Warriors': '#1D428A', 'Heat': '#98002E',
+  'Bulls': '#CE1141', 'Nets': '#000000', 'Knicks': '#006BB6', '76ers': '#006BB6',
+  'Bucks': '#00471B', 'Suns': '#1D1160', 'Mavericks': '#00538C', 'Clippers': '#C8102E',
+  // NFL Teams
+  'Chiefs': '#E31837', 'Eagles': '#004C54', 'Cowboys': '#003594', 'Bills': '#00338D',
+  'Ravens': '#241773', '49ers': '#AA0000', 'Dolphins': '#008E97', 'Lions': '#0076B6',
+  // Default
+  'default': '#3B82F6'
+};
+
+// ============================================
+// HELPER FUNCTIONS
+// ============================================
+
+// Normalize player name from "Last, First" to "First Last" format
+function normalizePlayerName(name: string): string {
+  if (name.includes(', ')) {
+    const [last, first] = name.split(', ');
+    return `${first} ${last}`;
+  }
+  return name;
+}
+
+function normalizeFollowedPlayerKey(name: string): string {
+  return normalizePlayerName(name).toLowerCase().replace(/\s+/g, ' ').trim();
+}
+
+const FOLLOWED_PLAYERS_LOCAL_KEY = 'gz_followed_players';
+
+function getTeamColor(team: string): string {
+  const key = Object.keys(TEAM_COLORS).find(k => team?.toLowerCase().includes(k.toLowerCase()));
+  return TEAM_COLORS[key || 'default'];
+}
+
+function formatOdds(odds?: number | null): string {
+  if (!odds) return '';
+  return odds > 0 ? `+${odds}` : `${odds}`;
+}
+
+function getSportsbookColor(sportsbook?: string): string {
+  if (!sportsbook) return SPORTSBOOK_COLORS.default;
+  const key = Object.keys(SPORTSBOOK_COLORS).find(k => 
+    sportsbook.toLowerCase().includes(k.toLowerCase())
+  );
+  return SPORTSBOOK_COLORS[key || 'default'];
+}
+
+function getGameDisplayLabel(gameId: string, sample?: PlayerProp): string {
+  const away = sample?.away_team?.trim();
+  const home = sample?.home_team?.trim();
+  if (away && home) return `${away} @ ${home}`;
+  const shortId = gameId.length > 20 ? gameId.slice(-12) : gameId;
+  return `Game ${shortId}`;
+}
+
+// ============================================
+// COMPONENTS
+// ============================================
+
+function CinematicBackground() {
+  return (
+    <div className="fixed inset-0 -z-10 overflow-hidden pointer-events-none">
+      <div className="absolute inset-0 bg-gradient-to-b from-[hsl(220,25%,6%)] via-[hsl(220,20%,8%)] to-[hsl(220,25%,4%)]" />
+      <div className="absolute top-0 left-1/4 w-[600px] h-[600px] bg-blue-500/[0.03] rounded-full blur-[120px]" />
+      <div className="absolute bottom-1/4 right-1/4 w-[500px] h-[500px] bg-emerald-500/[0.02] rounded-full blur-[100px]" />
+      <div className="absolute top-1/2 right-0 w-[400px] h-[400px] bg-amber-500/[0.02] rounded-full blur-[80px]" />
+    </div>
+  );
+}
+
+function SportTab({ 
+  sport, 
+  active, 
+  onClick 
+}: { 
+  sport: { key: string; label: string; icon: string }; 
+  active: boolean; 
+  onClick: () => void;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      className={cn(
+        "flex items-center gap-1.5 px-4 py-2 rounded-lg text-sm font-medium transition-all whitespace-nowrap",
+        active 
+          ? "bg-blue-500 text-white shadow-lg shadow-blue-500/25" 
+          : "bg-white/[0.04] text-white/60 hover:bg-white/[0.08] hover:text-white"
+      )}
+    >
+      <span>{sport.icon}</span>
+      <span>{sport.label}</span>
+    </button>
+  );
+}
+
+function PropTypeChip({ 
+  type, 
+  active, 
+  onClick 
+}: { 
+  type: string; 
+  active: boolean; 
+  onClick: () => void;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      className={cn(
+        "px-3 py-1 rounded-full text-xs font-medium transition-all whitespace-nowrap",
+        active 
+          ? "bg-amber-500/80 text-white" 
+          : "bg-white/[0.04] text-white/50 hover:bg-white/[0.08] hover:text-white/70"
+      )}
+    >
+      {PROP_TYPE_LABELS[type] || type}
+    </button>
+  );
+}
+
+function PlayerPropCard({ 
+  group,
+  onQuickAdd,
+  onChooseBoard,
+  isFollowed,
+  onToggleFollow
+}: { 
+  group: GroupedProp;
+  onQuickAdd?: (prop: PlayerProp) => void;
+  onChooseBoard?: (prop: PlayerProp) => void;
+  isFollowed?: boolean;
+  onToggleFollow?: (playerName: string) => void;
+}) {
+  const navigate = useNavigate();
+  const [expanded, setExpanded] = useState(false);
+  const [showDropdown, setShowDropdown] = useState(false);
+  const [recentlyAdded, setRecentlyAdded] = useState(false);
+  const teamColor = getTeamColor(group.team);
+  const displayName = normalizePlayerName(group.playerName);
+  
+  // Navigate to player profile
+  const handlePlayerClick = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    const encodedName = encodeURIComponent(displayName);
+    navigate(`/props/player/${group.sport.toLowerCase()}/${encodedName}`);
+  };
+  
+  // Get the primary prop (first one, usually points for basketball)
+  const primaryProp = group.props[0];
+  const additionalProps = group.props.slice(1);
+  
+  // Group by sportsbook for comparison
+  const sportsbookLines = useMemo(() => {
+    const byBook: Record<string, PlayerProp[]> = {};
+    group.props.forEach(p => {
+      const book = p.sportsbook || 'Unknown';
+      if (!byBook[book]) byBook[book] = [];
+      byBook[book].push(p);
+    });
+    return byBook;
+  }, [group.props]);
+  
+  const uniqueSportsbooks = Object.keys(sportsbookLines);
+  
+  return (
+    <div className="bg-white/[0.03] backdrop-blur-md border border-white/[0.06] rounded-xl overflow-hidden hover:border-white/[0.12] transition-all group">
+      {/* Team Color Accent Bar */}
+      <div 
+        className="h-1"
+        style={{ background: `linear-gradient(90deg, ${teamColor}, ${teamColor}66)` }}
+      />
+      
+      {/* Main Card Content */}
+      <div className="p-4">
+        <div className="flex gap-4">
+          {/* Player Photo - Clickable */}
+          <div className="shrink-0 cursor-pointer" onClick={handlePlayerClick}>
+            <div className="w-16 h-16 rounded-lg bg-gradient-to-br from-slate-700 to-slate-800 overflow-hidden shadow-lg hover:ring-2 hover:ring-blue-500/50 transition-all">
+              <PlayerPhoto
+                playerName={group.playerName}
+                sport={group.sport.toLowerCase()}
+                size={64}
+                className="w-16 h-16 rounded-lg object-cover"
+              />
+            </div>
+          </div>
+          
+          {/* Player Info & Primary Prop */}
+          <div className="flex-1 min-w-0">
+            <div className="flex items-start justify-between gap-2">
+              <div 
+                className="cursor-pointer group/name" 
+                onClick={handlePlayerClick}
+              >
+                <h3 className="text-base font-bold text-white truncate group-hover/name:text-blue-400 transition-colors">
+                  {displayName}
+                </h3>
+                <div className="flex items-center gap-2 mt-0.5">
+                  <span className="text-xs text-white/50">{group.team}</span>
+                  <span className="text-[10px] px-1.5 py-0.5 rounded bg-white/[0.06] text-white/40">
+                    {group.sport}
+                  </span>
+                </div>
+              </div>
+              
+              {/* Split Button: Quick Add + Choose Board */}
+              {(onQuickAdd || onChooseBoard || onToggleFollow) && (
+                <div className="relative flex items-center gap-1 opacity-90 md:opacity-0 md:group-hover:opacity-100 transition-all">
+                  {onToggleFollow && (
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onToggleFollow(group.playerName);
+                      }}
+                      className={cn(
+                        "p-1.5 rounded-lg transition-all",
+                        isFollowed
+                          ? "bg-amber-500/25 text-amber-300"
+                          : "bg-white/[0.04] hover:bg-amber-500/20 text-white/40 hover:text-amber-400"
+                      )}
+                      title={isFollowed ? "Unfollow player" : "Follow player"}
+                    >
+                      <Star className={cn("w-4 h-4", isFollowed && "fill-amber-300")} />
+                    </button>
+                  )}
+                  {recentlyAdded ? (
+                    <div className="flex items-center gap-1 px-2 py-1 rounded-lg bg-emerald-500/20 text-emerald-400 text-xs">
+                      <Check className="w-3 h-3" />
+                      <span>Added</span>
+                    </div>
+                  ) : (
+                    <>
+                      {/* Main quick-add button */}
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          onQuickAdd?.(primaryProp);
+                          setRecentlyAdded(true);
+                          setTimeout(() => setRecentlyAdded(false), 2000);
+                        }}
+                        className="p-1.5 rounded-l-lg bg-white/[0.04] hover:bg-amber-500/20 text-white/40 hover:text-amber-400 transition-all border-r border-white/[0.08]"
+                        title="Quick add to active board"
+                      >
+                        <Plus className="w-4 h-4" />
+                      </button>
+                      {/* Dropdown arrow for board selection */}
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setShowDropdown(!showDropdown);
+                        }}
+                        className="p-1.5 rounded-r-lg bg-white/[0.04] hover:bg-amber-500/20 text-white/40 hover:text-amber-400 transition-all"
+                        title="Choose watchboard"
+                      >
+                        <ChevronDown className="w-3 h-3" />
+                      </button>
+                      {/* Dropdown menu */}
+                      {showDropdown && (
+                        <>
+                          <div 
+                            className="fixed inset-0 z-10" 
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setShowDropdown(false);
+                            }}
+                          />
+                          <div className="absolute right-0 top-full mt-1 z-20 bg-slate-800 border border-white/10 rounded-lg shadow-xl overflow-hidden min-w-[140px]">
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setShowDropdown(false);
+                                onChooseBoard?.(primaryProp);
+                              }}
+                              className="w-full px-3 py-2 text-left text-xs text-white/70 hover:bg-white/10 hover:text-white transition-colors"
+                            >
+                              Choose board...
+                            </button>
+                          </div>
+                        </>
+                      )}
+                    </>
+                  )}
+                </div>
+              )}
+            </div>
+            
+            {/* Primary Prop Display */}
+            <div className="mt-3 flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <span className="text-xs text-white/40">
+                  {PROP_TYPE_LABELS[primaryProp.prop_type] || primaryProp.prop_type}
+                </span>
+                {primaryProp.movement !== null && primaryProp.movement !== 0 && (
+                  <span className={cn(
+                    "flex items-center gap-0.5 text-xs",
+                    primaryProp.movement > 0 ? "text-emerald-400" : "text-red-400"
+                  )}>
+                    {primaryProp.movement > 0 
+                      ? <TrendingUp className="w-3 h-3" />
+                      : <TrendingDown className="w-3 h-3" />
+                    }
+                    <span>{primaryProp.movement > 0 ? '+' : ''}{primaryProp.movement.toFixed(1)}</span>
+                  </span>
+                )}
+              </div>
+              <div className="flex items-baseline gap-1">
+                <span className="text-2xl font-bold text-white">{primaryProp.line_value}</span>
+                {primaryProp.odds_american && (
+                  <span className={cn(
+                    "text-sm",
+                    primaryProp.odds_american > 0 ? "text-emerald-400" : "text-white/50"
+                  )}>
+                    {formatOdds(primaryProp.odds_american)}
+                  </span>
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
+        
+        {/* Sportsbook Comparison Strip */}
+        {uniqueSportsbooks.length > 1 && (
+          <div className="mt-3 pt-3 border-t border-white/[0.04]">
+            <div className="flex gap-2 overflow-x-auto pb-1">
+              {uniqueSportsbooks.slice(0, 5).map(book => {
+                const bookProp = sportsbookLines[book][0];
+                return (
+                  <div 
+                    key={book}
+                    className={cn(
+                      "flex items-center gap-2 px-2 py-1 rounded-md border text-xs shrink-0",
+                      getSportsbookColor(book)
+                    )}
+                  >
+                    <span className="font-medium truncate max-w-[60px]">{book}</span>
+                    <span className="font-bold">{bookProp.line_value}</span>
+                    {bookProp.odds_american && (
+                      <span className="opacity-70">{formatOdds(bookProp.odds_american)}</span>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
+        
+        {/* Expand for more props */}
+        {additionalProps.length > 0 && (
+          <>
+            <button
+              onClick={() => setExpanded(!expanded)}
+              className="mt-3 w-full flex items-center justify-center gap-1 py-1.5 rounded-lg bg-white/[0.02] hover:bg-white/[0.04] text-white/40 text-xs transition-colors"
+            >
+              <span>{expanded ? 'Show less' : `+${additionalProps.length} more props`}</span>
+              {expanded ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
+            </button>
+            
+            {expanded && (
+              <div className="mt-2 space-y-1">
+                {additionalProps.map(prop => (
+                  <div 
+                    key={`${prop.id}-${prop.prop_type}`}
+                    className="flex items-center justify-between py-2 px-3 rounded-lg bg-white/[0.02]"
+                  >
+                    <span className="text-xs text-white/50">
+                      {PROP_TYPE_LABELS[prop.prop_type] || prop.prop_type}
+                    </span>
+                    <div className="flex items-center gap-2">
+                      <span className="text-sm font-semibold text-white">{prop.line_value}</span>
+                      {prop.odds_american && (
+                        <span className="text-xs text-white/40">{formatOdds(prop.odds_american)}</span>
+                      )}
+                      {prop.movement !== null && prop.movement !== 0 && (
+                        <span className={cn(
+                          "text-xs",
+                          prop.movement > 0 ? "text-emerald-400" : "text-red-400"
+                        )}>
+                          {prop.movement > 0 ? '+' : ''}{prop.movement.toFixed(1)}
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function CoachGPropsChat({ 
+  props, 
+  selectedSport 
+}: { 
+  props: PlayerProp[];
+  selectedSport: string;
+}) {
+  const { user } = useDemoAuth();
+  const [isOpen, setIsOpen] = useState(false);
+  const [message, setMessage] = useState('');
+  const [chatHistory, setChatHistory] = useState<{ role: 'user' | 'assistant'; content: string }[]>([]);
+  const [isLoading, setIsLoading] = useState(false);
+  const messagesEndRef = useRef<HTMLDivElement>(null);
+  
+  const scrollToBottom = () => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  };
+  
+  useEffect(() => {
+    scrollToBottom();
+  }, [chatHistory]);
+  
+  const suggestedQuestions = [
+    "Which props have the best value today?",
+    "Who should I target for points?",
+    "Any line movement I should know about?",
+    "Best player combos for a parlay?"
+  ];
+  
+  const askCoachG = async () => {
+    if (!message.trim() || isLoading) return;
+    
+    const userMessage = message.trim();
+    setMessage('');
+    setChatHistory(prev => [...prev, { role: 'user', content: userMessage }]);
+    setIsLoading(true);
+    
+    try {
+      // Build context about current props view
+      const topPlayers = props.slice(0, 10).map(p => 
+        `${p.player_name} (${p.team}) - ${PROP_TYPE_LABELS[p.prop_type] || p.prop_type}: ${p.line_value}`
+      ).join('\n');
+      
+      const contextMessage = `[Context: User is viewing ${selectedSport === 'ALL' ? 'all sports' : selectedSport} player props. Top props shown:\n${topPlayers}]\n\nUser question: ${userMessage}`;
+      
+      const response = await fetch('/api/ai/chat', {
+        method: 'POST',
+        headers: { 
+          'Content-Type': 'application/json',
+          'x-user-id': user?.id?.toString() || ''
+        },
+        credentials: 'include',
+        body: JSON.stringify({
+          persona: 'coach',
+          message: contextMessage,
+          pageContext: 'props',
+          conversationHistory: chatHistory.slice(-6)
+        })
+      });
+      
+      if (!response.ok) throw new Error('Failed to get response');
+      
+      const data = await response.json();
+      setChatHistory(prev => [...prev, { 
+        role: 'assistant', 
+        content: data.structured?.answerSummary || data.response 
+      }]);
+    } catch (err) {
+      setChatHistory(prev => [...prev, { 
+        role: 'assistant', 
+        content: "Having trouble connecting. Try again in a moment." 
+      }]);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+  
+  if (!isOpen) {
+    return (
+      <button
+        onClick={() => setIsOpen(true)}
+        className={cn(
+          "fixed bottom-20 right-4 z-50",
+          "w-14 h-14 rounded-full bg-blue-500 shadow-xl shadow-blue-500/30",
+          "flex items-center justify-center",
+          "hover:scale-110 transition-transform",
+          "group"
+        )}
+      >
+        <img 
+          src="/assets/coachg/coach-g-avatar.png"
+          alt="Coach G"
+          className="w-10 h-10 rounded-full"
+        />
+        <span className="absolute -top-1 -right-1 w-4 h-4 bg-amber-400 rounded-full flex items-center justify-center">
+          <Sparkles className="w-2.5 h-2.5 text-amber-900" />
+        </span>
+      </button>
+    );
+  }
+  
+  return (
+    <div className={cn(
+      "fixed bottom-20 right-4 z-50",
+      "w-[380px] max-w-[calc(100vw-32px)]",
+      "bg-slate-900/95 backdrop-blur-xl border border-white/10 rounded-2xl shadow-2xl",
+      "flex flex-col max-h-[60vh]",
+      "animate-in slide-in-from-bottom-4 fade-in duration-200"
+    )}>
+      {/* Header */}
+      <div className="flex items-center justify-between p-4 border-b border-white/10">
+        <div className="flex items-center gap-3">
+          <img 
+            src="/assets/coachg/coach-g-avatar.png"
+            alt="Coach G"
+            className="w-10 h-10 rounded-full"
+          />
+          <div>
+            <h3 className="font-semibold text-white flex items-center gap-1.5">
+              Coach G
+              <Sparkles className="w-3.5 h-3.5 text-amber-400" />
+            </h3>
+            <p className="text-xs text-white/50">Props Expert</p>
+          </div>
+        </div>
+        <button
+          onClick={() => setIsOpen(false)}
+          className="p-2 rounded-lg hover:bg-white/10 text-white/50 hover:text-white transition-colors"
+        >
+          <X className="w-5 h-5" />
+        </button>
+      </div>
+      
+      {/* Chat Messages */}
+      <div className="flex-1 overflow-y-auto p-4 space-y-3 min-h-[200px]">
+        {chatHistory.length === 0 ? (
+          <div className="space-y-3">
+            <p className="text-sm text-white/60 text-center">
+              Ask me about today's player props
+            </p>
+            <div className="space-y-2">
+              {suggestedQuestions.map((q, i) => (
+                <button
+                  key={i}
+                  onClick={() => {
+                    setMessage(q);
+                  }}
+                  className="w-full text-left px-3 py-2 rounded-lg bg-white/[0.04] hover:bg-white/[0.08] text-sm text-white/70 transition-colors"
+                >
+                  {q}
+                </button>
+              ))}
+            </div>
+          </div>
+        ) : (
+          <>
+            {chatHistory.map((msg, i) => (
+              <div 
+                key={i}
+                className={cn(
+                  "flex",
+                  msg.role === 'user' ? "justify-end" : "justify-start"
+                )}
+              >
+                <div className={cn(
+                  "max-w-[85%] px-3 py-2 rounded-2xl text-sm",
+                  msg.role === 'user'
+                    ? "bg-blue-500 text-white rounded-br-md"
+                    : "bg-white/[0.06] text-white/90 rounded-bl-md"
+                )}>
+                  {msg.content}
+                </div>
+              </div>
+            ))}
+            {isLoading && (
+              <div className="flex justify-start">
+                <div className="bg-white/[0.06] rounded-2xl rounded-bl-md px-4 py-3">
+                  <div className="flex gap-1">
+                    <span className="w-2 h-2 bg-white/30 rounded-full animate-bounce" style={{ animationDelay: '0ms' }} />
+                    <span className="w-2 h-2 bg-white/30 rounded-full animate-bounce" style={{ animationDelay: '150ms' }} />
+                    <span className="w-2 h-2 bg-white/30 rounded-full animate-bounce" style={{ animationDelay: '300ms' }} />
+                  </div>
+                </div>
+              </div>
+            )}
+            <div ref={messagesEndRef} />
+          </>
+        )}
+      </div>
+      
+      {/* Input */}
+      <div className="p-3 border-t border-white/10">
+        <div className="flex gap-2">
+          <input
+            type="text"
+            value={message}
+            onChange={(e) => setMessage(e.target.value)}
+            onKeyDown={(e) => e.key === 'Enter' && !e.shiftKey && askCoachG()}
+            placeholder="Ask about props..."
+            className="flex-1 bg-white/[0.06] rounded-xl px-4 py-2.5 text-sm text-white placeholder:text-white/30 outline-none focus:ring-2 focus:ring-blue-500/30"
+            disabled={isLoading}
+          />
+          <button
+            onClick={askCoachG}
+            disabled={!message.trim() || isLoading}
+            className="px-4 py-2.5 rounded-xl bg-blue-500 text-white disabled:opacity-50 hover:bg-blue-600 transition-colors"
+          >
+            <Send className="w-4 h-4" />
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function LoadingSkeleton() {
+  return (
+    <div className="space-y-4">
+      {[1, 2, 3, 4].map(i => (
+        <div key={i} className="bg-white/[0.03] rounded-xl p-4 animate-pulse">
+          <div className="h-1 bg-white/10 rounded mb-4" />
+          <div className="flex gap-4">
+            <div className="w-16 h-16 rounded-lg bg-white/10" />
+            <div className="flex-1 space-y-2">
+              <div className="h-5 w-32 bg-white/10 rounded" />
+              <div className="h-3 w-20 bg-white/10 rounded" />
+              <div className="h-8 w-24 bg-white/10 rounded mt-3" />
+            </div>
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function PropsUnavailableStub({ onBack }: { onBack: () => void }) {
+  return (
+    <div className="relative min-h-screen">
+      <CinematicBackground />
+      <div className="relative z-10 max-w-3xl mx-auto px-4 py-6 space-y-4 pb-24">
+        <div className="flex items-center gap-3">
+          <button
+            onClick={onBack}
+            className="p-2 rounded-lg bg-white/[0.04] hover:bg-white/[0.08] transition-colors"
+          >
+            <ArrowLeft className="w-5 h-5 text-white/70" />
+          </button>
+          <div className="flex-1 flex items-center gap-2">
+            <Target className="w-5 h-5 text-amber-400" />
+            <h1 className="text-xl font-bold text-white">Player Props</h1>
+          </div>
+        </div>
+        
+        <div className="bg-white/[0.03] border border-white/[0.06] rounded-xl p-8 text-center">
+          <div className="w-16 h-16 rounded-full bg-amber-500/10 flex items-center justify-center mx-auto mb-4">
+            <Lock className="w-8 h-8 text-amber-400/60" />
+          </div>
+          <h2 className="text-lg font-semibold text-white mb-2">Player Props Coming Soon</h2>
+          <p className="text-white/50 text-sm max-w-md mx-auto mb-6">
+            Player prop lines require additional data access. Check back later.
+          </p>
+          <button
+            onClick={onBack}
+            className="px-4 py-2 rounded-lg bg-amber-500/20 text-amber-400 text-sm font-medium hover:bg-amber-500/30 transition-colors"
+          >
+            Back to Games
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ============================================
+// MAIN COMPONENT
+// ============================================
+
+export function PlayerPropsPage() {
+  const navigate = useNavigate();
+  const { user } = useDemoAuth();
+  const { hasProps, loading: capabilitiesLoading } = useProviderCapabilities();
+  const { addProp, activeBoard } = useWatchboards();
+  const { favoriteSports, followedPlayers, saveFavorites } = useFavoriteSports();
+  
+  const [props, setProps] = useState<PlayerProp[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  
+  // Filters
+  const [searchQuery, setSearchQuery] = useState('');
+  const [selectedSport, setSelectedSport] = useState<string>('ALL');
+  const [selectedPropType, setSelectedPropType] = useState<string | null>(null);
+  const [selectedGameId, setSelectedGameId] = useState<string>('ALL');
+  const [selectedPlayerName, setSelectedPlayerName] = useState<string>('ALL');
+  
+  // Watchboard modal state
+  const [showWatchboardModal, setShowWatchboardModal] = useState(false);
+  const [selectedPropForModal, setSelectedPropForModal] = useState<PlayerProp | null>(null);
+  const [toast, setToast] = useState<{ message: string; type: 'success' | 'error' } | null>(null);
+  const [localFollowedPlayers, setLocalFollowedPlayers] = useState<string[]>([]);
+
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(FOLLOWED_PLAYERS_LOCAL_KEY);
+      if (!raw) return;
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) {
+        setLocalFollowedPlayers(parsed.filter((v): v is string => typeof v === 'string'));
+      }
+    } catch {
+      // no-op
+    }
+  }, []);
+
+  // Fetch props
+  useEffect(() => {
+    if (capabilitiesLoading) return;
+    if (!hasProps) {
+      setLoading(false);
+      return;
+    }
+    
+    const fetchData = async () => {
+      setLoading(true);
+      setError(null);
+      
+      try {
+        const res = await fetch('/api/sports-data/props/today', {
+          credentials: 'include',
+        });
+        
+        if (!res.ok) {
+          if (res.status === 404) {
+            setProps([]);
+            return;
+          }
+          throw new Error('Failed to fetch props');
+        }
+        
+        const data = await res.json();
+        setProps(data.props || []);
+      } catch (err) {
+        console.error('Failed to fetch props:', err);
+        setError('Unable to load player props. Check back when games are scheduled.');
+      } finally {
+        setLoading(false);
+      }
+    };
+    
+    fetchData();
+  }, [capabilitiesLoading, hasProps]);
+  
+  // Show stub if props not available
+  if (!capabilitiesLoading && !hasProps) {
+    return <PropsUnavailableStub onBack={() => navigate('/games')} />;
+  }
+
+  // Get prop types for current sport
+  const availablePropTypes = useMemo(() => {
+    if (selectedSport === 'ALL') {
+      const types = new Set<string>();
+      props.forEach(p => types.add(p.prop_type));
+      return Array.from(types);
+    }
+    return PROP_CATEGORIES[selectedSport as keyof typeof PROP_CATEGORIES] || [];
+  }, [props, selectedSport]);
+
+  const availableGames = useMemo(() => {
+    let filtered = [...props];
+    if (selectedSport !== 'ALL') {
+      filtered = filtered.filter((p) => p.sport === selectedSport);
+    }
+    const byGame = new Map<string, PlayerProp>();
+    for (const prop of filtered) {
+      if (!byGame.has(prop.game_id)) {
+        byGame.set(prop.game_id, prop);
+      }
+    }
+    return Array.from(byGame.entries()).map(([gameId, sample]) => ({
+      gameId,
+      label: getGameDisplayLabel(gameId, sample),
+    }));
+  }, [props, selectedSport]);
+
+  const realPropsGamesToday = useMemo(() => {
+    const byGame = new Map<string, { sample: PlayerProp; count: number }>();
+    for (const prop of props) {
+      const existing = byGame.get(prop.game_id);
+      if (existing) {
+        existing.count += 1;
+      } else {
+        byGame.set(prop.game_id, { sample: prop, count: 1 });
+      }
+    }
+    return Array.from(byGame.entries())
+      .map(([gameId, value]) => ({
+        gameId,
+        label: getGameDisplayLabel(gameId, value.sample),
+        count: value.count,
+        sport: value.sample.sport,
+      }))
+      .sort((a, b) => b.count - a.count);
+  }, [props]);
+
+  const availablePlayers = useMemo(() => {
+    let filtered = [...props];
+    if (selectedSport !== 'ALL') {
+      filtered = filtered.filter((p) => p.sport === selectedSport);
+    }
+    if (selectedGameId !== 'ALL') {
+      filtered = filtered.filter((p) => p.game_id === selectedGameId);
+    }
+    const playerNames = new Set<string>();
+    filtered.forEach((p) => playerNames.add(p.player_name));
+    return Array.from(playerNames).sort((a, b) => a.localeCompare(b));
+  }, [props, selectedSport, selectedGameId]);
+
+  // Filter and group props
+  const groupedProps = useMemo(() => {
+    let filtered = [...props];
+    
+    // Sport filter
+    if (selectedSport !== 'ALL') {
+      filtered = filtered.filter(p => p.sport === selectedSport);
+    }
+    
+    // Search filter
+    if (searchQuery) {
+      const query = searchQuery.toLowerCase();
+      filtered = filtered.filter(p => 
+        p.player_name.toLowerCase().includes(query) ||
+        (p.team && p.team.toLowerCase().includes(query))
+      );
+    }
+
+    // Game filter
+    if (selectedGameId !== 'ALL') {
+      filtered = filtered.filter((p) => p.game_id === selectedGameId);
+    }
+
+    // Player filter
+    if (selectedPlayerName !== 'ALL') {
+      filtered = filtered.filter((p) => p.player_name === selectedPlayerName);
+    }
+    
+    // Prop type filter
+    if (selectedPropType) {
+      filtered = filtered.filter(p => p.prop_type === selectedPropType);
+    }
+    
+    // Group by player
+    const grouped: Record<string, GroupedProp> = {};
+    filtered.forEach(prop => {
+      const key = `${prop.player_name}-${prop.team}-${prop.sport}`;
+      if (!grouped[key]) {
+        grouped[key] = {
+          playerName: prop.player_name,
+          playerId: prop.player_id,
+          team: prop.team || 'Unknown',
+          sport: prop.sport,
+          props: []
+        };
+      }
+      grouped[key].props.push(prop);
+    });
+    
+    // Sort players by first prop's line value (descending - bigger stars first)
+    return Object.values(grouped).sort((a, b) => {
+      // Prioritize players with more props (usually bigger names)
+      if (a.props.length !== b.props.length) {
+        return b.props.length - a.props.length;
+      }
+      // Then by line value
+      return (b.props[0]?.line_value || 0) - (a.props[0]?.line_value || 0);
+    });
+  }, [props, searchQuery, selectedSport, selectedPropType, selectedGameId, selectedPlayerName]);
+
+  // Quick add to active board
+  const handleQuickAdd = useCallback(async (prop: PlayerProp) => {
+    if (!user) {
+      setToast({ message: "Sign in to track props", type: 'error' });
+      setTimeout(() => setToast(null), 3000);
+      return;
+    }
+    
+    try {
+      const result = await addProp({
+        game_id: prop.game_id || '',
+        player_name: prop.player_name,
+        player_id: prop.player_id,
+        team: prop.team || '',
+        sport: prop.sport,
+        prop_type: prop.prop_type,
+        line_value: prop.line_value,
+        selection: 'OVER',
+        odds_american: prop.odds_american || -110,
+        added_from: 'props_page_quick'
+      });
+      
+      if (result.success) {
+        setToast({ message: `Added to ${result.boardName || activeBoard?.name || 'Watchboard'}`, type: 'success' });
+      } else {
+        setToast({ message: result.error || 'Failed to add', type: 'error' });
+      }
+      setTimeout(() => setToast(null), 3000);
+    } catch (err) {
+      console.error('Failed to add prop to watchboard:', err);
+      setToast({ message: 'Failed to add prop', type: 'error' });
+      setTimeout(() => setToast(null), 3000);
+    }
+  }, [user, addProp, activeBoard?.name]);
+  
+  // Open modal to choose board
+  const handleChooseBoard = useCallback((prop: PlayerProp) => {
+    if (!user) {
+      setToast({ message: "Sign in to track props", type: 'error' });
+      setTimeout(() => setToast(null), 3000);
+      return;
+    }
+    setSelectedPropForModal(prop);
+    setShowWatchboardModal(true);
+  }, [user]);
+
+  const clearFilters = useCallback(() => {
+    setSearchQuery('');
+    setSelectedSport('ALL');
+    setSelectedPropType(null);
+    setSelectedGameId('ALL');
+    setSelectedPlayerName('ALL');
+  }, []);
+
+  const hasActiveFilters =
+    searchQuery ||
+    selectedSport !== 'ALL' ||
+    selectedPropType ||
+    selectedGameId !== 'ALL' ||
+    selectedPlayerName !== 'ALL';
+
+  const effectiveFollowedPlayers = useMemo(() => {
+    const set = new Set<string>();
+    for (const name of followedPlayers || []) {
+      const normalized = normalizePlayerName(name);
+      if (normalized) set.add(normalized);
+    }
+    for (const name of localFollowedPlayers || []) {
+      const normalized = normalizePlayerName(name);
+      if (normalized) set.add(normalized);
+    }
+    return Array.from(set);
+  }, [followedPlayers, localFollowedPlayers]);
+
+  const followedPlayerKeys = useMemo(
+    () => new Set(effectiveFollowedPlayers.map((name) => normalizeFollowedPlayerKey(name))),
+    [effectiveFollowedPlayers]
+  );
+
+  const handleToggleFollowPlayer = useCallback(async (rawName: string) => {
+    const normalizedName = normalizePlayerName(rawName);
+    const normalizedKey = normalizeFollowedPlayerKey(normalizedName);
+    const existing = Array.isArray(effectiveFollowedPlayers) ? effectiveFollowedPlayers : [];
+    const exists = existing.some((name) => normalizeFollowedPlayerKey(name) === normalizedKey);
+    const nextPlayers = exists
+      ? existing.filter((name) => normalizeFollowedPlayerKey(name) !== normalizedKey)
+      : [...existing, normalizedName];
+
+    // Always update local state immediately for responsive UX.
+    setLocalFollowedPlayers(nextPlayers);
+    try {
+      localStorage.setItem(FOLLOWED_PLAYERS_LOCAL_KEY, JSON.stringify(nextPlayers));
+    } catch {
+      // no-op
+    }
+
+    // Try persisting to account if signed in.
+    const ok = user ? await saveFavorites(favoriteSports, false, undefined, nextPlayers) : false;
+    setToast({
+      message: ok
+        ? (exists ? `Unfollowed ${normalizedName}` : `Following ${normalizedName}`)
+        : (exists ? `Unfollowed ${normalizedName} (saved on this device)` : `Following ${normalizedName} (saved on this device)`),
+      type: 'success',
+    });
+    setTimeout(() => setToast(null), 3000);
+  }, [user, effectiveFollowedPlayers, saveFavorites, favoriteSports]);
+
+  useEffect(() => {
+    if (selectedGameId !== 'ALL' && !availableGames.some((g) => g.gameId === selectedGameId)) {
+      setSelectedGameId('ALL');
+    }
+  }, [selectedGameId, availableGames]);
+
+  useEffect(() => {
+    if (selectedPlayerName !== 'ALL' && !availablePlayers.includes(selectedPlayerName)) {
+      setSelectedPlayerName('ALL');
+    }
+  }, [selectedPlayerName, availablePlayers]);
+
+  return (
+    <div className="relative min-h-screen">
+      <CinematicBackground />
+      
+      <div className="relative z-10 max-w-4xl mx-auto px-4 py-6 space-y-4 pb-24">
+        {/* Header */}
+        <div className="flex items-center gap-3">
+          <button
+            onClick={() => navigate('/games')}
+            className="p-2 rounded-lg bg-white/[0.04] hover:bg-white/[0.08] transition-colors"
+          >
+            <ArrowLeft className="w-5 h-5 text-white/70" />
+          </button>
+          <div className="flex-1">
+            <div className="flex items-center gap-2">
+              <Target className="w-5 h-5 text-amber-400" />
+              <h1 className="text-xl font-bold text-white">Player Props</h1>
+            </div>
+            <p className="text-xs text-white/40 mt-0.5">
+              {props.length} props from multiple sportsbooks
+            </p>
+          </div>
+        </div>
+
+        {/* Search Bar */}
+        <div className="relative">
+          <Search className="absolute left-4 top-1/2 -translate-y-1/2 w-5 h-5 text-white/30" />
+          <input
+            type="text"
+            placeholder="Search player or team..."
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+            className={cn(
+              "w-full pl-12 pr-10 py-3 rounded-xl",
+              "bg-white/[0.04] border border-white/[0.08]",
+              "text-white placeholder:text-white/30",
+              "focus:outline-none focus:border-blue-500/50 focus:ring-1 focus:ring-blue-500/20",
+              "transition-all text-sm"
+            )}
+          />
+          {searchQuery && (
+            <button
+              onClick={() => setSearchQuery('')}
+              className="absolute right-4 top-1/2 -translate-y-1/2 p-1 rounded-full hover:bg-white/10"
+            >
+              <X className="w-4 h-4 text-white/40" />
+            </button>
+          )}
+        </div>
+
+        {/* Sport Tabs */}
+        <div className="flex gap-2 overflow-x-auto pb-2 -mx-4 px-4 scrollbar-hide">
+          {SPORTS.map((sport) => (
+            <SportTab
+              key={sport.key}
+              sport={sport}
+              active={selectedSport === sport.key}
+              onClick={() => {
+                setSelectedSport(sport.key);
+                setSelectedPropType(null);
+              }}
+            />
+          ))}
+        </div>
+
+        {/* Prop Type Chips */}
+        {availablePropTypes.length > 0 && (
+          <div className="flex gap-2 overflow-x-auto pb-2 -mx-4 px-4 scrollbar-hide">
+            <PropTypeChip
+              type="ALL"
+              active={selectedPropType === null}
+              onClick={() => setSelectedPropType(null)}
+            />
+            {availablePropTypes.slice(0, 8).map(type => (
+              <PropTypeChip
+                key={type}
+                type={type}
+                active={selectedPropType === type}
+                onClick={() => setSelectedPropType(selectedPropType === type ? null : type)}
+              />
+            ))}
+          </div>
+        )}
+
+        {/* Real Props Games Today */}
+        {realPropsGamesToday.length > 0 && (
+          <div className="bg-white/[0.03] border border-white/[0.06] rounded-xl p-3 space-y-2">
+            <div className="flex items-center justify-between">
+              <p className="text-xs font-medium text-white/80">Real Props Games Today</p>
+              <p className="text-[10px] text-white/45">{realPropsGamesToday.length} games</p>
+            </div>
+            <select
+              value={selectedGameId}
+              onChange={(e) => setSelectedGameId(e.target.value)}
+              className={cn(
+                "w-full px-3 py-2.5 rounded-xl text-sm",
+                "bg-white/[0.04] border border-white/[0.08] text-white",
+                "focus:outline-none focus:border-blue-500/50 focus:ring-1 focus:ring-blue-500/20"
+              )}
+            >
+              <option value="ALL" className="bg-slate-900 text-white">All Real Props Games</option>
+              {realPropsGamesToday.map((game) => (
+                <option key={game.gameId} value={game.gameId} className="bg-slate-900 text-white">
+                  {game.label} ({game.count} props)
+                </option>
+              ))}
+            </select>
+
+            {realPropsGamesToday.length > 0 && (
+              <div className="flex gap-2 overflow-x-auto pb-1">
+                {realPropsGamesToday.slice(0, 3).map((game) => (
+                  <button
+                    key={`quick-${game.gameId}`}
+                    onClick={() => setSelectedGameId(game.gameId)}
+                    className={cn(
+                      "px-2.5 py-1.5 rounded-lg text-xs border whitespace-nowrap transition-colors",
+                      selectedGameId === game.gameId
+                        ? "bg-blue-500/20 border-blue-500/40 text-blue-300"
+                        : "bg-white/[0.03] border-white/[0.08] text-white/70 hover:bg-white/[0.06]"
+                    )}
+                  >
+                    {game.label} ({game.count})
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Game + Player Filters */}
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+          <select
+            value={selectedGameId}
+            onChange={(e) => setSelectedGameId(e.target.value)}
+            className={cn(
+              "w-full px-3 py-2.5 rounded-xl text-sm",
+              "bg-white/[0.04] border border-white/[0.08] text-white",
+              "focus:outline-none focus:border-blue-500/50 focus:ring-1 focus:ring-blue-500/20"
+            )}
+          >
+            <option value="ALL" className="bg-slate-900 text-white">All Games</option>
+            {availableGames.map((game) => (
+              <option key={game.gameId} value={game.gameId} className="bg-slate-900 text-white">
+                {game.label}
+              </option>
+            ))}
+          </select>
+
+          <select
+            value={selectedPlayerName}
+            onChange={(e) => setSelectedPlayerName(e.target.value)}
+            className={cn(
+              "w-full px-3 py-2.5 rounded-xl text-sm",
+              "bg-white/[0.04] border border-white/[0.08] text-white",
+              "focus:outline-none focus:border-blue-500/50 focus:ring-1 focus:ring-blue-500/20"
+            )}
+          >
+            <option value="ALL" className="bg-slate-900 text-white">All Players</option>
+            {availablePlayers.map((player) => (
+              <option key={player} value={player} className="bg-slate-900 text-white">
+                {normalizePlayerName(player)}
+              </option>
+            ))}
+          </select>
+        </div>
+
+        {/* Clear Filters */}
+        {hasActiveFilters && (
+          <button
+            onClick={clearFilters}
+            className="text-xs text-amber-400 hover:underline"
+          >
+            Clear all filters
+          </button>
+        )}
+
+        {/* Disclaimer */}
+        <p className="text-[10px] text-white/25 px-1">
+          For informational purposes only. No wagering functionality.
+        </p>
+
+        {/* Loading State */}
+        {loading && <LoadingSkeleton />}
+
+        {/* Error State */}
+        {error && (
+          <div className="bg-white/[0.03] border border-white/[0.06] rounded-xl p-6 text-center">
+            <Target className="w-10 h-10 text-amber-400/50 mx-auto mb-3" />
+            <p className="text-white/70 mb-2">{error}</p>
+            <button
+              onClick={() => navigate('/games')}
+              className="text-xs text-amber-400 hover:underline"
+            >
+              Back to Games
+            </button>
+          </div>
+        )}
+
+        {/* Empty State */}
+        {!loading && !error && groupedProps.length === 0 && (
+          <div className="bg-white/[0.03] border border-white/[0.06] rounded-xl p-8 text-center">
+            <div className="w-16 h-16 rounded-full bg-white/[0.04] flex items-center justify-center mx-auto mb-4">
+              <Target className="w-8 h-8 text-white/20" />
+            </div>
+            <p className="text-white/50 mb-1">
+              {props.length === 0 
+                ? "No props available for today's games"
+                : "No props match your filters"
+              }
+            </p>
+            {hasActiveFilters && (
+              <button
+                onClick={clearFilters}
+                className="text-xs text-amber-400 hover:underline mt-2"
+              >
+                Clear filters
+              </button>
+            )}
+          </div>
+        )}
+
+        {/* Props Grid */}
+        {!loading && !error && groupedProps.length > 0 && (
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            {groupedProps.map((group) => (
+              <PlayerPropCard
+                key={`${group.playerName}-${group.team}-${group.sport}`}
+                group={group}
+                onQuickAdd={handleQuickAdd}
+                onChooseBoard={handleChooseBoard}
+                isFollowed={followedPlayerKeys.has(normalizeFollowedPlayerKey(group.playerName))}
+                onToggleFollow={handleToggleFollowPlayer}
+              />
+            ))}
+          </div>
+        )}
+      </div>
+      
+      {/* Coach G Chat */}
+      <CoachGPropsChat props={props} selectedSport={selectedSport} />
+      
+      {/* Toast Notification */}
+      {toast && (
+        <div 
+          className={cn(
+            "fixed bottom-24 left-1/2 -translate-x-1/2 z-50",
+            "px-4 py-2 rounded-full text-sm font-medium shadow-lg",
+            "animate-in slide-in-from-bottom-4 fade-in duration-200",
+            toast.type === 'success' 
+              ? "bg-emerald-500/90 text-white" 
+              : "bg-red-500/90 text-white"
+          )}
+        >
+          {toast.message}
+        </div>
+      )}
+      
+      {/* Watchboard Selection Modal */}
+      {selectedPropForModal && (
+        <AddPropToWatchboardModal
+          isOpen={showWatchboardModal}
+          onClose={() => {
+            setShowWatchboardModal(false);
+            setSelectedPropForModal(null);
+          }}
+          prop={{
+            game_id: selectedPropForModal.game_id || '',
+            player_name: selectedPropForModal.player_name,
+            player_id: selectedPropForModal.player_id,
+            team: selectedPropForModal.team || '',
+            sport: selectedPropForModal.sport,
+            prop_type: selectedPropForModal.prop_type,
+            line_value: selectedPropForModal.line_value,
+            selection: 'OVER',
+            odds_american: selectedPropForModal.odds_american || -110,
+          }}
+          propSummary={`${normalizePlayerName(selectedPropForModal.player_name)} ${PROP_TYPE_LABELS[selectedPropForModal.prop_type] || selectedPropForModal.prop_type} ${selectedPropForModal.line_value}`}
+          onSuccess={(boardName) => {
+            setToast({ message: `Added to ${boardName}`, type: 'success' });
+            setTimeout(() => setToast(null), 3000);
+          }}
+          onError={(error) => {
+            setToast({ message: error, type: 'error' });
+            setTimeout(() => setToast(null), 3000);
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+export default PlayerPropsPage;

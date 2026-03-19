@@ -1,0 +1,1 @@
+ALTER TABLE scout_alerts DROP COLUMN saved_at;
