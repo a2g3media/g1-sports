@@ -8,6 +8,7 @@
  */
 
 import { useState, useEffect } from "react";
+import { Link } from "react-router-dom";
 import { cn } from "@/react-app/lib/utils";
 import { 
   TrendingUp, 
@@ -223,11 +224,13 @@ export function GameContextCard({
       {showCoachG && context.coachGNote && (
         <div className="px-4 pb-4">
           <div className="flex gap-3 p-3 rounded-lg bg-gradient-to-r from-violet-500/10 to-purple-500/10 border border-violet-500/20">
-            <img
-              src={COACH_G_AVATAR}
-              alt="Coach G"
-              className="w-8 h-8 rounded-full flex-shrink-0 ring-2 ring-violet-500/30"
-            />
+            <Link to="/scout" className="flex-shrink-0" aria-label="Open Coach G">
+              <img
+                src={COACH_G_AVATAR}
+                alt="Coach G"
+                className="w-8 h-8 rounded-full ring-2 ring-violet-500/30 transition-transform hover:scale-105"
+              />
+            </Link>
             <div className="flex-1 min-w-0">
               <div className="flex items-center gap-1.5 mb-1">
                 <span className="text-xs font-semibold text-violet-400">Coach G</span>

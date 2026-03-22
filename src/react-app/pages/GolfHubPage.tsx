@@ -4,7 +4,6 @@ import { motion, AnimatePresence } from "framer-motion";
 import { Trophy, Calendar, Users, Sparkles, MapPin, Flag, Clock, DollarSign, ChevronRight, AlertCircle, Star, TrendingUp, Zap, Target, ArrowLeft, Award, Crown, Search, User, X, BarChart3, Globe, Check } from "lucide-react";
 import { GolfLeaderboard } from "@/react-app/components/hub/GolfLeaderboard";
 import { CoachCommandCard } from "@/react-app/components/hub/CoachCommandCard";
-import { CoachGIntelligenceLayer } from "@/react-app/components/CoachGIntelligenceLayer";
 
 interface Tournament {
   id: string;
@@ -585,7 +584,6 @@ export function GolfHubPage() {
           </div>
         </div>
 
-        <CoachGIntelligenceLayer surface="games" compact className="mb-6" />
 
         {/* Hero Tournament Card */}
         {currentTournament ? (
@@ -1697,9 +1695,10 @@ function GolfBettingSection({ tournament, formatPurse: _formatPurse }: {
         <div className="flex items-center gap-4 mb-5">
           <div className="relative">
             <img 
-              src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='96' height='96' viewBox='0 0 96 96'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop stop-color='%237c3aed'/%3E%3Cstop offset='1' stop-color='%230ea5e9'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='96' height='96' rx='48' fill='url(%23g)'/%3E%3Ctext x='48' y='56' font-size='32' text-anchor='middle' fill='white' font-family='Arial,sans-serif'%3ECG%3C/text%3E%3C/svg%3E"
+              src="/assets/coachg/coach-g-avatar.png?v=2"
               alt="Coach G"
-              className="w-14 h-14 rounded-2xl border-2 border-violet-400 shadow-lg shadow-violet-500/30 object-cover"
+              className="w-14 h-14 rounded-2xl border-2 border-violet-400 shadow-lg shadow-violet-500/30 object-cover cursor-pointer transition-transform hover:scale-105"
+              onClick={() => window.location.assign('/scout')}
             />
             <div className="absolute -bottom-1 -right-1 w-5 h-5 rounded-full bg-emerald-500 border-2 border-black flex items-center justify-center">
               <Check className="w-3 h-3 text-white" />

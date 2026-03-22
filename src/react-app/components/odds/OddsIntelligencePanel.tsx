@@ -37,10 +37,10 @@ interface OddsData {
 
 interface LineHistoryPoint {
   timestamp: string;
-  spread: number;
-  total: number;
-  mlHome?: number;
-  mlAway?: number;
+  spread: number | null;
+  total: number | null;
+  mlHome?: number | null;
+  mlAway?: number | null;
 }
 
 interface OddsIntelligencePanelProps {
@@ -161,8 +161,11 @@ const MiniLineChart = memo(function MiniLineChart({
 }) {
   const points = useMemo(() => {
     if (data.length < 2) return null;
-    
-    const values = data.map(d => d[valueKey]);
+
+    const filtered = data.filter((d) => d[valueKey] !== null);
+    if (filtered.length < 2) return null;
+
+    const values = filtered.map((d) => d[valueKey] as number);
     const min = Math.min(...values);
     const max = Math.max(...values);
     const range = max - min || 1;
@@ -170,10 +173,11 @@ const MiniLineChart = memo(function MiniLineChart({
     const width = 100;
     const padding = 4;
     
-    return data.map((d, i) => {
-      const x = padding + (i / (data.length - 1)) * (width - padding * 2);
-      const y = padding + (1 - (d[valueKey] - min) / range) * (height - padding * 2);
-      return { x, y, value: d[valueKey], time: d.timestamp };
+    return filtered.map((d, i) => {
+      const value = d[valueKey] as number;
+      const x = padding + (i / (filtered.length - 1)) * (width - padding * 2);
+      const y = padding + (1 - (value - min) / range) * (height - padding * 2);
+      return { x, y, value, time: d.timestamp };
     });
   }, [data, valueKey, height]);
   
@@ -473,16 +477,19 @@ export const OddsIntelligencePanel = memo(function OddsIntelligencePanel({
               <div className="text-xs text-white/40 mb-2">Spread</div>
               <MiniLineChart data={lineHistory} valueKey="spread" color="#22d3ee" />
               <div className="flex items-center justify-between mt-2 text-[10px] text-white/30">
-                <span>Open: {formatSpread(lineHistory[0].spread)}</span>
-                <span>Now: {formatSpread(lineHistory[lineHistory.length - 1].spread)}</span>
+                <span>Open: {lineHistory[0].spread !== null ? formatSpread(lineHistory[0].spread) : '—'}</span>
+                <span>Now: {(() => {
+                  const spread = lineHistory[lineHistory.length - 1]?.spread;
+                  return spread !== null && spread !== undefined ? formatSpread(spread) : '—';
+                })()}</span>
               </div>
             </div>
             <div>
               <div className="text-xs text-white/40 mb-2">Total</div>
               <MiniLineChart data={lineHistory} valueKey="total" color="#a78bfa" />
               <div className="flex items-center justify-between mt-2 text-[10px] text-white/30">
-                <span>Open: {lineHistory[0].total}</span>
-                <span>Now: {lineHistory[lineHistory.length - 1].total}</span>
+                <span>Open: {lineHistory[0].total ?? '—'}</span>
+                <span>Now: {lineHistory[lineHistory.length - 1].total ?? '—'}</span>
               </div>
             </div>
           </div>

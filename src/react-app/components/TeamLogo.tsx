@@ -6,6 +6,7 @@
 
 import { useState } from 'react';
 import { getTeamOrCountryLogoUrl } from '@/react-app/lib/teamLogos';
+import { getEspnTeamLogo } from '@/react-app/lib/espnSoccer';
 import { cn } from '@/react-app/lib/utils';
 
 // Fallback team icon when logo fails to load
@@ -38,6 +39,8 @@ function TeamFallback({
 export interface TeamLogoProps {
   /** Team abbreviation (e.g., 'LAL', 'NYY', 'MAN') */
   teamCode: string;
+  /** Optional full team name (used for soccer fallback lookup) */
+  teamName?: string;
   /** Sport code: NBA, NFL, MLB, NHL, NCAAB, NCAAF, SOCCER */
   sport: string;
   /** Size in pixels (default: 40) */
@@ -56,6 +59,7 @@ export interface TeamLogoProps {
 
 export function TeamLogo({
   teamCode,
+  teamName,
   sport,
   size = 40,
   league,
@@ -67,7 +71,15 @@ export function TeamLogo({
   const [failed, setFailed] = useState(false);
   
   // Get logo URL (club logo or country flag for WBC/World Cup)
-  const logoUrl = getTeamOrCountryLogoUrl(teamCode, sport, league);
+  const primaryLogoUrl = getTeamOrCountryLogoUrl(teamCode, sport, league);
+  const isSoccer = String(sport || '').toUpperCase() === 'SOCCER';
+  const soccerFallbackLogo = isSoccer
+    ? (() => {
+        const byName = getEspnTeamLogo(undefined, teamName || teamCode);
+        return byName.includes('default-team-logo') ? null : byName;
+      })()
+    : null;
+  const logoUrl = primaryLogoUrl || soccerFallbackLogo;
   
   // Show fallback if no URL or load failed
   if (!logoUrl || failed) {

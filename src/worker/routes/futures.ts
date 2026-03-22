@@ -18,12 +18,15 @@ interface Env {
 
 const futures = new Hono<{ Bindings: Env }>();
 
-// Competition IDs for SportsRadar
+// Competition IDs for SportsRadar Futures (oddscomparison-futures product).
+// Verified against odds API 2026-03-20.
 const COMPETITION_IDS: Record<string, string> = {
   nba: "sr:competition:132",
-  nfl: "sr:competition:1",
+  nfl: "sr:competition:31",
   mlb: "sr:competition:109",
   nhl: "sr:competition:234",
+  ncaab: "sr:competition:28370",
+  ncaaf: "sr:competition:27653",
 };
 
 // Market type to SportsRadar market name mapping

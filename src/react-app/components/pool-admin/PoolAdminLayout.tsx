@@ -14,6 +14,11 @@ import {
   History,
   DollarSign,
   ShieldAlert,
+  Wallet,
+  BookOpen,
+  RefreshCw,
+  Package,
+  Gavel,
 } from "lucide-react";
 import { cn } from "@/react-app/lib/utils";
 import { Button } from "@/react-app/components/ui/button";
@@ -35,6 +40,11 @@ const navItems: NavItem[] = [
   { label: "Payments", path: "/pool-admin/payments", icon: <DollarSign className="h-4 w-4" /> },
   { label: "Notifications", path: "/pool-admin/notifications", icon: <Bell className="h-4 w-4" /> },
   { label: "Activity Log", path: "/pool-admin/activity", icon: <History className="h-4 w-4" /> },
+  { label: "Payouts", path: "/pool-admin/payouts", icon: <Wallet className="h-4 w-4" /> },
+  { label: "Rule Config", path: "/pool-admin/rule-config", icon: <BookOpen className="h-4 w-4" /> },
+  { label: "Recalculation", path: "/pool-admin/recalculation", icon: <RefreshCw className="h-4 w-4" /> },
+  { label: "Bundles", path: "/pool-admin/bundles", icon: <Package className="h-4 w-4" /> },
+  { label: "Calcutta", path: "/pool-admin/calcutta", icon: <Gavel className="h-4 w-4" /> },
   { label: "Settings", path: "/pool-admin/settings", icon: <Settings className="h-4 w-4" /> },
 ];
 

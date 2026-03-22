@@ -25,10 +25,14 @@ featureFlagsRouter.get("/public", async (c) => {
   // Only return specific flags that the frontend needs
   const publicPoolsFlag = await service.getFlag("PUBLIC_POOLS");
   const marketplaceEnabledFlag = await service.getFlag("MARKETPLACE_ENABLED");
+  const gameFavoritesFlag = await service.getFlag("GAME_FAVORITES_ENABLED");
+  const homeFavoritesRailFlag = await service.getFlag("HOME_FAVORITES_RAIL_ENABLED");
   
   return c.json({
     PUBLIC_POOLS: publicPoolsFlag?.is_enabled ?? false,
     MARKETPLACE_ENABLED: marketplaceEnabledFlag?.is_enabled ?? false,
+    GAME_FAVORITES_ENABLED: gameFavoritesFlag?.is_enabled ?? true,
+    HOME_FAVORITES_RAIL_ENABLED: homeFavoritesRailFlag?.is_enabled ?? true,
   });
 });
 

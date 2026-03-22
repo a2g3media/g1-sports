@@ -11,8 +11,8 @@
 
 import { getCachedData, setCachedData } from './apiCacheService';
 
-// Cache TTL - 5 minutes for odds (fresher data with full access)
-const ODDS_CACHE_TTL_SECONDS = 5 * 60;
+// Cache TTL - 1 minute for odds to preserve movement fidelity.
+const ODDS_CACHE_TTL_SECONDS = 60;
 
 // Rate limit backoff - cache empty results for 2 minutes when rate limited
 const RATE_LIMIT_BACKOFF_SECONDS = 2 * 60;
@@ -22,28 +22,44 @@ let lastApiCallTimestamp = 0;
 const MIN_API_INTERVAL_MS = 500; // 500ms between API calls (full access allows more)
 
 // Competition ID mapping for SportsRadar Odds Comparison API
-// Full coverage for all major sports and leagues
+// These IDs are specific to the Odds Comparison product and differ from
+// the Sports Data API competition IDs. Verified against the live
+// oddscomparison-prematch competitions endpoint 2026-03-20.
 const COMPETITION_IDS: Record<string, string[]> = {
   'nba': ['sr:competition:132'],
-  'nfl': ['sr:competition:1'],
-  'mlb': ['sr:competition:109'],
+  'nfl': ['sr:competition:31'],
+  'mlb': ['sr:competition:109', 'sr:competition:2456'], // MLB + Spring Training
   'nhl': ['sr:competition:234'],
-  'ncaab': ['sr:competition:233'],
-  'ncaaf': ['sr:competition:298'],
-  // Soccer - multiple leagues
-  'soccer': [
-    'sr:competition:17',   // EPL - Premier League
-    'sr:competition:8',    // La Liga
-    'sr:competition:23',   // Serie A
-    'sr:competition:35',   // Bundesliga
-    'sr:competition:34',   // Ligue 1
-    'sr:competition:7',    // Champions League
-    'sr:competition:325',  // MLS
-    'sr:competition:1',    // World Cup
+  'ncaab': [
+    'sr:competition:28370',  // NCAA Division I National Championship (March Madness)
+    'sr:competition:648',    // NCAA Regular Season
+    'sr:competition:24135',  // NIT
   ],
-  'mma': ['sr:competition:250'],   // UFC
-  'golf': ['sr:competition:170'],  // PGA Tour
-  'nascar': ['sr:competition:168'], // NASCAR Cup Series
+  'ncaaf': [
+    'sr:competition:27653',  // NCAA Regular Season
+    'sr:competition:27625',  // NCAA FBS Post Season (bowls/playoff)
+  ],
+  // Soccer - multiple leagues (verified against odds API)
+  'soccer': [
+    'sr:competition:17',     // EPL - Premier League
+    'sr:competition:8',      // La Liga
+    'sr:competition:23',     // Serie A
+    'sr:competition:35',     // Bundesliga
+    'sr:competition:34',     // Ligue 1
+    'sr:competition:7',      // Champions League
+    'sr:competition:679',    // Europa League
+    'sr:competition:34480',  // Conference League
+    'sr:competition:242',    // MLS
+    'sr:competition:16',     // FIFA World Cup
+    'sr:competition:155',    // Liga Profesional Argentina
+    'sr:competition:325',    // Brasileiro Serie A
+    'sr:competition:27466',  // Liga MX Clausura
+  ],
+  // No odds competitions available for MMA, Golf, or NASCAR in the
+  // Odds Comparison product — keep empty so sport-URN fallback triggers.
+  'mma': [],
+  'golf': [],
+  'nascar': [],
 };
 
 // Sport URN mapping (backup)
@@ -169,14 +185,15 @@ export async function fetchSportsRadarOdds(
   const competitionIds = COMPETITION_IDS[sportLower];
   const sportUrn = SPORT_URNS[sportLower];
   
-  if (!competitionIds && !sportUrn) {
+  if ((!competitionIds || competitionIds.length === 0) && !sportUrn) {
     console.log(`[SportsRadar Odds] Unknown sport: ${sport}`);
     return oddsMap;
   }
   
-  // Use production endpoints only.
+  // Prematch and liveodds feeds are the active products for this account.
+  // The "regular" feed consistently returns 403 — skip it to avoid
+  // wasting a call and hitting rate limits.
   const BASE_URLS = [
-    'https://api.sportradar.com/oddscomparison-regular/production/v2',
     'https://api.sportradar.com/oddscomparison-prematch/production/v2',
     'https://api.sportradar.com/oddscomparison-liveodds/production/v2',
   ];
@@ -318,7 +335,17 @@ export async function fetchSportsRadarOdds(
           const eventId = String(event?.id || "").trim();
           if (!eventId) continue;
           const eventSport = String(event?.sport?.id || event?.tournament?.sport?.id || "").trim();
-          if (eventSport && eventSport !== sportUrn) continue;
+          const eventCompetition = String(
+            event?.competition?.id
+            || event?.tournament?.id
+            || event?.sport_event_context?.competition?.id
+            || ""
+          ).trim();
+          if (competitionIds && competitionIds.length > 0 && eventCompetition) {
+            if (!competitionIds.includes(eventCompetition)) continue;
+          } else if (eventSport && eventSport !== sportUrn) {
+            continue;
+          }
           scheduleEventIds.add(eventId);
         }
       } catch {
@@ -326,7 +353,8 @@ export async function fetchSportsRadarOdds(
       }
     }
 
-    const idsToProbe = Array.from(scheduleEventIds).slice(0, 60);
+    const maxScheduleProbe = sportLower === "ncaab" ? 300 : 120;
+    const idsToProbe = Array.from(scheduleEventIds).slice(0, maxScheduleProbe);
     for (const eventId of idsToProbe) {
       try {
         const resolved = await fetchSportsRadarOddsForGame(eventId, effectiveApiKey);
@@ -403,13 +431,16 @@ function parseOddsResponse(data: SportsRadarOddsResponse, sport: string): Map<st
       moneyline1HAway: null,
     };
     
-    // Parse markets from first bookmaker (consensus)
+    // Parse markets from best-coverage bookmaker, not blindly first.
     const markets = event.markets || [];
     
     for (const market of markets) {
       const marketName = (market.name || '').toLowerCase();
       const books = market.books || [];
-      const book = books[0]; // Use first bookmaker as consensus
+      const orderedBooks = books
+        .filter((candidate: any) => Array.isArray(candidate?.outcomes) && candidate.outcomes.length > 0)
+        .sort((a: any, b: any) => (b.outcomes?.length || 0) - (a.outcomes?.length || 0));
+      const book = orderedBooks[0];
       
       if (!book?.outcomes) continue;
       
@@ -418,12 +449,9 @@ function parseOddsResponse(data: SportsRadarOddsResponse, sport: string): Map<st
 
       // Spread/Handicap
       if (isMarketType(marketName, MARKET_TYPES.SPREAD)) {
-        console.log(`[SportsRadar Odds] SPREAD MARKET FOUND for ${homeTeam.name}: market="${marketName}", outcomes=${book.outcomes.length}`);
-        console.log(`[SportsRadar Odds] First outcome raw data:`, JSON.stringify(book.outcomes[0], null, 2));
         for (const outcome of book.outcomes) {
           // SportsRadar uses string handicap values - parse to number
           const rawHandicap = outcome.handicap ?? outcome.spread ?? outcome.line;
-          console.log(`[SportsRadar Odds] Outcome handicap check - handicap:${outcome.handicap}, spread:${outcome.spread}, line:${outcome.line}, odds_decimal:${outcome.odds_decimal}, odds_american:${outcome.odds_american}, type:${outcome.type}`);
           const handicapValue = rawHandicap !== undefined ? parseFloat(String(rawHandicap)) : undefined;
           
           if (handicapValue !== undefined && !isNaN(handicapValue)) {
@@ -491,12 +519,9 @@ function parseOddsResponse(data: SportsRadarOddsResponse, sport: string): Map<st
       
       // Moneyline/Winner
       if (isMarketType(marketName, MARKET_TYPES.MONEYLINE)) {
-        console.log(`[SportsRadar Odds] MONEYLINE MARKET FOUND for ${homeTeam.name}: market="${marketName}"`);
-        console.log(`[SportsRadar Odds] First moneyline outcome:`, JSON.stringify(book.outcomes[0], null, 2));
         for (const outcome of book.outcomes) {
           // SportsRadar provides odds_american directly, or odds_decimal we can convert
           let americanOdds: number | null = null;
-          console.log(`[SportsRadar Odds] ML outcome - odds_american:${outcome.odds_american}, odds_decimal:${outcome.odds_decimal}, odds:${outcome.odds}, type:${outcome.type}`);
           if (outcome.odds_american !== undefined) {
             americanOdds = parseInt(String(outcome.odds_american), 10);
           } else if (outcome.odds_decimal !== undefined) {
@@ -504,7 +529,6 @@ function parseOddsResponse(data: SportsRadarOddsResponse, sport: string): Map<st
           } else if (outcome.odds !== undefined) {
             americanOdds = decimalToAmerican(outcome.odds);
           }
-          console.log(`[SportsRadar Odds] ML converted americanOdds: ${americanOdds}`);
           
           if (americanOdds !== null && !isNaN(americanOdds)) {
             // Use outcome.type field for team identification
@@ -534,8 +558,20 @@ function parseOddsResponse(data: SportsRadarOddsResponse, sport: string): Map<st
       }
     }
     
-    // Only add if we found some odds data
-    if (odds.spread !== null || odds.total !== null || odds.moneylineHome !== null) {
+    // Add entry when any primary or first-half market is available.
+    if (
+      odds.spread !== null ||
+      odds.spreadHome !== null ||
+      odds.spreadAway !== null ||
+      odds.total !== null ||
+      odds.moneylineHome !== null ||
+      odds.moneylineAway !== null ||
+      odds.spread1HHome !== null ||
+      odds.spread1HAway !== null ||
+      odds.total1H !== null ||
+      odds.moneyline1HHome !== null ||
+      odds.moneyline1HAway !== null
+    ) {
       // Create key based on team names for matching
       const homeKey = normalizeTeamName(homeTeam.name);
       const awayKey = normalizeTeamName(awayTeam.name);
@@ -1015,6 +1051,7 @@ export interface LineMovementData {
   outcome: 'HOME' | 'AWAY' | 'OVER' | 'UNDER';
   openingLine: number | null;
   openingPrice: number | null;
+  openingTimestamp: string | null;
   currentLine: number | null;
   currentPrice: number | null;
   movement: number;
@@ -1039,64 +1076,93 @@ export async function captureOddsSnapshot(
 ): Promise<void> {
   const now = new Date().toISOString();
   const dataScope = 'PROD';
-  
-  const inserts: Promise<D1Result>[] = [];
-  
-  // Spread snapshots
+  const nowMs = Date.now();
+
+  const targets: Array<{
+    market: 'SPREAD' | 'TOTAL' | 'MONEYLINE';
+    outcome: 'HOME' | 'AWAY' | 'OVER' | 'UNDER';
+    line: number | null;
+    price: number | null;
+  }> = [];
+
   if (odds.spreadHome !== null) {
-    inserts.push(
-      db.prepare(`
-        INSERT INTO odds_snapshots (data_scope, game_id, bookmaker_key, market_key, outcome_key, line_value, price_american, captured_at, created_at, updated_at)
-        VALUES (?, ?, 'consensus', 'SPREAD', 'HOME', ?, -110, ?, ?, ?)
-      `).bind(dataScope, gameId, odds.spreadHome, now, now, now).run()
-    );
-    inserts.push(
-      db.prepare(`
-        INSERT INTO odds_snapshots (data_scope, game_id, bookmaker_key, market_key, outcome_key, line_value, price_american, captured_at, created_at, updated_at)
-        VALUES (?, ?, 'consensus', 'SPREAD', 'AWAY', ?, -110, ?, ?, ?)
-      `).bind(dataScope, gameId, odds.spreadAway ?? -odds.spreadHome, now, now, now).run()
-    );
+    targets.push({ market: 'SPREAD', outcome: 'HOME', line: odds.spreadHome, price: -110 });
+    targets.push({ market: 'SPREAD', outcome: 'AWAY', line: odds.spreadAway ?? -odds.spreadHome, price: -110 });
   }
-  
-  // Total snapshots
   if (odds.total !== null) {
-    inserts.push(
-      db.prepare(`
-        INSERT INTO odds_snapshots (data_scope, game_id, bookmaker_key, market_key, outcome_key, line_value, price_american, captured_at, created_at, updated_at)
-        VALUES (?, ?, 'consensus', 'TOTAL', 'OVER', ?, -110, ?, ?, ?)
-      `).bind(dataScope, gameId, odds.total, now, now, now).run()
-    );
-    inserts.push(
-      db.prepare(`
-        INSERT INTO odds_snapshots (data_scope, game_id, bookmaker_key, market_key, outcome_key, line_value, price_american, captured_at, created_at, updated_at)
-        VALUES (?, ?, 'consensus', 'TOTAL', 'UNDER', ?, -110, ?, ?, ?)
-      `).bind(dataScope, gameId, odds.total, now, now, now).run()
-    );
+    targets.push({ market: 'TOTAL', outcome: 'OVER', line: odds.total, price: -110 });
+    targets.push({ market: 'TOTAL', outcome: 'UNDER', line: odds.total, price: -110 });
   }
-  
-  // Moneyline snapshots
-  if (odds.moneylineHome !== null || odds.moneylineAway !== null) {
-    if (odds.moneylineHome !== null) {
-      inserts.push(
-        db.prepare(`
-          INSERT INTO odds_snapshots (data_scope, game_id, bookmaker_key, market_key, outcome_key, line_value, price_american, captured_at, created_at, updated_at)
-          VALUES (?, ?, 'consensus', 'MONEYLINE', 'HOME', NULL, ?, ?, ?, ?)
-        `).bind(dataScope, gameId, odds.moneylineHome, now, now, now).run()
-      );
-    }
-    if (odds.moneylineAway !== null) {
-      inserts.push(
-        db.prepare(`
-          INSERT INTO odds_snapshots (data_scope, game_id, bookmaker_key, market_key, outcome_key, line_value, price_american, captured_at, created_at, updated_at)
-          VALUES (?, ?, 'consensus', 'MONEYLINE', 'AWAY', NULL, ?, ?, ?, ?)
-        `).bind(dataScope, gameId, odds.moneylineAway, now, now, now).run()
-      );
-    }
+  if (odds.moneylineHome !== null) {
+    targets.push({ market: 'MONEYLINE', outcome: 'HOME', line: null, price: odds.moneylineHome });
   }
-  
+  if (odds.moneylineAway !== null) {
+    targets.push({ market: 'MONEYLINE', outcome: 'AWAY', line: null, price: odds.moneylineAway });
+  }
+
+  const sameNullable = (a: number | null, b: number | null) => a === b;
+  const inserts: Promise<D1Result>[] = [];
+
   try {
+    const latestRows = await db.prepare(`
+      SELECT market_key, outcome_key, line_value, price_american, captured_at
+      FROM odds_snapshots
+      WHERE game_id = ? AND data_scope = ? AND bookmaker_key = 'consensus'
+      ORDER BY captured_at DESC
+      LIMIT 32
+    `).bind(gameId, dataScope).all<{
+      market_key: string;
+      outcome_key: string;
+      line_value: number | null;
+      price_american: number | null;
+      captured_at: string | null;
+    }>();
+
+    const latestByPair = new Map<string, { line_value: number | null; price_american: number | null }>();
+    let newestCapturedAtMs = 0;
+    for (const row of latestRows.results) {
+      const pairKey = `${String(row.market_key || "").toUpperCase()}:${String(row.outcome_key || "").toUpperCase()}`;
+      if (!latestByPair.has(pairKey)) {
+        latestByPair.set(pairKey, {
+          line_value: row.line_value ?? null,
+          price_american: row.price_american ?? null,
+        });
+      }
+      const ts = row.captured_at ? new Date(row.captured_at).getTime() : 0;
+      if (Number.isFinite(ts) && ts > newestCapturedAtMs) newestCapturedAtMs = ts;
+    }
+
+    // Guardrail: skip high-frequency writes during traffic spikes.
+    if (newestCapturedAtMs > 0 && nowMs - newestCapturedAtMs < 45000) {
+      return;
+    }
+
+    targets.forEach((target) => {
+      const pairKey = `${target.market}:${target.outcome}`;
+      const latest = latestByPair.get(pairKey);
+      const hasChanged =
+        !latest ||
+        !sameNullable(latest.line_value ?? null, target.line) ||
+        !sameNullable(latest.price_american ?? null, target.price);
+
+      if (!hasChanged) return;
+
+      inserts.push(
+        db.prepare(`
+          INSERT INTO odds_snapshots (data_scope, game_id, bookmaker_key, market_key, outcome_key, line_value, price_american, captured_at, created_at, updated_at)
+          VALUES (?, ?, 'consensus', ?, ?, ?, ?, ?, ?, ?)
+        `).bind(dataScope, gameId, target.market, target.outcome, target.line, target.price, now, now, now).run()
+      );
+    });
+  } catch (err) {
+    console.error(`[Line Movement] Failed to compare latest snapshot for ${gameId}:`, err);
+    return;
+  }
+
+  try {
+    if (inserts.length === 0) return;
     await Promise.all(inserts);
-    console.log(`[Line Movement] Captured snapshot for ${gameId}: spread=${odds.spreadHome}, total=${odds.total}`);
+    console.log(`[Line Movement] Captured ${inserts.length} changed snapshot(s) for ${gameId}: spread=${odds.spreadHome}, total=${odds.total}`);
   } catch (err) {
     console.error(`[Line Movement] Failed to capture snapshot:`, err);
   }
@@ -1106,6 +1172,68 @@ export async function captureOddsSnapshot(
  * Store opening lines for a game (first time we see odds)
  * These serve as the baseline for line movement calculations
  */
+// Track whether odds D1 tables have been ensured in this isolate.
+let oddsTablesReady = false;
+
+async function ensureOddsTables(db: D1Database): Promise<void> {
+  if (oddsTablesReady) return;
+  try {
+    await db.prepare(`
+      CREATE TABLE IF NOT EXISTS odds_opening (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        data_scope TEXT NOT NULL DEFAULT 'PROD',
+        game_id TEXT NOT NULL,
+        bookmaker_key TEXT NOT NULL DEFAULT 'consensus',
+        market_key TEXT NOT NULL,
+        outcome_key TEXT NOT NULL,
+        opening_line_value REAL,
+        opening_price_american REAL,
+        opened_at TEXT NOT NULL DEFAULT (datetime('now')),
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      )
+    `).run();
+    await db.prepare(`
+      CREATE TABLE IF NOT EXISTS odds_snapshots (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        data_scope TEXT NOT NULL DEFAULT 'PROD',
+        game_id TEXT NOT NULL,
+        bookmaker_key TEXT NOT NULL DEFAULT 'consensus',
+        market_key TEXT NOT NULL,
+        outcome_key TEXT NOT NULL,
+        line_value REAL,
+        price_american REAL,
+        snapshot_at TEXT NOT NULL DEFAULT (datetime('now')),
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      )
+    `).run();
+    // Backward-compat: older snapshots schema used snapshot_at only.
+    // New reads/writes use captured_at/updated_at.
+    try {
+      await db.prepare(`ALTER TABLE odds_snapshots ADD COLUMN captured_at TEXT`).run();
+    } catch {
+      // column already exists
+    }
+    try {
+      await db.prepare(`ALTER TABLE odds_snapshots ADD COLUMN updated_at TEXT`).run();
+    } catch {
+      // column already exists
+    }
+    try {
+      await db.prepare(`
+        UPDATE odds_snapshots
+        SET captured_at = COALESCE(captured_at, snapshot_at, created_at)
+        WHERE captured_at IS NULL
+      `).run();
+    } catch {
+      // non-fatal best-effort backfill
+    }
+    oddsTablesReady = true;
+  } catch (err) {
+    console.error('[Line Movement] Failed to ensure odds tables:', err);
+  }
+}
+
 export async function storeOpeningLines(
   db: D1Database,
   gameId: string,
@@ -1114,6 +1242,8 @@ export async function storeOpeningLines(
   const now = new Date().toISOString();
   const dataScope = 'PROD';
   
+  await ensureOddsTables(db);
+
   // Check if we already have opening lines for this game
   const existing = await db.prepare(`
     SELECT COUNT(*) as count FROM odds_opening WHERE game_id = ? AND data_scope = ?
@@ -1194,6 +1324,7 @@ export async function getLineMovement(
   market: 'SPREAD' | 'TOTAL' | 'MONEYLINE' = 'SPREAD',
   outcome: 'HOME' | 'AWAY' | 'OVER' | 'UNDER' = 'HOME'
 ): Promise<LineMovementData | null> {
+  await ensureOddsTables(db);
   const scopes: Array<"PROD" | "DEMO"> = ["PROD", "DEMO"];
   let opening: {
     opening_line_value: number | null;
@@ -1222,8 +1353,8 @@ export async function getLineMovement(
       SELECT line_value, price_american, captured_at
       FROM odds_snapshots
       WHERE game_id = ? AND data_scope = ? AND market_key = ? AND outcome_key = ?
-      ORDER BY captured_at ASC
-      LIMIT 100
+      ORDER BY captured_at DESC
+      LIMIT 200
     `).bind(gameId, dataScope, market, outcome).all<{
       line_value: number | null;
       price_american: number | null;
@@ -1232,7 +1363,8 @@ export async function getLineMovement(
 
     if (openingRow || snapshotRows.results.length > 0) {
       opening = openingRow;
-      snapshots = snapshotRows.results;
+      // Keep API contract chronological while querying from newest rows for accuracy.
+      snapshots = snapshotRows.results.slice().reverse();
       break;
     }
   }
@@ -1246,6 +1378,7 @@ export async function getLineMovement(
   
   const openingLine = opening?.opening_line_value ?? (snapshots[0]?.line_value ?? null);
   const openingPrice = opening?.opening_price_american ?? (snapshots[0]?.price_american ?? null);
+  const openingTimestamp = opening?.opened_at ?? (snapshots[0]?.captured_at ?? null);
   const currentLine = current?.line_value ?? openingLine;
   const currentPrice = current?.price_american ?? openingPrice;
   
@@ -1275,6 +1408,7 @@ export async function getLineMovement(
     outcome,
     openingLine,
     openingPrice,
+    openingTimestamp,
     currentLine,
     currentPrice,
     movement: Math.round(movement * 100) / 100,
@@ -1310,6 +1444,8 @@ export interface GamePlayerProp {
   over_odds: number;
   under_odds: number;
   sportsbook: string;
+  provider_game_id?: string;
+  provider_event_id?: string;
 }
 
 /**
@@ -1356,12 +1492,16 @@ export async function fetchGamePlayerProps(
   const isLiveGame = status === "LIVE" || status === "IN_PROGRESS";
   const candidateUrls = isLiveGame
     ? [
-        // Live/in-game props must come from OC Live Odds API.
+        // Prefer live feed first for in-progress games.
         `https://api.sportradar.com/oddscomparison-liveodds/production/v2/en/sport_events/${encodedEventId}/players_props.json?api_key=${apiKey}`,
+        // Fall back to dedicated player-props feed when live endpoint is sparse.
+        `https://api.sportradar.com/oddscomparison-player-props/production/v2/en/sport_events/${encodedEventId}/players_props.json?api_key=${apiKey}`,
       ]
     : [
-        // Pre-match props must come from OC Player Props API (production server per OpenAPI spec).
+        // Prefer pre-match props feed for scheduled games.
         `https://api.sportradar.com/oddscomparison-player-props/production/v2/en/sport_events/${encodedEventId}/players_props.json?api_key=${apiKey}`,
+        // Fall back to liveodds feed if provider routes this market there.
+        `https://api.sportradar.com/oddscomparison-liveodds/production/v2/en/sport_events/${encodedEventId}/players_props.json?api_key=${apiKey}`,
       ];
   
   // Clean team names for logging
@@ -1467,6 +1607,8 @@ export async function fetchGamePlayerProps(
               over_odds: overOdds,
               under_odds: underOdds,
               sportsbook,
+              provider_game_id: sportEventId,
+              provider_event_id: sportEventId,
             });
           }
         }
@@ -1494,6 +1636,8 @@ export async function fetchGamePlayerProps(
               over_odds: overOdds,
               under_odds: underOdds,
               sportsbook: 'SportsRadar',
+              provider_game_id: sportEventId,
+              provider_event_id: sportEventId,
             });
           }
         }
@@ -1611,6 +1755,7 @@ export async function captureAllOddsSnapshots(
   oddsMap: Map<string, SportsRadarOdds>,
   sport: string
 ): Promise<{ captured: number; errors: number }> {
+  await ensureOddsTables(db);
   let captured = 0;
   let errors = 0;
   

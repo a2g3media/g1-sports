@@ -474,7 +474,7 @@ export function AdminPoolTypes() {
   };
 
   const getCatalogSportLabel = (key: string) => {
-    return SPORTS.find(s => s.key === key)?.label || key.replaceAll("_", " ");
+    return SPORTS.find(s => s.key === key)?.label || key.replace(/_/g, " ");
   };
 
   const filteredCatalog = useMemo(() => {
@@ -880,7 +880,7 @@ export function AdminPoolTypes() {
                   <SelectContent>
                     <SelectItem value="all">All variants</SelectItem>
                     {catalogVariantOptions.map((variant) => (
-                      <SelectItem key={variant} value={variant}>{variant.replaceAll("_", " ")}</SelectItem>
+                      <SelectItem key={variant} value={variant}>{variant.replace(/_/g, " ")}</SelectItem>
                     ))}
                   </SelectContent>
                 </Select>

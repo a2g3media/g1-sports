@@ -24,6 +24,11 @@ import type { Game } from "../../shared/types";
 
 const thresholdsRouter = new Hono<{ Bindings: Env }>();
 
+function isMissingThresholdStorage(error: unknown): boolean {
+  const msg = String(error || "").toLowerCase();
+  return msg.includes("no such table") || msg.includes("threshold_");
+}
+
 /**
  * GET /api/thresholds/what-changed
  * 
@@ -51,6 +56,13 @@ thresholdsRouter.get("/what-changed", async (c) => {
     return c.json(result);
   } catch (error) {
     console.error("Error getting what changed:", error);
+    if (isMissingThresholdStorage(error)) {
+      return c.json({
+        changes: [],
+        has_changes: false,
+        summary: "Threshold storage not initialized",
+      });
+    }
     return c.json({ error: "Failed to get changes" }, 500);
   }
 });
@@ -76,6 +88,12 @@ thresholdsRouter.get("/ai-activation", async (c) => {
     return c.json(result);
   } catch (error) {
     console.error("Error checking AI activation:", error);
+    if (isMissingThresholdStorage(error)) {
+      return c.json({
+        allowed: false,
+        reason: "Threshold storage not initialized",
+      });
+    }
     return c.json({ error: "Failed to check AI activation" }, 500);
   }
 });
@@ -91,6 +109,9 @@ thresholdsRouter.get("/config", async (c) => {
     return c.json({ config });
   } catch (error) {
     console.error("Error getting config:", error);
+    if (isMissingThresholdStorage(error)) {
+      return c.json({ config: {} });
+    }
     return c.json({ error: "Failed to get config" }, 500);
   }
 });
@@ -155,6 +176,9 @@ thresholdsRouter.get("/events", async (c) => {
     return c.json({ events });
   } catch (error) {
     console.error("Error getting events:", error);
+    if (isMissingThresholdStorage(error)) {
+      return c.json({ events: [] });
+    }
     return c.json({ error: "Failed to get events" }, 500);
   }
 });
@@ -354,6 +378,9 @@ thresholdsRouter.delete("/demo/clear", async (c) => {
     return c.json({ success: true, message: "Demo threshold events cleared" });
   } catch (error) {
     console.error("Error clearing demo events:", error);
+    if (isMissingThresholdStorage(error)) {
+      return c.json({ success: true, message: "Threshold storage not initialized" });
+    }
     return c.json({ error: "Failed to clear demo events" }, 500);
   }
 });

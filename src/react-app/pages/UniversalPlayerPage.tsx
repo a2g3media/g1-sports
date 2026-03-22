@@ -663,7 +663,12 @@ function CoachGIntelCard({ playerName, sport: _sport }: { playerName: string; sp
     <div className="rounded-2xl bg-gradient-to-br from-violet-500/10 to-purple-600/10 border border-violet-500/20 p-5">
       <div className="flex items-center gap-3 mb-4">
         <div className="w-12 h-12 rounded-full overflow-hidden bg-violet-500/20 border-2 border-violet-400/50">
-          <img src={COACH_G_AVATAR} alt="Coach G" className="w-full h-full object-cover" />
+          <img
+            src={COACH_G_AVATAR}
+            alt="Coach G"
+            className="w-full h-full object-cover cursor-pointer transition-transform hover:scale-105"
+            onClick={() => navigate('/scout')}
+          />
         </div>
         <div>
           <div className="text-violet-300 font-bold">Coach G Player Intel</div>
@@ -723,6 +728,7 @@ function PropLineCard({ prop }: { prop: PropLine }) {
 }
 
 function NewsCard({ item }: { item: NewsItem }) {
+  const navigate = useNavigate();
   return (
     <div className="rounded-xl bg-white/5 border border-white/10 p-4">
       <div className="flex items-start gap-3">
@@ -734,7 +740,12 @@ function NewsCard({ item }: { item: NewsItem }) {
           <div className="text-sm text-white/60 mb-2">{item.summary}</div>
           {item.coachGNote && (
             <div className="flex items-start gap-2 p-2 rounded-lg bg-violet-500/10 border border-violet-500/20">
-              <img src={COACH_G_AVATAR} alt="Coach G" className="w-5 h-5 rounded-full" />
+              <img
+                src={COACH_G_AVATAR}
+                alt="Coach G"
+                className="w-5 h-5 rounded-full cursor-pointer transition-transform hover:scale-110"
+                onClick={() => navigate('/scout')}
+              />
               <div className="text-xs text-violet-300">{item.coachGNote}</div>
             </div>
           )}
@@ -1124,7 +1135,12 @@ export default function UniversalPlayerPage() {
             </div>
             <div className="mt-4 p-4 rounded-xl bg-gradient-to-br from-violet-500/10 to-purple-600/10 border border-violet-500/20">
               <div className="flex items-start gap-3">
-                <img src={COACH_G_AVATAR} alt="Coach G" className="w-8 h-8 rounded-full" />
+                <img
+                  src={COACH_G_AVATAR}
+                  alt="Coach G"
+                  className="w-8 h-8 rounded-full cursor-pointer transition-transform hover:scale-105"
+                  onClick={() => navigate('/scout')}
+                />
                 <div>
                   <div className="text-sm text-violet-300 font-medium mb-1">Coach G Edge</div>
                   <div className="text-sm text-white/70">

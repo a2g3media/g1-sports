@@ -41,7 +41,7 @@ export function normalizeNascarNameToken(value: string): string {
 export function normalizeProviderRaceResults(rawRows: unknown): NascarRaceResultRow[] {
   if (!Array.isArray(rawRows)) return [];
   const rows = rawRows
-    .map((row, idx) => {
+    .map((row, idx): NascarRaceResultRow | null => {
       const driverName = readDriverName(row);
       if (!driverName) return null;
       return {
@@ -51,7 +51,7 @@ export function normalizeProviderRaceResults(rawRows: unknown): NascarRaceResult
         status: String((row as any)?.status || (row as any)?.statusDetail || "").trim() || undefined,
       };
     })
-    .filter((row): row is NascarRaceResultRow => Boolean(row))
+    .filter((row): row is NascarRaceResultRow => row !== null)
     .sort((a, b) => a.position - b.position);
   return rows;
 }

@@ -34,6 +34,7 @@ interface CompactGameTileProps {
   game: CompactGameTileGame;
   onClick?: () => void;
   isInWatchboard?: boolean;
+  isFavorite?: boolean;
 }
 
 type VideoJobSummary = {
@@ -71,7 +72,7 @@ const getTeamName = (team: string | { abbr: string; name?: string }): string => 
   return team.name || team.abbr || '';
 };
 
-const CompactGameTileComponent = ({ game, onClick, isInWatchboard }: CompactGameTileProps) => {
+const CompactGameTileComponent = ({ game, onClick, isInWatchboard, isFavorite }: CompactGameTileProps) => {
   const isLive = game.status === 'live' || game.status === 'in_progress' || game.status === 'LIVE' || game.status === 'IN_PROGRESS';
   const isFinal = game.status === 'final' || game.status === 'FINAL' || game.status === 'closed';
   const isScheduled = !isLive && !isFinal;
@@ -211,12 +212,16 @@ const CompactGameTileComponent = ({ game, onClick, isInWatchboard }: CompactGame
         "border border-slate-700/40 hover:border-slate-600/60",
         "min-h-[120px]", // Ensure minimum touch-friendly height
         isLive && "ring-1 ring-red-500/30",
+        isLive && isFavorite && "ring-2 ring-amber-400/40 shadow-[0_0_24px_rgba(251,191,36,0.15)]",
         isInWatchboard && "ring-1 ring-cyan-500/40"
       )}
     >
       {/* Live glow effect */}
       {isLive && (
         <div className="absolute inset-0 bg-gradient-to-br from-red-500/5 to-transparent pointer-events-none" />
+      )}
+      {isLive && isFavorite && (
+        <div className="absolute inset-0 bg-gradient-to-r from-amber-400/8 via-transparent to-amber-300/5 pointer-events-none" />
       )}
       
       {/* Watchboard indicator */}

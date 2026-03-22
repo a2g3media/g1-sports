@@ -4,6 +4,7 @@ import { useCoachGPreview } from "@/react-app/hooks/useCoachGPreview";
 import { Badge } from "@/react-app/components/ui/badge";
 import { cn } from "@/react-app/lib/utils";
 import { CoachGAvatar } from "@/react-app/components/CoachGAvatar";
+import { CoachGInlineAsk } from "@/react-app/components/CoachGInlineAsk";
 
 interface CoachGSpotlightCardProps {
   gameId: string;
@@ -150,6 +151,7 @@ export function CoachGSpotlightCard({
               Read Full Analysis
             </button>
           </div>
+          <CoachGInlineAsk gameId={gameId} />
         </div>
       </div>
     </div>

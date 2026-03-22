@@ -40,15 +40,49 @@ const DEFAULT_FLAGS: { flag_key: string; is_enabled: boolean; description: strin
     is_enabled: true,
     description: "Enable commissioner profile ratings and review aggregation.",
   },
+  {
+    flag_key: "GAME_FAVORITES_ENABLED",
+    is_enabled: true,
+    description: "Enable game-level favorites action on game detail pages.",
+  },
+  {
+    flag_key: "HOME_FAVORITES_RAIL_ENABLED",
+    is_enabled: true,
+    description: "Enable compact favorites rail on the dashboard home surface.",
+  },
 ];
 
 export class FeatureFlagService {
+  private storageReady = false;
+
   constructor(private db: D1Database) {}
+
+  private async ensureStorage(): Promise<void> {
+    if (this.storageReady) return;
+    await this.db.prepare(`
+      CREATE TABLE IF NOT EXISTS feature_flags (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        flag_key TEXT NOT NULL UNIQUE,
+        is_enabled BOOLEAN DEFAULT 0,
+        description TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `).run();
+    for (const flag of DEFAULT_FLAGS) {
+      await this.db.prepare(`
+        INSERT OR IGNORE INTO feature_flags (flag_key, is_enabled, description)
+        VALUES (?, ?, ?)
+      `).bind(flag.flag_key, flag.is_enabled ? 1 : 0, flag.description).run();
+    }
+    this.storageReady = true;
+  }
 
   /**
    * Initialize default flags in database
    */
   async seedDefaults(): Promise<void> {
+    await this.ensureStorage();
     for (const flag of DEFAULT_FLAGS) {
       await this.db.prepare(`
         INSERT OR IGNORE INTO feature_flags (flag_key, is_enabled, description)
@@ -61,6 +95,7 @@ export class FeatureFlagService {
    * Get all feature flags
    */
   async getAllFlags(): Promise<FeatureFlag[]> {
+    await this.ensureStorage();
     const { results } = await this.db.prepare(`
       SELECT id, flag_key, is_enabled, description, created_at, updated_at
       FROM feature_flags
@@ -81,6 +116,7 @@ export class FeatureFlagService {
    * Get a single flag by key
    */
   async getFlag(flagKey: string): Promise<FeatureFlag | null> {
+    await this.ensureStorage();
     const result = await this.db.prepare(`
       SELECT id, flag_key, is_enabled, description, created_at, updated_at
       FROM feature_flags
@@ -111,6 +147,7 @@ export class FeatureFlagService {
    * Set a flag's enabled state
    */
   async setFlag(flagKey: string, isEnabled: boolean): Promise<void> {
+    await this.ensureStorage();
     await this.db.prepare(`
       UPDATE feature_flags
       SET is_enabled = ?, updated_at = CURRENT_TIMESTAMP
@@ -122,6 +159,7 @@ export class FeatureFlagService {
    * Create or update a flag
    */
   async upsertFlag(flagKey: string, isEnabled: boolean, description?: string): Promise<FeatureFlag> {
+    await this.ensureStorage();
     await this.db.prepare(`
       INSERT INTO feature_flags (flag_key, is_enabled, description)
       VALUES (?, ?, ?)
@@ -139,6 +177,7 @@ export class FeatureFlagService {
    * Delete a flag
    */
   async deleteFlag(flagKey: string): Promise<void> {
+    await this.ensureStorage();
     await this.db.prepare(`
       DELETE FROM feature_flags WHERE flag_key = ?
     `).bind(flagKey).run();

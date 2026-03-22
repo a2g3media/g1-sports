@@ -314,6 +314,9 @@ app.post("/checkout", async (c) => {
  */
 app.post("/reactivate", async (c) => {
   const userId = c.get("userId");
+  if (!userId) {
+    return c.json({ error: "Authentication required" }, 401);
+  }
 
   try {
     // Check if there's a subscription pending cancellation

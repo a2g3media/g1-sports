@@ -1,5 +1,6 @@
 import { getPoolTypeByKey, getTemplateForPoolType } from "../../shared/poolTypeCatalog";
 import { generatePoolRuleEngineOutput, type PoolRuleEngineOutput, type RuleUserState } from "../../shared/poolRuleEngine";
+import { deserializePoolRuleConfig } from "../../shared/poolRuleConfig";
 
 interface LeagueRecord {
   id: number;

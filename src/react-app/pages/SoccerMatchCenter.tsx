@@ -17,13 +17,11 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { useParams, Link, useSearchParams } from "react-router-dom";
 import { motion, AnimatePresence } from "framer-motion";
-import SoccerPageHeader, { buildMatchBreadcrumbs } from "@/react-app/components/soccer/SoccerPageHeader";
-import { useSoccerBackNavigation, buildSoccerTeamUrl, buildSoccerPlayerUrl } from "@/react-app/hooks/useSoccerBackNavigation";
+import { useSoccerBackNavigation, buildSoccerPlayerUrl } from "@/react-app/hooks/useSoccerBackNavigation";
 import { fetchPlayerPhotos } from "@/react-app/lib/espnSoccer";
 import TeamCrest from "@/react-app/components/soccer/TeamCrest";
 import {
   Clock,
-  MapPin,
   Users,
   Activity,
   Target,
@@ -44,8 +42,10 @@ import {
   Lock,
   Heart,
   Eye,
+  Plus,
   Share2,
   Ticket,
+  ChevronLeft,
   ChevronRight,
   Play,
   Radio,
@@ -58,6 +58,7 @@ import { useWatchboards } from "@/react-app/hooks/useWatchboards";
 import { useSubscription } from "@/react-app/hooks/useSubscription";
 import AddToWatchboardModal from "@/react-app/components/AddToWatchboardModal";
 import { CoachGAvatar } from "@/react-app/components/CoachGAvatar";
+import { CoachGInlineAsk } from "@/react-app/components/CoachGInlineAsk";
 import { cn } from "@/react-app/lib/utils";
 import {
   deriveUnifiedFinalOutcomes,
@@ -369,6 +370,14 @@ export default function SoccerMatchCenter() {
     homeScore: match?.homeScore,
     awayScore: match?.awayScore,
   });
+  const shortCode = (team?: Team | null) =>
+    String(team?.abbreviation || team?.name || "TEAM")
+      .replace(/[^A-Za-z]/g, "")
+      .slice(0, 3)
+      .toUpperCase();
+  const marketSpread = "N/A";
+  const marketTotal = "N/A";
+  const marketMoneyline = "N/A";
   const liveNotes = [
     {
       time: new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }),
@@ -505,14 +514,23 @@ export default function SoccerMatchCenter() {
     { key: "matchups", label: "Matchups", icon: <Layers className="h-4 w-4" /> },
     { key: "pools", label: "Pools", icon: <Trophy className="h-4 w-4" /> },
   ];
+  const tabSubtitles: Record<TabKey, string> = {
+    overview: "Match overview and Coach G brief",
+    timeline: "Live event flow and key moments",
+    lineups: "Starting XI, formation, and bench",
+    stats: "Team performance and advanced metrics",
+    h2h: "Recent meetings and trend context",
+    matchups: "Market signals, lines, and props",
+    pools: "Pool picks, lock timer, and standings",
+  };
 
   return (
-    <div className="min-h-screen bg-[#0a0a0a]">
+    <div className="min-h-screen bg-gradient-to-b from-[#0a0a0a] via-[#0d1117] to-[#0a0a0a]">
       {/* Background gradient */}
       <div className="fixed inset-0 pointer-events-none">
-        <div className="absolute inset-0 bg-gradient-to-b from-emerald-900/20 via-transparent to-transparent" />
-        <div className="absolute top-0 left-1/4 w-96 h-96 bg-emerald-500/10 rounded-full blur-3xl" />
-        <div className="absolute top-0 right-1/4 w-96 h-96 bg-cyan-500/10 rounded-full blur-3xl" />
+        <div className="absolute inset-0 bg-gradient-to-b from-slate-900/35 via-transparent to-transparent" />
+        <div className="absolute top-0 left-1/4 h-96 w-96 rounded-full bg-emerald-500/10 blur-3xl" />
+        <div className="absolute top-0 right-1/4 h-96 w-96 rounded-full bg-cyan-500/10 blur-3xl" />
       </div>
       
       {/* Add to Watchboard Modal */}
@@ -556,40 +574,89 @@ export default function SoccerMatchCenter() {
         )}
       </AnimatePresence>
 
-      {/* Breadcrumb Header */}
-      {match && (
-        <SoccerPageHeader
-          breadcrumbs={buildMatchBreadcrumbs(
-            match.homeTeam.name,
-            match.awayTeam.name,
-            match.competition ? { id: match.competition.toLowerCase().replace(/\s+/g, '-'), name: match.competition } : undefined,
-            undefined,
-            fromLeagueId,
-            fromTeamId
+      <div className="relative z-10 px-4 md:px-6 pt-4 md:pt-5 flex items-center justify-between mb-4 md:mb-5 max-w-3xl mx-auto">
+        <button
+          onClick={goBack}
+          className="flex items-center gap-2 rounded-xl bg-[#121821]/85 px-3 py-2 text-[#9CA3AF] backdrop-blur-sm transition-all hover:bg-[#16202B] hover:text-[#E5E7EB]"
+        >
+          <ChevronLeft className="h-4 w-4" />
+          <span className="text-sm font-medium">SOCCER</span>
+        </button>
+        <div className="flex items-center gap-2">
+          {lastUpdated && (
+            <span className="hidden xl:inline text-[11px] text-white/45">
+              Updated {Math.max(0, Math.round((Date.now() - lastUpdated.getTime()) / 60000))}m ago
+            </span>
           )}
-          title={`${match.homeTeam.name} vs ${match.awayTeam.name}`}
-          subtitle={[
-            match.competition,
-            match.startTime ? new Date(match.startTime).toLocaleDateString('en-US', { 
-              weekday: 'short', 
-              month: 'short', 
-              day: 'numeric' 
-            }) : null
-          ].filter(Boolean).join(' • ')}
-          onBack={goBack}
-        />
-      )}
+          <button
+            onClick={() => fetchMatch(true)}
+            disabled={isRefreshing}
+            className="flex items-center gap-2 px-3 py-2 rounded-xl border border-white/[0.08] bg-[#121821]/85 text-[#9CA3AF] hover:text-[#E5E7EB] hover:border-white/[0.14] hover:bg-[#16202B] transition-all disabled:opacity-60"
+          >
+            <RefreshCw className={cn("h-4 w-4", isRefreshing && "animate-spin")} />
+            <span className="hidden sm:inline text-sm font-medium">{isRefreshing ? "Updating..." : "Refresh"}</span>
+          </button>
+          <button
+            onClick={handleFollowToggle}
+            className={cn(
+              "flex items-center gap-2 px-3 py-2 rounded-xl border transition-all",
+              isFollowing
+                ? "border-rose-400/45 bg-rose-500/20 text-rose-100"
+                : "border-white/[0.08] bg-[#121821]/85 text-[#9CA3AF] hover:text-[#E5E7EB] hover:border-white/[0.14] hover:bg-[#16202B]"
+            )}
+          >
+            <Heart className={cn("h-4 w-4", isFollowing && "fill-current")} />
+            <span className="hidden sm:inline text-sm font-medium">{isFollowing ? "Following" : "Follow"}</span>
+          </button>
+          <button
+            onClick={handleWatchToggle}
+            className={cn(
+              "flex items-center gap-2 px-3 py-2 rounded-xl transition-all",
+              isWatching
+                ? "bg-amber-500/28 text-amber-200 hover:bg-amber-500/35"
+                : "bg-amber-500/20 text-amber-400 hover:bg-amber-500/30 hover:text-amber-300"
+            )}
+          >
+            <Plus className="h-4 w-4" />
+            <span className="hidden sm:inline text-sm font-medium">{isWatching ? "Watching" : "Watchboard"}</span>
+          </button>
+          <button
+            onClick={handleShare}
+            className="flex items-center gap-2 px-3 py-2 rounded-xl border border-white/[0.08] bg-[#121821]/85 text-[#9CA3AF] hover:text-[#E5E7EB] hover:border-white/[0.14] hover:bg-[#16202B] transition-all"
+          >
+            <Share2 className="h-4 w-4" />
+            <span className="hidden sm:inline text-sm font-medium">Share</span>
+          </button>
+          {match && (
+            <span
+              className={cn(
+                "hidden sm:inline-flex items-center rounded-full px-2.5 py-1 text-[10px] font-semibold uppercase tracking-wide border",
+                isLive
+                  ? "border-red-400/45 bg-red-500/18 text-red-100"
+                  : isFinished
+                    ? "border-white/20 bg-white/8 text-white/70"
+                    : "border-cyan-400/35 bg-cyan-500/15 text-cyan-100"
+              )}
+            >
+              {isLive ? "Live" : isFinished ? "Final" : "Pregame"}
+            </span>
+          )}
+          {match?.competition && (
+            <Link
+              to={`/sports/soccer/league/${match.competition.toLowerCase().replace(/\s+/g, '-')}`}
+              className="px-3 py-2 rounded-xl border border-emerald-500/30 bg-emerald-500/10 text-emerald-300 text-xs font-medium hover:bg-emerald-500/20 transition-colors"
+            >
+              {match.competition}
+            </Link>
+          )}
+        </div>
+      </div>
 
-      <div className="relative max-w-5xl mx-auto px-4 py-4 sm:py-6">
+      <div className="relative max-w-3xl mx-auto px-4 md:px-6 py-1 sm:py-2">
         {loading && !data ? (
           <MatchSkeleton />
         ) : error ? (
           <>
-            <SoccerPageHeader
-              breadcrumbs={[{ label: "Match" }]}
-              title="Match Not Found"
-              onBack={goBack}
-            />
             <div className="p-8 rounded-2xl bg-red-500/10 border border-red-500/30 text-center mt-6">
               <AlertCircle className="h-8 w-8 mx-auto mb-3 text-red-400" />
               <p className="text-red-400 font-medium">{error}</p>
@@ -597,22 +664,129 @@ export default function SoccerMatchCenter() {
           </>
         ) : match ? (
           <>
-            {/* Premium Match Header */}
-            <PremiumMatchHeader 
-              match={match} 
-              isLive={isLive}
-              isFinished={isFinished}
-              isWatching={isWatching}
-              onWatchToggle={handleWatchToggle}
-              onShare={handleShare}
-              isInPool={isInPool}
-              lastUpdated={lastUpdated}
-              isRefreshing={isRefreshing}
-              onRefresh={() => fetchMatch(true)}
-              isFollowing={isFollowing}
-              onFollowToggle={handleFollowToggle}
-              fromLeagueId={fromLeagueId}
-            />
+            {viewMode === "pregame" && (
+              <div className="mt-2 space-y-4">
+                <div className="rounded-xl border border-cyan-500/25 bg-[#1B2633] p-4 md:p-5">
+                  <div className="grid grid-cols-3 items-center gap-3">
+                    <div className="rounded-xl border border-white/[0.05] bg-[#121821] p-3">
+                      <div className="flex items-center gap-2">
+                        <TeamCrest teamId={match.awayTeam.id} teamName={match.awayTeam.name} className="h-14 w-14" />
+                        <div className="min-w-0">
+                          <p className="truncate text-sm font-semibold text-[#E5E7EB]">{match.awayTeam.name}</p>
+                          <p className="text-[10px] uppercase tracking-wide text-[#6B7280]">Away</p>
+                        </div>
+                      </div>
+                      <p className="mt-1 text-3xl font-black text-[#E5E7EB]">{match.awayScore ?? "0"}</p>
+                    </div>
+                    <div className="text-center">
+                      <p className="text-[10px] uppercase tracking-wide text-cyan-300">{match.competition || "Soccer"}</p>
+                      <p className="mt-1 text-xs text-[#9CA3AF]">
+                        {match.startTime
+                          ? new Date(match.startTime).toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric" })
+                          : "Scheduled"}
+                      </p>
+                      <p className="text-sm font-semibold text-[#E5E7EB]">
+                        {match.startTime
+                          ? new Date(match.startTime).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })
+                          : "TBD"}
+                      </p>
+                    </div>
+                    <div className="rounded-xl border border-white/[0.05] bg-[#121821] p-3 text-right">
+                      <div className="flex items-center justify-end gap-2">
+                        <div className="min-w-0">
+                          <p className="truncate text-sm font-semibold text-[#E5E7EB]">{match.homeTeam.name}</p>
+                          <p className="text-[10px] uppercase tracking-wide text-[#6B7280]">Home</p>
+                        </div>
+                        <TeamCrest teamId={match.homeTeam.id} teamName={match.homeTeam.name} className="h-14 w-14" />
+                      </div>
+                      <p className="mt-1 text-3xl font-black text-[#E5E7EB]">{match.homeScore ?? "0"}</p>
+                    </div>
+                  </div>
+                  <div className="mt-3 grid grid-cols-3 gap-2">
+                    <div className="rounded-xl border border-white/[0.05] bg-[#121821] p-2 text-center">
+                      <p className="text-[10px] uppercase text-[#6B7280]">Spread</p>
+                      <p className="text-sm font-bold text-[#E5E7EB]">{shortCode(match.homeTeam)} {marketSpread}</p>
+                    </div>
+                    <div className="rounded-xl border border-white/[0.05] bg-[#121821] p-2 text-center">
+                      <p className="text-[10px] uppercase text-[#6B7280]">Total</p>
+                      <p className="text-sm font-bold text-[#E5E7EB]">{marketTotal}</p>
+                    </div>
+                    <div className="rounded-xl border border-white/[0.05] bg-[#121821] p-2 text-center">
+                      <p className="text-[10px] uppercase text-[#6B7280]">Moneyline</p>
+                      <p className="text-sm font-bold text-[#E5E7EB]">{shortCode(match.homeTeam)} {marketMoneyline}</p>
+                    </div>
+                  </div>
+                </div>
+
+                <UnifiedLiveSignalStrip
+                  cards={[
+                    {
+                      title: "Line Movement",
+                      value: "Waiting for market history",
+                      chip: "LIVE SHIFT",
+                      tone: "red",
+                    },
+                    {
+                      title: "Prop Heat",
+                      value: "Awaiting featured props",
+                      chip: "HEAT MAP",
+                      tone: "green",
+                    },
+                    {
+                      title: "Pace / Momentum",
+                      value: "Projected possession profile",
+                      chip: "FLOW SIGNAL",
+                      tone: "amber",
+                    },
+                  ]}
+                />
+
+                <div className="rounded-xl border border-cyan-500/25 bg-[#1B2633] p-4 md:p-5">
+                  <div className="flex items-start gap-3">
+                    <CoachGAvatar size="lg" presence="monitoring" onClick={() => window.location.assign("/scout")} />
+                    <div className="min-w-0 flex-1">
+                      <div className="flex items-center gap-2">
+                        <p className="text-[10px] font-semibold uppercase tracking-wide text-cyan-200">Coach G Spotlight</p>
+                        <span className="rounded-full border border-white/[0.08] bg-white/[0.04] px-1.5 py-0.5 text-[9px] text-[#9CA3AF]">
+                          {match.competition || "Soccer"}
+                        </span>
+                      </div>
+                      <p className="mt-1 text-sm text-[#E5E7EB]">
+                        {match.homeTeam.name} vs {match.awayTeam.name} | Coach G pregame intelligence snapshot.
+                      </p>
+                      <p className="mt-1 text-[11px] text-[#6B7280]">Market Shift · Rotation Risk · Tempo Edge</p>
+                      <div className="mt-3 flex items-center gap-2">
+                        <button
+                          onClick={() => window.location.assign("/scout")}
+                          className="rounded-md border border-white/[0.08] bg-white/[0.04] px-2.5 py-1 text-xs text-[#9CA3AF] hover:text-[#E5E7EB] hover:bg-white/[0.08]"
+                        >
+                          Video Pending
+                        </button>
+                        <button
+                          onClick={() => window.location.assign("/scout")}
+                          className="rounded-md border border-cyan-400/30 bg-cyan-500/15 px-2.5 py-1 text-xs text-cyan-100 hover:bg-cyan-500/25"
+                        >
+                          Read Full Analysis
+                        </button>
+                      </div>
+                      <CoachGInlineAsk
+                        gameId={match.eventId}
+                        className="mt-3"
+                        inputClassName="bg-white/[0.03] border-white/[0.08]"
+                        buttonClassName="border-cyan-400/35 bg-cyan-500/18 hover:bg-cyan-500/28"
+                        replyClassName="bg-white/[0.03] border-white/[0.08]"
+                      />
+                    </div>
+                  </div>
+                </div>
+
+                <UnifiedVideoPanel
+                  title="Coach G Video"
+                  subtitle="Video and article stay synchronized from the same Coach G source."
+                  fallbackText="Video analysis coming soon."
+                />
+              </div>
+            )}
 
             {viewMode === "live" && (
               <div className="mt-4 space-y-4">
@@ -662,6 +836,7 @@ export default function SoccerMatchCenter() {
                   totalResult={finalOutcomes.totalResult}
                   coverResult={finalOutcomes.coverResult}
                   overUnderResult={finalOutcomes.overUnderResult}
+                  teamLogoSize={64}
                 />
                 <div className="rounded-xl border border-violet-400/20 bg-[#121821] p-4 md:p-5">
                   <h3 className="text-sm font-semibold text-[#E5E7EB]">Coach G Postgame Take</h3>
@@ -678,17 +853,17 @@ export default function SoccerMatchCenter() {
               </div>
             )}
 
-            {/* Premium Tab Navigation - Mobile-optimized horizontal scroll */}
-            <div className="mt-4 mb-4 sm:mb-6 -mx-4 px-4 sm:mx-0 sm:px-0">
-              <div className="flex items-center gap-1 p-1.5 bg-black/40 backdrop-blur-sm rounded-xl border border-white/10 overflow-x-auto scrollbar-hide snap-x snap-mandatory">
+            {/* NHL-style Tab Navigation shell */}
+            <div className="relative mt-4 mb-4 sm:mb-6">
+              <div className="flex items-center gap-1.5 p-2 rounded-[14px] border border-white/[0.05] bg-[#121821] overflow-x-auto scrollbar-hide shadow-[0_8px_24px_rgba(0,0,0,0.25)]">
                 {tabs.map((tab) => (
                   <button
                     key={tab.key}
                     onClick={() => setActiveTab(tab.key)}
-                    className={`relative flex items-center justify-center gap-1.5 min-w-[44px] sm:min-w-0 px-3 sm:px-4 py-3 sm:py-2.5 rounded-lg text-sm font-medium transition-all whitespace-nowrap snap-start ${
+                    className={`relative flex min-h-[48px] items-center justify-center gap-1.5 min-w-[44px] sm:min-w-0 px-3 sm:px-4 py-2.5 rounded-xl text-sm font-semibold transition-all whitespace-nowrap ${
                       activeTab === tab.key
-                        ? "bg-gradient-to-r from-emerald-500 to-cyan-500 text-white shadow-lg shadow-emerald-500/25"
-                        : "text-white/60 hover:text-white active:bg-white/10"
+                        ? "text-[#E5E7EB] border-cyan-300/45 bg-cyan-500/20 shadow-[0_0_24px_rgba(34,211,238,0.22)]"
+                        : "text-[#9CA3AF] border border-white/[0.05] bg-[#121821] hover:text-[#E5E7EB] hover:border-white/[0.10] hover:bg-[#16202B]"
                     }`}
                   >
                     {tab.icon}
@@ -701,6 +876,10 @@ export default function SoccerMatchCenter() {
                   </button>
                 ))}
               </div>
+              <p className="mt-2 flex items-center gap-2 px-1 text-[11px] md:text-xs text-[#9CA3AF]">
+                <span className="inline-block h-1.5 w-1.5 rounded-full bg-cyan-300/80" />
+                Switch views instantly: timeline, lineups, stats, H2H, markets, and pools.
+              </p>
             </div>
 
             {/* Tab Content */}
@@ -712,333 +891,89 @@ export default function SoccerMatchCenter() {
                 exit={{ opacity: 0, y: -10 }}
                 transition={{ duration: 0.2 }}
               >
-                {activeTab === "overview" && (
-                  <OverviewTab 
-                    match={match} 
-                    timeline={data?.timeline || []} 
-                    statistics={data?.statistics}
-                    isLive={isLive}
-                    playerPhotos={playerPhotos}
-                  />
-                )}
-                {activeTab === "timeline" && (
-                  <TimelineTab 
-                    timeline={data?.timeline || []} 
-                    homeTeam={match.homeTeam}
-                    awayTeam={match.awayTeam}
-                    isLive={isLive}
-                    timelineRef={timelineRef}
-                  />
-                )}
-                {activeTab === "lineups" && (
-                  <LineupsTab 
-                    lineups={data?.lineups || { home: [], away: [] }}
-                    homeTeam={match.homeTeam}
-                    awayTeam={match.awayTeam}
-                    isPlayerFollowed={isPlayerFollowed}
-                    onFollowToggle={(player, team) => {
-                      const isFollowing = isPlayerFollowed(player.name, "soccer");
-                      if (isFollowing) {
-                        unfollowPlayerByName(player.name, "soccer");
-                      } else {
-                        followPlayer({
-                          player_name: player.name,
-                          player_id: player.playerId,
-                          sport: "soccer",
-                          team: team.name,
-                          team_abbr: team.abbreviation,
-                          position: player.position,
-                        });
-                      }
-                    }}
-                  />
-                )}
-                {activeTab === "stats" && (
-                  <StatsTab 
-                    statistics={data?.statistics}
-                    homeTeam={match.homeTeam}
-                    awayTeam={match.awayTeam}
-                  />
-                )}
-                {activeTab === "h2h" && (
-                  <H2HTab 
-                    h2hData={h2hData}
-                    loading={h2hLoading}
-                    homeTeam={match.homeTeam}
-                    awayTeam={match.awayTeam}
-                  />
-                )}
-                {activeTab === "matchups" && (
-                  hasPremiumAccess ? (
-                    <MatchupsTab 
-                      match={match}
+                <div className="rounded-[14px] border border-white/[0.05] bg-[#16202B] p-4 shadow-[0_0_28px_rgba(59,130,246,0.09)] md:p-5">
+                  <div className="mb-2 text-[11px] text-[#6B7280]">{tabSubtitles[activeTab]}</div>
+                  {activeTab === "overview" && (
+                    <OverviewTab 
+                      match={match} 
+                      timeline={data?.timeline || []} 
+                      statistics={data?.statistics}
+                      isLive={isLive}
+                      playerPhotos={playerPhotos}
+                    />
+                  )}
+                  {activeTab === "timeline" && (
+                    <TimelineTab 
+                      timeline={data?.timeline || []} 
+                      homeTeam={match.homeTeam}
+                      awayTeam={match.awayTeam}
+                      isLive={isLive}
+                      timelineRef={timelineRef}
+                    />
+                  )}
+                  {activeTab === "lineups" && (
+                    <LineupsTab 
+                      lineups={data?.lineups || { home: [], away: [] }}
+                      homeTeam={match.homeTeam}
+                      awayTeam={match.awayTeam}
+                      isPlayerFollowed={isPlayerFollowed}
+                      onFollowToggle={(player, team) => {
+                        const isFollowing = isPlayerFollowed(player.name, "soccer");
+                        if (isFollowing) {
+                          unfollowPlayerByName(player.name, "soccer");
+                        } else {
+                          followPlayer({
+                            player_name: player.name,
+                            player_id: player.playerId,
+                            sport: "soccer",
+                            team: team.name,
+                            team_abbr: team.abbreviation,
+                            position: player.position,
+                          });
+                        }
+                      }}
+                    />
+                  )}
+                  {activeTab === "stats" && (
+                    <StatsTab 
+                      statistics={data?.statistics}
                       homeTeam={match.homeTeam}
                       awayTeam={match.awayTeam}
                     />
-                  ) : (
-                    <PremiumGate 
-                      feature="Market Insights & Betting Intelligence"
-                      currentTier={subscription?.tier || 'anonymous'}
+                  )}
+                  {activeTab === "h2h" && (
+                    <H2HTab 
+                      h2hData={h2hData}
+                      loading={h2hLoading}
+                      homeTeam={match.homeTeam}
+                      awayTeam={match.awayTeam}
                     />
-                  )
-                )}
-                {activeTab === "pools" && (
-                  <PoolsTab 
-                    match={match}
-                    isInPool={isInPool}
-                  />
-                )}
+                  )}
+                  {activeTab === "matchups" && (
+                    hasPremiumAccess ? (
+                      <MatchupsTab 
+                        match={match}
+                        homeTeam={match.homeTeam}
+                        awayTeam={match.awayTeam}
+                      />
+                    ) : (
+                      <PremiumGate 
+                        feature="Market Insights & Betting Intelligence"
+                        currentTier={subscription?.tier || 'anonymous'}
+                      />
+                    )
+                  )}
+                  {activeTab === "pools" && (
+                    <PoolsTab 
+                      match={match}
+                      isInPool={isInPool}
+                    />
+                  )}
+                </div>
               </motion.div>
             </AnimatePresence>
           </>
         ) : null}
-      </div>
-    </div>
-  );
-}
-
-// ============================================================================
-// PREMIUM MATCH HEADER
-// ============================================================================
-
-interface PremiumMatchHeaderProps {
-  match: Match;
-  isLive: boolean;
-  isFinished: boolean;
-  isWatching: boolean;
-  onWatchToggle: () => void;
-  onShare: () => void;
-  isInPool: boolean;
-  lastUpdated: Date | null;
-  isRefreshing: boolean;
-  onRefresh: () => void;
-  isFollowing: boolean;
-  onFollowToggle: () => void;
-  fromLeagueId: string | null;
-}
-
-function PremiumMatchHeader({ 
-  match, 
-  isLive, 
-  isFinished,
-  isWatching,
-  onWatchToggle,
-  onShare,
-  isInPool,
-  lastUpdated,
-  isRefreshing,
-  onRefresh,
-  isFollowing,
-  onFollowToggle,
-  fromLeagueId
-}: PremiumMatchHeaderProps) {
-  const formatTime = (time: string | null) => {
-    if (!time) return "TBD";
-    return new Date(time).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-  };
-
-  const formatDate = (time: string | null) => {
-    if (!time) return "";
-    return new Date(time).toLocaleDateString([], { weekday: "short", month: "short", day: "numeric" });
-  };
-
-  const formatUpdated = (date: Date | null) => {
-    if (!date) return "";
-    const seconds = Math.floor((Date.now() - date.getTime()) / 1000);
-    if (seconds < 60) return `${seconds}s ago`;
-    const minutes = Math.floor(seconds / 60);
-    return `${minutes}m ago`;
-  };
-
-  const getStatusDisplay = () => {
-    if (isLive) {
-      return (
-        <div className="flex items-center gap-2">
-          <span className="relative flex h-3 w-3">
-            <span className="absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75 animate-ping" />
-            <span className="relative inline-flex h-3 w-3 rounded-full bg-emerald-500" />
-          </span>
-          <span className="text-emerald-400 font-bold text-lg">{match.clock || "LIVE"}</span>
-        </div>
-      );
-    }
-    
-    if (isFinished) {
-      return <span className="text-white/60 font-semibold text-lg">FT</span>;
-    }
-
-    return (
-      <div className="text-center">
-        <p className="text-white/40 text-xs">{formatDate(match.startTime)}</p>
-        <p className="text-white font-bold text-lg">{formatTime(match.startTime)}</p>
-      </div>
-    );
-  };
-
-  return (
-    <div className="rounded-2xl bg-gradient-to-br from-white/10 to-white/5 border border-white/10 backdrop-blur-sm overflow-hidden">
-      {/* Competition & Venue Bar */}
-      <div className="px-4 py-2 bg-black/30 border-b border-white/5 flex items-center justify-between gap-4">
-        <div className="flex items-center gap-3 text-white/50 text-xs sm:text-sm">
-          {match.competition && (
-            <Link 
-              to={`/sports/soccer/league/${match.competition.toLowerCase().replace(/\s+/g, '-')}`}
-              className="font-medium text-white/70 hover:text-emerald-400 transition-colors"
-            >
-              {match.competition}
-            </Link>
-          )}
-          {match.venue && (
-            <span className="flex items-center gap-1">
-              <MapPin className="h-3 w-3" />
-              <span className="hidden sm:inline">{match.venue}</span>
-            </span>
-          )}
-        </div>
-        
-        {/* Updated timestamp */}
-        {lastUpdated && (
-          <div className="flex items-center gap-1 text-white/40 text-xs">
-            <RefreshCw className="h-3 w-3" />
-            <span>Updated {formatUpdated(lastUpdated)}</span>
-          </div>
-        )}
-      </div>
-
-      {/* Main Scoreboard */}
-      <div className="p-4 sm:p-6">
-        <div className="flex items-center justify-between gap-2 sm:gap-4">
-          {/* Home Team */}
-          <Link 
-            to={buildSoccerTeamUrl(match.homeTeam.id, { fromLeagueId: fromLeagueId || undefined })}
-            className="flex-1 flex flex-col items-center text-center group"
-          >
-            <TeamCrest 
-              teamId={match.homeTeam.id} 
-              teamName={match.homeTeam.name} 
-              size="lg"
-              className="mb-2 sm:mb-3 transition-transform group-hover:scale-105"
-            />
-            <h2 className="text-sm sm:text-lg font-bold text-white leading-tight group-hover:text-emerald-400 transition-colors">{match.homeTeam.name}</h2>
-            <p className="text-[10px] sm:text-xs text-white/40 uppercase tracking-wide mt-0.5">Home</p>
-            <span className="text-[9px] sm:text-[10px] text-emerald-400/70 group-hover:text-emerald-400 transition-colors mt-1">View Team →</span>
-          </Link>
-
-          {/* Score / Status */}
-          <div className="text-center px-2 sm:px-6 shrink-0">
-            {match.homeScore !== null && match.awayScore !== null ? (
-              <div className="flex items-center gap-2 sm:gap-4 mb-2">
-                <span className="text-4xl sm:text-5xl font-black text-white tabular-nums">{match.homeScore}</span>
-                <span className="text-xl sm:text-2xl text-white/30">-</span>
-                <span className="text-4xl sm:text-5xl font-black text-white tabular-nums">{match.awayScore}</span>
-              </div>
-            ) : (
-              <div className="mb-2">
-                <span className="text-xl sm:text-2xl text-white/30">vs</span>
-              </div>
-            )}
-            {getStatusDisplay()}
-            {match.halfTimeScore && (
-              <p className="text-xs text-white/40 mt-2">HT: {match.halfTimeScore}</p>
-            )}
-          </div>
-
-          {/* Away Team */}
-          <Link 
-            to={buildSoccerTeamUrl(match.awayTeam.id, { fromLeagueId: fromLeagueId || undefined })}
-            className="flex-1 flex flex-col items-center text-center group"
-          >
-            <TeamCrest 
-              teamId={match.awayTeam.id} 
-              teamName={match.awayTeam.name} 
-              size="lg"
-              className="mb-2 sm:mb-3 transition-transform group-hover:scale-105"
-            />
-            <h2 className="text-sm sm:text-lg font-bold text-white leading-tight group-hover:text-cyan-400 transition-colors">{match.awayTeam.name}</h2>
-            <p className="text-[10px] sm:text-xs text-white/40 uppercase tracking-wide mt-0.5">Away</p>
-            <span className="text-[9px] sm:text-[10px] text-cyan-400/70 group-hover:text-cyan-400 transition-colors mt-1">View Team →</span>
-          </Link>
-        </div>
-
-        {/* Action Buttons - Mobile: icon-only row, Desktop: full labels */}
-        <div className="flex items-center justify-center gap-2 mt-4 sm:mt-5 pt-4 border-t border-white/10">
-          {/* Refresh Button - Live matches only */}
-          {isLive && (
-            <button 
-              onClick={onRefresh}
-              disabled={isRefreshing}
-              className="flex items-center justify-center gap-1.5 h-11 w-11 sm:w-auto sm:px-4 rounded-xl bg-emerald-500/10 hover:bg-emerald-500/20 active:bg-emerald-500/30 border border-emerald-500/30 text-emerald-400 transition-all text-sm disabled:opacity-50"
-              title={isRefreshing ? "Updating..." : "Refresh"}
-            >
-              <RefreshCw className={`h-5 w-5 sm:h-4 sm:w-4 ${isRefreshing ? 'animate-spin' : ''}`} />
-              <span className="hidden sm:inline">{isRefreshing ? "Updating..." : "Refresh"}</span>
-            </button>
-          )}
-          
-          {/* Follow Button */}
-          <button 
-            onClick={onFollowToggle}
-            className={`flex items-center justify-center gap-1.5 h-11 w-11 sm:w-auto sm:px-4 rounded-xl border transition-all text-sm ${
-              isFollowing 
-                ? "bg-pink-500/20 border-pink-500/50 text-pink-400" 
-                : "bg-white/5 hover:bg-white/10 active:bg-white/20 border-white/10 text-white/70 hover:text-white"
-            }`}
-            title={isFollowing ? "Following" : "Follow"}
-          >
-            <Heart className={`h-5 w-5 sm:h-4 sm:w-4 ${isFollowing ? 'fill-current' : ''}`} />
-            <span className="hidden sm:inline">{isFollowing ? "Following" : "Follow"}</span>
-          </button>
-
-          {/* Watch/Scout Button */}
-          <button 
-            onClick={onWatchToggle}
-            className={`flex items-center justify-center gap-1.5 h-11 w-11 sm:w-auto sm:px-4 rounded-xl border transition-all text-sm ${
-              isWatching 
-                ? "bg-cyan-500/20 border-cyan-500/50 text-cyan-400" 
-                : "bg-white/5 hover:bg-white/10 active:bg-white/20 border-white/10 text-white/70 hover:text-white"
-            }`}
-            title={isWatching ? "Watching" : "Watch"}
-          >
-            <Eye className="h-5 w-5 sm:h-4 sm:w-4" />
-            <span className="hidden sm:inline">{isWatching ? "Watching" : "Watch"}</span>
-          </button>
-
-          {/* Share Button */}
-          <button 
-            onClick={onShare}
-            className="flex items-center justify-center gap-1.5 h-11 w-11 sm:w-auto sm:px-4 rounded-xl bg-white/5 hover:bg-white/10 active:bg-white/20 border border-white/10 text-white/70 hover:text-white transition-all text-sm"
-            title="Share"
-          >
-            <Share2 className="h-5 w-5 sm:h-4 sm:w-4" />
-            <span className="hidden sm:inline">Share</span>
-          </button>
-
-          {/* Pool Picks Button - only show if in pool */}
-          {isInPool && (
-            <button className="flex items-center gap-1.5 h-11 px-4 rounded-xl bg-gradient-to-r from-amber-500 to-orange-500 text-white font-medium transition-all active:scale-95 sm:hover:shadow-lg sm:hover:shadow-amber-500/25 text-sm">
-              <Ticket className="h-5 w-5 sm:h-4 sm:w-4" />
-              <span className="sr-only sm:not-sr-only">Enter Pool Picks</span>
-            </button>
-          )}
-        </div>
-
-        {/* Match info strip */}
-        {(match.referee || match.attendance) && (
-          <div className="flex items-center justify-center gap-4 sm:gap-6 mt-4 pt-3 border-t border-white/5">
-            {match.referee && (
-              <div className="flex items-center gap-2 text-white/40 text-xs sm:text-sm">
-                <User className="h-3.5 w-3.5" />
-                <span>{match.referee}</span>
-              </div>
-            )}
-            {match.attendance && (
-              <div className="flex items-center gap-2 text-white/40 text-xs sm:text-sm">
-                <Users className="h-3.5 w-3.5" />
-                <span>{match.attendance.toLocaleString()}</span>
-              </div>
-            )}
-          </div>
-        )}
       </div>
     </div>
   );
@@ -1124,18 +1059,18 @@ function OverviewTab({ match, timeline, statistics, isLive, playerPhotos }: Over
   return (
     <div className="space-y-4 sm:space-y-6">
       {/* Coach G Match Brief - Broadcast Desk Style */}
-      <div className="relative p-4 sm:p-6 rounded-2xl bg-gradient-to-br from-purple-600/20 via-purple-500/10 to-cyan-500/20 border border-purple-500/30 overflow-hidden">
-        {/* Ambient glow */}
-        <div className="absolute inset-0 bg-gradient-to-r from-purple-500/10 via-transparent to-cyan-500/10 animate-pulse" />
+      <div className="relative overflow-hidden rounded-2xl border border-violet-500/20 bg-gradient-to-br from-white/[0.07] to-white/[0.02] p-4 sm:p-6 shadow-[0_10px_24px_rgba(0,0,0,0.28)]">
+        {/* Subtle ambient tint */}
+        <div className="absolute inset-0 bg-gradient-to-r from-violet-500/8 via-transparent to-cyan-500/8" />
         
         <div className="relative flex items-start gap-3 sm:gap-4">
-          <div className="h-12 w-12 sm:h-14 sm:w-14 rounded-xl bg-gradient-to-br from-purple-500/40 to-cyan-500/40 flex items-center justify-center shrink-0 ring-2 ring-purple-400/30">
+          <div className="h-12 w-12 shrink-0 rounded-xl border border-violet-400/25 bg-violet-500/15 sm:h-14 sm:w-14 flex items-center justify-center">
             <CoachGAvatar size="sm" presence={isLive ? "alert" : "monitoring"} className="h-10 w-10 sm:h-12 sm:w-12 rounded-lg" />
           </div>
           <div className="flex-1 min-w-0">
             <div className="flex items-center gap-2 mb-1.5">
               <h4 className="font-black text-white text-sm sm:text-base">Coach G</h4>
-              <span className="px-2 py-0.5 rounded-full bg-purple-500/20 text-purple-300 text-[10px] font-bold uppercase tracking-wide">
+              <span className="rounded-full bg-violet-500/20 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide text-violet-200">
                 Match Brief
               </span>
             </div>
@@ -1166,7 +1101,7 @@ function OverviewTab({ match, timeline, statistics, isLive, playerPhotos }: Over
       {statistics && (
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 sm:gap-4">
           {/* Possession Flow */}
-          <div className="p-4 rounded-xl bg-gradient-to-br from-white/5 to-white/[0.02] border border-white/10">
+          <div className="p-4 rounded-xl bg-gradient-to-br from-white/[0.06] to-white/[0.02] border border-white/10 shadow-[0_8px_20px_rgba(0,0,0,0.22)]">
             <h3 className="text-xs font-bold text-white/60 uppercase tracking-wide mb-3 flex items-center gap-2">
               <Activity className="h-3.5 w-3.5 text-cyan-400" />
               Ball Control
@@ -1184,7 +1119,7 @@ function OverviewTab({ match, timeline, statistics, isLive, playerPhotos }: Over
           </div>
 
           {/* Attacking Pressure */}
-          <div className="p-4 rounded-xl bg-gradient-to-br from-white/5 to-white/[0.02] border border-white/10">
+          <div className="p-4 rounded-xl bg-gradient-to-br from-white/[0.06] to-white/[0.02] border border-white/10 shadow-[0_8px_20px_rgba(0,0,0,0.22)]">
             <h3 className="text-xs font-bold text-white/60 uppercase tracking-wide mb-3 flex items-center gap-2">
               <Zap className="h-3.5 w-3.5 text-amber-400" />
               Attack Pressure
@@ -1205,7 +1140,7 @@ function OverviewTab({ match, timeline, statistics, isLive, playerPhotos }: Over
 
       {/* Key Stats Grid - Broadcast Dashboard */}
       {statistics && (
-        <div className="p-4 sm:p-5 rounded-xl bg-gradient-to-br from-white/5 to-white/[0.02] border border-white/10">
+        <div className="p-4 sm:p-5 rounded-xl bg-gradient-to-br from-white/[0.06] to-white/[0.02] border border-white/10 shadow-[0_8px_20px_rgba(0,0,0,0.22)]">
           <h3 className="text-xs font-bold text-white/60 uppercase tracking-wide mb-3 flex items-center gap-2">
             <BarChart3 className="h-3.5 w-3.5 text-cyan-400" />
             Quick Stats
@@ -1238,7 +1173,7 @@ function OverviewTab({ match, timeline, statistics, isLive, playerPhotos }: Over
             {goals.length > 0 && (
               <div className="p-4 sm:p-5 rounded-xl bg-gradient-to-br from-emerald-500/20 to-emerald-500/5 border border-emerald-500/30">
                 <h3 className="text-xs sm:text-sm font-bold text-emerald-400 uppercase tracking-wide mb-3 flex items-center gap-2">
-                  <span className="text-lg">⚽</span>
+                  <Target className="h-4 w-4" />
                   Goal Scorers ({goals.length})
                 </h3>
                 <div className="space-y-2">
@@ -1316,7 +1251,7 @@ function OverviewTab({ match, timeline, statistics, isLive, playerPhotos }: Over
       })()}
 
       {/* Key Moments - All Events */}
-      <div className="p-4 sm:p-5 rounded-xl bg-gradient-to-br from-white/5 to-white/[0.02] border border-white/10">
+      <div className="p-4 sm:p-5 rounded-xl bg-gradient-to-br from-white/[0.06] to-white/[0.02] border border-white/10 shadow-[0_8px_20px_rgba(0,0,0,0.22)]">
         <div className="flex items-center justify-between mb-3 sm:mb-4">
           <h3 className="text-xs sm:text-sm font-bold text-white/80 uppercase tracking-wide flex items-center gap-2">
             <Zap className="h-4 w-4 text-amber-400" />
@@ -1384,7 +1319,7 @@ function OverviewTab({ match, timeline, statistics, isLive, playerPhotos }: Over
 
       {/* Pre-Match Preview */}
       {!isLive && !match.homeScore && (
-        <div className="p-4 sm:p-5 rounded-xl bg-gradient-to-br from-cyan-500/10 to-blue-500/10 border border-cyan-500/20">
+        <div className="p-4 sm:p-5 rounded-xl bg-gradient-to-br from-cyan-500/10 to-blue-500/10 border border-cyan-500/25 shadow-[0_8px_20px_rgba(0,0,0,0.22)]">
           <h3 className="text-xs sm:text-sm font-bold text-white uppercase tracking-wide mb-2 flex items-center gap-2">
             <Eye className="h-4 w-4 text-cyan-400" />
             Pre-Match Focus
@@ -1535,7 +1470,7 @@ function TimelineTab({ timeline, homeTeam, awayTeam, isLive, timelineRef }: Time
 
   if (timeline.length === 0) {
     return (
-      <div className="p-8 rounded-xl bg-white/5 border border-white/10 text-center">
+      <div className="p-8 rounded-xl bg-gradient-to-br from-white/[0.06] to-white/[0.02] border border-white/10 text-center shadow-[0_8px_20px_rgba(0,0,0,0.22)]">
         <Clock className="h-8 w-8 mx-auto mb-3 text-white/30" />
         <p className="text-white/50">No events recorded yet</p>
         <p className="text-xs text-white/30 mt-1">Events will appear here as the match progresses</p>
@@ -1560,7 +1495,7 @@ function TimelineTab({ timeline, homeTeam, awayTeam, isLive, timelineRef }: Time
   });
 
   return (
-    <div ref={endRef} className="space-y-4 sm:space-y-6 max-h-[600px] overflow-y-auto pr-2 scrollbar-thin scrollbar-thumb-white/10 scrollbar-track-transparent">
+    <div ref={endRef} className="space-y-4 sm:space-y-6 max-h-[600px] overflow-y-auto pr-2 p-4 rounded-2xl border border-white/10 bg-gradient-to-br from-white/[0.05] to-transparent scrollbar-thin scrollbar-thumb-white/10 scrollbar-track-transparent shadow-[0_10px_24px_rgba(0,0,0,0.25)]">
       {/* Jump to latest button for live matches */}
       {isLive && (
         <div className="sticky top-0 z-10 pb-3">
@@ -2067,7 +2002,7 @@ function LineupsTab({ lineups, homeTeam, awayTeam, isPlayerFollowed, onFollowTog
 
   if (lineups.home.length === 0 && lineups.away.length === 0) {
     return (
-      <div className="p-8 rounded-xl bg-white/5 border border-white/10 text-center">
+      <div className="p-8 rounded-xl bg-gradient-to-br from-white/[0.06] to-white/[0.02] border border-white/10 text-center shadow-[0_8px_20px_rgba(0,0,0,0.22)]">
         <Users className="h-8 w-8 mx-auto mb-3 text-white/30" />
         <p className="text-white/50">Lineups not yet available</p>
         <p className="text-xs text-white/30 mt-1">Lineups typically appear 1 hour before kickoff</p>
@@ -2078,7 +2013,7 @@ function LineupsTab({ lineups, homeTeam, awayTeam, isPlayerFollowed, onFollowTog
   return (
     <div className="space-y-4 sm:space-y-6">
       {/* View Mode Toggle */}
-      <div className="flex items-center justify-center gap-1 p-1 bg-white/5 rounded-lg w-fit mx-auto">
+      <div className="flex items-center justify-center gap-1 p-1 bg-gradient-to-br from-white/[0.06] to-white/[0.02] rounded-xl border border-white/10 w-fit mx-auto shadow-[0_8px_20px_rgba(0,0,0,0.22)]">
         <button
           onClick={() => setViewMode('formation')}
           className={`px-3 py-1.5 rounded-md text-xs font-medium transition-all ${
@@ -2158,7 +2093,7 @@ function LineupsTab({ lineups, homeTeam, awayTeam, isPlayerFollowed, onFollowTog
       {(homeBench.length > 0 || awayBench.length > 0) && (
         <button
           onClick={() => setShowBench(!showBench)}
-          className="w-full py-2.5 sm:py-3 rounded-xl bg-white/5 border border-white/10 text-white/60 hover:text-white hover:bg-white/10 transition-all flex items-center justify-center gap-2 text-sm"
+          className="w-full py-2.5 sm:py-3 rounded-xl bg-gradient-to-br from-white/[0.06] to-white/[0.02] border border-white/10 text-white/60 hover:text-white hover:bg-white/10 transition-all flex items-center justify-center gap-2 text-sm shadow-[0_8px_20px_rgba(0,0,0,0.22)]"
         >
           <Users className="h-4 w-4" />
           {showBench ? "Hide Substitutes" : `Show Substitutes (${homeBench.length + awayBench.length})`}
@@ -2176,7 +2111,7 @@ function LineupsTab({ lineups, homeTeam, awayTeam, isPlayerFollowed, onFollowTog
             className="grid md:grid-cols-2 gap-4 sm:gap-6"
           >
             {/* Home Bench */}
-            <div className="p-4 sm:p-5 rounded-xl bg-white/5 border border-white/10">
+            <div className="p-4 sm:p-5 rounded-xl bg-gradient-to-br from-white/[0.06] to-white/[0.02] border border-white/10 shadow-[0_8px_20px_rgba(0,0,0,0.22)]">
               <h4 className="text-xs sm:text-sm font-bold text-white/60 mb-2 sm:mb-3">Substitutes</h4>
               <div className="space-y-1.5 sm:space-y-2">
                 {homeBench.map((player) => (
@@ -2186,7 +2121,7 @@ function LineupsTab({ lineups, homeTeam, awayTeam, isPlayerFollowed, onFollowTog
             </div>
 
             {/* Away Bench */}
-            <div className="p-4 sm:p-5 rounded-xl bg-white/5 border border-white/10">
+            <div className="p-4 sm:p-5 rounded-xl bg-gradient-to-br from-white/[0.06] to-white/[0.02] border border-white/10 shadow-[0_8px_20px_rgba(0,0,0,0.22)]">
               <h4 className="text-xs sm:text-sm font-bold text-white/60 mb-2 sm:mb-3">Substitutes</h4>
               <div className="space-y-1.5 sm:space-y-2">
                 {awayBench.map((player) => (
@@ -2308,7 +2243,7 @@ function StatsTab({ statistics, homeTeam, awayTeam }: StatsTabProps) {
 
   if (!statistics || (Object.keys(statistics.home).length === 0 && Object.keys(statistics.away).length === 0)) {
     return (
-      <div className="p-8 rounded-xl bg-white/5 border border-white/10 text-center">
+      <div className="p-8 rounded-xl bg-gradient-to-br from-white/[0.06] to-white/[0.02] border border-white/10 text-center shadow-[0_8px_20px_rgba(0,0,0,0.22)]">
         <Target className="h-8 w-8 mx-auto mb-3 text-white/30" />
         <p className="text-white/50">Statistics not yet available</p>
         <p className="text-xs text-white/30 mt-1">Stats will be updated during the match</p>
@@ -2398,7 +2333,7 @@ function StatsTab({ statistics, homeTeam, awayTeam }: StatsTabProps) {
     <div className="space-y-4 sm:space-y-6">
       {/* Match Leaders */}
       {matchLeaders.length > 0 && (
-        <div className="p-4 sm:p-5 rounded-xl bg-gradient-to-br from-amber-500/10 to-orange-500/10 border border-amber-500/20">
+        <div className="p-4 sm:p-5 rounded-xl bg-gradient-to-br from-amber-500/10 to-orange-500/10 border border-amber-500/20 shadow-[0_8px_20px_rgba(0,0,0,0.22)]">
           <h3 className="text-xs sm:text-sm font-bold text-white uppercase tracking-wide mb-3 flex items-center gap-2">
             <Trophy className="h-4 w-4 text-amber-400" />
             Match Leaders
@@ -2418,7 +2353,7 @@ function StatsTab({ statistics, homeTeam, awayTeam }: StatsTabProps) {
       )}
 
       {/* Attacking Stats */}
-      <div className="p-4 sm:p-5 rounded-xl bg-gradient-to-br from-white/5 to-white/[0.02] border border-white/10">
+      <div className="p-4 sm:p-5 rounded-xl bg-gradient-to-br from-white/[0.06] to-white/[0.02] border border-white/10 shadow-[0_8px_20px_rgba(0,0,0,0.22)]">
         <h3 className="text-xs font-bold text-white/60 uppercase tracking-wide mb-3 flex items-center gap-2">
           <Target className="h-3.5 w-3.5 text-emerald-400" />
           Attacking
@@ -2442,7 +2377,7 @@ function StatsTab({ statistics, homeTeam, awayTeam }: StatsTabProps) {
       </div>
 
       {/* Possession Stats */}
-      <div className="p-4 sm:p-5 rounded-xl bg-gradient-to-br from-white/5 to-white/[0.02] border border-white/10">
+      <div className="p-4 sm:p-5 rounded-xl bg-gradient-to-br from-white/[0.06] to-white/[0.02] border border-white/10 shadow-[0_8px_20px_rgba(0,0,0,0.22)]">
         <h3 className="text-xs font-bold text-white/60 uppercase tracking-wide mb-3 flex items-center gap-2">
           <Activity className="h-3.5 w-3.5 text-cyan-400" />
           Possession
@@ -2466,7 +2401,7 @@ function StatsTab({ statistics, homeTeam, awayTeam }: StatsTabProps) {
       </div>
 
       {/* Set Plays */}
-      <div className="p-4 sm:p-5 rounded-xl bg-gradient-to-br from-white/5 to-white/[0.02] border border-white/10">
+      <div className="p-4 sm:p-5 rounded-xl bg-gradient-to-br from-white/[0.06] to-white/[0.02] border border-white/10 shadow-[0_8px_20px_rgba(0,0,0,0.22)]">
         <h3 className="text-xs font-bold text-white/60 uppercase tracking-wide mb-3 flex items-center gap-2">
           <ArrowRightLeft className="h-3.5 w-3.5 text-teal-400" />
           Set Pieces
@@ -2492,7 +2427,7 @@ function StatsTab({ statistics, homeTeam, awayTeam }: StatsTabProps) {
       {/* Advanced Stats Toggle */}
       <button
         onClick={() => setShowAdvanced(!showAdvanced)}
-        className="w-full py-3 rounded-xl bg-white/5 border border-white/10 text-white/60 hover:text-white hover:bg-white/10 transition-all flex items-center justify-center gap-2 text-sm font-medium"
+        className="w-full py-3 rounded-xl bg-gradient-to-br from-white/[0.06] to-white/[0.02] border border-white/10 text-white/60 hover:text-white hover:bg-white/10 transition-all flex items-center justify-center gap-2 text-sm font-medium shadow-[0_8px_20px_rgba(0,0,0,0.22)]"
       >
         <BarChart3 className="h-4 w-4" />
         {showAdvanced ? "Hide Advanced Stats" : "Show Advanced Stats"}
@@ -2585,7 +2520,7 @@ function H2HTab({ h2hData, loading, homeTeam, awayTeam }: H2HTabProps) {
   
   if (loading) {
     return (
-      <div className="p-8 rounded-xl bg-white/5 border border-white/10 text-center">
+      <div className="p-8 rounded-xl bg-gradient-to-br from-white/[0.06] to-white/[0.02] border border-white/10 text-center shadow-[0_8px_20px_rgba(0,0,0,0.22)]">
         <RefreshCw className="h-8 w-8 mx-auto mb-3 text-white/30 animate-spin" />
         <p className="text-white/50">Loading head-to-head history...</p>
       </div>
@@ -2594,7 +2529,7 @@ function H2HTab({ h2hData, loading, homeTeam, awayTeam }: H2HTabProps) {
 
   if (!h2hData || h2hData.meetings.length === 0) {
     return (
-      <div className="p-8 rounded-xl bg-white/5 border border-white/10 text-center">
+      <div className="p-8 rounded-xl bg-gradient-to-br from-white/[0.06] to-white/[0.02] border border-white/10 text-center shadow-[0_8px_20px_rgba(0,0,0,0.22)]">
         <History className="h-8 w-8 mx-auto mb-3 text-white/30" />
         <p className="text-white/50">No previous meetings found</p>
         <p className="text-xs text-white/30 mt-1">These teams haven't played each other recently</p>
@@ -2744,7 +2679,7 @@ function H2HTab({ h2hData, loading, homeTeam, awayTeam }: H2HTabProps) {
     const gd = split.goalsFor - split.goalsAgainst;
     
     return (
-      <div className="p-3 rounded-lg bg-white/5 border border-white/10">
+      <div className="p-3 rounded-lg bg-gradient-to-br from-white/[0.06] to-white/[0.02] border border-white/10 shadow-[0_6px_16px_rgba(0,0,0,0.2)]">
         <div className="flex items-center justify-between mb-2">
           <span className={`text-xs font-medium ${teamColor === 'emerald' ? 'text-emerald-400' : 'text-cyan-400'}`}>
             {label}
@@ -2778,7 +2713,7 @@ function H2HTab({ h2hData, loading, homeTeam, awayTeam }: H2HTabProps) {
   return (
     <div className="space-y-4 sm:space-y-6">
       {/* Summary Card */}
-      <div className="p-4 sm:p-6 rounded-xl bg-gradient-to-br from-white/10 to-white/5 border border-white/10">
+      <div className="p-4 sm:p-6 rounded-xl bg-gradient-to-br from-white/[0.08] to-white/[0.03] border border-white/10 shadow-[0_10px_24px_rgba(0,0,0,0.25)]">
         <h3 className="text-xs sm:text-sm font-medium text-white/60 mb-3 sm:mb-4 flex items-center gap-2">
           <Trophy className="h-4 w-4 text-amber-400" />
           Head-to-Head Record
@@ -2830,7 +2765,7 @@ function H2HTab({ h2hData, loading, homeTeam, awayTeam }: H2HTabProps) {
       </div>
 
       {/* Home/Away Split */}
-      <div className="p-4 sm:p-6 rounded-xl bg-white/5 border border-white/10">
+      <div className="p-4 sm:p-6 rounded-xl bg-gradient-to-br from-white/[0.06] to-white/[0.02] border border-white/10 shadow-[0_10px_24px_rgba(0,0,0,0.25)]">
         <h3 className="text-xs sm:text-sm font-medium text-white/60 mb-4 flex items-center gap-2">
           <ArrowRightLeft className="h-4 w-4" />
           Venue Split in H2H
@@ -2933,7 +2868,7 @@ function H2HTab({ h2hData, loading, homeTeam, awayTeam }: H2HTabProps) {
                 animate={{ opacity: 1, y: 0 }}
                 exit={{ opacity: 0, y: -10 }}
                 transition={{ delay: Math.min(idx * 0.03, 0.15) }}
-                className="p-3 sm:p-4 rounded-xl bg-white/5 border border-white/10 hover:bg-white/[0.07] transition-colors"
+                className="p-3 sm:p-4 rounded-xl bg-gradient-to-br from-white/[0.06] to-white/[0.02] border border-white/10 hover:bg-white/[0.08] transition-colors shadow-[0_8px_20px_rgba(0,0,0,0.22)]"
               >
                 <div className="flex items-center justify-between mb-2">
                   <div className="flex items-center gap-2">
@@ -3276,7 +3211,7 @@ function MatchupsTab({ match, homeTeam, awayTeam }: MatchupsTabProps) {
   // For finished matches, show different UI
   if (isMatchFinished) {
     return (
-      <div className="p-8 rounded-xl bg-white/5 border border-white/10 text-center">
+      <div className="p-8 rounded-xl bg-gradient-to-br from-white/[0.06] to-white/[0.02] border border-white/10 text-center shadow-[0_8px_20px_rgba(0,0,0,0.22)]">
         <Lock className="h-8 w-8 mx-auto mb-3 text-white/30" />
         <p className="text-white/50">Markets closed</p>
         <p className="text-xs text-white/30 mt-1">This match has finished</p>
@@ -3295,7 +3230,7 @@ function MatchupsTab({ match, homeTeam, awayTeam }: MatchupsTabProps) {
     <div className="space-y-3 sm:space-y-4">
       {/* Live Indicator */}
       {isMatchLive && (
-        <div className="p-3 sm:p-4 rounded-xl bg-emerald-500/10 border border-emerald-500/20 flex items-center gap-3">
+        <div className="p-3 sm:p-4 rounded-xl bg-gradient-to-br from-emerald-500/10 to-emerald-500/5 border border-emerald-500/25 flex items-center gap-3 shadow-[0_8px_20px_rgba(0,0,0,0.22)]">
           <span className="relative flex h-3 w-3">
             <span className="absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75 animate-ping" />
             <span className="relative inline-flex h-3 w-3 rounded-full bg-emerald-500" />
@@ -3433,7 +3368,7 @@ function MatchupsTab({ match, homeTeam, awayTeam }: MatchupsTabProps) {
       </CollapsibleSection>
 
       {/* Disclaimer */}
-      <div className="p-3 rounded-lg bg-amber-500/5 border border-amber-500/10">
+      <div className="p-3 rounded-lg bg-gradient-to-br from-amber-500/10 to-amber-500/5 border border-amber-500/15 shadow-[0_6px_16px_rgba(0,0,0,0.2)]">
         <p className="text-[10px] sm:text-xs text-amber-400/70 text-center">
           Odds shown for reference only. Always verify with your sportsbook before placing bets.
         </p>
@@ -3469,7 +3404,7 @@ function CollapsibleSection({
   };
 
   return (
-    <div className="rounded-xl bg-white/5 border border-white/10 overflow-hidden">
+    <div className="rounded-xl bg-gradient-to-br from-white/[0.06] to-white/[0.02] border border-white/10 overflow-hidden shadow-[0_8px_20px_rgba(0,0,0,0.22)]">
       <button
         onClick={onToggle}
         className="w-full flex items-center justify-between p-4 min-h-[56px] hover:bg-white/5 active:bg-white/10 transition-colors touch-manipulation"
@@ -3529,7 +3464,7 @@ function SignalCard({ signal }: { signal: MarketSignal }) {
   };
 
   return (
-    <div className={`p-3 sm:p-4 rounded-xl border ${bgColors[signal.type]} flex items-center gap-3`}>
+    <div className={`p-3 sm:p-4 rounded-xl border ${bgColors[signal.type]} bg-gradient-to-br from-white/[0.04] to-transparent shadow-[0_8px_20px_rgba(0,0,0,0.2)] flex items-center gap-3`}>
       <div className="shrink-0 p-2 sm:p-0 rounded-lg sm:rounded-none bg-white/5 sm:bg-transparent">{icons[signal.type]}</div>
       <div className="flex-1 min-w-0">
         <p className={`text-[11px] sm:text-xs font-medium ${iconColors[signal.type]}`}>{signal.label}</p>
@@ -3556,7 +3491,7 @@ function OddsButton({ market }: { market: MarketOdd }) {
   };
 
   return (
-    <button className="group relative min-h-[64px] p-3 rounded-xl bg-white/5 hover:bg-white/10 active:bg-white/15 border border-white/10 hover:border-emerald-500/30 transition-all text-left touch-manipulation active:scale-[0.98]">
+    <button className="group relative min-h-[64px] p-3 rounded-xl bg-gradient-to-br from-white/[0.06] to-white/[0.02] hover:bg-white/10 active:bg-white/15 border border-white/10 hover:border-emerald-500/30 transition-all text-left touch-manipulation active:scale-[0.98] shadow-[0_6px_16px_rgba(0,0,0,0.2)]">
       {market.trend && market.trend !== 'stable' && (
         <div className="absolute top-2 right-2 flex items-center gap-1">
           {getTrendIcon()}
@@ -3583,7 +3518,7 @@ function PropCard({ prop, homeTeam, awayTeam }: { prop: PropMarket; homeTeam: st
   const teamColor = prop.team === 'home' ? 'emerald' : 'cyan';
   
   return (
-    <div className="p-3 sm:p-4 rounded-xl bg-white/5 border border-white/10">
+    <div className="p-3 sm:p-4 rounded-xl bg-gradient-to-br from-white/[0.06] to-white/[0.02] border border-white/10 shadow-[0_6px_16px_rgba(0,0,0,0.2)]">
       <div className="flex items-center gap-2.5 mb-3">
         <div className={`w-8 h-8 sm:w-7 sm:h-7 rounded-full bg-${teamColor}-500/20 flex items-center justify-center shrink-0`}>
           <User className={`h-4 w-4 sm:h-3.5 sm:w-3.5 text-${teamColor}-400`} />
@@ -3749,7 +3684,7 @@ function PoolsTab({ match, isInPool }: PoolsTabProps) {
             </Link>
             <Link
               to="/leagues/create"
-              className="inline-flex items-center justify-center gap-2 px-5 py-2.5 rounded-xl bg-white/5 border border-white/10 text-white font-medium text-sm hover:bg-white/10 transition-all active:scale-[0.98]"
+              className="inline-flex items-center justify-center gap-2 px-5 py-2.5 rounded-xl bg-gradient-to-br from-white/[0.06] to-white/[0.02] border border-white/10 text-white font-medium text-sm hover:bg-white/10 transition-all active:scale-[0.98]"
             >
               <Users className="h-4 w-4" />
               Create Pool
@@ -3758,7 +3693,7 @@ function PoolsTab({ match, isInPool }: PoolsTabProps) {
         </div>
 
         {/* Quick Match Info */}
-        <div className="p-4 rounded-xl bg-white/5 border border-white/10">
+        <div className="p-4 rounded-xl bg-gradient-to-br from-white/[0.06] to-white/[0.02] border border-white/10 shadow-[0_8px_20px_rgba(0,0,0,0.22)]">
           <div className="flex items-center gap-3 text-sm text-white/50">
             <Clock className="h-4 w-4" />
             <span>
@@ -3789,7 +3724,7 @@ function PoolsTab({ match, isInPool }: PoolsTabProps) {
           ? "bg-red-500/10 border-red-500/30" 
           : isUrgent 
             ? "bg-gradient-to-r from-amber-500/10 to-red-500/10 border-amber-500/30 animate-pulse"
-            : "bg-white/5 border-white/10"
+            : "bg-gradient-to-br from-white/[0.06] to-white/[0.02] border-white/10"
       )}>
         <div className="flex items-center justify-between gap-4">
           <div className="flex items-center gap-3">
@@ -3875,7 +3810,7 @@ function PoolsTab({ match, isInPool }: PoolsTabProps) {
                 "flex-shrink-0 px-4 py-2 rounded-xl border transition-all text-sm font-medium whitespace-nowrap",
                 selectedPool?.id === pool.id
                   ? "bg-amber-500/20 border-amber-500/50 text-amber-400"
-                  : "bg-white/5 border-white/10 text-white/70 hover:bg-white/10"
+                  : "bg-gradient-to-br from-white/[0.06] to-white/[0.02] border-white/10 text-white/70 hover:bg-white/10"
               )}
             >
               <span className="flex items-center gap-2">
@@ -3948,7 +3883,7 @@ function PoolsTab({ match, isInPool }: PoolsTabProps) {
                       "relative p-4 rounded-xl border-2 transition-all min-h-[88px] flex flex-col items-center justify-center gap-1",
                       isSelected
                         ? "border-amber-400 bg-amber-500/20 shadow-lg shadow-amber-500/20"
-                        : "border-white/10 bg-white/5 hover:border-white/20 hover:bg-white/10",
+                        : "border-white/10 bg-gradient-to-br from-white/[0.06] to-white/[0.02] hover:border-white/20 hover:bg-white/10",
                       isLocked && "opacity-50 cursor-not-allowed"
                     )}
                   >
@@ -3996,7 +3931,7 @@ function PoolsTab({ match, isInPool }: PoolsTabProps) {
                       "relative p-5 rounded-xl border-2 transition-all flex flex-col items-center justify-center gap-2",
                       isSelected
                         ? "border-amber-400 bg-amber-500/20 shadow-lg shadow-amber-500/20"
-                        : "border-white/10 bg-white/5 hover:border-white/20 hover:bg-white/10",
+                        : "border-white/10 bg-gradient-to-br from-white/[0.06] to-white/[0.02] hover:border-white/20 hover:bg-white/10",
                       isLocked && "opacity-50 cursor-not-allowed"
                     )}
                   >
@@ -4044,7 +3979,7 @@ function PoolsTab({ match, isInPool }: PoolsTabProps) {
                       "relative p-5 rounded-xl border-2 transition-all flex flex-col items-center justify-center gap-1",
                       isSelected
                         ? "border-amber-400 bg-amber-500/20 shadow-lg shadow-amber-500/20"
-                        : "border-white/10 bg-white/5 hover:border-white/20 hover:bg-white/10",
+                        : "border-white/10 bg-gradient-to-br from-white/[0.06] to-white/[0.02] hover:border-white/20 hover:bg-white/10",
                       isLocked && "opacity-50 cursor-not-allowed"
                     )}
                   >
@@ -4087,7 +4022,7 @@ function PoolsTab({ match, isInPool }: PoolsTabProps) {
                 "w-full py-3 px-4 rounded-xl font-semibold text-sm transition-all flex items-center justify-center gap-2",
                 selectedPick
                   ? "bg-gradient-to-r from-amber-500 to-orange-500 text-white hover:shadow-lg hover:shadow-amber-500/25 active:scale-[0.98]"
-                  : "bg-white/5 text-white/30 cursor-not-allowed"
+                  : "bg-gradient-to-br from-white/[0.06] to-white/[0.02] text-white/30 cursor-not-allowed"
               )}
             >
               {isSubmitting ? (
@@ -4139,7 +4074,7 @@ function PoolsTab({ match, isInPool }: PoolsTabProps) {
       </div>
 
       {/* Pool Standings */}
-      <div className="rounded-xl bg-white/5 border border-white/10 overflow-hidden">
+      <div className="rounded-xl bg-gradient-to-br from-white/[0.06] to-white/[0.02] border border-white/10 overflow-hidden shadow-[0_10px_24px_rgba(0,0,0,0.25)]">
         <div className="p-4 border-b border-white/10 flex items-center justify-between">
           <h3 className="font-bold text-white flex items-center gap-2">
             <Trophy className="h-4 w-4 text-amber-400" />

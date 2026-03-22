@@ -16,7 +16,11 @@ pushRouter.get("/vapid-public-key", (c) => {
   const vapidPublicKey = getVapidPublicKey(env);
   
   if (!vapidPublicKey) {
-    return c.json({ error: "Push notifications not configured" }, 503);
+    return c.json({
+      vapidPublicKey: null,
+      config_required: true,
+      error: "Push notifications not configured",
+    });
   }
   
   return c.json({ vapidPublicKey });

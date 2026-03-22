@@ -283,7 +283,8 @@ const ExpandedGamePanel = memo(function ExpandedGamePanel({
           <img 
             src="/assets/coachg/coach-g-avatar.png"
             alt="Coach G"
-            className="w-6 h-6 rounded-full border border-blue-500/30"
+            className="w-6 h-6 rounded-full border border-blue-500/30 cursor-pointer transition-transform hover:scale-105"
+            onClick={() => navigate('/scout')}
           />
           <p className="text-xs text-white/70 flex-1">
             {trendsLoading ? (

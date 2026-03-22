@@ -27,11 +27,11 @@ import {
   Ticket,
   TrendingUp,
   Compass,
+  Star,
 } from "lucide-react";
 import { useImpersonation } from "@/react-app/contexts/ImpersonationContext";
 import { ThemeToggle } from "@/react-app/components/ThemeToggle";
 import { UnifiedNotificationCenter } from "@/react-app/components/UnifiedNotificationCenter";
-import { CoachGIntelligenceLayer } from "@/react-app/components/CoachGIntelligenceLayer";
 import { useFeatureFlags } from "@/react-app/hooks/useFeatureFlags";
 
 import { useFirstSession } from "@/react-app/hooks/useFirstSession";
@@ -320,6 +320,12 @@ export function Layout({ children, hideFooter: _hideFooter }: LayoutProps) {
                       Performance
                     </Link>
                   </DropdownMenuItem>
+                  <DropdownMenuItem asChild className="cursor-pointer">
+                    <Link to="/favorites" className="flex items-center gap-2">
+                      <Star className="h-4 w-4" />
+                      My Favorites
+                    </Link>
+                  </DropdownMenuItem>
                   
                   <DropdownMenuSeparator />
                   
@@ -484,14 +490,6 @@ export function Layout({ children, hideFooter: _hideFooter }: LayoutProps) {
           mounted && "animate-page-enter"
         )}
       >
-        {!isHomePage
-          && !location.pathname.startsWith('/create-league')
-          && !location.pathname.startsWith('/admin')
-          && !location.pathname.startsWith('/pool-admin')
-          && !location.pathname.startsWith('/settings')
-          && !location.pathname.startsWith('/join')
-          && location.pathname !== '/games'
-          && <CoachGIntelligenceLayer />}
         {children}
       </main>
 
@@ -611,7 +609,7 @@ export function Layout({ children, hideFooter: _hideFooter }: LayoutProps) {
                           : "w-5 h-5 border-white/20"
                       )}>
                         <img
-                          src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='80' height='80'%3E%3Crect width='100%25' height='100%25' rx='40' fill='%230f172a'/%3E%3Ccircle cx='40' cy='30' r='14' fill='%233b82f6'/%3E%3Cpath d='M14 68c4-14 16-22 26-22s22 8 26 22' fill='%233b82f6'/%3E%3C/svg%3E"
+                          src="/assets/coachg/coach-g-avatar.png?v=2"
                           alt="Coach G"
                           className="w-full h-full object-cover"
                           onError={(e) => {

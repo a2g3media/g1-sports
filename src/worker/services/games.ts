@@ -133,8 +133,9 @@ function getPeriodLabel(sport: SportKey, period: number): string {
     case "ncaaf":
       return period <= 4 ? `Q${period}` : "OT";
     case "nba":
-    case "ncaab":
       return period <= 4 ? `Q${period}` : `OT${period - 4}`;
+    case "ncaab":
+      return period <= 2 ? `${period}H` : `OT${period - 2}`;
     case "nhl":
       return period <= 3 ? `P${period}` : `OT${period - 3}`;
     case "mlb":

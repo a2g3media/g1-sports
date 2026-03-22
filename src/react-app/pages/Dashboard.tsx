@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback, memo, useRef, useMemo } from "react";
 import { useDocumentTitle } from "@/react-app/hooks/useDocumentTitle";
 import { Link, useNavigate } from "react-router-dom";
 import { ROUTES } from "@/react-app/config/routes";
-import { Trophy, ChevronRight, Users, Flame, ChevronUp, ChevronDown, TrendingUp, TrendingDown } from "lucide-react";
+import { Trophy, ChevronRight, Users, Flame, ChevronUp, ChevronDown, TrendingUp, TrendingDown, Star, Sparkles } from "lucide-react";
 import { getSport } from "@/react-app/data/sports";
 import { ErrorState } from "@/react-app/components/ui/states";
 import { cn } from "@/react-app/lib/utils";
@@ -13,9 +13,13 @@ import { WatchboardPreviewHub } from "@/react-app/components/WatchboardPreview";
 import { SportQuickAccess } from "@/react-app/components/SportQuickAccess";
 import { CoachGCommandCenter } from "@/react-app/components/CoachGCommandCenter";
 import { AIIntelligenceFeed } from "@/react-app/components/AIIntelligenceFeed";
+import { TeamLogo } from "@/react-app/components/TeamLogo";
+import { PlayerPhoto } from "@/react-app/components/PlayerPhoto";
+import { useFavorites } from "@/react-app/hooks/useFavorites";
 import { useDemoAuth } from "@/react-app/contexts/DemoAuthContext";
 import { Component, type ReactNode, type ErrorInfo } from "react";
 import { toGameDetailPath } from "@/react-app/lib/gameRoutes";
+import { useFeatureFlags } from "@/react-app/hooks/useFeatureFlags";
 
 // Error boundary wrapper for isolating component crashes
 class ComponentErrorBoundary extends Component<
@@ -53,6 +57,106 @@ function SafeWatchboardPreview() {
     <ComponentErrorBoundary name="WatchboardPreview">
       <WatchboardPreviewHub />
     </ComponentErrorBoundary>
+  );
+}
+
+function FavoritesRail() {
+  const { fetchDashboard } = useFavorites();
+  const [loading, setLoading] = useState(true);
+  const [teams, setTeams] = useState<Array<Record<string, unknown>>>([]);
+  const [players, setPlayers] = useState<Array<Record<string, unknown>>>([]);
+  const [liveCount, setLiveCount] = useState(0);
+
+  useEffect(() => {
+    let mounted = true;
+    (async () => {
+      setLoading(true);
+      try {
+        const data = await fetchDashboard();
+        if (!mounted || !data) return;
+        const nextTeams = Array.isArray(data.teams) ? (data.teams as Array<Record<string, unknown>>) : [];
+        const nextPlayers = Array.isArray(data.players) ? (data.players as Array<Record<string, unknown>>) : [];
+        const nextLive = Array.isArray(data.live_priority) ? data.live_priority.length : 0;
+        setTeams(nextTeams.slice(0, 4));
+        setPlayers(nextPlayers.slice(0, 4));
+        setLiveCount(nextLive);
+      } finally {
+        if (mounted) setLoading(false);
+      }
+    })();
+    return () => {
+      mounted = false;
+    };
+  }, [fetchDashboard]);
+
+  const hasAny = teams.length > 0 || players.length > 0;
+  if (!loading && !hasAny) return null;
+
+  return (
+    <section className="rounded-2xl border border-white/[0.08] bg-white/[0.03] backdrop-blur-sm p-4">
+      <div className="mb-3 flex items-center justify-between">
+        <div className="flex items-center gap-2 text-white">
+          <Star className="h-4 w-4 text-amber-300" />
+          <h3 className="text-sm font-semibold">My Favorites</h3>
+          {liveCount > 0 && (
+            <span className="inline-flex items-center gap-1 rounded-full border border-emerald-400/40 bg-emerald-500/15 px-2 py-0.5 text-[10px] font-bold text-emerald-200">
+              <Sparkles className="h-3 w-3" /> LIVE {liveCount}
+            </span>
+          )}
+        </div>
+        <Link to="/favorites" className="text-[11px] text-white/60 hover:text-white inline-flex items-center gap-1">
+          Open <ChevronRight className="h-3 w-3" />
+        </Link>
+      </div>
+
+      {loading ? (
+        <div className="text-xs text-white/45">Loading favorites...</div>
+      ) : (
+        <div className="space-y-2">
+          {teams.length > 0 && (
+            <div className="flex gap-2 overflow-x-auto scrollbar-hide pb-1">
+              {teams.map((team) => {
+                const code = String(team.team_code || "").toUpperCase();
+                const name = String(team.team_name || team.entity_id || "Team");
+                const sport = String(team.sport || "nba");
+                return (
+                  <Link
+                    key={`team-${String(team.id || team.entity_id)}`}
+                    to="/favorites"
+                    className="min-w-[150px] rounded-xl border border-white/[0.07] bg-white/[0.02] px-3 py-2 hover:bg-white/[0.05] transition-colors"
+                  >
+                    <div className="flex items-center gap-2">
+                      <TeamLogo teamCode={code} sport={sport} size={20} className="rounded-full" />
+                      <span className="text-xs font-semibold text-white truncate">{name}</span>
+                    </div>
+                  </Link>
+                );
+              })}
+            </div>
+          )}
+          {players.length > 0 && (
+            <div className="flex gap-2 overflow-x-auto scrollbar-hide">
+              {players.map((player) => {
+                const name = String(player.player_name || player.entity_id || "Player");
+                const sport = String(player.sport || "nba");
+                return (
+                  <Link
+                    key={`player-${String(player.id || player.entity_id)}`}
+                    to="/favorites"
+                    className="min-w-[170px] rounded-xl border border-white/[0.07] bg-white/[0.02] px-3 py-2 hover:bg-white/[0.05] transition-colors"
+                  >
+                    <div className="flex items-center gap-2">
+                      <PlayerPhoto playerName={name} sport={sport} size={20} className="border border-white/10" />
+                      <span className="text-xs font-semibold text-white truncate">{name}</span>
+                    </div>
+                  </Link>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      )}
+    </section>
   );
 }
 
@@ -1010,6 +1114,7 @@ function DashboardInner() {
   }
   
   const navigate = useNavigate();
+  const { flags } = useFeatureFlags();
   const [leagues, setLeagues] = useState<League[]>([]);
   const [activeCarouselSport, setActiveCarouselSport] = useState<string | null>(null);
   const [skeletonExpired, setSkeletonExpired] = useState(false);
@@ -1082,6 +1187,9 @@ function DashboardInner() {
         
         {/* 2. SPORTS NAVIGATION */}
         <SportQuickAccess activeSportKey={activeCarouselSport} />
+        
+        {/* 2.5 FAVORITES RAIL */}
+        {flags.HOME_FAVORITES_RAIL_ENABLED && <FavoritesRail />}
         
         {/* 3. COACH G INTELLIGENCE + GAMES TODAY */}
         <section className="space-y-3">

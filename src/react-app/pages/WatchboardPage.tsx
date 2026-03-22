@@ -42,7 +42,7 @@ import { cn } from "@/react-app/lib/utils";
 import { useWatchboards, type Watchboard, type WatchboardProp, type WatchboardPlayer } from "@/react-app/hooks/useWatchboards";
 import { GripVertical, Zap, Target, CheckCircle2, MessageCircle, Ticket, User } from "lucide-react";
 import { TeamLogo } from "@/react-app/components/TeamLogo";
-import { CoachGIntelligenceLayer } from "@/react-app/components/CoachGIntelligenceLayer";
+import { PlayerPhoto } from "@/react-app/components/PlayerPhoto";
 import { CoachGExternalLinkIcon } from "@/react-app/components/CoachGExternalLinkIcon";
 import { CoachGAvatar } from "@/react-app/components/CoachGAvatar";
 import { getTeamColors } from "@/react-app/data/team-colors";
@@ -117,7 +117,7 @@ interface TierLimits {
   hasProps: boolean;
 }
 
-// TESTING: All limits removed - all tiers get unlimited boards/games
+// Generous board/game caps keep watchboard workflows frictionless.
 const TIER_LIMITS: Record<GZSportsTier, TierLimits> = {
   anonymous: { maxBoards: 99, maxGames: 99, hasProps: true },
   free: { maxBoards: 99, maxGames: 99, hasProps: true },
@@ -211,18 +211,15 @@ function CinematicBackground() {
     <div className="fixed inset-0 pointer-events-none overflow-hidden -z-10">
       <div className="absolute inset-0 bg-gradient-to-b from-slate-950 via-slate-900 to-slate-950" />
       <div
-        className="absolute top-1/4 -left-32 w-96 h-96 rounded-full blur-[120px] animate-pulse"
+        className="absolute top-1/4 -left-32 h-96 w-96 rounded-full blur-[120px]"
         style={{
-          background: "radial-gradient(circle, rgba(59, 130, 246, 0.15) 0%, transparent 70%)",
-          animationDuration: "4s",
+          background: "radial-gradient(circle, rgba(59, 130, 246, 0.12) 0%, transparent 70%)",
         }}
       />
       <div
-        className="absolute bottom-1/3 -right-32 w-96 h-96 rounded-full blur-[120px] animate-pulse"
+        className="absolute bottom-1/3 -right-32 h-96 w-96 rounded-full blur-[120px]"
         style={{
-          background: "radial-gradient(circle, rgba(168, 85, 247, 0.12) 0%, transparent 70%)",
-          animationDuration: "5s",
-          animationDelay: "1s",
+          background: "radial-gradient(circle, rgba(168, 85, 247, 0.1) 0%, transparent 70%)",
         }}
       />
     </div>
@@ -958,6 +955,13 @@ function PropTile({ prop, onRemove, liveStatValue, gameData, justUpdated, justHi
           </div>
         )}
 
+        <PlayerPhoto
+          playerName={prop.player_name}
+          sport={String(prop.sport || "").toLowerCase() || "nba"}
+          size={42}
+          className="border border-white/10 bg-slate-800 flex-shrink-0"
+        />
+
         {/* Player & Prop Info */}
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2 mb-1">
@@ -1308,16 +1312,6 @@ function CoachGWatcher({ games, latestPlays, liveGameCount, userId }: CoachGWatc
 
   return (
     <div className="rounded-2xl border border-amber-500/20 bg-gradient-to-br from-amber-500/5 via-slate-900/50 to-purple-500/5 backdrop-blur-sm p-4 mb-6">
-      <CoachGIntelligenceLayer
-        surface="watchboards"
-        compact
-        className="mb-4"
-        watchedGames={games.map((g) => ({
-          gameId: g.game_id,
-          label: `${g.away_team_code} @ ${g.home_team_code}`,
-          sport: g.sport,
-        }))}
-      />
       <div className="flex items-start gap-4">
         {/* Coach G Avatar */}
         <div className="relative flex-shrink-0">
@@ -2015,7 +2009,7 @@ export function WatchboardPage() {
                       const name = `Board ${boards.length + 1}`;
                       createBoard(name);
                     }}
-                    className="gap-2 bg-gradient-to-r from-blue-600 to-purple-600 hover:from-blue-500 hover:to-purple-500 text-white min-h-[44px] active:scale-[0.98]"
+                    className="min-h-[44px] gap-2 border border-cyan-400/30 bg-cyan-500/15 text-cyan-100 hover:bg-cyan-500/20 active:scale-[0.98]"
                     size="sm"
                   >
                     <Plus className="w-4 h-4" />

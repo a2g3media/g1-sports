@@ -14,6 +14,9 @@ type Bindings = {
   SPORTSRADAR_ODDS_KEY?: string;
   SPORTSRADAR_PLAYER_PROPS_KEY?: string;
   SPORTSRADAR_PROPS_KEY?: string;
+  MOCHA_USERS_SERVICE_API_URL?: string;
+  MOCHA_USERS_SERVICE_API_KEY?: string;
+  VAPID_PUBLIC_KEY?: string;
 };
 
 const app = new Hono<{ Bindings: Bindings }>();
@@ -53,6 +56,17 @@ interface FixItem {
   fix: string;
 }
 
+type ConfigReadinessItem = {
+  key: string;
+  configured: boolean;
+  requiredForEndpoint: string;
+  expectedWhenMissing: {
+    status: number;
+    classification: 'CONFIG_REQUIRED';
+    message: string;
+  };
+};
+
 async function isAdmin(c: any): Promise<boolean> {
   const user = c.get('user');
   if (!user) return false;
@@ -70,12 +84,16 @@ function isDemoMode(c: any): boolean {
   return c.req.header('X-Demo-Mode') === 'true';
 }
 
+function hasConfiguredValue(value: string | undefined): boolean {
+  const trimmed = String(value || '').trim();
+  return Boolean(trimmed) && trimmed !== 'REPLACE_ME';
+}
+
 async function demoOrAuthMiddleware(c: any, next: () => Promise<void>) {
   if (isDemoMode(c)) {
-    await next();
-    return;
+    return next();
   }
-  await authMiddleware(c, next);
+  return authMiddleware(c, next);
 }
 
 function buildFixChecklist(sportsRadar: SportsRadarResult, openAI: OpenAIResult): FixItem[] {
@@ -255,6 +273,53 @@ app.get('/openai', demoOrAuthMiddleware, async (c) => {
     return c.json({ error: 'Admin access required' }, 403);
   }
   return c.json(await testOpenAI(c));
+});
+
+app.get('/config-readiness', demoOrAuthMiddleware, async (c) => {
+  if (!isDemoMode(c) && !(await isAdmin(c))) {
+    return c.json({ error: 'Admin access required' }, 403);
+  }
+
+  const checks: ConfigReadinessItem[] = [
+    {
+      key: 'MOCHA_USERS_SERVICE_API_URL',
+      configured: hasConfiguredValue(c.env.MOCHA_USERS_SERVICE_API_URL),
+      requiredForEndpoint: '/api/oauth/google/redirect_url',
+      expectedWhenMissing: {
+        status: 503,
+        classification: 'CONFIG_REQUIRED',
+        message: 'Mocha auth is not configured for local development',
+      },
+    },
+    {
+      key: 'MOCHA_USERS_SERVICE_API_KEY',
+      configured: hasConfiguredValue(c.env.MOCHA_USERS_SERVICE_API_KEY),
+      requiredForEndpoint: '/api/sessions',
+      expectedWhenMissing: {
+        status: 503,
+        classification: 'CONFIG_REQUIRED',
+        message: 'Mocha auth is not configured for local development',
+      },
+    },
+    {
+      key: 'VAPID_PUBLIC_KEY',
+      configured: hasConfiguredValue(c.env.VAPID_PUBLIC_KEY),
+      requiredForEndpoint: '/api/push/vapid-public-key',
+      expectedWhenMissing: {
+        status: 503,
+        classification: 'CONFIG_REQUIRED',
+        message: 'Push notifications not configured',
+      },
+    },
+  ];
+
+  return c.json({
+    timestamp: new Date().toISOString(),
+    overall: checks.every((item) => item.configured) ? 'READY' : 'CONFIG_REQUIRED',
+    configuredCount: checks.filter((item) => item.configured).length,
+    requiredCount: checks.length,
+    checks,
+  });
 });
 
 export default app;

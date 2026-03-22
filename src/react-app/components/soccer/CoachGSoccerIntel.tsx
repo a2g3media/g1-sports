@@ -4,6 +4,7 @@
  */
 
 import { useState } from "react";
+import { Link } from "react-router-dom";
 import { 
   TrendingUp, 
   AlertTriangle, 
@@ -179,11 +180,13 @@ export function CoachGSoccerIntel() {
     <div className="space-y-3">
       {/* Header */}
       <div className="flex items-center gap-3 mb-4">
-        <img 
-          src="/assets/coachg/coach-g-avatar.png"
-          alt="Coach G"
-          className="w-10 h-10 rounded-full border-2 border-cyan-500/30"
-        />
+        <Link to="/scout" aria-label="Open Coach G">
+          <img 
+            src="/assets/coachg/coach-g-avatar.png"
+            alt="Coach G"
+            className="w-10 h-10 rounded-full border-2 border-cyan-500/30 transition-transform hover:scale-105"
+          />
+        </Link>
         <div>
           <h3 className="text-sm font-semibold text-white">Coach G</h3>
           <p className="text-xs text-zinc-500">Live Soccer Intelligence</p>

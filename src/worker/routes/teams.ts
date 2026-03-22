@@ -102,7 +102,15 @@ teams.get('/:sport/standings', async (c) => {
     );
     
     if (result.errors.length > 0 && result.teams.length === 0) {
-      return c.json({ error: result.errors[0] }, 500);
+      return c.json({
+        sport,
+        season: season || new Date().getFullYear(),
+        conferences: [],
+        divisions: [],
+        teams: [],
+        warnings: result.errors,
+        source_stale: true,
+      });
     }
     
     return c.json({

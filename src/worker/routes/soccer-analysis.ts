@@ -11,6 +11,20 @@ import { generateSoccerAnalysis, clearAnalysisCache } from "../services/coachGSo
 
 const soccerAnalysisRouter = new Hono<{ Bindings: Env }>();
 
+async function withTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number
+): Promise<{ timedOut: boolean; value: T | null }> {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const timeoutPromise = new Promise<null>((resolve) => {
+    timer = setTimeout(() => resolve(null), timeoutMs);
+  });
+  const result = (await Promise.race([promise, timeoutPromise])) as T | null;
+  if (timer) clearTimeout(timer);
+  if (result === null) return { timedOut: true, value: null };
+  return { timedOut: false, value: result };
+}
+
 /**
  * GET /api/soccer-analysis/:matchId/pregame
  * Get pregame analysis for a match
@@ -23,13 +37,24 @@ soccerAnalysisRouter.get("/:matchId/pregame", async (c) => {
   }
 
   try {
-    const analysis = await generateSoccerAnalysis(
-      c.env.DB,
-      { OPENAI_API_KEY: c.env.OPENAI_API_KEY },
-      matchId,
-      'pregame',
-      false
+    const timed = await withTimeout(
+      generateSoccerAnalysis(
+        c.env.DB,
+        { OPENAI_API_KEY: c.env.OPENAI_API_KEY },
+        matchId,
+        'pregame',
+        false
+      ),
+      7000
     );
+    if (timed.timedOut) {
+      return c.json({
+        success: false,
+        message: "Pregame analysis still processing",
+        status: "deferred",
+      }, 202);
+    }
+    const analysis = timed.value!;
 
     return c.json({
       success: true,
@@ -65,13 +90,24 @@ soccerAnalysisRouter.get("/:matchId/postgame", async (c) => {
   }
 
   try {
-    const analysis = await generateSoccerAnalysis(
-      c.env.DB,
-      { OPENAI_API_KEY: c.env.OPENAI_API_KEY },
-      matchId,
-      'postgame',
-      false
+    const timed = await withTimeout(
+      generateSoccerAnalysis(
+        c.env.DB,
+        { OPENAI_API_KEY: c.env.OPENAI_API_KEY },
+        matchId,
+        'postgame',
+        false
+      ),
+      7000
     );
+    if (timed.timedOut) {
+      return c.json({
+        success: false,
+        message: "Postgame analysis still processing",
+        status: "deferred",
+      }, 202);
+    }
+    const analysis = timed.value!;
 
     return c.json({
       success: true,
@@ -103,13 +139,24 @@ soccerAnalysisRouter.post("/:matchId/refresh", async (c) => {
   }
 
   try {
-    const analysis = await generateSoccerAnalysis(
-      c.env.DB,
-      { OPENAI_API_KEY: c.env.OPENAI_API_KEY },
-      matchId,
-      phase,
-      true // Force refresh
+    const timed = await withTimeout(
+      generateSoccerAnalysis(
+        c.env.DB,
+        { OPENAI_API_KEY: c.env.OPENAI_API_KEY },
+        matchId,
+        phase,
+        true // Force refresh
+      ),
+      7000
     );
+    if (timed.timedOut) {
+      return c.json({
+        success: false,
+        message: "Refresh request accepted; analysis still processing",
+        status: "deferred",
+      }, 202);
+    }
+    const analysis = timed.value!;
 
     return c.json({
       success: true,

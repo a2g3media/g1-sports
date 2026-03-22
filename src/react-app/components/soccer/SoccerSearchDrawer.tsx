@@ -12,6 +12,7 @@
 import { useState, useEffect, useRef } from "react";
 import { Link } from "react-router-dom";
 import { Search, X, ChevronRight } from "lucide-react";
+import { buildSoccerMatchUrl } from "@/react-app/hooks/useSoccerBackNavigation";
 
 // ============================================================================
 // TYPES
@@ -281,7 +282,7 @@ export default function SoccerSearchDrawer({ isOpen, onClose }: SoccerSearchDraw
                 {results.matches.slice(0, 5).map((match) => (
                   <Link
                     key={match.id}
-                    to={`/sports/soccer/match/${match.id}`}
+                    to={buildSoccerMatchUrl(match.id, { from: "soccer-directory" })}
                     onClick={handleLinkClick}
                     className="flex items-center gap-3 px-4 py-3 hover:bg-white/5 
                              active:bg-white/10 transition-colors touch-manipulation"

@@ -5,17 +5,19 @@
  * Uses same SportHubLayout and Hub* components as NBA
  */
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useMemo } from "react";
 import { useParams, Navigate, Link } from "react-router-dom";
 import { SportHubLayout, HubSection } from "@/react-app/components/hub/SportHubLayout";
-import { HubHero } from "@/react-app/components/hub/HubHero";
-import { Trophy, Users, Calendar, Pin, PinOff } from "lucide-react";
+import { LiveHeroMorph } from "@/react-app/components/hub/LiveHeroMorph";
+import { LeaguePulseStrip } from "@/react-app/components/hub/LeaguePulseStrip";
+import { Trophy, Users, Calendar, Pin, PinOff, Sparkles } from "lucide-react";
 import { getSoccerLeagueMeta } from "@/react-app/lib/soccerLeagueMeta";
-import SoccerPageHeader, { buildLeagueBreadcrumbs } from "@/react-app/components/soccer/SoccerPageHeader";
-import { useSoccerBackNavigation, buildSoccerTeamUrl, buildSoccerMatchUrl, buildSoccerPlayerUrl } from "@/react-app/hooks/useSoccerBackNavigation";
+import { buildSoccerTeamUrl, buildSoccerMatchUrl, buildSoccerPlayerUrl } from "@/react-app/hooks/useSoccerBackNavigation";
 import { fetchPlayerPhotos } from "@/react-app/lib/espnSoccer";
 import TeamCrest from "@/react-app/components/soccer/TeamCrest";
 import { CoachGPanel } from "@/react-app/components/soccer/CoachGPanel";
+import { CoachCommandCard } from "@/react-app/components/hub/CoachCommandCard";
+import { PlayerSearch } from "@/react-app/components/PlayerSearch";
 import { useWatchboards } from "@/react-app/hooks/useWatchboards";
 import { AnimatePresence, motion } from "framer-motion";
 import AddToWatchboardModal from "@/react-app/components/AddToWatchboardModal";
@@ -72,14 +74,8 @@ interface MatchFixture {
 
 export default function SoccerLeagueHubPage() {
   const { leagueId } = useParams<{ leagueId: string }>();
-  const { goBack } = useSoccerBackNavigation({ 
-    pageType: 'league',
-    leagueId: leagueId || undefined 
-  });
-  
   const leagueMeta = getSoccerLeagueMeta(leagueId);
   const [featuredGames, setFeaturedGames] = useState<HeroGame[]>([]);
-  const [carouselIndex, setCarouselIndex] = useState(0);
   const [loading, setLoading] = useState(true);
   const [standings, setStandings] = useState<StandingsTeam[]>([]);
   const [goalScorers, setGoalScorers] = useState<LeaderPlayer[]>([]);
@@ -266,72 +262,78 @@ export default function SoccerLeagueHubPage() {
     return () => clearInterval(interval);
   }, [leagueId]);
 
-  // Auto-rotate carousel every 5 seconds
-  useEffect(() => {
-    if (featuredGames.length <= 1) return;
-    
-    const rotationInterval = setInterval(() => {
-      setCarouselIndex((prev) => (prev + 1) % featuredGames.length);
-    }, 5000);
-    
-    return () => clearInterval(rotationInterval);
-  }, [featuredGames.length]);
-
-  // Reset carousel index when featured games change
-  useEffect(() => {
-    setCarouselIndex(0);
-  }, [leagueId]);
-
   // Redirect check AFTER all hooks (React rules of hooks)
   if (!leagueId) {
     return <Navigate to="/sports/soccer" replace />;
   }
   
-  // Get current hero game for display
-  const currentHeroGame = featuredGames[carouselIndex] || null;
+  const pulseGames = useMemo(
+    () =>
+      todayMatches.map((match) => ({
+        status:
+          match.status === "live"
+            ? "LIVE"
+            : match.status === "finished"
+              ? "FINAL"
+              : "SCHEDULED",
+        home_score: match.homeScore ?? 0,
+        away_score: match.awayScore ?? 0,
+        period_label: match.minute,
+        start_time: match.date,
+      })),
+    [todayMatches]
+  );
 
   return (
     <>
-      <SoccerPageHeader
-        breadcrumbs={buildLeagueBreadcrumbs(leagueMeta.name)}
-        title={leagueMeta.name}
-        subtitle={`${leagueMeta.country} • ${leagueMeta.seasonLabel}`}
-        onBack={goBack}
-      />
-      
       <SportHubLayout 
         sportKey="soccer"
         heroSlot={
-          <>
-            <HubHero 
-              sportKey="soccer" 
-              game={currentHeroGame} 
-              loading={loading} 
-            />
-            {/* Carousel navigation dots */}
-            {featuredGames.length > 1 && (
-              <div className="flex items-center justify-center gap-2 -mt-4 pb-2">
-                {featuredGames.map((_, idx) => (
-                  <button
-                    key={idx}
-                    onClick={() => setCarouselIndex(idx)}
-                    className={`w-2 h-2 rounded-full transition-all duration-300 ${
-                      idx === carouselIndex 
-                        ? 'bg-emerald-400 w-6' 
-                        : 'bg-white/20 hover:bg-white/40'
-                    }`}
-                    aria-label={`Go to game ${idx + 1}`}
-                  />
-                ))}
+          <section className="relative overflow-hidden border-b border-white/5">
+            <div className="absolute inset-0 bg-gradient-to-br from-emerald-500/10 via-transparent to-slate-900/45" />
+            <div className="max-w-7xl mx-auto px-4 py-8">
+              <div className="flex items-center justify-between gap-4 mb-6 flex-wrap">
+                <div className="flex items-center gap-3">
+                  <div className="w-10 h-10 rounded-xl bg-emerald-500/20 border border-emerald-500/35 flex items-center justify-center">
+                    <span className="text-xl">⚽</span>
+                  </div>
+                  <div>
+                    <h1 className="text-2xl font-bold text-white">{leagueMeta.name} Command Center</h1>
+                    <p className="text-white/50 text-sm">{leagueMeta.country} • {leagueMeta.seasonLabel}</p>
+                  </div>
+                </div>
+                <PlayerSearch
+                  sport="Soccer"
+                  placeholder="Search soccer players..."
+                  className="w-full sm:w-72"
+                />
               </div>
-            )}
-            {/* Coach G Panel - Prominent position directly below hero */}
-            <div className="px-4 pb-6">
-              <CoachGPanel leagueId={leagueId} />
+              <LiveHeroMorph
+                sportKey="soccer"
+                games={featuredGames}
+                loading={loading}
+                buildGameUrl={(gameId) => buildSoccerMatchUrl(gameId, { fromLeagueId: leagueId, from: "soccer-league" })}
+              />
+              <div className="mt-4">
+                <CoachGPanel leagueId={leagueId} />
+              </div>
             </div>
-          </>
+          </section>
         }
       >
+        <div className="mb-6 -mt-1 rounded-2xl border border-white/8 bg-[rgba(15,23,42,0.55)] p-2">
+          <LeaguePulseStrip sportKey="soccer" games={pulseGames} />
+        </div>
+
+        <HubSection
+          id="coach-actions"
+          title="Ask Coach G"
+          subtitle="Quick insights with one tap"
+          icon={<Sparkles className="h-5 w-5 text-emerald-400" />}
+        >
+          <CoachCommandCard sportKey="soccer" />
+        </HubSection>
+
         {/* Standings Preview */}
 
         <HubSection
@@ -364,8 +366,8 @@ export default function SoccerLeagueHubPage() {
         {/* Schedule / Fixtures */}
         <HubSection
           id="scores"
-          title="Fixtures"
-          subtitle={`${leagueMeta.name} schedule`}
+          title="Today's Games"
+          subtitle={`${leagueMeta.name} schedule and recent results`}
           icon={<Calendar className="h-5 w-5 text-emerald-400" />}
         >
           <TodaysMatches 
@@ -620,7 +622,7 @@ function TodaysMatches({ matches, leagueId, loading }: {
   return (
     <div>
       {/* Filter tabs */}
-      <div className="flex gap-2 mb-4 overflow-x-auto">
+      <div className="mb-4 inline-flex gap-2 overflow-x-auto rounded-xl border border-white/10 bg-[#121821] p-1">
         {[
           { key: 'all' as const, label: 'All' },
           { key: 'live' as const, label: 'Live' },
@@ -630,10 +632,10 @@ function TodaysMatches({ matches, leagueId, loading }: {
           <button
             key={key}
             onClick={() => setFilter(key)}
-            className={`px-4 py-2 rounded-lg text-sm font-medium whitespace-nowrap transition-all ${
+            className={`rounded-lg px-4 py-2 text-sm font-medium whitespace-nowrap transition-all ${
               filter === key
-                ? 'bg-emerald-500/20 text-emerald-400'
-                : 'bg-white/5 text-white/60 hover:bg-white/10'
+                ? 'border border-emerald-400/30 bg-emerald-500/15 text-emerald-200'
+                : 'text-white/60 hover:bg-white/8'
             }`}
           >
             {label}
@@ -652,16 +654,16 @@ function TodaysMatches({ matches, leagueId, loading }: {
             return (
             <a
               key={match.eventId}
-              href={buildSoccerMatchUrl(match.eventId, { fromLeagueId: leagueId })}
-              className="block p-4 rounded-lg bg-white/[0.02] border border-white/10 hover:border-emerald-500/30 transition-all relative group"
+              href={buildSoccerMatchUrl(match.eventId, { fromLeagueId: leagueId, from: "soccer-league" })}
+              className="group relative block rounded-xl border border-white/10 bg-[#121821] p-4 transition-all hover:border-emerald-500/30"
             >
               {/* Quick-add watchboard button */}
               <button
                 onClick={(e) => handleWatchToggle(e, match.eventId, `${match.homeTeam.name} vs ${match.awayTeam.name}`)}
-                className={`absolute top-2 right-2 p-1.5 rounded-lg transition-all z-10 ${
+                className={`absolute right-2 top-2 z-10 rounded-lg p-1.5 transition-all ${
                   isWatching 
                     ? 'bg-emerald-500/20 text-emerald-400' 
-                    : 'bg-white/5 text-white/30 opacity-0 group-hover:opacity-100 hover:bg-white/10 hover:text-white/60'
+                    : 'bg-white/5 text-white/45 hover:bg-white/10 hover:text-white/70'
                 }`}
                 title={isWatching ? "Remove from Watchboard" : "Add to Watchboard"}
               >

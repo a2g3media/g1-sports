@@ -19,6 +19,16 @@ type Bindings = {
 
 const freshnessRoutes = new Hono<{ Bindings: Bindings }>();
 
+function isMissingFreshnessStorage(error: unknown): boolean {
+  const msg = String(error || "").toLowerCase();
+  return (
+    msg.includes("no such table") ||
+    msg.includes("data_source_freshness") ||
+    msg.includes("data_freshness_alerts") ||
+    msg.includes("scout_cache")
+  );
+}
+
 // Get current freshness status for all sources
 freshnessRoutes.get("/status", async (c) => {
   try {
@@ -36,6 +46,23 @@ freshnessRoutes.get("/status", async (c) => {
     });
   } catch (error) {
     console.error("Freshness check error:", error);
+    if (isMissingFreshnessStorage(error)) {
+      return c.json({
+        success: true,
+        data: {
+          sources: [],
+          summary: {
+            healthyCount: 0,
+            warningCount: 0,
+            criticalCount: 0,
+            totalCount: 0,
+          },
+          newAlerts: 0,
+          monitoredCount: MONITORED_SOURCES.length,
+          checkedAt: new Date().toISOString(),
+        },
+      });
+    }
     return c.json({ success: false, error: "Failed to check data freshness" }, 500);
   }
 });
@@ -54,6 +81,18 @@ freshnessRoutes.get("/summary", async (c) => {
     });
   } catch (error) {
     console.error("Freshness summary error:", error);
+    if (isMissingFreshnessStorage(error)) {
+      return c.json({
+        success: true,
+        data: {
+          healthyCount: 0,
+          warningCount: 0,
+          criticalCount: 0,
+          totalCount: 0,
+          checkedAt: new Date().toISOString(),
+        },
+      });
+    }
     return c.json({ success: false, error: "Failed to get freshness summary" }, 500);
   }
 });
@@ -73,6 +112,12 @@ freshnessRoutes.get("/alerts", async (c) => {
     });
   } catch (error) {
     console.error("Get alerts error:", error);
+    if (isMissingFreshnessStorage(error)) {
+      return c.json({
+        success: true,
+        data: { alerts: [], count: 0, hasCritical: false },
+      });
+    }
     return c.json({ success: false, error: "Failed to get alerts" }, 500);
   }
 });
@@ -93,6 +138,12 @@ freshnessRoutes.get("/source/:key", async (c) => {
     });
   } catch (error) {
     console.error("Get source history error:", error);
+    if (isMissingFreshnessStorage(error)) {
+      return c.json({
+        success: false,
+        error: "Source not found",
+      }, 404);
+    }
     return c.json({ success: false, error: "Failed to get source history" }, 500);
   }
 });
@@ -111,6 +162,12 @@ freshnessRoutes.post("/alerts/:id/resolve", async (c) => {
     });
   } catch (error) {
     console.error("Resolve alert error:", error);
+    if (isMissingFreshnessStorage(error)) {
+      return c.json({
+        success: true,
+        message: "Freshness storage not initialized",
+      });
+    }
     return c.json({ success: false, error: "Failed to resolve alert" }, 500);
   }
 });
@@ -147,6 +204,20 @@ freshnessRoutes.get("/cache/stats", async (c) => {
     });
   } catch (error) {
     console.error("Cache stats error:", error);
+    if (isMissingFreshnessStorage(error)) {
+      return c.json({
+        success: true,
+        data: {
+          totalEntries: 0,
+          totalHits: 0,
+          entriesByTool: [],
+          oldestEntry: null,
+          newestEntry: null,
+          config: CACHE_CONFIG,
+          checkedAt: new Date().toISOString(),
+        },
+      });
+    }
     return c.json({ success: false, error: "Failed to get cache stats" }, 500);
   }
 });
@@ -179,6 +250,13 @@ freshnessRoutes.post("/cache/clear", async (c) => {
     });
   } catch (error) {
     console.error("Cache clear error:", error);
+    if (isMissingFreshnessStorage(error)) {
+      return c.json({
+        success: true,
+        message: "Freshness cache storage not initialized",
+        deletedCount: 0,
+      });
+    }
     return c.json({ success: false, error: "Failed to clear cache" }, 500);
   }
 });

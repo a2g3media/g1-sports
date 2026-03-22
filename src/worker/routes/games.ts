@@ -18,7 +18,6 @@ import {
   getActiveProviderName,
   isOddsApiAvailable,
   fetchOddsForSport,
-  fetchOddsForGame,
   type SportKey,
 } from "../services/providers";
 
@@ -191,6 +190,86 @@ function buildLineHistoryIdCandidates(gameId: string): string[] {
   return Array.from(candidates).slice(0, 6);
 }
 
+function normalizePropGameId(value: string): string {
+  return String(value || "").trim().toLowerCase();
+}
+
+function buildPropIsolationIdCandidates(gameId: string): Set<string> {
+  const raw = String(gameId || "").trim();
+  const out = new Set<string>();
+  if (!raw) return out;
+
+  const add = (value: string | null | undefined) => {
+    const normalized = normalizePropGameId(String(value || ""));
+    if (normalized) out.add(normalized);
+  };
+
+  add(raw);
+  add(toSportsRadarEventId(raw));
+  add(toSportsRadarMatchId(raw));
+
+  if (raw.startsWith("sr_")) {
+    const parts = raw.split("_");
+    const tailUnderscore = parts.slice(2).join("_");
+    if (tailUnderscore) {
+      const tailHyphen = tailUnderscore.replace(/_/g, "-");
+      add(tailUnderscore);
+      add(tailHyphen);
+      add(`sr:sport_event:${tailHyphen}`);
+      add(`sr:sport_event:${tailUnderscore}`);
+      add(`sr:match:${tailUnderscore}`);
+      add(`sr:match:${tailHyphen}`);
+    }
+  }
+
+  if (raw.startsWith("sr:sport_event:")) {
+    const tail = raw.replace("sr:sport_event:", "");
+    add(tail);
+    add(tail.replace(/-/g, "_"));
+    add(tail.replace(/_/g, "-"));
+  }
+
+  if (raw.startsWith("sr:match:")) {
+    const tail = raw.replace("sr:match:", "");
+    add(tail);
+    add(tail.replace(/-/g, "_"));
+    add(tail.replace(/_/g, "-"));
+  }
+
+  return out;
+}
+
+function extractPropGameIds(prop: Record<string, unknown>): string[] {
+  const idFields = [
+    prop.providerGameId,
+    prop.provider_game_id,
+    prop.providerEventId,
+    prop.provider_event_id,
+    prop.sportEventId,
+    prop.sport_event_id,
+    prop.eventId,
+    prop.event_id,
+    prop.gameId,
+    prop.game_id,
+  ];
+  return idFields
+    .map((value) => String(value || "").trim())
+    .filter(Boolean);
+}
+
+function isPropMappedToGame(prop: Record<string, unknown>, candidateIds: Set<string>): boolean {
+  const propIds = extractPropGameIds(prop);
+  if (propIds.length === 0) return false;
+
+  for (const id of propIds) {
+    const propCandidates = buildPropIsolationIdCandidates(id);
+    for (const candidate of propCandidates) {
+      if (candidateIds.has(candidate)) return true;
+    }
+  }
+  return false;
+}
+
 function getSportsRadarPropsKey(env: Env): string | null {
   const keyChain = [
     env.SPORTSRADAR_ODDS_KEY,
@@ -215,11 +294,13 @@ async function fetchCompetitionPropsForGame(
     const result = await fetchPropsCached(env.DB, provider, dataSport, propsKey);
     if (!Array.isArray(result.props) || result.props.length === 0) return [];
 
-    const candidateIds = new Set([gameId, toSportsRadarEventId(gameId)].filter(Boolean) as string[]);
-    const matched = result.props.filter((prop) => candidateIds.has(String(prop.providerGameId)));
-    if (matched.length === 0) return [];
+    const candidateIds = buildPropIsolationIdCandidates(gameId);
+    const matchedById = result.props.filter((prop) =>
+      isPropMappedToGame(prop as unknown as Record<string, unknown>, candidateIds)
+    );
+    if (matchedById.length === 0) return [];
 
-    return matched.map((prop, idx) => ({
+    return matchedById.map((prop, idx) => ({
       playerId: prop.playerId || `sr_prop_${idx}`,
       playerName: prop.playerName,
       team: prop.team || "",
@@ -229,6 +310,8 @@ async function fetchCompetitionPropsForGame(
       underOdds: prop.oddsAmerican ?? -110,
       sportsbook: prop.sportsbook || "SportsRadar",
       isPlaceholder: false,
+      providerGameId: prop.providerGameId || prop.provider_game_id || prop.sportEventId || prop.sport_event_id || prop.eventId || prop.event_id,
+      providerEventId: prop.providerEventId || prop.provider_event_id || prop.sportEventId || prop.sport_event_id || prop.eventId || prop.event_id,
     }));
   } catch (err) {
     console.log("[Games API] Competition props fallback fetch failed:", err);
@@ -539,6 +622,8 @@ async function resolveOddsEventIdForGame(
   env: Env,
   gameId: string
 ): Promise<string | null> {
+  if (gameId.startsWith("sr:sport_event:")) return gameId;
+  if (gameId.startsWith("sr:match:")) return gameId.replace("sr:match:", "sr:sport_event:");
   const gameDetail = await fetchGameWithFallback(gameId);
   const game = gameDetail.data?.game;
   if (!game) return null;
@@ -640,7 +725,11 @@ gamesRouter.get("/", async (c) => {
     
     // Optional fast-path for clients that only need scoreboard data.
     if (includeOdds) {
-      allGames = await enrichGamesWithOdds(allGames, c.env);
+      allGames = await withTimeout(
+        enrichGamesWithOdds(allGames, c.env),
+        9000,
+        allGames
+      );
     }
     
     // Sort by sport then start time
@@ -684,7 +773,11 @@ gamesRouter.get("/", async (c) => {
     );
 
     const soccerEnrichedGames = includeOdds
-      ? await enrichGamesWithOdds(soccerResult.data, c.env)
+      ? await withTimeout(
+          enrichGamesWithOdds(soccerResult.data, c.env),
+          9000,
+          soccerResult.data
+        )
       : soccerResult.data;
 
     const soccerPayload = {
@@ -714,7 +807,11 @@ gamesRouter.get("/", async (c) => {
   
   // Optional fast-path for clients that only need scoreboard data.
   const enrichedGames = includeOdds
-    ? await enrichGamesWithOdds(result.data, c.env)
+    ? await withTimeout(
+        enrichGamesWithOdds(result.data, c.env),
+        9000,
+        result.data
+      )
     : result.data;
   
   // Determine cache headers based on game statuses
@@ -740,19 +837,31 @@ gamesRouter.get("/", async (c) => {
  */
 gamesRouter.get("/live", async (c) => {
   const sportsParam = c.req.query("sports");
+  const singleSportParam = c.req.query("sport");
   
   let sports: SportKey[] | undefined;
-  if (sportsParam) {
-    sports = sportsParam.split(",").filter(s => 
-      SUPPORTED_SPORTS.includes(s as SportKey)
-    ) as SportKey[];
+  if (sportsParam || singleSportParam) {
+    const raw = sportsParam
+      ? sportsParam.split(",")
+      : [singleSportParam as string];
+    const normalized = raw.map((s) => String(s || "").trim().toLowerCase());
+    sports = normalized.filter((s) => SUPPORTED_SPORTS.includes(s as SportKey)) as SportKey[];
     
     if (sports.length === 0) {
       return c.json({ error: "No valid sports specified" }, 400);
     }
   }
   
-  const result = await fetchLiveGamesWithFallback({ sports });
+  const result = await withTimeout(
+    fetchLiveGamesWithFallback({ sports }),
+    7000,
+    {
+      data: [],
+      fromCache: false,
+      provider: "timeout_fallback",
+      error: "Provider request timed out",
+    }
+  );
   
   // Group by sport for easier consumption
   const bySport: Record<string, Game[]> = {};
@@ -781,13 +890,16 @@ gamesRouter.get("/live", async (c) => {
  */
 gamesRouter.get("/scheduled", async (c) => {
   const sportsParam = c.req.query("sports");
+  const singleSportParam = c.req.query("sport");
   const hoursParam = c.req.query("hours");
   
   let sports: SportKey[] | undefined;
-  if (sportsParam) {
-    sports = sportsParam.split(",").filter(s => 
-      SUPPORTED_SPORTS.includes(s as SportKey)
-    ) as SportKey[];
+  if (sportsParam || singleSportParam) {
+    const raw = sportsParam
+      ? sportsParam.split(",")
+      : [singleSportParam as string];
+    const normalized = raw.map((s) => String(s || "").trim().toLowerCase());
+    sports = normalized.filter((s) => SUPPORTED_SPORTS.includes(s as SportKey)) as SportKey[];
   }
   
   const hours = hoursParam ? parseInt(hoursParam, 10) : 48;
@@ -795,7 +907,16 @@ gamesRouter.get("/scheduled", async (c) => {
     return c.json({ error: "Hours must be between 1 and 168" }, 400);
   }
   
-  const result = await fetchScheduledGamesWithFallback({ sports, hours });
+  const result = await withTimeout(
+    fetchScheduledGamesWithFallback({ sports, hours }),
+    7000,
+    {
+      data: [],
+      fromCache: false,
+      provider: "timeout_fallback",
+      error: "Provider request timed out",
+    }
+  );
   
   return c.json({
     games: result.data.map(withClientGameId),
@@ -1304,16 +1425,71 @@ gamesRouter.get("/:gameId", async (c) => {
   let propsFallbackReason: string | null = null;
   
   // Try to fetch live odds only for in-progress games.
-  // Scheduled games can be slow/noisy here and are handled by /api/games/:gameId/odds.
+  // Use SportsRadar event endpoint first to avoid legacy provider mismatch.
   if (!liteMode && isOddsApiAvailable(c.env) && game.status === "IN_PROGRESS") {
-    const liveOdds = await fetchOddsForGame(
-      game.sport as SportKey,
-      game.home_team_name,
-      game.away_team_name,
-      c.env
+    const keysToTry = Array.from(
+      new Set([
+        c.env.SPORTSRADAR_ODDS_KEY,
+        c.env.SPORTSRADAR_PLAYER_PROPS_KEY,
+        c.env.SPORTSRADAR_PROPS_KEY,
+        c.env.SPORTSRADAR_API_KEY,
+      ].filter((key): key is string => Boolean(key && key.trim())))
     );
-    if (liveOdds.length > 0) {
-      odds = liveOdds;
+    const srEventId = toSportsRadarEventId(gameId) || toSportsRadarEventId(normalizedGameId)
+      || (String(game.game_id || "").startsWith("sr:sport_event:") ? String(game.game_id) : null);
+    if (srEventId) {
+      for (const keyCandidate of keysToTry) {
+        try {
+          const srOdds = await fetchSportsRadarOddsForGame(srEventId, keyCandidate);
+          if (!srOdds) continue;
+          odds = [{
+            bookmaker: srOdds.bookmaker || "SportsRadar",
+            spread: srOdds.spread !== null ? `${srOdds.spread > 0 ? "+" : ""}${srOdds.spread}` : "N/A",
+            total: srOdds.total !== null ? String(srOdds.total) : "N/A",
+            moneylineAway: srOdds.moneylineAway !== null ? `${srOdds.moneylineAway > 0 ? "+" : ""}${srOdds.moneylineAway}` : "N/A",
+            moneylineHome: srOdds.moneylineHome !== null ? `${srOdds.moneylineHome > 0 ? "+" : ""}${srOdds.moneylineHome}` : "N/A",
+            updated: new Date().toISOString(),
+          }];
+          break;
+        } catch (err) {
+          console.warn("[Games API] live event odds fetch failed for key candidate", err);
+        }
+      }
+    }
+
+    if (!Array.isArray(odds) || odds.length === 0) {
+      const normalize = (value: string) => String(value || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+      const homeNorm = normalize(String(game.home_team_name || ""));
+      const awayNorm = normalize(String(game.away_team_name || ""));
+      for (const keyCandidate of keysToTry) {
+        try {
+          const sportOdds = await fetchSportsRadarOdds(String(game.sport || ""), c.env.SPORTSRADAR_API_KEY || "", c.env.DB, undefined, keyCandidate);
+          let matched: any = null;
+          for (const candidate of sportOdds.values()) {
+            const candidateHome = normalize(String(candidate?.homeTeam || ""));
+            const candidateAway = normalize(String(candidate?.awayTeam || ""));
+            if (
+              (candidateHome.includes(homeNorm) || homeNorm.includes(candidateHome)) &&
+              (candidateAway.includes(awayNorm) || awayNorm.includes(candidateAway))
+            ) {
+              matched = candidate;
+              break;
+            }
+          }
+          if (!matched) continue;
+          odds = [{
+            bookmaker: matched.bookmaker || "SportsRadar",
+            spread: matched.spread !== null ? `${matched.spread > 0 ? "+" : ""}${matched.spread}` : "N/A",
+            total: matched.total !== null ? String(matched.total) : "N/A",
+            moneylineAway: matched.moneylineAway !== null ? `${matched.moneylineAway > 0 ? "+" : ""}${matched.moneylineAway}` : "N/A",
+            moneylineHome: matched.moneylineHome !== null ? `${matched.moneylineHome > 0 ? "+" : ""}${matched.moneylineHome}` : "N/A",
+            updated: new Date().toISOString(),
+          }];
+          break;
+        } catch (err) {
+          console.warn("[Games API] live sport-map odds fetch failed for key candidate", err);
+        }
+      }
     }
   }
   
@@ -1330,6 +1506,7 @@ gamesRouter.get("/:gameId", async (c) => {
         propsFallbackReason = "No SportsRadar props key configured";
       }
       
+      const gameIdCandidates = buildPropIsolationIdCandidates(gameId);
       for (const { name, key } of keysToTry) {
         console.log(`[Props API] Trying ${name}...`);
         const srProps = await fetchGamePlayerProps(
@@ -1340,16 +1517,19 @@ gamesRouter.get("/:gameId", async (c) => {
           key,
           game.status
         );
-        if (srProps.length > 0) {
-          console.log(`[Props API] SUCCESS with ${name}: ${srProps.length} props found`);
-          props = srProps;
+        const strictProps = srProps.filter((row) =>
+          isPropMappedToGame(row as unknown as Record<string, unknown>, gameIdCandidates)
+        );
+        if (strictProps.length > 0) {
+          console.log(`[Props API] SUCCESS with ${name}: ${strictProps.length}/${srProps.length} props matched game IDs`);
+          props = strictProps;
           propsProvider = name;
           propsSource = "event";
           propsFallbackReason = null;
           break;
         } else {
-          console.log(`[Props API] ${name} returned 0 props, trying next key...`);
-          propsFallbackReason = `SportsRadar connected, but no player props are posted yet for this event (${name})`;
+          console.log(`[Props API] ${name} returned ${srProps.length} rows, 0 matched this game ID`);
+          propsFallbackReason = `SportsRadar connected, but no player props matched this game_id/event_id (${name})`;
         }
       }
     }
@@ -1381,6 +1561,9 @@ gamesRouter.get("/:gameId", async (c) => {
   // Real-data-only mode: do not inject placeholder props for scheduled games.
   if (!liteMode && props.length === 0 && game.status === "SCHEDULED" && !propsFallbackReason) {
     propsFallbackReason = "No player props posted yet for this game";
+  }
+  if (props.length === 0 && !propsFallbackReason) {
+    propsFallbackReason = "No player props available for this game_id/event_id";
   }
   
   // Use status-appropriate cache headers
@@ -1570,7 +1753,8 @@ gamesRouter.get("/:gameId/odds", async (c) => {
   }
   
   // Track if odds are live in-game odds
-  const isLiveOdds = game.status === 'IN_PROGRESS';
+  const status = String(game.status || "").toUpperCase();
+  const isLiveOdds = status === 'IN_PROGRESS' || status === 'LIVE';
   
   // Calculate consensus (average of all sportsbooks)
   let consensus = undefined;
@@ -2273,6 +2457,17 @@ gamesRouter.get("/:gameId/playbyplay", async (c) => {
  */
 gamesRouter.get("/:gameId/line-history", async (c) => {
   const gameId = c.req.param("gameId");
+  let detailGame: Record<string, unknown> | null = null;
+  const pickNumber = (...values: unknown[]): number | null => {
+    for (const value of values) {
+      if (typeof value === "number" && Number.isFinite(value)) return value;
+      if (typeof value === "string" && value.trim()) {
+        const parsed = Number(value);
+        if (Number.isFinite(parsed)) return parsed;
+      }
+    }
+    return null;
+  };
   const candidates = buildLineHistoryIdCandidates(gameId);
   const addCandidate = (value: unknown) => {
     const v = String(value || "").trim();
@@ -2283,8 +2478,12 @@ gamesRouter.get("/:gameId/line-history", async (c) => {
   // This prevents summary/line-history mismatches when a route is called with
   // sr_* but snapshots were stored under provider_game_id (or vice-versa).
   try {
-    const detailResult = await fetchGameWithFallback(gameId);
-    const detailGame = detailResult.data?.game;
+    const detailResult = await withTimeout(
+      fetchGameWithFallback(gameId),
+      3500,
+      { data: null } as any
+    );
+    detailGame = (detailResult.data?.game as Record<string, unknown> | null) || null;
     if (detailGame) {
       addCandidate(detailGame.game_id);
       addCandidate(detailGame.external_id);
@@ -2294,7 +2493,13 @@ gamesRouter.get("/:gameId/line-history", async (c) => {
   } catch {
     // non-fatal: keep existing candidates
   }
-  const resolvedOddsEventId = await resolveOddsEventIdForGame(c.env, gameId).catch(() => null);
+  // Keep this lookup bounded; full odds-map scans can be expensive and should
+  // never block line-history rendering.
+  const resolvedOddsEventId = await withTimeout(
+    resolveOddsEventIdForGame(c.env, gameId).catch(() => null),
+    2500,
+    null
+  );
   if (resolvedOddsEventId && !candidates.includes(resolvedOddsEventId)) {
     candidates.unshift(resolvedOddsEventId);
   }
@@ -2302,7 +2507,6 @@ gamesRouter.get("/:gameId/line-history", async (c) => {
   const c1 = candidates[1] || c0;
   const c2 = candidates[2] || c0;
   const c3 = candidates[3] || c0;
-  const tail = candidates[candidates.length - 1] || gameId;
   
   const lineHistory: Array<{
     timestamp: string;
@@ -2314,48 +2518,24 @@ gamesRouter.get("/:gameId/line-history", async (c) => {
   }> = [];
   
   try {
-    // Query line_history table
-    const lhResults = await c.env.DB.prepare(`
-      SELECT * FROM line_history
-      WHERE game_id IN (?, ?, ?, ?)
-        OR game_id LIKE ?
-      ORDER BY timestamp ASC
-      LIMIT 100
-    `).bind(c0, c1, c2, c3, `%${tail}%`).all();
-    
-    if (lhResults.results?.length) {
-      // Group by timestamp
-      const grouped = new Map<string, { spread?: number; total?: number; moneyline?: number }>();
-      for (const row of lhResults.results) {
-        const ts = String(row.timestamp);
-        if (!grouped.has(ts)) grouped.set(ts, {});
-        const entry = grouped.get(ts)!;
-        
-        if (row.market_type === 'spread') entry.spread = row.value as number;
-        else if (row.market_type === 'total') entry.total = row.value as number;
-        else if (row.market_type === 'moneyline') entry.moneyline = row.value as number;
-      }
-      
-      for (const [ts, values] of grouped) {
-        lineHistory.push({
-          timestamp: ts,
-          spread: values.spread ?? null,
-          total: values.total ?? null,
-          moneylineHome: values.moneyline ?? null,
-          moneylineAway: null,
-          source: "SportsRadar",
-        });
-      }
-    }
-    
+    // Build history from modern odds tables.
     if (lineHistory.length === 0) {
-      // Fallback to newer odds_opening + odds_snapshots tables.
-      for (const candidateId of candidates) {
+      let bestHistory: Array<{
+        timestamp: string;
+        spread: number | null;
+        total: number | null;
+        moneylineHome: number | null;
+        moneylineAway: number | null;
+        source: string;
+      }> = [];
+      let bestLatestTs = 0;
+
+      for (const candidateId of candidates.slice(0, 2)) {
         const [spreadHome, totalOver, moneylineHome, moneylineAway] = await Promise.all([
-          getLineMovement(c.env.DB, candidateId, "SPREAD", "HOME"),
-          getLineMovement(c.env.DB, candidateId, "TOTAL", "OVER"),
-          getLineMovement(c.env.DB, candidateId, "MONEYLINE", "HOME"),
-          getLineMovement(c.env.DB, candidateId, "MONEYLINE", "AWAY"),
+          withTimeout(getLineMovement(c.env.DB, candidateId, "SPREAD", "HOME"), 1800, null),
+          withTimeout(getLineMovement(c.env.DB, candidateId, "TOTAL", "OVER"), 1800, null),
+          withTimeout(getLineMovement(c.env.DB, candidateId, "MONEYLINE", "HOME"), 1800, null),
+          withTimeout(getLineMovement(c.env.DB, candidateId, "MONEYLINE", "AWAY"), 1800, null),
         ]);
 
         const byTimestamp = new Map<string, {
@@ -2376,6 +2556,28 @@ gamesRouter.get("/:gameId/line-history", async (c) => {
           }
           return byTimestamp.get(timestamp)!;
         };
+
+        // Seed with opening anchors so movement is visible even if snapshots are flat/current-only.
+        if (spreadHome?.openingLine !== null && spreadHome?.openingLine !== undefined) {
+          const ts = spreadHome.openingTimestamp || new Date(Date.now() - 60_000).toISOString();
+          const entry = ensureEntry(ts);
+          entry.spread = spreadHome.openingLine;
+        }
+        if (totalOver?.openingLine !== null && totalOver?.openingLine !== undefined) {
+          const ts = totalOver.openingTimestamp || new Date(Date.now() - 60_000).toISOString();
+          const entry = ensureEntry(ts);
+          entry.total = totalOver.openingLine;
+        }
+        if (moneylineHome?.openingPrice !== null && moneylineHome?.openingPrice !== undefined) {
+          const ts = moneylineHome.openingTimestamp || new Date(Date.now() - 60_000).toISOString();
+          const entry = ensureEntry(ts);
+          entry.moneylineHome = moneylineHome.openingPrice;
+        }
+        if (moneylineAway?.openingPrice !== null && moneylineAway?.openingPrice !== undefined) {
+          const ts = moneylineAway.openingTimestamp || new Date(Date.now() - 60_000).toISOString();
+          const entry = ensureEntry(ts);
+          entry.moneylineAway = moneylineAway.openingPrice;
+        }
 
         for (const point of spreadHome?.snapshots || []) {
           const entry = ensureEntry(point.timestamp);
@@ -2411,153 +2613,672 @@ gamesRouter.get("/:gameId/line-history", async (c) => {
           }
         }
 
+        let candidateHistory: typeof bestHistory = [];
         if (byTimestamp.size > 0) {
-          for (const [timestamp, values] of byTimestamp) {
-            lineHistory.push({
-              timestamp,
-              spread: values.spread,
-              total: values.total,
-              moneylineHome: values.moneylineHome,
-              moneylineAway: values.moneylineAway,
-              source: "SportsRadarSnapshots",
-            });
-          }
-          break;
+          candidateHistory = Array.from(byTimestamp.entries()).map(([timestamp, values]) => ({
+            timestamp,
+            spread: values.spread,
+            total: values.total,
+            moneylineHome: values.moneylineHome,
+            moneylineAway: values.moneylineAway,
+            source: "SportsRadarSnapshots",
+          }));
         }
 
         // Final fallback: read snapshots table directly and map key fields.
-        const snapshotRows = await c.env.DB.prepare(`
-          SELECT market_key, outcome_key, line_value, price_american, captured_at
-          FROM odds_snapshots
-          WHERE game_id = ?
-          ORDER BY captured_at ASC
-          LIMIT 300
-        `).bind(candidateId).all<{
-          market_key: string;
-          outcome_key: string;
-          line_value: number | null;
-          price_american: number | null;
-          captured_at: string;
-        }>();
-
-        if (snapshotRows.results.length > 0) {
-          const rowsByTs = new Map<string, {
-            spread: number | null;
-            total: number | null;
-            moneylineHome: number | null;
-            moneylineAway: number | null;
+        if (candidateHistory.length === 0) {
+          const snapshotRows = await c.env.DB.prepare(`
+            SELECT market_key, outcome_key, line_value, price_american, captured_at
+            FROM odds_snapshots
+            WHERE game_id = ?
+            ORDER BY captured_at DESC
+            LIMIT 300
+          `).bind(candidateId).all<{
+            market_key: string;
+            outcome_key: string;
+            line_value: number | null;
+            price_american: number | null;
+            captured_at: string;
           }>();
-          const getEntry = (timestamp: string) => {
-            if (!rowsByTs.has(timestamp)) {
-              rowsByTs.set(timestamp, {
-                spread: null,
-                total: null,
-                moneylineHome: null,
-                moneylineAway: null,
-              });
+
+          if (snapshotRows.results.length > 0) {
+            const rowsByTs = new Map<string, {
+              spread: number | null;
+              total: number | null;
+              moneylineHome: number | null;
+              moneylineAway: number | null;
+            }>();
+            const getEntry = (timestamp: string) => {
+              if (!rowsByTs.has(timestamp)) {
+                rowsByTs.set(timestamp, {
+                  spread: null,
+                  total: null,
+                  moneylineHome: null,
+                  moneylineAway: null,
+                });
+              }
+              return rowsByTs.get(timestamp)!;
+            };
+
+            for (const row of snapshotRows.results) {
+              const ts = String(row.captured_at);
+              const market = String(row.market_key || "").toUpperCase();
+              const outcome = String(row.outcome_key || "").toUpperCase();
+              const entry = getEntry(ts);
+              if (market === "SPREAD" && outcome === "HOME") entry.spread = row.line_value ?? null;
+              if (market === "TOTAL" && outcome === "OVER") entry.total = row.line_value ?? null;
+              if (market === "MONEYLINE" && outcome === "HOME") entry.moneylineHome = row.price_american ?? null;
+              if (market === "MONEYLINE" && outcome === "AWAY") entry.moneylineAway = row.price_american ?? null;
             }
-            return rowsByTs.get(timestamp)!;
-          };
 
-          for (const row of snapshotRows.results) {
-            const ts = String(row.captured_at);
-            const market = String(row.market_key || "").toUpperCase();
-            const outcome = String(row.outcome_key || "").toUpperCase();
-            const entry = getEntry(ts);
-            if (market === "SPREAD" && outcome === "HOME") entry.spread = row.line_value ?? null;
-            if (market === "TOTAL" && outcome === "OVER") entry.total = row.line_value ?? null;
-            if (market === "MONEYLINE" && outcome === "HOME") entry.moneylineHome = row.price_american ?? null;
-            if (market === "MONEYLINE" && outcome === "AWAY") entry.moneylineAway = row.price_american ?? null;
-          }
-
-          for (const [timestamp, values] of rowsByTs) {
-            lineHistory.push({
+            candidateHistory = Array.from(rowsByTs.entries()).map(([timestamp, values]) => ({
               timestamp,
               spread: values.spread,
               total: values.total,
               moneylineHome: values.moneylineHome,
               moneylineAway: values.moneylineAway,
               source: "SportsRadarSnapshots",
-            });
+            }));
           }
-          break;
         }
+
+        if (candidateHistory.length > 0) {
+          candidateHistory.sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
+          const latestTs = new Date(candidateHistory[candidateHistory.length - 1]?.timestamp || 0).getTime();
+          const bestHasOnlySinglePoint = bestHistory.length <= 1;
+          const candidateHasMultiplePoints = candidateHistory.length >= 2;
+          if (
+            bestHistory.length === 0 ||
+            (bestHasOnlySinglePoint && candidateHasMultiplePoints) ||
+            latestTs > bestLatestTs ||
+            (latestTs === bestLatestTs && candidateHistory.length > bestHistory.length)
+          ) {
+            bestHistory = candidateHistory;
+            bestLatestTs = latestTs;
+          }
+        }
+      }
+
+      if (bestHistory.length > 0) {
+        lineHistory.push(...bestHistory);
       }
     }
 
-    // Final fallback: synthesize a single current point from latest odds map
-    // so the UI can render a non-empty line card while snapshots backfill.
-    if (lineHistory.length === 0) {
+    // Fast fallback: fetch direct event odds only (bounded), avoiding full odds-map scans.
+    if (lineHistory.length === 0 && detailGame) {
       try {
-        const gameDetail = await withTimeout(
-          fetchGameWithFallback(gameId),
-          8000,
-          { data: null, error: "timeout" } as any
+        const oddsKey =
+          c.env.SPORTSRADAR_ODDS_KEY ||
+          c.env.SPORTSRADAR_PLAYER_PROPS_KEY ||
+          c.env.SPORTSRADAR_PROPS_KEY ||
+          c.env.SPORTSRADAR_API_KEY ||
+          "";
+        const srIdCandidates = Array.from(
+          new Set(
+            [
+              toSportsRadarEventId(String(detailGame.game_id || "")),
+              toSportsRadarEventId(String(detailGame.external_id || "")),
+              toSportsRadarMatchId(String(detailGame.game_id || "")),
+              toSportsRadarMatchId(String(detailGame.external_id || "")),
+              String(detailGame.external_id || "").includes("-") ? `sr:sport_event:${String(detailGame.external_id || "").trim()}` : null,
+              String(detailGame.external_id || "").includes("-") ? `sr:match:${String(detailGame.external_id || "").trim()}` : null,
+            ].filter(Boolean) as string[]
+          )
         );
-        const game = gameDetail.data?.game;
-        const sportKey = String(game?.sport || "").toLowerCase() as SportKey;
-        const apiKey = c.env.SPORTSRADAR_API_KEY;
-        if (game && apiKey && SUPPORTED_SPORTS.includes(sportKey)) {
-          const oddsApiKey = c.env.SPORTSRADAR_ODDS_KEY || apiKey;
-          const oddsMap = await withTimeout(
-            fetchSportsRadarOdds(sportKey, apiKey, c.env.DB, undefined, oddsApiKey),
-            12000,
-            new Map<string, any>()
+
+        let directOdds: any = null;
+        for (const srEventId of srIdCandidates.slice(0, 1)) {
+          directOdds = await withTimeout(
+            fetchSportsRadarOddsForGame(srEventId, oddsKey),
+            1200,
+            null
           );
+          if (directOdds) break;
+        }
 
-          const away = String(game.away_team_name || "");
-          const home = String(game.home_team_name || "");
-          const awayNorm = normalizeNameToken(away);
-          const homeNorm = normalizeNameToken(home);
-          const lookupKeys = [
-            String(game.game_id || ""),
-            String(game.external_id || ""),
-            `${sportKey}|${awayNorm.split(" ").pop() || awayNorm}|${homeNorm.split(" ").pop() || homeNorm}`,
-            `${sportKey}|${awayNorm}|${homeNorm}`,
-          ].filter(Boolean);
-
-          let matched: any = null;
-          for (const key of lookupKeys) {
-            matched = oddsMap.get(key);
-            if (matched) break;
-          }
-          if (!matched) {
-            const seen = new Set<string>();
-            for (const odds of oddsMap.values()) {
-              if (!odds?.gameId || seen.has(odds.gameId)) continue;
-              seen.add(odds.gameId);
-              if (
-                teamsRoughlyMatch(String(odds.awayTeam || ""), away) &&
-                teamsRoughlyMatch(String(odds.homeTeam || ""), home)
-              ) {
-                matched = odds;
-                break;
-              }
-            }
-          }
-
-          if (matched) {
-            lineHistory.push({
-              timestamp: new Date().toISOString(),
-              spread: matched.spread ?? matched.spreadHome ?? null,
-              total: matched.total ?? null,
-              moneylineHome: matched.moneylineHome ?? null,
-              moneylineAway: matched.moneylineAway ?? null,
-              source: "SportsRadarCurrent",
-            });
-          }
+        if (directOdds) {
+          lineHistory.push({
+            timestamp: new Date().toISOString(),
+            spread: pickNumber(directOdds.spreadHome, directOdds.spread),
+            total: pickNumber(directOdds.total),
+            moneylineHome: pickNumber(directOdds.moneylineHome),
+            moneylineAway: pickNumber(directOdds.moneylineAway),
+            source: "SportsRadarCurrent",
+          });
         }
       } catch (err) {
         console.log("[Line History] Current odds fallback failed:", err);
       }
     }
 
+    // Last-resort fallback: use current game-detail odds fields directly.
+    if (lineHistory.length === 0 && detailGame) {
+      const spread = pickNumber(
+        detailGame.spread,
+        detailGame.spread_home,
+        detailGame.spreadHome
+      );
+      const total = pickNumber(
+        detailGame.total,
+        detailGame.over_under,
+        detailGame.overUnder
+      );
+      const moneylineHome = pickNumber(
+        detailGame.moneyline_home,
+        detailGame.moneylineHome,
+        detailGame.ml_home,
+        detailGame.mlHome
+      );
+      const moneylineAway = pickNumber(
+        detailGame.moneyline_away,
+        detailGame.moneylineAway,
+        detailGame.ml_away,
+        detailGame.mlAway
+      );
+      const hasAny = spread !== null || total !== null || moneylineHome !== null || moneylineAway !== null;
+      if (hasAny) {
+        lineHistory.push({
+          timestamp: new Date().toISOString(),
+          spread,
+          total,
+          moneylineHome,
+          moneylineAway,
+          source: "GameCurrentOdds",
+        });
+      }
+    }
+
+    // Reconcile with current odds even when history exists:
+    // if current values differ from latest history point, append a fresh "now" point.
+    if (detailGame) {
+      let currentSpread = pickNumber(
+        detailGame.spread,
+        detailGame.spread_home,
+        detailGame.spreadHome
+      );
+      let currentTotal = pickNumber(
+        detailGame.total,
+        detailGame.over_under,
+        detailGame.overUnder
+      );
+      let currentMoneylineHome = pickNumber(
+        detailGame.moneyline_home,
+        detailGame.moneylineHome,
+        detailGame.ml_home,
+        detailGame.mlHome
+      );
+      let currentMoneylineAway = pickNumber(
+        detailGame.moneyline_away,
+        detailGame.moneylineAway,
+        detailGame.ml_away,
+        detailGame.mlAway
+      );
+
+      // Some game-detail payloads omit live odds fields. Pull direct current odds by event id.
+      if (
+        currentSpread === null &&
+        currentTotal === null &&
+        currentMoneylineHome === null &&
+        currentMoneylineAway === null
+      ) {
+        try {
+          const apiKey = c.env.SPORTSRADAR_API_KEY || "";
+          const oddsKeyCandidates = Array.from(
+            new Set(
+              [
+                c.env.SPORTSRADAR_ODDS_KEY,
+                c.env.SPORTSRADAR_PLAYER_PROPS_KEY,
+                c.env.SPORTSRADAR_PROPS_KEY,
+                c.env.SPORTSRADAR_API_KEY,
+              ].filter((value): value is string => Boolean(value && String(value).trim()))
+            )
+          ).slice(0, 2);
+          const srIdCandidates = Array.from(
+            new Set(
+              [
+                toSportsRadarEventId(String(detailGame.game_id || "")),
+                toSportsRadarEventId(String(detailGame.external_id || "")),
+                toSportsRadarMatchId(String(detailGame.game_id || "")),
+                toSportsRadarMatchId(String(detailGame.external_id || "")),
+                String(detailGame.external_id || "").includes("-") ? `sr:sport_event:${String(detailGame.external_id || "").trim()}` : null,
+                String(detailGame.external_id || "").includes("-") ? `sr:match:${String(detailGame.external_id || "").trim()}` : null,
+              ].filter(Boolean) as string[]
+            )
+          );
+
+          let directOdds: any = null;
+          for (const srEventId of srIdCandidates.slice(0, 2)) {
+            for (const keyCandidate of oddsKeyCandidates) {
+              directOdds = await withTimeout(
+                fetchSportsRadarOddsForGame(srEventId, keyCandidate || apiKey),
+                1200,
+                null
+              );
+              if (directOdds) break;
+            }
+            if (directOdds) break;
+          }
+
+          if (directOdds) {
+            currentSpread = pickNumber(directOdds.spreadHome, directOdds.spread);
+            currentTotal = pickNumber(directOdds.total);
+            currentMoneylineHome = pickNumber(directOdds.moneylineHome);
+            currentMoneylineAway = pickNumber(directOdds.moneylineAway);
+          }
+        } catch {
+          // Non-fatal: keep existing reconciliation values.
+        }
+      }
+      // Final current-odds fallback: use /odds consensus if available.
+      if (
+        currentSpread === null &&
+        currentTotal === null &&
+        currentMoneylineHome === null &&
+        currentMoneylineAway === null
+      ) {
+        try {
+          const baseUrl = new URL(c.req.url).origin;
+          const oddsResponse = await withTimeout(
+            fetch(`${baseUrl}/api/games/${encodeURIComponent(gameId)}/odds`, {
+              headers: { Accept: "application/json" },
+            }),
+            3000,
+            null
+          );
+          if (oddsResponse?.ok) {
+            const oddsPayload = await oddsResponse.json() as any;
+            const consensus = oddsPayload?.consensus || null;
+            if (consensus) {
+              currentSpread = pickNumber(consensus.spreadHome);
+              currentTotal = pickNumber(consensus.total);
+              currentMoneylineHome = pickNumber(consensus.moneylineHome);
+              currentMoneylineAway = pickNumber(consensus.moneylineAway);
+            }
+          }
+        } catch {
+          // Non-fatal: leave current values as null.
+        }
+      }
+      // Prefer sportsbook consensus for sparse histories so "current" matches books tab.
+      if (lineHistory.length <= 1) {
+      try {
+        const sport = String(detailGame.sport || "").toLowerCase();
+        const homeTeam = String(
+          detailGame.home_team_name ||
+          detailGame.homeTeam ||
+          ""
+        );
+        const awayTeam = String(
+          detailGame.away_team_name ||
+          detailGame.awayTeam ||
+          ""
+        );
+        const apiKey = String(c.env.SPORTSRADAR_API_KEY || "").trim();
+        if (apiKey && sport && homeTeam && awayTeam) {
+          const oddsKeyCandidates = Array.from(
+            new Set(
+              [
+                c.env.SPORTSRADAR_ODDS_KEY,
+                c.env.SPORTSRADAR_PLAYER_PROPS_KEY,
+                c.env.SPORTSRADAR_PROPS_KEY,
+                c.env.SPORTSRADAR_API_KEY,
+              ].filter((value): value is string => Boolean(value && String(value).trim()))
+            )
+          ).slice(0, 3);
+
+          let books: Array<{
+            spreadHome: number | null;
+            total: number | null;
+            moneylineHome: number | null;
+            moneylineAway: number | null;
+          }> = [];
+
+          for (const oddsKey of oddsKeyCandidates) {
+            const candidateBooks = await withTimeout(
+              fetchAllSportsbooksForGame(
+                sport as SportKey,
+                apiKey,
+                c.env.DB,
+                homeTeam,
+                awayTeam,
+                oddsKey
+              ),
+              6000,
+              []
+            );
+            if (candidateBooks.length > 0) {
+              books = candidateBooks;
+              break;
+            }
+          }
+
+          if (books.length > 0) {
+            const avg = (values: Array<number | null | undefined>): number | null => {
+              const nums = values.filter((v): v is number => typeof v === "number" && Number.isFinite(v));
+              if (nums.length === 0) return null;
+              return nums.reduce((sum, value) => sum + value, 0) / nums.length;
+            };
+            const snapHalf = (value: number | null) => (value === null ? null : Math.round(value * 2) / 2);
+            const snapInt = (value: number | null) => (value === null ? null : Math.round(value));
+            const consensusSpread = snapHalf(avg(books.map((book) => book.spreadHome)));
+            const consensusTotal = snapHalf(avg(books.map((book) => book.total)));
+            const consensusMlHome = snapInt(avg(books.map((book) => book.moneylineHome)));
+            const consensusMlAway = snapInt(avg(books.map((book) => book.moneylineAway)));
+            if (consensusSpread !== null) currentSpread = consensusSpread;
+            if (consensusTotal !== null) currentTotal = consensusTotal;
+            if (consensusMlHome !== null) currentMoneylineHome = consensusMlHome;
+            if (consensusMlAway !== null) currentMoneylineAway = consensusMlAway;
+          } else {
+            // Mirror /odds fallback behavior when individual books are unavailable.
+            const candidateIds = new Set<string>(
+              [
+                String(detailGame.game_id || "").trim(),
+                String(detailGame.external_id || "").trim(),
+                toSportsRadarEventId(String(detailGame.game_id || "")) || "",
+                toSportsRadarEventId(String(detailGame.external_id || "")) || "",
+                toSportsRadarMatchId(String(detailGame.game_id || "")) || "",
+                toSportsRadarMatchId(String(detailGame.external_id || "")) || "",
+              ].filter(Boolean)
+            );
+
+            let fallbackOdds: any = null;
+            for (const oddsKey of oddsKeyCandidates) {
+              const oddsMap = await withTimeout(
+                fetchSportsRadarOdds(sport as SportKey, apiKey, c.env.DB, undefined, oddsKey),
+                6000,
+                new Map<string, any>()
+              );
+
+              for (const [key, odds] of oddsMap) {
+                if (candidateIds.has(String(key || "")) || candidateIds.has(String(odds?.gameId || ""))) {
+                  fallbackOdds = odds;
+                  break;
+                }
+              }
+
+              if (!fallbackOdds) {
+                for (const odds of oddsMap.values()) {
+                  if (
+                    teamsRoughlyMatch(String(odds?.homeTeam || ""), homeTeam) &&
+                    teamsRoughlyMatch(String(odds?.awayTeam || ""), awayTeam)
+                  ) {
+                    fallbackOdds = odds;
+                    break;
+                  }
+                }
+              }
+
+              if (fallbackOdds) break;
+            }
+
+            if (fallbackOdds) {
+              const consensusSpread = pickNumber(fallbackOdds.spreadHome, fallbackOdds.spread);
+              const consensusTotal = pickNumber(fallbackOdds.total);
+              const consensusMlHome = pickNumber(fallbackOdds.moneylineHome);
+              const consensusMlAway = pickNumber(fallbackOdds.moneylineAway);
+              if (consensusSpread !== null) currentSpread = consensusSpread;
+              if (consensusTotal !== null) currentTotal = consensusTotal;
+              if (consensusMlHome !== null) currentMoneylineHome = consensusMlHome;
+              if (consensusMlAway !== null) currentMoneylineAway = consensusMlAway;
+            }
+          }
+        }
+      } catch {
+        // Non-fatal: keep best-effort current values.
+      }
+      }
+      const hasCurrent =
+        currentSpread !== null ||
+        currentTotal !== null ||
+        currentMoneylineHome !== null ||
+        currentMoneylineAway !== null;
+      if (hasCurrent) {
+        const last = lineHistory[lineHistory.length - 1] || null;
+        const sameNullable = (a: number | null, b: number | null) => a === b;
+        const differsFromLast =
+          !last ||
+          !sameNullable(last.spread, currentSpread) ||
+          !sameNullable(last.total, currentTotal) ||
+          !sameNullable(last.moneylineHome, currentMoneylineHome) ||
+          !sameNullable(last.moneylineAway, currentMoneylineAway);
+        if (differsFromLast) {
+          lineHistory.push({
+            timestamp: new Date().toISOString(),
+            spread: currentSpread,
+            total: currentTotal,
+            moneylineHome: currentMoneylineHome,
+            moneylineAway: currentMoneylineAway,
+            source: "GameCurrentOddsReconciled",
+          });
+        }
+      }
+    }
+
+    // Final parity step: align with /odds consensus when available.
+    // Trigger for sparse or flat histories where movement can appear stuck at 0.
+    const firstHistoryPoint = lineHistory[0] || null;
+    const lastHistoryPoint = lineHistory[lineHistory.length - 1] || null;
+    const spreadLooksFlat =
+      firstHistoryPoint?.spread !== null &&
+      firstHistoryPoint?.spread !== undefined &&
+      lastHistoryPoint?.spread !== null &&
+      lastHistoryPoint?.spread !== undefined &&
+      firstHistoryPoint.spread === lastHistoryPoint.spread;
+    const totalLooksFlat =
+      firstHistoryPoint?.total !== null &&
+      firstHistoryPoint?.total !== undefined &&
+      lastHistoryPoint?.total !== null &&
+      lastHistoryPoint?.total !== undefined &&
+      firstHistoryPoint.total === lastHistoryPoint.total;
+    const needsOddsParity = lineHistory.length <= 1 || spreadLooksFlat || totalLooksFlat;
+
+    if (needsOddsParity) {
+    if (lineHistory.length <= 1 && candidates.length > 0) {
+    try {
+      let spreadRecovery: any = null;
+      let totalRecovery: any = null;
+      let mlHomeRecovery: any = null;
+      let mlAwayRecovery: any = null;
+      let bestScore = -1;
+
+      for (const recoveryId of candidates.slice(0, 6)) {
+        const [s, t, mh, ma] = await Promise.all([
+          withTimeout(getLineMovement(c.env.DB, recoveryId, "SPREAD", "HOME"), 5000, null),
+          withTimeout(getLineMovement(c.env.DB, recoveryId, "TOTAL", "OVER"), 5000, null),
+          withTimeout(getLineMovement(c.env.DB, recoveryId, "MONEYLINE", "HOME"), 5000, null),
+          withTimeout(getLineMovement(c.env.DB, recoveryId, "MONEYLINE", "AWAY"), 5000, null),
+        ]);
+        const score =
+          Math.max(s?.snapshots?.length || 0, 0) +
+          Math.max(t?.snapshots?.length || 0, 0) +
+          Math.max(mh?.snapshots?.length || 0, 0) +
+          Math.max(ma?.snapshots?.length || 0, 0);
+        if (score > bestScore) {
+          bestScore = score;
+          spreadRecovery = s;
+          totalRecovery = t;
+          mlHomeRecovery = mh;
+          mlAwayRecovery = ma;
+        }
+        if (score >= 8) break;
+      }
+
+      const anyRecovery =
+        spreadRecovery?.openingLine != null ||
+        spreadRecovery?.currentLine != null ||
+        totalRecovery?.openingLine != null ||
+        totalRecovery?.currentLine != null ||
+        mlHomeRecovery?.openingPrice != null ||
+        mlHomeRecovery?.currentPrice != null ||
+        mlAwayRecovery?.openingPrice != null ||
+        mlAwayRecovery?.currentPrice != null;
+
+      if (anyRecovery) {
+        const openingPoint = {
+          timestamp:
+            spreadRecovery?.openingTimestamp ||
+            totalRecovery?.openingTimestamp ||
+            mlHomeRecovery?.openingTimestamp ||
+            mlAwayRecovery?.openingTimestamp ||
+            new Date(Date.now() - 120_000).toISOString(),
+          spread: spreadRecovery?.openingLine ?? null,
+          total: totalRecovery?.openingLine ?? null,
+          moneylineHome: mlHomeRecovery?.openingPrice ?? null,
+          moneylineAway: mlAwayRecovery?.openingPrice ?? null,
+          source: "SportsRadarRecovery",
+        };
+        const currentPoint = {
+          timestamp: new Date().toISOString(),
+          spread: spreadRecovery?.currentLine ?? openingPoint.spread,
+          total: totalRecovery?.currentLine ?? openingPoint.total,
+          moneylineHome: mlHomeRecovery?.currentPrice ?? openingPoint.moneylineHome,
+          moneylineAway: mlAwayRecovery?.currentPrice ?? openingPoint.moneylineAway,
+          source: "SportsRadarRecovery",
+        };
+        lineHistory.length = 0;
+        lineHistory.push(openingPoint, currentPoint);
+      }
+    } catch {
+      // Non-fatal recovery attempt.
+    }
+    }
+    try {
+      const baseUrl = new URL(c.req.url).origin;
+      const oddsResponse = await withTimeout(
+        fetch(`${baseUrl}/api/games/${encodeURIComponent(gameId)}/odds`, {
+          headers: { Accept: "application/json" },
+        }),
+        3000,
+        null
+      );
+      if (oddsResponse?.ok) {
+        const oddsPayload = await oddsResponse.json() as any;
+        const consensus = oddsPayload?.consensus || null;
+        const openSpread = pickNumber(oddsPayload?.openSpread);
+        const openTotal = pickNumber(oddsPayload?.openTotal);
+        const openMoneylineHome = pickNumber(oddsPayload?.openMoneylineHome);
+        const openMoneylineAway = pickNumber(oddsPayload?.openMoneylineAway);
+        if (consensus) {
+          const consensusSpread = pickNumber(consensus.spreadHome);
+          const consensusTotal = pickNumber(consensus.total);
+          const consensusMlHome = pickNumber(consensus.moneylineHome);
+          const consensusMlAway = pickNumber(consensus.moneylineAway);
+
+          const shouldInjectOpening =
+            lineHistory.length === 0 ||
+            (spreadLooksFlat && openSpread !== null && consensusSpread !== null && openSpread !== consensusSpread) ||
+            (totalLooksFlat && openTotal !== null && consensusTotal !== null && openTotal !== consensusTotal);
+          if (shouldInjectOpening) {
+            const first = lineHistory[0] || null;
+            const sameNullable = (a: number | null, b: number | null) => a === b;
+            const openingSpread = openSpread !== null ? openSpread : (first?.spread ?? null);
+            const openingTotal = openTotal !== null ? openTotal : (first?.total ?? null);
+            const openingMlHome = openMoneylineHome !== null ? openMoneylineHome : (first?.moneylineHome ?? null);
+            const openingMlAway = openMoneylineAway !== null ? openMoneylineAway : (first?.moneylineAway ?? null);
+            const differsFromFirst =
+              !first ||
+              !sameNullable(first.spread, openingSpread) ||
+              !sameNullable(first.total, openingTotal) ||
+              !sameNullable(first.moneylineHome, openingMlHome) ||
+              !sameNullable(first.moneylineAway, openingMlAway);
+            if (differsFromFirst) {
+              lineHistory.push({
+                timestamp: new Date(Date.now() - 120_000).toISOString(),
+                spread: openingSpread,
+                total: openingTotal,
+                moneylineHome: openingMlHome,
+                moneylineAway: openingMlAway,
+                source: "OddsEndpointOpening",
+              });
+            }
+          }
+          const hasConsensusCurrent =
+            consensusSpread !== null ||
+            consensusTotal !== null ||
+            consensusMlHome !== null ||
+            consensusMlAway !== null;
+          if (hasConsensusCurrent) {
+            const last = lineHistory[lineHistory.length - 1] || null;
+            const sameNullable = (a: number | null, b: number | null) => a === b;
+            const differsFromLast =
+              !last ||
+              !sameNullable(last.spread, consensusSpread) ||
+              !sameNullable(last.total, consensusTotal) ||
+              !sameNullable(last.moneylineHome, consensusMlHome) ||
+              !sameNullable(last.moneylineAway, consensusMlAway);
+            if (differsFromLast) {
+              lineHistory.push({
+                timestamp: new Date().toISOString(),
+                spread: consensusSpread,
+                total: consensusTotal,
+                moneylineHome: consensusMlHome,
+                moneylineAway: consensusMlAway,
+                source: "OddsEndpointConsensus",
+              });
+            }
+          }
+        }
+      }
+    } catch {
+      // Non-fatal.
+    }
+    }
+
     // Sort by timestamp
     lineHistory.sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
+
+    const sameNullable = (a: number | null, b: number | null) => a === b;
+    const isSamePoint = (
+      a: { spread: number | null; total: number | null; moneylineHome: number | null; moneylineAway: number | null },
+      b: { spread: number | null; total: number | null; moneylineHome: number | null; moneylineAway: number | null }
+    ) =>
+      sameNullable(a.spread, b.spread) &&
+      sameNullable(a.total, b.total) &&
+      sameNullable(a.moneylineHome, b.moneylineHome) &&
+      sameNullable(a.moneylineAway, b.moneylineAway);
+
+    const swingHistory: typeof lineHistory = [];
+    for (const point of lineHistory) {
+      const last = swingHistory[swingHistory.length - 1];
+      if (!last || !isSamePoint(last, point)) {
+        swingHistory.push(point);
+      }
+    }
     
-    // Calculate opening and current lines
-    const opening = lineHistory.length > 0 ? lineHistory[0] : null;
-    const current = lineHistory.length > 0 ? lineHistory[lineHistory.length - 1] : null;
+    // Calculate opening/current by metric, using first/last non-null values.
+    const firstBy = <T extends number | null>(getter: (p: typeof swingHistory[number]) => T): T => {
+      for (const point of swingHistory) {
+        const value = getter(point);
+        if (value !== null && value !== undefined) return value;
+      }
+      return null as T;
+    };
+    const lastBy = <T extends number | null>(getter: (p: typeof swingHistory[number]) => T): T => {
+      for (let i = swingHistory.length - 1; i >= 0; i--) {
+        const value = getter(swingHistory[i]);
+        if (value !== null && value !== undefined) return value;
+      }
+      return null as T;
+    };
+    const openingTimestamp = swingHistory.length > 0 ? swingHistory[0].timestamp : null;
+    const currentTimestamp = swingHistory.length > 0 ? swingHistory[swingHistory.length - 1].timestamp : null;
+
+    const opening = swingHistory.length > 0 ? {
+      timestamp: openingTimestamp,
+      spread: firstBy((p) => p.spread),
+      total: firstBy((p) => p.total),
+      moneylineHome: firstBy((p) => p.moneylineHome),
+      moneylineAway: firstBy((p) => p.moneylineAway),
+      source: swingHistory[0].source,
+    } : null;
+    const current = swingHistory.length > 0 ? {
+      timestamp: currentTimestamp,
+      spread: lastBy((p) => p.spread),
+      total: lastBy((p) => p.total),
+      moneylineHome: lastBy((p) => p.moneylineHome),
+      moneylineAway: lastBy((p) => p.moneylineAway),
+      source: swingHistory[swingHistory.length - 1].source,
+    } : null;
     
     // Calculate movements
     const movements = {
@@ -2571,14 +3292,15 @@ gamesRouter.get("/:gameId/line-history", async (c) => {
     
     return c.json({
       gameId,
-      historyCount: lineHistory.length,
+      historyCount: swingHistory.length,
+      rawHistoryCount: lineHistory.length,
       opening,
       current,
       movements,
-      history: lineHistory,
-      degraded: lineHistory.length === 0,
-      fallback_type: lineHistory.length === 0 ? "no_coverage" : null,
-      fallback_reason: lineHistory.length === 0 ? "No line history rows found for this game ID mapping" : null,
+      history: swingHistory,
+      degraded: swingHistory.length === 0,
+      fallback_type: swingHistory.length === 0 ? "no_coverage" : null,
+      fallback_reason: swingHistory.length === 0 ? "No line history rows found for this game ID mapping" : null,
       lastUpdated: new Date().toISOString(),
     }, {
       headers: cacheHeaders(60, { isPublic: true }) // 1 minute cache
@@ -2621,26 +3343,78 @@ gamesRouter.get("/odds/:sport", async (c) => {
     }, 503);
   }
   
-  const result = await fetchOddsForSport(sport, c.env);
-  
-  if (result.error) {
-    return c.json({ 
-      error: result.error,
-      odds: {},
-    }, 200);
-  }
-  
-  // Convert Map to object for JSON serialization
+  const mainApiKey = c.env.SPORTSRADAR_API_KEY || "";
+  const keyChain = Array.from(
+    new Set(
+      [
+        c.env.SPORTSRADAR_ODDS_KEY,
+        c.env.SPORTSRADAR_PLAYER_PROPS_KEY,
+        c.env.SPORTSRADAR_PROPS_KEY,
+        c.env.SPORTSRADAR_API_KEY,
+      ].filter((value): value is string => Boolean(value && value.trim()))
+    )
+  );
   const oddsObject: Record<string, unknown> = {};
-  for (const [key, value] of result.odds) {
-    oddsObject[key] = value;
+  let usedKey: string | null = null;
+  for (const keyCandidate of keyChain) {
+    try {
+      const oddsMap = await fetchSportsRadarOdds(sport, mainApiKey, c.env.DB, undefined, keyCandidate);
+      for (const [key, value] of oddsMap) oddsObject[key] = value;
+      usedKey = keyCandidate;
+      if (Object.keys(oddsObject).length > 0) break;
+    } catch (err) {
+      console.warn(`[Games API] /odds/${sport} failed with key candidate`, err);
+    }
+  }
+  if (Object.keys(oddsObject).length === 0) {
+    const fallbackEventIds = new Set<string>();
+    try {
+      const [liveResult, scheduledResult] = await Promise.all([
+        fetchLiveGamesWithFallback({ sports: [sport] }),
+        fetchScheduledGamesWithFallback({ sports: [sport], hours: 24 }),
+      ]);
+      for (const row of [...liveResult.data, ...scheduledResult.data]) {
+        const rawId = String((row as any)?.game_id || (row as any)?.id || "");
+        const srEventId = toSportsRadarEventId(rawId) || (rawId.startsWith("sr:sport_event:") ? rawId : null);
+        if (srEventId) fallbackEventIds.add(srEventId);
+      }
+    } catch (err) {
+      console.warn(`[Games API] sport fallback event id lookup failed for /odds/${sport}`, err);
+    }
+    for (const eventId of Array.from(fallbackEventIds).slice(0, 180)) {
+      for (const keyCandidate of keyChain) {
+        try {
+          const resolved = await fetchSportsRadarOddsForGame(eventId, keyCandidate);
+          if (!resolved) continue;
+          oddsObject[eventId] = resolved;
+          break;
+        } catch {
+          // Continue probing.
+        }
+      }
+    }
+  }
+
+  if (Object.keys(oddsObject).length === 0) {
+    return c.json({
+      sport,
+      odds: {},
+      gamesWithOdds: 0,
+      provider: "sportsradar",
+      degraded: true,
+      fallback_reason: keyChain.length === 0
+        ? "No SportsRadar keys configured"
+        : "SportsRadar odds returned no markets",
+      timestamp: new Date().toISOString(),
+    }, 200);
   }
   
   return c.json({
     sport,
     odds: oddsObject,
-    gamesWithOdds: result.odds.size,
+    gamesWithOdds: Object.keys(oddsObject).length,
     provider: "sportsradar",
+    keyUsed: usedKey ? "configured" : null,
     timestamp: new Date().toISOString(),
   }, { 
     headers: cacheHeaders(300, { isPublic: true }) // 5 minute cache

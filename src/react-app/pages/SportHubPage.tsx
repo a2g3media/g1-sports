@@ -12,6 +12,7 @@ import { SoccerHubStandings } from "@/react-app/components/hub/SoccerHubStanding
 import { SoccerHubLeaders } from "@/react-app/components/hub/SoccerHubLeaders";
 import { HubLeaders } from "@/react-app/components/hub/HubLeaders";
 import { HubSchedule } from "@/react-app/components/hub/HubSchedule";
+import { PlayerSearch } from "@/react-app/components/PlayerSearch";
 import { Trophy, Users, Calendar, Sparkles } from "lucide-react";
 
 interface GameData {
@@ -207,16 +208,37 @@ export function SportHubPage() {
       <SportHubLayout 
         sportKey={normalizedKey}
         heroSlot={
-          <LiveHeroMorph 
-            sportKey={normalizedKey} 
-            games={heroGames} 
-            loading={false}
-            onActiveIndexChange={setActiveHeroIndex}
-          />
+          <section className="relative overflow-hidden border-b border-white/5">
+            <div className="absolute inset-0 bg-gradient-to-br from-[var(--sport-accent)]/8 via-transparent to-slate-900/40" />
+            <div className="max-w-7xl mx-auto px-4 py-8">
+              <div className="flex items-center justify-between gap-4 mb-6 flex-wrap">
+                <div className="flex items-center gap-3">
+                  <div className="w-10 h-10 rounded-xl bg-[var(--sport-accent)]/15 border border-[var(--sport-accent)]/35 flex items-center justify-center">
+                    <span className="text-xl">{sportConfig.icon}</span>
+                  </div>
+                  <div>
+                    <h1 className="text-2xl font-bold text-white">{sportConfig.name} Command Center</h1>
+                    <p className="text-white/50 text-sm">Live games, standings, and Coach G intel</p>
+                  </div>
+                </div>
+                <PlayerSearch 
+                  sport={sportConfig.name}
+                  placeholder={`Search ${sportConfig.name} players...`}
+                  className="w-full sm:w-72"
+                />
+              </div>
+              <LiveHeroMorph 
+                sportKey={normalizedKey} 
+                games={heroGames} 
+                loading={false}
+                onActiveIndexChange={setActiveHeroIndex}
+              />
+            </div>
+          </section>
         }
       >
         {/* League Pulse Strip - Quick insights (uses allGames, no fetch) */}
-        <div className="mb-6 -mt-2">
+        <div className="mb-6 -mt-1 rounded-2xl border border-white/8 bg-[rgba(15,23,42,0.55)] p-2">
           <LeaguePulseStrip sportKey={normalizedKey} games={todayGames} />
         </div>
 

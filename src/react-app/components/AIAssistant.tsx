@@ -14,6 +14,7 @@ import { useSuperAdmin } from "@/react-app/contexts/SuperAdminContext";
 import { cn } from "@/react-app/lib/utils";
 import { ScoutResponseRenderer } from "@/react-app/components/ScoutResponseRenderer";
 import { detectIntent, generateActionButtons, type ActionButton } from "@/react-app/lib/coachGActionEngine";
+import { useGlobalAI } from "@/react-app/components/GlobalAIProvider";
 
 interface AIAssistantProps {
   leagueId?: number;
@@ -62,6 +63,7 @@ export function AIAssistant({ leagueId, defaultPersona, isOpen: controlledOpen, 
   const { user } = useDemoAuth();
   const { isAdminMode } = useAdminMode();
   const { isSuperAdmin } = useSuperAdmin();
+  const { shouldAutoOpenScout, consumeAutoOpenScout, pendingMessage, consumePendingMessage } = useGlobalAI();
   
   const userRole: "consumer" | "pool_admin" | "super_admin" = 
     isSuperAdmin ? "super_admin" : 
@@ -174,11 +176,17 @@ export function AIAssistant({ leagueId, defaultPersona, isOpen: controlledOpen, 
       }
 
       const data = await response.json();
+      const responseText = String(
+        data?.response ?? data?.reply ?? data?.message ?? ""
+      ).trim();
+      if (!responseText) {
+        throw new Error("Coach G returned an empty response");
+      }
 
       const assistantMessage: AIMessage = {
         id: generateMessageId(),
         role: "assistant",
-        content: data.response,
+        content: responseText,
         timestamp: new Date(),
         persona: selectedPersona,
       };
@@ -204,6 +212,19 @@ export function AIAssistant({ leagueId, defaultPersona, isOpen: controlledOpen, 
       setIsLoading(false);
     }
   };
+
+  useEffect(() => {
+    if (!shouldAutoOpenScout) return;
+    setIsOpen(true);
+    consumeAutoOpenScout();
+  }, [shouldAutoOpenScout, consumeAutoOpenScout]);
+
+  useEffect(() => {
+    if (!pendingMessage || isLoading) return;
+    setIsOpen(true);
+    setInputValue(pendingMessage);
+    consumePendingMessage();
+  }, [pendingMessage, isLoading, consumePendingMessage]);
 
   const handleSuggestedQuestion = (question: string) => {
     setInputValue(question);

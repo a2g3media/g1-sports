@@ -15,6 +15,11 @@ type AppContext = Context<AppBindings>;
 
 const alertsRouter = new Hono<AppBindings>();
 
+function isMissingAlertStorage(error: unknown): boolean {
+  const msg = String(error || "").toLowerCase();
+  return msg.includes("no such table") || msg.includes("alert_events") || msg.includes("threshold_events");
+}
+
 // Demo user ID for unauthenticated demo mode
 const DEMO_USER_ID = "demo-user-001";
 
@@ -33,11 +38,10 @@ async function demoOrAuthMiddleware(c: AppContext, next: () => Promise<void>) {
   const isDemoMode = c.req.header("X-Demo-Mode") === "true";
   if (isDemoMode) {
     // Allow demo mode requests without real auth
-    await next();
-    return;
+    return next();
   }
   // Otherwise require real authentication
-  await authMiddleware(c, next);
+  return authMiddleware(c, next);
 }
 
 // =====================================================
@@ -649,19 +653,35 @@ alertsRouter.post("/generate-batch", async (c) => {
   const scope = c.req.query("scope") || "PROD";
   const lookbackMinutes = parseInt(c.req.query("lookback") || "30");
 
-  const result = await generateAlertsFromThresholdEvents(db, scope, {
-    lookbackMinutes,
-    maxEventsPerRun: 1000,
-  });
+  try {
+    const result = await generateAlertsFromThresholdEvents(db, scope, {
+      lookbackMinutes,
+      maxEventsPerRun: 1000,
+    });
 
-  return c.json({ 
-    success: true, 
-    alerts_created: result.alerts_created,
-    events_processed: result.events_processed,
-    users_notified: result.users_notified.size,
-    dedupe_skipped: result.dedupe_skipped,
-    preference_skipped: result.preference_skipped,
-  });
+    return c.json({
+      success: true,
+      alerts_created: result.alerts_created,
+      events_processed: result.events_processed,
+      users_notified: result.users_notified.size,
+      dedupe_skipped: result.dedupe_skipped,
+      preference_skipped: result.preference_skipped,
+    });
+  } catch (error) {
+    console.error("[alerts] generate-batch failed:", error);
+    if (isMissingAlertStorage(error)) {
+      return c.json({
+        success: true,
+        alerts_created: 0,
+        events_processed: 0,
+        users_notified: 0,
+        dedupe_skipped: 0,
+        preference_skipped: 0,
+        warning: "Alert storage not initialized",
+      });
+    }
+    return c.json({ error: "Failed to generate batch alerts" }, 500);
+  }
 });
 
 /**
@@ -678,12 +698,23 @@ alertsRouter.post("/cleanup", async (c) => {
   const db = c.env.DB;
   const daysToKeep = parseInt(c.req.query("days") || "7");
 
-  const result = await cleanupOldAlerts(db, daysToKeep);
-
-  return c.json({ 
-    success: true, 
-    alerts_deleted: result.deleted,
-  });
+  try {
+    const result = await cleanupOldAlerts(db, daysToKeep);
+    return c.json({
+      success: true,
+      alerts_deleted: result.deleted,
+    });
+  } catch (error) {
+    console.error("[alerts] cleanup failed:", error);
+    if (isMissingAlertStorage(error)) {
+      return c.json({
+        success: true,
+        alerts_deleted: 0,
+        warning: "Alert storage not initialized",
+      });
+    }
+    return c.json({ error: "Failed to cleanup alerts" }, 500);
+  }
 });
 
 /**

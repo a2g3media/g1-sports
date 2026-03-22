@@ -146,13 +146,14 @@ export function useSoccerBackNavigation(
  */
 export function buildSoccerMatchUrl(
   matchId: string,
-  context?: { fromTeamId?: string; fromLeagueId?: string }
+  context?: { fromTeamId?: string; fromLeagueId?: string; from?: string }
 ): string {
   let url = `/sports/soccer/match/${matchId}`;
   const params = new URLSearchParams();
   
   if (context?.fromTeamId) params.set("fromTeamId", context.fromTeamId);
   if (context?.fromLeagueId) params.set("fromLeagueId", context.fromLeagueId);
+  if (context?.from) params.set("from", context.from);
   
   const paramString = params.toString();
   if (paramString) url += `?${paramString}`;

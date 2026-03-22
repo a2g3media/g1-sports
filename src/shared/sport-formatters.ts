@@ -430,6 +430,8 @@ export function formatPeriod(period: string | number | undefined, sportKey: stri
   if (!period) return "";
   
   const category = detectSportCategory(sportKey);
+  const sportKeyLower = sportKey.toLowerCase();
+  const isNcaab = sportKeyLower.includes("ncaab");
   const p = typeof period === "number" ? period : parseInt(period) || period;
   
   switch (category) {
@@ -450,7 +452,14 @@ export function formatPeriod(period: string | number | undefined, sportKey: stri
       
     case "basketball":
       if (typeof p === "number") {
+        if (isNcaab) {
+          return p <= 2 ? `${p}H` : `OT${p - 2}`;
+        }
         return p <= 4 ? `Q${p}` : `OT${p-4}`;
+      }
+      if (isNcaab) {
+        if (period === "Q1") return "1H";
+        if (period === "Q2") return "2H";
       }
       return String(period);
       

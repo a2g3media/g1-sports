@@ -170,6 +170,25 @@ coachGPreviewRouter.get("/:gameId", async (c) => {
 coachGPreviewRouter.post("/:gameId", async (c) => {
   const gameId = c.req.param("gameId");
 
+  // Preserve /cleanup behavior even with dynamic route ordering.
+  if (gameId === "cleanup") {
+    const isDemoMode = c.req.header("X-Demo-Mode") === "true";
+    const isAdmin = c.req.header("X-Admin-Key") === "cleanup-authorized";
+    if (!isDemoMode && !isAdmin) {
+      return c.json({ error: "Unauthorized" }, 401);
+    }
+    try {
+      const deletedCount = await cleanupExpiredPreviews(c.env.DB);
+      return c.json({
+        success: true,
+        message: `Cleaned up ${deletedCount} expired previews`,
+        deletedCount,
+      });
+    } catch {
+      return c.json({ error: "Failed to cleanup previews" }, 500);
+    }
+  }
+
   if (!gameId) {
     return c.json({ error: "Game ID is required" }, 400);
   }
@@ -202,6 +221,14 @@ coachGPreviewRouter.post("/:gameId", async (c) => {
     });
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : "Failed to generate preview";
+    if (errorMessage.includes("Game not found")) {
+      return c.json({
+        error: "Game not found",
+        gameId,
+        fallback_type: "no_coverage",
+        fallback_reason: "Unable to resolve game in provider chain",
+      }, 404);
+    }
     return c.json({
       error: "Failed to generate game preview",
       details: errorMessage,
@@ -260,6 +287,14 @@ coachGPreviewRouter.post("/:gameId/refresh", async (c) => {
     console.error("[CoachGPreview] Refresh error:", error);
     
     const errorMessage = error instanceof Error ? error.message : "Failed to refresh preview";
+    if (errorMessage.includes("Game not found")) {
+      return c.json({
+        error: "Game not found",
+        gameId,
+        fallback_type: "no_coverage",
+        fallback_reason: "Unable to resolve game in provider chain",
+      }, 404);
+    }
     
     return c.json({ 
       error: "Failed to refresh game preview",

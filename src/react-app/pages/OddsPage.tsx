@@ -71,6 +71,19 @@ interface ProjectionRow {
   confidence?: "low" | "medium" | "high";
 }
 
+function toDateParam(date: Date): string {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+}
+
+function shiftDate(date: Date, deltaDays: number): Date {
+  const next = new Date(date);
+  next.setDate(next.getDate() + deltaDays);
+  return next;
+}
+
 // Sport filter chips
 const SPORT_FILTERS = [
   { key: 'ALL', label: 'All Sports', emoji: '🎯' },
@@ -111,6 +124,7 @@ export function OddsPage() {
   });
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [selectedDate, setSelectedDate] = useState<Date>(() => new Date());
   const hasFetchedRef = useRef(false);
   const mountedRef = useRef(true);
   
@@ -135,18 +149,12 @@ export function OddsPage() {
       }
     };
 
-    const getTodayDateParam = () => {
-      const now = new Date();
-      const year = now.getFullYear();
-      const month = String(now.getMonth() + 1).padStart(2, '0');
-      const day = String(now.getDate()).padStart(2, '0');
-      return `${year}-${month}-${day}`;
-    };
+    const selectedDateParam = toDateParam(selectedDate);
 
     const fetchGamesData = async (): Promise<any[] | null> => {
       const endpoints = [
-        '/api/games',
-        `/api/games?date=${encodeURIComponent(getTodayDateParam())}`,
+        `/api/games?date=${encodeURIComponent(selectedDateParam)}&includeOdds=0`,
+        '/api/games?includeOdds=0',
       ];
 
       for (const endpoint of endpoints) {
@@ -329,7 +337,7 @@ export function OddsPage() {
       if (!mountedRef.current) return;
       setLoading(false);
     }
-  }, [isDemoMode, user?.id]);
+  }, [isDemoMode, user?.id, selectedDate]);
   
   // Initial fetch
   useEffect(() => {
@@ -480,6 +488,15 @@ export function OddsPage() {
     () => games.length > 0 && realOddsGamesCount === 0,
     [games.length, realOddsGamesCount]
   );
+  const selectedDateLabel = useMemo(
+    () =>
+      selectedDate.toLocaleDateString(undefined, {
+        weekday: 'short',
+        month: 'short',
+        day: 'numeric',
+      }),
+    [selectedDate]
+  );
 
   if (loading) {
     return (
@@ -520,41 +537,64 @@ export function OddsPage() {
             <span className="truncate">Odds Intelligence</span>
           </h1>
           <p className="text-xs sm:text-sm text-slate-500 mt-1">
-            {hasAnyRealOdds ? `${filteredGames.length} real-odds games` : `${filteredGames.length} scheduled/live games (real odds pending)`} • {liveCount > 0 && (
+            {hasAnyRealOdds ? `${filteredGames.length} games with verified lines` : `${filteredGames.length} games on the board`} • {liveCount > 0 && (
               <span className="text-red-400">{liveCount} live</span>
             )}
           </p>
         </div>
-        
-        {/* Refresh button */}
-        <button
-          onClick={handleRefresh}
-          disabled={refreshing}
-          className={cn(
-            "p-3 rounded-lg border transition-all min-h-[44px] min-w-[44px] flex items-center justify-center flex-shrink-0 active:scale-95",
-            refreshing
-              ? "bg-slate-800/50 border-slate-700/50 text-slate-500"
-              : "bg-cyan-500/10 border-cyan-500/30 text-cyan-400 hover:bg-cyan-500/20"
-          )}
-        >
-          <RefreshCw className={cn("w-5 h-5", refreshing && "animate-spin")} />
-        </button>
+
+        <div className="flex items-center gap-2 flex-shrink-0">
+          <div className="flex items-center rounded-lg border border-slate-700/60 bg-slate-900/60 p-1">
+            <button
+              onClick={() => setSelectedDate((prev) => shiftDate(prev, -1))}
+              className="px-2.5 py-1.5 text-xs text-slate-300 hover:text-white"
+            >
+              Prev
+            </button>
+            <button
+              onClick={() => setSelectedDate(new Date())}
+              className="px-2.5 py-1.5 text-xs text-cyan-200 hover:text-cyan-100"
+            >
+              {selectedDateLabel}
+            </button>
+            <button
+              onClick={() => setSelectedDate((prev) => shiftDate(prev, 1))}
+              className="px-2.5 py-1.5 text-xs text-slate-300 hover:text-white"
+            >
+              Next
+            </button>
+          </div>
+
+          {/* Refresh button */}
+          <button
+            onClick={handleRefresh}
+            disabled={refreshing}
+            className={cn(
+              "p-3 rounded-lg border transition-all min-h-[44px] min-w-[44px] flex items-center justify-center active:scale-95",
+              refreshing
+                ? "bg-slate-800/50 border-slate-700/50 text-slate-500"
+                : "bg-cyan-500/10 border-cyan-500/30 text-cyan-400 hover:bg-cyan-500/20"
+            )}
+          >
+            <RefreshCw className={cn("w-5 h-5", refreshing && "animate-spin")} />
+          </button>
+        </div>
       </div>
 
       {/* Real Data Coverage */}
       <div className="flex flex-wrap items-center gap-2">
         <span className="px-2.5 py-1 rounded-lg bg-slate-800/50 border border-slate-700/50 text-xs text-slate-300">
-          Real odds games: <span className="text-cyan-300 font-semibold">{realOddsGamesCount}</span>
+          Verified lines: <span className="text-cyan-300 font-semibold">{realOddsGamesCount}</span>
         </span>
         <span className="px-2.5 py-1 rounded-lg bg-slate-800/50 border border-slate-700/50 text-xs text-slate-300">
-          Split-feed games: <span className="text-emerald-300 font-semibold">{splitFeedGamesCount}</span>
+          Market depth: <span className="text-emerald-300 font-semibold">{splitFeedGamesCount}</span>
         </span>
         <span className="px-2.5 py-1 rounded-lg bg-slate-800/50 border border-slate-700/50 text-xs text-slate-300">
-          Projections: <span className="text-amber-300 font-semibold">{projectionCoverage.count}</span>
+          Projection insights: <span className="text-amber-300 font-semibold">{projectionCoverage.count}</span>
         </span>
         {projectionCoverage.source === 'none' && projectionCoverage.fallbackReason && (
           <span className="text-[11px] text-slate-500">
-            projections pending: {projectionCoverage.fallbackReason}
+            Projection model is warming up for this slate.
           </span>
         )}
       </div>
@@ -562,7 +602,7 @@ export function OddsPage() {
       {hasCoverageGap && (
         <div className="rounded-xl border border-amber-500/30 bg-amber-500/10 px-3 py-2">
           <p className="text-[11px] text-amber-300">
-            Market feeds are connected but books have not posted verified lines for this slate yet. We will keep retrying automatically.
+            This slate is live, but books have not posted enough lines yet. We will keep updating automatically.
           </p>
         </div>
       )}

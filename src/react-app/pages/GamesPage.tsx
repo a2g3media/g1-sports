@@ -6,12 +6,11 @@
 import { useState, useEffect, useCallback, useMemo, useRef, useLayoutEffect } from 'react';
 import { createPortal } from 'react-dom';
 import { useSearchParams, useNavigate } from 'react-router-dom';
-import { RefreshCw, AlertCircle, ChevronDown, ChevronUp, X, Zap, Star, Navigation2, Settings, ChevronLeft, ChevronRight } from 'lucide-react';
+import { RefreshCw, AlertCircle, ChevronDown, X, Zap, Star, Settings, ChevronLeft, ChevronRight } from 'lucide-react';
 import { LivePulseTicker } from '@/react-app/components/LivePulseTicker';
 import { ApprovedScoreCardGame } from '@/react-app/components/ApprovedScoreCard';
 import { CompactGameTile } from '@/react-app/components/CompactGameTile';
 import { OddsIntelligenceDashboard } from '@/react-app/components/OddsIntelligenceDashboard';
-import { CoachGIntelligenceLayer } from '@/react-app/components/CoachGIntelligenceLayer';
 import { useGlobalAI } from '@/react-app/components/GlobalAIProvider';
 import { AVAILABLE_SPORTS } from '@/react-app/hooks/useScoreboard';
 import { useWatchboards } from '@/react-app/hooks/useWatchboards';
@@ -20,6 +19,9 @@ import AddToWatchboardModal from '@/react-app/components/AddToWatchboardModal';
 import { cn } from '@/react-app/lib/utils';
 import { toGameDetailPath, toOddsGamePath } from '@/react-app/lib/gameRoutes';
 import { generateCoachWhisper as _generateCoachWhisper } from '@/react-app/lib/coachWhisper';
+import { useFeatureFlags } from '@/react-app/hooks/useFeatureFlags';
+import FavoriteEntityButton from '@/react-app/components/FavoriteEntityButton';
+import { useFavorites } from '@/react-app/hooks/useFavorites';
 // getTeamLogoUrl imported via teamLogos but unused currently
 // import { getTeamLogoUrl } from '@/react-app/lib/teamLogos';
 
@@ -521,6 +523,8 @@ export function GamesPage() {
   const [searchParams, setSearchParams] = useSearchParams();
   const navigate = useNavigate();
   const { openChat } = useGlobalAI();
+  const { flags } = useFeatureFlags();
+  const { isFavorite } = useFavorites();
   
   // Watchboard integration - with defensive checks
   const watchboardsResult = useWatchboards();
@@ -1241,16 +1245,6 @@ export function GamesPage() {
     return { liveGames: live, scheduledGames: scheduled, finalGames: final, filteredCount: filtered.length };
   }, [games, statusFilter, selectedSport, leagueFilter, conferenceFilter, ncaabTeamLookup, ncaafTeamLookup]);
 
-  const oddsReadyCount = useMemo(
-    () => games.filter((g) =>
-      typeof g.odds?.spread === 'number'
-      || typeof g.odds?.overUnder === 'number'
-      || typeof g.odds?.homeML === 'number'
-      || typeof g.odds?.awayML === 'number'
-    ).length,
-    [games]
-  );
-
   // Status counts (same date filter as sections so tab counts match displayed games)
   const statusCounts = useMemo(() => {
     if (games.length === 0) return { all: 0, live: 0, scheduled: 0, final: 0 };
@@ -1380,6 +1374,58 @@ export function GamesPage() {
     };
   }, []);
 
+  const renderCompactGameTile = useCallback((game: ApprovedScoreCardGame, forceInWatchboard?: boolean) => {
+    const home = typeof game.homeTeam === 'string' ? game.homeTeam : game.homeTeam?.name || game.homeTeam?.abbr || 'Home';
+    const away = typeof game.awayTeam === 'string' ? game.awayTeam : game.awayTeam?.name || game.awayTeam?.abbr || 'Away';
+    const favoriteEnabled = Boolean(flags.GAME_FAVORITES_ENABLED);
+    const gameIsFavorite = favoriteEnabled ? isFavorite('game', game.id) : false;
+    return (
+      <div key={game.id} className="relative">
+        {favoriteEnabled && (
+          <div className="absolute right-2 top-2 z-20">
+            <FavoriteEntityButton
+              type="game"
+              entityId={game.id}
+              sport={String(game.sport || '').toLowerCase()}
+              metadata={{
+                game_id: game.id,
+                home_team: home,
+                away_team: away,
+                sport: String(game.sport || '').toLowerCase(),
+              }}
+              compact
+              className="border-slate-600/50 bg-slate-950/70 hover:bg-slate-900/85"
+            />
+          </div>
+        )}
+        <CompactGameTile
+          game={{
+            id: game.id,
+            sport: game.sport,
+            homeTeam: game.homeTeam,
+            awayTeam: game.awayTeam,
+            homeScore: game.homeScore,
+            awayScore: game.awayScore,
+            status: game.status,
+            period: game.period,
+            clock: game.clock,
+            startTime: game.startTime,
+            channel: game.channel,
+            spread: game.spread,
+            overUnder: game.overUnder,
+            spread1H: game.odds?.spread1HHome ?? null,
+            total1H: game.odds?.total1H ?? null,
+            ml1HHome: game.odds?.moneyline1HHome ?? null,
+            ml1HAway: game.odds?.moneyline1HAway ?? null,
+          }}
+          onClick={() => handleGameClick(game)}
+          isInWatchboard={forceInWatchboard ?? isGameInWatchboard(game.id)}
+          isFavorite={gameIsFavorite}
+        />
+      </div>
+    );
+  }, [flags.GAME_FAVORITES_ENABLED, handleGameClick, isFavorite, isGameInWatchboard]);
+
   // Special section for watchboard games with enhanced styling
   const renderWatchboardSection = () => {
     if (watchboardGames.length === 0) return null;
@@ -1402,32 +1448,7 @@ export function GamesPage() {
           </span>
         </div>
         <div className="grid grid-cols-2 gap-3">
-          {displayGames.map((game) => (
-            <CompactGameTile
-              key={game.id}
-              game={{
-                id: game.id,
-                sport: game.sport,
-                homeTeam: game.homeTeam,
-                awayTeam: game.awayTeam,
-                homeScore: game.homeScore,
-                awayScore: game.awayScore,
-                status: game.status,
-                period: game.period,
-                clock: game.clock,
-                startTime: game.startTime,
-                channel: game.channel,
-                spread: game.spread,
-                overUnder: game.overUnder,
-                spread1H: game.odds?.spread1HHome ?? null,
-                total1H: game.odds?.total1H ?? null,
-                ml1HHome: game.odds?.moneyline1HHome ?? null,
-                ml1HAway: game.odds?.moneyline1HAway ?? null,
-              }}
-              onClick={() => handleGameClick(game)}
-              isInWatchboard={true}
-            />
-          ))}
+          {displayGames.map((game) => renderCompactGameTile(game, true))}
         </div>
         {hasMore && (
           <button
@@ -1492,32 +1513,7 @@ export function GamesPage() {
                   </button>
                 </div>
                 <div className="grid grid-cols-2 gap-3">
-                  {displayGames.map((game) => (
-                    <CompactGameTile
-                      key={game.id}
-                      game={{
-                        id: game.id,
-                        sport: game.sport,
-                        homeTeam: game.homeTeam,
-                        awayTeam: game.awayTeam,
-                        homeScore: game.homeScore,
-                        awayScore: game.awayScore,
-                        status: game.status,
-                        period: game.period,
-                        clock: game.clock,
-                        startTime: game.startTime,
-                        channel: game.channel,
-                        spread: game.spread,
-                        overUnder: game.overUnder,
-                        spread1H: game.odds?.spread1HHome ?? null,
-                        total1H: game.odds?.total1H ?? null,
-                        ml1HHome: game.odds?.moneyline1HHome ?? null,
-                        ml1HAway: game.odds?.moneyline1HAway ?? null,
-                      }}
-                      onClick={() => handleGameClick(game)}
-                      isInWatchboard={isGameInWatchboard(game.id)}
-                    />
-                  ))}
+                  {displayGames.map((game) => renderCompactGameTile(game))}
                 </div>
                 {sportHasMore && (
                   <button
@@ -1549,32 +1545,7 @@ export function GamesPage() {
           </span>
         </div>
         <div className="grid grid-cols-2 gap-3">
-          {sectionGames.map((game) => (
-            <CompactGameTile
-              key={game.id}
-              game={{
-                id: game.id,
-                sport: game.sport,
-                homeTeam: game.homeTeam,
-                awayTeam: game.awayTeam,
-                homeScore: game.homeScore,
-                awayScore: game.awayScore,
-                status: game.status,
-                period: game.period,
-                clock: game.clock,
-                startTime: game.startTime,
-                channel: game.channel,
-                spread: game.spread,
-                overUnder: game.overUnder,
-                spread1H: game.odds?.spread1HHome ?? null,
-                total1H: game.odds?.total1H ?? null,
-                ml1HHome: game.odds?.moneyline1HHome ?? null,
-                ml1HAway: game.odds?.moneyline1HAway ?? null,
-              }}
-              onClick={() => handleGameClick(game)}
-              isInWatchboard={isGameInWatchboard(game.id)}
-            />
-          ))}
+          {sectionGames.map((game) => renderCompactGameTile(game))}
         </div>
       </div>
     );
@@ -1602,32 +1573,7 @@ export function GamesPage() {
           </span>
         </div>
         <div className="grid grid-cols-2 gap-3">
-          {displayGames.map((game) => (
-            <CompactGameTile
-              key={game.id}
-              game={{
-                id: game.id,
-                sport: game.sport,
-                homeTeam: game.homeTeam,
-                awayTeam: game.awayTeam,
-                homeScore: game.homeScore,
-                awayScore: game.awayScore,
-                status: game.status,
-                period: game.period,
-                clock: game.clock,
-                startTime: game.startTime,
-                channel: game.channel,
-                spread: game.spread,
-                overUnder: game.overUnder,
-                spread1H: game.odds?.spread1HHome ?? null,
-                total1H: game.odds?.total1H ?? null,
-                ml1HHome: game.odds?.moneyline1HHome ?? null,
-                ml1HAway: game.odds?.moneyline1HAway ?? null,
-              }}
-              onClick={() => handleGameClick(game)}
-              isInWatchboard={isGameInWatchboard(game.id)}
-            />
-          ))}
+          {displayGames.map((game) => renderCompactGameTile(game))}
         </div>
         {hasMore && (
           <button
@@ -1662,32 +1608,7 @@ export function GamesPage() {
           </span>
         </div>
         <div className="grid grid-cols-2 gap-3">
-          {displayGames.map((game) => (
-            <CompactGameTile
-              key={game.id}
-              game={{
-                id: game.id,
-                sport: game.sport,
-                homeTeam: game.homeTeam,
-                awayTeam: game.awayTeam,
-                homeScore: game.homeScore,
-                awayScore: game.awayScore,
-                status: game.status,
-                period: game.period,
-                clock: game.clock,
-                startTime: game.startTime,
-                channel: game.channel,
-                spread: game.spread,
-                overUnder: game.overUnder,
-                spread1H: game.odds?.spread1HHome ?? null,
-                total1H: game.odds?.total1H ?? null,
-                ml1HHome: game.odds?.moneyline1HHome ?? null,
-                ml1HAway: game.odds?.moneyline1HAway ?? null,
-              }}
-              onClick={() => handleGameClick(game)}
-              isInWatchboard={isGameInWatchboard(game.id)}
-            />
-          ))}
+          {displayGames.map((game) => renderCompactGameTile(game))}
         </div>
         {hasMore && (
           <button
@@ -1747,32 +1668,7 @@ export function GamesPage() {
                   </button>
                 </div>
                 <div className="grid grid-cols-2 gap-3">
-                  {displayGames.map((game) => (
-                    <CompactGameTile
-                      key={game.id}
-                      game={{
-                        id: game.id,
-                        sport: game.sport,
-                        homeTeam: game.homeTeam,
-                        awayTeam: game.awayTeam,
-                        homeScore: game.homeScore,
-                        awayScore: game.awayScore,
-                        status: game.status,
-                        period: game.period,
-                        clock: game.clock,
-                        startTime: game.startTime,
-                        channel: game.channel,
-                        spread: game.spread,
-                        overUnder: game.overUnder,
-                        spread1H: game.odds?.spread1HHome ?? null,
-                        total1H: game.odds?.total1H ?? null,
-                        ml1HHome: game.odds?.moneyline1HHome ?? null,
-                        ml1HAway: game.odds?.moneyline1HAway ?? null,
-                      }}
-                      onClick={() => handleGameClick(game)}
-                      isInWatchboard={isGameInWatchboard(game.id)}
-                    />
-                  ))}
+                  {displayGames.map((game) => renderCompactGameTile(game))}
                 </div>
                 {sportHasMore && (
                   <button
@@ -1800,32 +1696,7 @@ export function GamesPage() {
           </span>
         </div>
         <div className="grid grid-cols-2 gap-3">
-          {displayGames.map((game) => (
-            <CompactGameTile
-              key={game.id}
-              game={{
-                id: game.id,
-                sport: game.sport,
-                homeTeam: game.homeTeam,
-                awayTeam: game.awayTeam,
-                homeScore: game.homeScore,
-                awayScore: game.awayScore,
-                status: game.status,
-                period: game.period,
-                clock: game.clock,
-                startTime: game.startTime,
-                channel: game.channel,
-                spread: game.spread,
-                overUnder: game.overUnder,
-                spread1H: game.odds?.spread1HHome ?? null,
-                total1H: game.odds?.total1H ?? null,
-                ml1HHome: game.odds?.moneyline1HHome ?? null,
-                ml1HAway: game.odds?.moneyline1HAway ?? null,
-              }}
-              onClick={() => handleGameClick(game)}
-              isInWatchboard={isGameInWatchboard(game.id)}
-            />
-          ))}
+          {displayGames.map((game) => renderCompactGameTile(game))}
         </div>
         {hasMore && (
           <button
@@ -1873,28 +1744,6 @@ export function GamesPage() {
             
             {/* Actions */}
             <div className="flex items-center gap-2">
-              {/* Date Nav */}
-              <div className="hidden items-center rounded-lg border border-slate-700/50 bg-slate-800/60 sm:flex">
-                <button
-                  onClick={() => setSelectedDate(addDays(selectedDate, -1))}
-                  className="rounded-l-lg p-2 transition-colors hover:bg-slate-700/50"
-                >
-                  <ChevronLeft className="w-4 h-4 text-slate-400" />
-                </button>
-                <button
-                  onClick={() => setSelectedDate(new Date())}
-                  className="px-3 py-1.5 text-xs font-medium text-slate-300 transition-colors hover:text-white"
-                >
-                  Today
-                </button>
-                <button
-                  onClick={() => setSelectedDate(addDays(selectedDate, 1))}
-                  className="rounded-r-lg p-2 transition-colors hover:bg-slate-700/50"
-                >
-                  <ChevronRight className="w-4 h-4 text-slate-400" />
-                </button>
-              </div>
-              
               {/* Refresh */}
               <button
                 onClick={handleRefresh}
@@ -1914,31 +1763,18 @@ export function GamesPage() {
               >
                 <Settings className="w-4 h-4 text-slate-400" />
               </button>
-            </div>
-          </div>
 
-          {/* Mobile Date Navigation */}
-          <div className="pb-2 sm:hidden">
-            <div className="grid grid-cols-3 gap-2 rounded-xl border border-slate-800/70 bg-slate-900/70 p-2">
+              {/* Coach G quick entry */}
               <button
-                onClick={() => setSelectedDate(addDays(selectedDate, -1))}
-                className="flex items-center justify-center gap-1 rounded-lg border border-slate-700/50 bg-slate-800/60 px-2 py-2 text-xs text-slate-300"
+                onClick={() => navigate('/coach')}
+                className="flex items-center gap-1.5 rounded-lg border border-violet-500/25 bg-violet-500/10 px-2 py-1.5 transition-all hover:border-violet-400/40 hover:bg-violet-500/15"
               >
-                <ChevronLeft className="w-3.5 h-3.5" />
-                <span>Prev</span>
-              </button>
-              <button
-                onClick={() => setSelectedDate(new Date())}
-                className="rounded-lg border border-cyan-500/30 bg-cyan-500/15 px-2 py-2 text-xs font-semibold text-cyan-200"
-              >
-                Today
-              </button>
-              <button
-                onClick={() => setSelectedDate(addDays(selectedDate, 1))}
-                className="flex items-center justify-center gap-1 rounded-lg border border-slate-700/50 bg-slate-800/60 px-2 py-2 text-xs text-slate-300"
-              >
-                <span>Next</span>
-                <ChevronRight className="w-3.5 h-3.5" />
+                <img
+                  src="/assets/coachg/coach-g-avatar.png?v=2"
+                  alt="Coach G"
+                  className="h-5 w-5 rounded-full border border-violet-300/40 object-cover"
+                />
+                <span className="hidden text-[11px] font-semibold text-violet-200 sm:inline">Coach G</span>
               </button>
             </div>
           </div>
@@ -2006,6 +1842,35 @@ export function GamesPage() {
               </button>
             ))}
             </div>
+
+            <div className="inline-flex items-center rounded-xl border border-slate-700/60 bg-slate-900/70 p-1">
+              <button
+                onClick={() => setSelectedDate(addDays(selectedDate, -1))}
+                className="rounded-lg p-1.5 transition-colors hover:bg-slate-800/70"
+                aria-label="Previous date"
+              >
+                <ChevronLeft className="h-3.5 w-3.5 text-slate-300" />
+              </button>
+              <button
+                onClick={() => setDateModalOpen(true)}
+                className="rounded-lg px-2.5 py-1 text-[11px] font-semibold text-slate-200 transition-colors hover:bg-slate-800/70 hover:text-white"
+              >
+                {dateLabel}
+              </button>
+              <button
+                onClick={() => setSelectedDate(new Date())}
+                className="rounded-lg px-2 py-1 text-[11px] font-semibold text-cyan-200 transition-colors hover:bg-cyan-500/10"
+              >
+                Today
+              </button>
+              <button
+                onClick={() => setSelectedDate(addDays(selectedDate, 1))}
+                className="rounded-lg p-1.5 transition-colors hover:bg-slate-800/70"
+                aria-label="Next date"
+              >
+                <ChevronRight className="h-3.5 w-3.5 text-slate-300" />
+              </button>
+            </div>
             
             {/* Status Filter */}
             <div className="ml-auto inline-flex flex-wrap items-center gap-1 rounded-xl border border-slate-700/60 bg-slate-900/70 p-1 text-[10px] font-medium">
@@ -2038,7 +1903,6 @@ export function GamesPage() {
       <div className="h-px w-full bg-gradient-to-r from-transparent via-cyan-500/30 to-transparent" />
 
       <div className="mx-auto max-w-5xl px-4 pb-8 pt-5">
-        <CoachGIntelligenceLayer surface="games" compact />
         {/* SCORES TAB CONTENT */}
         {activeTab === 'scores' && (
           <>
@@ -2137,32 +2001,57 @@ export function GamesPage() {
                     return (
                       <>
                         <div className="grid grid-cols-2 gap-3">
-                          {displayGames.map((game) => (
-                            <CompactGameTile
-                              key={game.id}
-                              game={{
-                                id: game.id,
-                                sport: game.sport,
-                                homeTeam: game.homeTeam,
-                                awayTeam: game.awayTeam,
-                                homeScore: game.homeScore,
-                                awayScore: game.awayScore,
-                                status: game.status,
-                                period: game.period,
-                                clock: game.clock,
-                                startTime: game.startTime,
-                                channel: game.channel,
-                                spread: game.spread,
-                                overUnder: game.overUnder,
-                                spread1H: game.odds?.spread1HHome ?? null,
-                                total1H: game.odds?.total1H ?? null,
-                                ml1HHome: game.odds?.moneyline1HHome ?? null,
-                                ml1HAway: game.odds?.moneyline1HAway ?? null,
-                              }}
-                              onClick={() => handleGameClick(game)}
-                              isInWatchboard={isGameInWatchboard(game.id)}
-                            />
-                          ))}
+                          {displayGames.map((game) => {
+                            const home = typeof game.homeTeam === 'string' ? game.homeTeam : game.homeTeam?.name || game.homeTeam?.abbr || 'Home';
+                            const away = typeof game.awayTeam === 'string' ? game.awayTeam : game.awayTeam?.name || game.awayTeam?.abbr || 'Away';
+                            const favoriteEnabled = Boolean(flags.GAME_FAVORITES_ENABLED);
+                            const gameIsFavorite = favoriteEnabled ? isFavorite('game', game.id) : false;
+                            return (
+                              <div key={game.id} className="relative">
+                                {favoriteEnabled && (
+                                  <div className="absolute right-2 top-2 z-20">
+                                    <FavoriteEntityButton
+                                      type="game"
+                                      entityId={game.id}
+                                      sport={String(game.sport || '').toLowerCase()}
+                                      metadata={{
+                                        game_id: game.id,
+                                        home_team: home,
+                                        away_team: away,
+                                        sport: String(game.sport || '').toLowerCase(),
+                                      }}
+                                      compact
+                                      className="border-slate-600/50 bg-slate-950/70 hover:bg-slate-900/85"
+                                    />
+                                  </div>
+                                )}
+                                <CompactGameTile
+                                  game={{
+                                    id: game.id,
+                                    sport: game.sport,
+                                    homeTeam: game.homeTeam,
+                                    awayTeam: game.awayTeam,
+                                    homeScore: game.homeScore,
+                                    awayScore: game.awayScore,
+                                    status: game.status,
+                                    period: game.period,
+                                    clock: game.clock,
+                                    startTime: game.startTime,
+                                    channel: game.channel,
+                                    spread: game.spread,
+                                    overUnder: game.overUnder,
+                                    spread1H: game.odds?.spread1HHome ?? null,
+                                    total1H: game.odds?.total1H ?? null,
+                                    ml1HHome: game.odds?.moneyline1HHome ?? null,
+                                    ml1HAway: game.odds?.moneyline1HAway ?? null,
+                                  }}
+                                  onClick={() => handleGameClick(game)}
+                                  isInWatchboard={isGameInWatchboard(game.id)}
+                                  isFavorite={gameIsFavorite}
+                                />
+                              </div>
+                            );
+                          })}
                         </div>
                         {hasMore && (
                           <button
@@ -2246,13 +2135,6 @@ export function GamesPage() {
               </div>
             ) : (
               <div className="space-y-3">
-                {games.length > 0 && oddsReadyCount === 0 && (
-                  <div className="rounded-xl border border-amber-500/30 bg-amber-500/10 px-3 py-2">
-                    <p className="text-[11px] text-amber-200">
-                      Odds feeds are syncing for this slate. Verified books and movement cards appear automatically as lines post.
-                    </p>
-                  </div>
-                )}
                 <OddsIntelligenceDashboard
                   games={games}
                   isGameInWatchboard={isGameInWatchboard}
@@ -2334,20 +2216,6 @@ export function GamesPage() {
         }}
       />
       
-      {/* Floating Jump To Button */}
-      {activeTab === 'scores' && (
-        <FloatingJumpMenu 
-          sections={[
-            { id: 'watchboard-section', label: 'Watchboard', icon: '⭐', show: watchboardGames.length > 0 },
-            { id: 'live-section', label: 'Live Now', icon: '🔴', show: liveGames.length > 0 },
-            { id: 'coachg-section', label: 'Coach G Picks', icon: '💜', show: coachGPicks.length > 0 },
-            { id: 'prime-section', label: 'Prime Time', icon: '📺', show: primeTimeGames.length > 0 },
-            { id: 'upcoming-section', label: 'Upcoming', icon: '⏰', show: regularScheduledGames.length > 0 },
-            { id: 'final-section', label: 'Final', icon: '✓', show: finalGames.length > 0 },
-          ].filter(s => s.show)}
-        />
-      )}
-      
       {/* Toast notification */}
       {toast && (
         <div className={`fixed bottom-6 left-1/2 -translate-x-1/2 px-4 py-2 rounded-lg text-sm font-medium z-[100] ${
@@ -2358,65 +2226,6 @@ export function GamesPage() {
           {toast.message}
         </div>
       )}
-    </div>
-  );
-}
-
-// Floating Jump Menu Component
-function FloatingJumpMenu({ sections }: { sections: { id: string; label: string; icon: string }[] }) {
-  const [isOpen, setIsOpen] = useState(false);
-  
-  if (sections.length === 0) return null;
-  
-  const scrollToSection = (sectionId: string) => {
-    const element = document.getElementById(sectionId);
-    if (element) {
-      element.scrollIntoView({ behavior: 'smooth', block: 'start' });
-    }
-    setIsOpen(false);
-  };
-  
-  return (
-    <div className="fixed bottom-20 right-4 z-50">
-      {/* Dropdown menu */}
-      {isOpen && (
-        <div className="absolute bottom-full right-0 mb-2 w-44 bg-slate-800/95 backdrop-blur-md rounded-xl border border-slate-700/50 shadow-2xl overflow-hidden animate-in fade-in slide-in-from-bottom-2 duration-200">
-          {sections.map((section, index) => (
-            <button
-              key={section.id}
-              onClick={() => scrollToSection(section.id)}
-              className={cn(
-                "w-full flex items-center gap-3 px-4 py-3 text-left text-sm font-medium text-slate-200 hover:bg-white/10 transition-colors",
-                index !== sections.length - 1 && "border-b border-slate-700/30"
-              )}
-            >
-              <span className="text-base">{section.icon}</span>
-              <span>{section.label}</span>
-            </button>
-          ))}
-        </div>
-      )}
-      
-      {/* Toggle button */}
-      <button
-        onClick={() => setIsOpen(!isOpen)}
-        className={cn(
-          "flex items-center gap-2 px-4 py-3 rounded-full shadow-lg transition-all duration-200 min-h-[48px]",
-          isOpen 
-            ? "bg-slate-700 text-white" 
-            : "bg-gradient-to-r from-cyan-600 to-blue-600 text-white hover:from-cyan-500 hover:to-blue-500"
-        )}
-      >
-        {isOpen ? (
-          <ChevronDown className="h-5 w-5" />
-        ) : (
-          <Navigation2 className="h-5 w-5" />
-        )}
-        <span className="text-sm font-semibold">Jump To</span>
-        {isOpen ? null : (
-          <ChevronUp className="h-4 w-4 opacity-70" />
-        )}
-      </button>
     </div>
   );
 }

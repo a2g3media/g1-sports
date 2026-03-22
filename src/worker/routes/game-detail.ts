@@ -59,11 +59,83 @@ async function fetchSportsRadarInjuries(
   apiKey: string,
   sport: string,
   homeTeam: string,
-  awayTeam: string
+  awayTeam: string,
+  homeTeamId?: string,
+  awayTeamId?: string
 ): Promise<{ home: SRInjury[]; away: SRInjury[] }> {
   const config = SR_SPORT_CONFIG[sport.toLowerCase()];
   if (!config) {
     return { home: [], away: [] };
+  }
+  const normalizeToken = (value: string) =>
+    String(value || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+  const buildCandidates = (teamName: string) => {
+    const out = new Set<string>();
+    const trimmed = String(teamName || "").trim();
+    const token = normalizeToken(trimmed);
+    if (token) out.add(token);
+    const parts = trimmed.split(/\s+/).filter(Boolean);
+    if (parts.length > 0) out.add(normalizeToken(parts[0]));
+    if (parts.length > 1) out.add(normalizeToken(parts[parts.length - 1]));
+    if (parts.length > 2) out.add(normalizeToken(parts.slice(-2).join(" ")));
+    return out;
+  };
+  const homeCandidates = buildCandidates(homeTeam);
+  const awayCandidates = buildCandidates(awayTeam);
+  const homeInjuries: SRInjury[] = [];
+  const awayInjuries: SRInjury[] = [];
+  const seen = new Set<string>();
+  const getTeamSide = (teamNameRaw: string, teamAliasRaw: string, teamMarketRaw: string): "home" | "away" | null => {
+    const full = normalizeToken(`${teamMarketRaw} ${teamNameRaw}`.trim());
+    const alias = normalizeToken(teamAliasRaw);
+    const name = normalizeToken(teamNameRaw);
+    const matches = (candidates: Set<string>) =>
+      Array.from(candidates).some((candidate) =>
+        (candidate && full && (full.includes(candidate) || candidate.includes(full)))
+        || (candidate && alias && (alias === candidate || alias.includes(candidate) || candidate.includes(alias)))
+        || (candidate && name && (name === candidate || name.includes(candidate) || candidate.includes(name)))
+      );
+    if (matches(homeCandidates)) return "home";
+    if (matches(awayCandidates)) return "away";
+    return null;
+  };
+  const appendInjuryRows = (players: any[], teamLabel: string, side: "home" | "away") => {
+    for (const player of players || []) {
+      const injuryStatus = player?.injury?.status || player?.injuries?.[0]?.status || player?.status;
+      const injuryDesc = player?.injury?.desc || player?.injuries?.[0]?.description || player?.injury?.description || "";
+      if (!injuryStatus && !injuryDesc) continue;
+      const playerName = player?.full_name || `${player?.first_name || ""} ${player?.last_name || ""}`.trim();
+      if (!playerName) continue;
+      const key = `${side}|${playerName}|${injuryStatus || ""}|${injuryDesc || ""}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const injury: SRInjury = {
+        playerName,
+        team: teamLabel,
+        position: player?.position || player?.primary_position || '-',
+        status: String(injuryStatus || 'Questionable'),
+        injury: String(injuryDesc || 'Undisclosed'),
+        lastUpdated: player?.injury?.updated || new Date().toISOString(),
+      };
+      if (side === "home") homeInjuries.push(injury);
+      else awayInjuries.push(injury);
+    }
+  };
+
+  // First pass: team profile injuries (more reliable team assignment)
+  const teamIds: Array<{ id: string; side: "home" | "away"; label: string }> = [];
+  if (homeTeamId) teamIds.push({ id: homeTeamId, side: "home", label: homeTeam });
+  if (awayTeamId) teamIds.push({ id: awayTeamId, side: "away", label: awayTeam });
+  for (const team of teamIds) {
+    try {
+      const profileUrl = `${config.base}/${config.version}/en/teams/${encodeURIComponent(team.id)}/profile.json?api_key=${apiKey}`;
+      const profileRes = await fetch(profileUrl);
+      if (!profileRes.ok) continue;
+      const profile = await profileRes.json() as any;
+      appendInjuryRows(profile?.players || [], team.label, team.side);
+    } catch {
+      // non-fatal
+    }
   }
   
   // SportsRadar injuries endpoint: /league/injuries.json
@@ -77,43 +149,15 @@ async function fetchSportsRadarInjuries(
     }
     
     const data = await response.json() as any;
-    const homeInjuries: SRInjury[] = [];
-    const awayInjuries: SRInjury[] = [];
-    
     // Parse teams array - each team has a players array with injury info
     const teams = data.teams || data.league?.teams || [];
     
     for (const team of teams) {
-      const teamName = team.name || team.market || '';
+      const teamName = team.name || '';
       const teamAlias = team.alias || '';
-      const isHome = teamName.toLowerCase().includes(homeTeam.toLowerCase()) ||
-                     teamAlias.toLowerCase() === homeTeam.toLowerCase();
-      const isAway = teamName.toLowerCase().includes(awayTeam.toLowerCase()) ||
-                     teamAlias.toLowerCase() === awayTeam.toLowerCase();
-      
-      if (!isHome && !isAway) continue;
-      
-      const players = team.players || [];
-      for (const player of players) {
-        // Check if player has injury info
-        const injuryStatus = player.injury?.status || player.injuries?.[0]?.status;
-        if (!injuryStatus) continue;
-        
-        const injury: SRInjury = {
-          playerName: player.full_name || `${player.first_name} ${player.last_name}`,
-          team: teamAlias || teamName,
-          position: player.position || player.primary_position || '-',
-          status: injuryStatus,
-          injury: player.injury?.desc || player.injuries?.[0]?.description || 'Undisclosed',
-          lastUpdated: player.injury?.updated || new Date().toISOString()
-        };
-        
-        if (isHome) {
-          homeInjuries.push(injury);
-        } else {
-          awayInjuries.push(injury);
-        }
-      }
+      const side = getTeamSide(teamName, teamAlias, team.market || "");
+      if (!side) continue;
+      appendInjuryRows(team.players || [], teamAlias || teamName || (side === "home" ? homeTeam : awayTeam), side);
     }
     
     return { home: homeInjuries, away: awayInjuries };
@@ -154,7 +198,7 @@ async function fetchSportsRadarH2H(
   try {
     // For SportsRadar, fetch multiple seasons to find H2H matchups
     const currentYear = new Date().getFullYear();
-    const years = [currentYear, currentYear - 1]; // Current + last season
+    const years = [currentYear, currentYear - 1, currentYear - 2]; // Guarantee >=2 full seasons
     
     // Normalize team names for comparison
     const normalizeTeam = (name: string) => name.toLowerCase().replace(/[^a-z]/g, '');
@@ -166,92 +210,87 @@ async function fetchSportsRadarH2H(
     let awayWins = 0;
     let ties = 0;
     
+    const seenGames = new Set<string>();
     // Try to fetch schedules for multiple seasons
     for (const year of years) {
-      // Build schedule URL based on sport
-      let scheduleUrl: string;
+      // Build schedule URL(s) based on sport and season phase
       const sportLower = sport.toLowerCase();
-      
-      if (sportLower === 'nba') {
-        scheduleUrl = `${config.base}/${config.version}/en/games/${year}/REG/schedule.json?api_key=${apiKey}`;
-      } else if (sportLower === 'nhl') {
-        scheduleUrl = `${config.base}/${config.version}/en/games/${year}/REG/schedule.json?api_key=${apiKey}`;
-      } else if (sportLower === 'mlb') {
-        scheduleUrl = `${config.base}/${config.version}/en/games/${year}/REG/schedule.json?api_key=${apiKey}`;
-      } else if (sportLower === 'nfl' || sportLower === 'ncaaf') {
-        scheduleUrl = `${config.base}/${config.version}/en/games/${year}/REG/schedule.json?api_key=${apiKey}`;
-      } else {
-        continue;
-      }
+      const seasonTypes = ['REG', 'PST'];
+      if (!['nba', 'nhl', 'mlb', 'nfl', 'ncaaf', 'ncaab'].includes(sportLower)) continue;
 
-      try {
-        const res = await fetch(scheduleUrl, {
-          headers: { 'Accept': 'application/json' }
-        });
-
-        if (!res.ok) {
-          console.log(`[H2H] Schedule fetch failed for ${year}: ${res.status}`);
-          continue;
-        }
-
-        const data = await res.json() as any;
-        const games = data.games || [];
-        
-        // Find completed games between these two teams
-        for (const game of games) {
-          const gameHome = game.home?.name || game.home?.alias || '';
-          const gameAway = game.away?.name || game.away?.alias || '';
-          const gameHomeNorm = normalizeTeam(gameHome);
-          const gameAwayNorm = normalizeTeam(gameAway);
-
-          // Check if this is a matchup between our two teams (either direction)
-          const isMatchup = (
-            (gameHomeNorm.includes(homeNorm) || homeNorm.includes(gameHomeNorm)) &&
-            (gameAwayNorm.includes(awayNorm) || awayNorm.includes(gameAwayNorm))
-          ) || (
-            (gameHomeNorm.includes(awayNorm) || awayNorm.includes(gameHomeNorm)) &&
-            (gameAwayNorm.includes(homeNorm) || homeNorm.includes(gameAwayNorm))
-          );
-
-          if (!isMatchup) continue;
-
-          // Only include completed games
-          const status = game.status?.toLowerCase() || '';
-          if (status !== 'closed' && status !== 'final' && status !== 'complete') continue;
-
-          const homeScore = game.home_points ?? game.home?.points ?? game.home?.runs ?? 0;
-          const awayScore = game.away_points ?? game.away?.points ?? game.away?.runs ?? 0;
-          
-          const winner = homeScore > awayScore ? gameHome 
-            : awayScore > homeScore ? gameAway 
-            : 'TIE';
-
-          allMatchups.push({
-            date: game.scheduled || game.date || '',
-            homeTeam: gameHome,
-            awayTeam: gameAway,
-            homeScore,
-            awayScore,
-            winner,
-            margin: Math.abs(homeScore - awayScore),
-            venue: game.venue?.name
+      for (const seasonType of seasonTypes) {
+        const scheduleUrl = `${config.base}/${config.version}/en/games/${year}/${seasonType}/schedule.json?api_key=${apiKey}`;
+        try {
+          const res = await fetch(scheduleUrl, {
+            headers: { 'Accept': 'application/json' }
           });
 
-          // Track series record
-          if (winner === 'TIE') {
-            ties++;
-          } else {
-            const winnerNorm = normalizeTeam(winner);
-            if (winnerNorm.includes(homeNorm) || homeNorm.includes(winnerNorm)) {
-              homeWins++;
+          if (!res.ok) {
+            continue;
+          }
+
+          const data = await res.json() as any;
+          const games = data.games || [];
+        
+          // Find completed games between these two teams
+          for (const game of games) {
+            const gameKey = String(game.id || `${game.scheduled || ""}:${game.home?.id || ""}:${game.away?.id || ""}`);
+            if (seenGames.has(gameKey)) continue;
+            const gameHome = game.home?.name || game.home?.alias || '';
+            const gameAway = game.away?.name || game.away?.alias || '';
+            const gameHomeNorm = normalizeTeam(gameHome);
+            const gameAwayNorm = normalizeTeam(gameAway);
+
+            // Check if this is a matchup between our two teams (either direction)
+            const isMatchup = (
+              (gameHomeNorm.includes(homeNorm) || homeNorm.includes(gameHomeNorm)) &&
+              (gameAwayNorm.includes(awayNorm) || awayNorm.includes(gameAwayNorm))
+            ) || (
+              (gameHomeNorm.includes(awayNorm) || awayNorm.includes(gameHomeNorm)) &&
+              (gameAwayNorm.includes(homeNorm) || homeNorm.includes(gameAwayNorm))
+            );
+
+            if (!isMatchup) continue;
+
+            // Only include completed games
+            const status = game.status?.toLowerCase() || '';
+            if (status !== 'closed' && status !== 'final' && status !== 'complete') continue;
+
+            const homeScore = game.home_points ?? game.home?.points ?? game.home?.runs ?? 0;
+            const awayScore = game.away_points ?? game.away?.points ?? game.away?.runs ?? 0;
+          
+            const winner = homeScore > awayScore ? gameHome 
+              : awayScore > homeScore ? gameAway 
+              : 'TIE';
+            seenGames.add(gameKey);
+
+            allMatchups.push({
+              date: game.scheduled || game.date || '',
+              homeTeam: gameHome,
+              awayTeam: gameAway,
+              homeScore,
+              awayScore,
+              winner,
+              margin: Math.abs(homeScore - awayScore),
+              venue: game.venue?.name
+            });
+
+            // Track series record
+            if (winner === 'TIE') {
+              ties++;
             } else {
-              awayWins++;
+              const winnerNorm = normalizeTeam(winner);
+              if (winnerNorm.includes(homeNorm) || homeNorm.includes(winnerNorm)) {
+                homeWins++;
+              } else {
+                awayWins++;
+              }
             }
           }
+        } catch (err) {
+          console.log(`[H2H] Error fetching ${year} ${seasonType} schedule:`, err);
+          continue;
         }
-      } catch (err) {
-        console.log(`[H2H] Error fetching ${year} schedule:`, err);
-        continue;
       }
     }
 
@@ -379,8 +418,12 @@ function normalizeSportsRadarBoxScore(raw: any, sport: string): Partial<BoxScore
     const periods = game.periods || home.scoring || [];
     if (Array.isArray(periods)) {
       for (const p of periods) {
+        const periodNumber = Number(p.number);
+        const periodLabel = sport === 'ncaab'
+          ? (Number.isFinite(periodNumber) ? (periodNumber <= 2 ? `${periodNumber}H` : `OT${periodNumber - 2}`) : (p.type || 'H'))
+          : (Number.isFinite(periodNumber) ? `Q${periodNumber}` : (p.type || 'Q'));
         quarterScores.push({
-          period: p.number ? `Q${p.number}` : (p.type || 'Q'),
+          period: periodLabel,
           homeScore: p.home_points ?? home.scoring?.[periods.indexOf(p)]?.points ?? 0,
           awayScore: p.away_points ?? away.scoring?.[periods.indexOf(p)]?.points ?? 0
         });
@@ -539,7 +582,7 @@ function _normalizeBoxScore(raw: any, sport: string): Partial<BoxScoreData> {
   
   // Handle different sport formats
   if (sport === 'nba' || sport === 'ncaab') {
-    return normalizeBasketballBoxScore(raw);
+    return normalizeBasketballBoxScore(raw, sport);
   } else if (sport === 'nfl' || sport === 'ncaaf') {
     return normalizeFootballBoxScore(raw);
   } else if (sport === 'mlb') {
@@ -551,7 +594,7 @@ function _normalizeBoxScore(raw: any, sport: string): Partial<BoxScoreData> {
   return result;
 }
 
-function normalizeBasketballBoxScore(raw: any): Partial<BoxScoreData> {
+function normalizeBasketballBoxScore(raw: any, sport: string = 'nba'): Partial<BoxScoreData> {
   const game = raw.Game || raw;
   const status = game.Status || 'SCHEDULED';
   
@@ -567,7 +610,7 @@ function normalizeBasketballBoxScore(raw: any): Partial<BoxScoreData> {
     }
   } else {
     // Try to build from period scores
-    const periods = ['Q1', 'Q2', 'Q3', 'Q4'];
+    const periods = sport === 'ncaab' ? ['1H', '2H'] : ['Q1', 'Q2', 'Q3', 'Q4'];
     for (let i = 0; i < periods.length; i++) {
       const homeKey = `HomeTeam${periods[i]}Score` as keyof typeof game;
       const awayKey = `AwayTeam${periods[i]}Score` as keyof typeof game;
@@ -926,6 +969,8 @@ gameDetailRouter.get("/:gameId/injuries", async (c) => {
   let awayTeam = '';
   let homeTeamName = '';
   let awayTeamName = '';
+  let homeTeamId = '';
+  let awayTeamId = '';
   
   const srApiKey = c.env.SPORTSRADAR_API_KEY;
   if (srApiKey && isSportsRadar) {
@@ -936,6 +981,8 @@ gameDetailRouter.get("/:gameId/injuries", async (c) => {
       awayTeam = game.away?.alias || game.away?.name || '';
       homeTeamName = game.home?.name || homeTeam;
       awayTeamName = game.away?.name || awayTeam;
+      homeTeamId = String(game.home?.id || '');
+      awayTeamId = String(game.away?.id || '');
     }
   }
 
@@ -970,7 +1017,9 @@ gameDetailRouter.get("/:gameId/injuries", async (c) => {
     srApiKey,
     sport,
     homeTeam,
-    awayTeam
+    awayTeam,
+    homeTeamId || undefined,
+    awayTeamId || undefined
   );
   
   // Sort by severity
@@ -1114,33 +1163,38 @@ gameDetailRouter.get("/:gameId/line-summary", async (c) => {
   const searchId = isSportsRadar ? gameId : numericId;
   
   // Query database for line history - search with both full ID and numeric portion
-  const historyResult = await c.env.DB.prepare(`
-    SELECT 
-      market_type,
-      MIN(value) as low,
-      MAX(value) as high,
-      (SELECT value FROM line_history lh2 
-       WHERE (lh2.game_id = ? OR lh2.game_id = ? OR lh2.game_id LIKE ?) AND lh2.market_type = line_history.market_type 
-       ORDER BY timestamp ASC LIMIT 1) as open_value,
-      (SELECT value FROM line_history lh3 
-       WHERE (lh3.game_id = ? OR lh3.game_id = ? OR lh3.game_id LIKE ?) AND lh3.market_type = line_history.market_type 
-       ORDER BY timestamp DESC LIMIT 1) as current_value,
-      (SELECT timestamp FROM line_history lh4 
-       WHERE (lh4.game_id = ? OR lh4.game_id = ? OR lh4.game_id LIKE ?) AND lh4.market_type = line_history.market_type 
-       ORDER BY timestamp ASC LIMIT 1) as open_time,
-      (SELECT timestamp FROM line_history lh5 
-       WHERE (lh5.game_id = ? OR lh5.game_id = ? OR lh5.game_id LIKE ?) AND lh5.market_type = line_history.market_type 
-       ORDER BY timestamp DESC LIMIT 1) as current_time
-    FROM line_history
-    WHERE game_id = ? OR game_id = ? OR game_id LIKE ?
-    GROUP BY market_type
-  `).bind(
-    searchId, numericId, `%${numericId}%`,
-    searchId, numericId, `%${numericId}%`,
-    searchId, numericId, `%${numericId}%`,
-    searchId, numericId, `%${numericId}%`,
-    searchId, numericId, `%${numericId}%`
-  ).all();
+  let historyResult: { results?: unknown[] } = { results: [] };
+  try {
+    historyResult = await c.env.DB.prepare(`
+      SELECT
+        market_type,
+        MIN(value) as low,
+        MAX(value) as high,
+        (SELECT value FROM line_history lh2
+         WHERE (lh2.game_id = ? OR lh2.game_id = ? OR lh2.game_id LIKE ?) AND lh2.market_type = line_history.market_type
+         ORDER BY timestamp ASC LIMIT 1) as open_value,
+        (SELECT value FROM line_history lh3
+         WHERE (lh3.game_id = ? OR lh3.game_id = ? OR lh3.game_id LIKE ?) AND lh3.market_type = line_history.market_type
+         ORDER BY timestamp DESC LIMIT 1) as current_value,
+        (SELECT timestamp FROM line_history lh4
+         WHERE (lh4.game_id = ? OR lh4.game_id = ? OR lh4.game_id LIKE ?) AND lh4.market_type = line_history.market_type
+         ORDER BY timestamp ASC LIMIT 1) as open_time,
+        (SELECT timestamp FROM line_history lh5
+         WHERE (lh5.game_id = ? OR lh5.game_id = ? OR lh5.game_id LIKE ?) AND lh5.market_type = line_history.market_type
+         ORDER BY timestamp DESC LIMIT 1) as current_time
+      FROM line_history
+      WHERE game_id = ? OR game_id = ? OR game_id LIKE ?
+      GROUP BY market_type
+    `).bind(
+      searchId, numericId, `%${numericId}%`,
+      searchId, numericId, `%${numericId}%`,
+      searchId, numericId, `%${numericId}%`,
+      searchId, numericId, `%${numericId}%`,
+      searchId, numericId, `%${numericId}%`
+    ).all();
+  } catch (error) {
+    console.warn("[Line Summary] line_history lookup failed; returning sparse summary", error);
+  }
   
   const summary: Record<string, {
     open: number | null;
@@ -1174,36 +1228,40 @@ gameDetailRouter.get("/:gameId/line-summary", async (c) => {
   
   // Also try sdio_odds_current for opening odds
   if (!summary.spread || !summary.total) {
-    const oddsResult = await c.env.DB.prepare(`
-      SELECT oc.* FROM sdio_odds_current oc
-      JOIN sdio_games g ON g.id = oc.game_id
-      WHERE g.provider_game_id = ?
-      LIMIT 1
-    `).bind(numericId).first();
-    
-    if (oddsResult) {
-      if (!summary.spread && oddsResult.open_spread) {
-        summary.spread = {
-          open: oddsResult.open_spread as number,
-          current: oddsResult.spread_home as number | null,
-          high: null,
-          low: null,
-          openTime: null,
-          currentTime: oddsResult.last_updated as string | null,
-          movement: oddsResult.movement_spread as number | null
-        };
+    try {
+      const oddsResult = await c.env.DB.prepare(`
+        SELECT oc.* FROM sdio_odds_current oc
+        JOIN sdio_games g ON g.id = oc.game_id
+        WHERE g.provider_game_id = ?
+        LIMIT 1
+      `).bind(numericId).first();
+
+      if (oddsResult) {
+        if (!summary.spread && oddsResult.open_spread) {
+          summary.spread = {
+            open: oddsResult.open_spread as number,
+            current: oddsResult.spread_home as number | null,
+            high: null,
+            low: null,
+            openTime: null,
+            currentTime: oddsResult.last_updated as string | null,
+            movement: oddsResult.movement_spread as number | null
+          };
+        }
+        if (!summary.total && oddsResult.open_total) {
+          summary.total = {
+            open: oddsResult.open_total as number,
+            current: oddsResult.total as number | null,
+            high: null,
+            low: null,
+            openTime: null,
+            currentTime: oddsResult.last_updated as string | null,
+            movement: oddsResult.movement_total as number | null
+          };
+        }
       }
-      if (!summary.total && oddsResult.open_total) {
-        summary.total = {
-          open: oddsResult.open_total as number,
-          current: oddsResult.total as number | null,
-          high: null,
-          low: null,
-          openTime: null,
-          currentTime: oddsResult.last_updated as string | null,
-          movement: oddsResult.movement_total as number | null
-        };
-      }
+    } catch (error) {
+      console.warn("[Line Summary] sdio_odds_current fallback unavailable", error);
     }
   }
   

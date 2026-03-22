@@ -210,6 +210,7 @@ export function UnifiedFinalHeroPanel({
   totalResult,
   coverResult,
   overUnderResult,
+  teamLogoSize = 44,
 }: {
   sport: string;
   homeTeam: string;
@@ -220,6 +221,7 @@ export function UnifiedFinalHeroPanel({
   totalResult: string;
   coverResult: string;
   overUnderResult: string;
+  teamLogoSize?: number;
 }) {
   const hasBothScores = typeof awayScore === "number" && typeof homeScore === "number";
   const awayWon = hasBothScores && awayScore > homeScore;
@@ -236,7 +238,7 @@ export function UnifiedFinalHeroPanel({
             <TeamLogo
               teamCode={awayTeam}
               sport={sport}
-              size={44}
+              size={teamLogoSize}
               winnerGlow={awayWon}
               className="drop-shadow-[0_8px_14px_rgba(0,0,0,0.45)]"
             />
@@ -252,7 +254,7 @@ export function UnifiedFinalHeroPanel({
             <TeamLogo
               teamCode={homeTeam}
               sport={sport}
-              size={44}
+              size={teamLogoSize}
               winnerGlow={homeWon}
               className="drop-shadow-[0_8px_14px_rgba(0,0,0,0.45)]"
             />

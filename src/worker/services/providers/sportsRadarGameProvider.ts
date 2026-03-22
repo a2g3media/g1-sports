@@ -141,13 +141,23 @@ function mapPeriod(sport: SportKey, srGame: any): { period?: number; periodLabel
   // Extract clock time
   result.clock = srGame.clock || srGame.game_clock || undefined;
   
-  // NBA / NCAAB - quarters (OT starts at quarter 5+)
-  if (sport === 'nba' || sport === 'ncaab') {
+  // NBA - quarters (OT starts at quarter 5+)
+  if (sport === 'nba') {
     const quarter = srGame.quarter || srGame.period;
     if (quarter) {
       result.period = quarter;
       result.periodLabel = quarter <= 4 ? `Q${quarter}` : `OT${quarter - 4}`;
       result.isOvertime = quarter > 4;
+    }
+  }
+
+  // NCAAB - halves (OT starts at period 3+)
+  if (sport === 'ncaab') {
+    const period = srGame.period || srGame.quarter;
+    if (period) {
+      result.period = period;
+      result.periodLabel = period <= 2 ? `${period}H` : `OT${period - 2}`;
+      result.isOvertime = period > 2;
     }
   }
   

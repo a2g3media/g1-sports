@@ -83,6 +83,48 @@ async function withTimeoutOrNull<T>(promise: Promise<T>, timeoutMs: number): Pro
   return result;
 }
 
+function buildSurfaceFallback(surface: string, query?: string, gameId?: string) {
+  const focus = String(query || gameId || "today's board").trim();
+  if (surface === "game") {
+    return {
+      summary: `Live game read active for ${focus}. Coach G is monitoring line movement and momentum shifts.`,
+      actionable: [
+        "Watch for late movement before lock.",
+        "Track injury and rotation updates tied to line swings.",
+      ],
+      signal: "Game monitoring active",
+    };
+  }
+  if (surface === "watchboards") {
+    return {
+      summary: "Watchboard intelligence is active. Coach G is ranking your tracked games by edge and signal strength.",
+      actionable: [
+        "Prioritize entries with the strongest edge score first.",
+        "Re-check live games when sharp signals update.",
+      ],
+      signal: "Watchboard scan active",
+    };
+  }
+  if (surface === "odds") {
+    return {
+      summary: "Odds intelligence is online. Coach G is validating posted lines and monitoring market depth.",
+      actionable: [
+        "Refresh to capture newly posted verified lines.",
+        "Use market depth and projection count together before placing a position.",
+      ],
+      signal: "Market feed monitoring",
+    };
+  }
+  return {
+    summary: `Live read active for ${focus}. Coach G is scanning market movement and context updates.`,
+    actionable: [
+      "Monitor line and momentum changes as books refresh.",
+      "Check top sharp signals before committing to a side.",
+    ],
+    signal: "Live market updating",
+  };
+}
+
 coachGIntelligenceRouter.use("/admin/*", async (c, next) => {
   if (isDemoMode(c)) {
     await next();
@@ -109,6 +151,7 @@ coachGIntelligenceRouter.get("/intelligence", async (c) => {
   const surface = c.req.query("surface") || "global";
   const query = c.req.query("q") || undefined;
   const userId = getUserId(c);
+  const fallback = buildSurfaceFallback(surface, query, gameId);
   try {
     const payload = await withTimeoutOrNull(
       runCoachGBrain({
@@ -122,24 +165,21 @@ coachGIntelligenceRouter.get("/intelligence", async (c) => {
       surface === "home" ? 2400 : 3200
     );
     if (!payload) {
-      const matchup = query || gameId || "live matchup";
       return c.json({
         surface,
-        summary: `Live read active for ${matchup}. Monitoring line movement and momentum updates.`,
+        summary: fallback.summary,
         edge_score: 0,
         sharp_radar: [
           {
             type: "market_monitor",
             icon: "📡",
-            message: "Live market updating",
+            message: fallback.signal,
             importance: "medium",
           },
         ],
         line_prediction: null,
         player_prop_edges: [],
-        actionable_intel: [
-          "Monitoring live movement and key momentum swings.",
-        ],
+        actionable_intel: fallback.actionable,
         generated_at: new Date().toISOString(),
         model_route: {
           task: "fallback",
@@ -156,25 +196,22 @@ coachGIntelligenceRouter.get("/intelligence", async (c) => {
       ...payload,
     });
   } catch (error) {
-    const matchup = query || gameId || "live matchup";
     console.error("[CoachG] /intelligence fallback:", error);
     return c.json({
       surface,
-      summary: `Live read active for ${matchup}. Monitoring line movement and momentum updates.`,
+      summary: fallback.summary,
       edge_score: 0,
       sharp_radar: [
         {
           type: "market_monitor",
           icon: "📡",
-          message: "Live market updating",
+          message: fallback.signal,
           importance: "medium",
         },
       ],
       line_prediction: null,
       player_prop_edges: [],
-      actionable_intel: [
-        "Monitoring live movement and key momentum swings.",
-      ],
+      actionable_intel: fallback.actionable,
       generated_at: new Date().toISOString(),
       model_route: {
         task: "fallback",
@@ -193,23 +230,36 @@ coachGIntelligenceRouter.get("/intelligence", async (c) => {
  */
 coachGIntelligenceRouter.get("/daily-brief", async (c) => {
   const userId = getUserId(c);
-  const payload = await runCoachGBrain({
-    db: c.env.DB,
-    env: c.env,
-    userId,
-    surface: "home",
-    query: "daily briefing",
-  });
+  try {
+    const payload = await runCoachGBrain({
+      db: c.env.DB,
+      env: c.env,
+      userId,
+      surface: "home",
+      query: "daily briefing",
+    });
 
-  return c.json({
-    title: "Coach G Daily Brief",
-    generated_at: payload.generated_at,
-    edge_score: payload.edge_score,
-    summary: payload.summary,
-    top_signals: payload.sharp_radar.slice(0, 3),
-    top_prop_edges: payload.player_prop_edges.slice(0, 3),
-    source: "coachg_brain_service",
-  });
+    return c.json({
+      title: "Coach G Daily Brief",
+      generated_at: payload.generated_at,
+      edge_score: payload.edge_score,
+      summary: payload.summary,
+      top_signals: payload.sharp_radar.slice(0, 3),
+      top_prop_edges: payload.player_prop_edges.slice(0, 3),
+      source: "coachg_brain_service",
+    });
+  } catch (error) {
+    console.error("[CoachG] /daily-brief fallback:", error);
+    return c.json({
+      title: "Coach G Daily Brief",
+      generated_at: new Date().toISOString(),
+      edge_score: 0,
+      summary: "Daily brief fallback active while intelligence sources rehydrate.",
+      top_signals: [],
+      top_prop_edges: [],
+      source: "deterministic_fallback",
+    });
+  }
 });
 
 /**
@@ -217,68 +267,79 @@ coachGIntelligenceRouter.get("/daily-brief", async (c) => {
  * Intelligence feed for /intelligence dashboard surfaces.
  */
 coachGIntelligenceRouter.get("/feed", async (c) => {
-  const userId = getUserId(c);
-  const requestedLimit = Math.max(1, Math.min(20, Number(c.req.query("limit") || 8)));
-  // Keep feed latency predictable while still filling meaningful cards.
-  const limit = Math.min(requestedLimit, 6);
-  const surface = c.req.query("surface") || "home";
-  const live = await fetchLiveGamesWithFallback({ sports: ["nba", "nfl", "mlb", "nhl", "ncaab", "ncaaf", "soccer", "mma", "golf", "nascar"] });
-  const ids = live.data
-    .slice(0, limit)
-    .map((g) => String(g.game_id || ""))
-    .filter((id) => id.length > 0);
-  if (ids.length < limit) {
-    const upcoming = await fetchScheduledGamesWithFallback({ hours: 24 });
-    for (const game of upcoming.data) {
-      if (ids.length >= limit) break;
-      const id = String(game.game_id || "");
-      if (!id || ids.includes(id)) continue;
-      ids.push(id);
-    }
-  }
-  if (ids.length < limit) {
-    // Fallback to broad sport sweeps so feed stays populated off-hours.
-    const fallbackSports: Array<"nba" | "nfl" | "mlb" | "nhl" | "ncaab" | "ncaaf" | "soccer" | "mma" | "golf" | "nascar"> =
-      ["nba", "nfl", "mlb", "nhl", "ncaab", "ncaaf", "soccer", "mma", "golf", "nascar"];
-    for (const sport of fallbackSports) {
-      if (ids.length >= limit) break;
-      const sweep = await fetchGamesWithFallback(sport, {});
-      for (const game of sweep.data) {
+  try {
+    const userId = getUserId(c);
+    const requestedLimit = Math.max(1, Math.min(20, Number(c.req.query("limit") || 8)));
+    // Keep feed latency predictable while still filling meaningful cards.
+    const limit = Math.min(requestedLimit, 6);
+    const surface = c.req.query("surface") || "home";
+    const live = await fetchLiveGamesWithFallback({ sports: ["nba", "nfl", "mlb", "nhl", "ncaab", "ncaaf", "soccer", "mma", "golf", "nascar"] });
+    const ids = live.data
+      .slice(0, limit)
+      .map((g) => String(g.game_id || ""))
+      .filter((id) => id.length > 0);
+    if (ids.length < limit) {
+      const upcoming = await fetchScheduledGamesWithFallback({ hours: 24 });
+      for (const game of upcoming.data) {
         if (ids.length >= limit) break;
         const id = String(game.game_id || "");
         if (!id || ids.includes(id)) continue;
         ids.push(id);
       }
     }
-  }
+    if (ids.length < limit) {
+      // Fallback to broad sport sweeps so feed stays populated off-hours.
+      const fallbackSports: Array<"nba" | "nfl" | "mlb" | "nhl" | "ncaab" | "ncaaf" | "soccer" | "mma" | "golf" | "nascar"> =
+        ["nba", "nfl", "mlb", "nhl", "ncaab", "ncaaf", "soccer", "mma", "golf", "nascar"];
+      for (const sport of fallbackSports) {
+        if (ids.length >= limit) break;
+        const sweep = await fetchGamesWithFallback(sport, {});
+        for (const game of sweep.data) {
+          if (ids.length >= limit) break;
+          const id = String(game.game_id || "");
+          if (!id || ids.includes(id)) continue;
+          ids.push(id);
+        }
+      }
+    }
 
-  const payloads: IntelligencePayload[] = [];
-  const feedResults = await Promise.all(
-    ids.map((gameId) =>
-      withTimeoutOrNull(
-        runCoachGBrain({
-          db: c.env.DB,
-          env: c.env,
-          userId,
-          surface,
-          gameId,
-          query: "intelligence feed",
-        }),
-        5000
+    const payloads: IntelligencePayload[] = [];
+    const feedResults = await Promise.all(
+      ids.map((gameId) =>
+        withTimeoutOrNull(
+          runCoachGBrain({
+            db: c.env.DB,
+            env: c.env,
+            userId,
+            surface,
+            gameId,
+            query: "intelligence feed",
+          }),
+          5000
+        )
       )
-    )
-  );
-  for (const result of feedResults) {
-    if (result?.intelligence_payload) payloads.push(result.intelligence_payload);
-  }
+    );
+    for (const result of feedResults) {
+      if (result?.intelligence_payload) payloads.push(result.intelligence_payload);
+    }
 
-  return c.json({
-    surface,
-    count: payloads.length,
-    payloads,
-    source: "provider_chain",
-    fallback_reason: ids.length === 0 ? (live.error || "No live/scheduled games available from provider chain") : null,
-  });
+    return c.json({
+      surface,
+      count: payloads.length,
+      payloads,
+      source: "provider_chain",
+      fallback_reason: ids.length === 0 ? (live.error || "No live/scheduled games available from provider chain") : null,
+    });
+  } catch (error) {
+    console.error("[CoachG] /feed fallback:", error);
+    return c.json({
+      surface: c.req.query("surface") || "home",
+      count: 0,
+      payloads: [],
+      source: "deterministic_fallback",
+      fallback_reason: "Feed fallback active while intelligence sources rehydrate.",
+    });
+  }
 });
 
 /**

@@ -1193,14 +1193,16 @@ oddsRouter.get("/props/projections", authMiddleware, async (c) => {
  */
 oddsRouter.get("/bookmakers", async (c) => {
   const db = c.env.DB;
-  
-  // Try to get from database first
-  const { results } = await db.prepare(`
-    SELECT * FROM bookmakers WHERE is_active = 1 ORDER BY priority ASC
-  `).all();
-  
-  if (results.length > 0) {
-    return c.json({ bookmakers: results });
+  try {
+    // Try to get from database first
+    const { results } = await db.prepare(`
+      SELECT * FROM bookmakers WHERE is_active = 1 ORDER BY priority ASC
+    `).all();
+    if (results.length > 0) {
+      return c.json({ bookmakers: results });
+    }
+  } catch (error) {
+    console.warn("[odds] bookmakers lookup failed, using fallback list", error);
   }
   
   // Fallback to hardcoded list
@@ -1226,13 +1228,15 @@ oddsRouter.get("/bookmakers", async (c) => {
  */
 oddsRouter.get("/markets", async (c) => {
   const db = c.env.DB;
-  
-  const { results } = await db.prepare(`
-    SELECT * FROM odds_markets WHERE is_enabled = 1 ORDER BY sort_order ASC
-  `).all();
-  
-  if (results.length > 0) {
-    return c.json({ markets: results });
+  try {
+    const { results } = await db.prepare(`
+      SELECT * FROM odds_markets WHERE is_enabled = 1 ORDER BY sort_order ASC
+    `).all();
+    if (results.length > 0) {
+      return c.json({ markets: results });
+    }
+  } catch (error) {
+    console.warn("[odds] markets lookup failed, using fallback list", error);
   }
   
   // Fallback
@@ -1629,80 +1633,111 @@ oddsRouter.get("/snapshots/:gameId", async (c) => {
   const scope = (c.req.query("scope") || "DEMO") as DataScope;
   const db = c.env.DB;
   
-  // Try to get real line movement data first (for PROD scope)
-  if (scope === "PROD" && market) {
-    const outcomes: ('HOME' | 'AWAY' | 'OVER' | 'UNDER')[] = 
-      market === 'TOTAL' ? ['OVER', 'UNDER'] : ['HOME', 'AWAY'];
-    
-    const series = [];
-    for (const outcome of outcomes) {
-      const movement = await getLineMovement(db, gameId, market, outcome);
-      if (movement && movement.snapshots.length > 0) {
-        series.push({
-          market_key: market,
-          outcome_key: outcome,
-          points: movement.snapshots,
-          opening_line: movement.openingLine,
-          current_line: movement.currentLine,
-          movement: movement.movement,
-          direction: movement.direction,
+  try {
+    // Try to get real line movement data first (for PROD scope)
+    if (scope === "PROD" && market) {
+      const outcomes: ('HOME' | 'AWAY' | 'OVER' | 'UNDER')[] =
+        market === 'TOTAL' ? ['OVER', 'UNDER'] : ['HOME', 'AWAY'];
+
+      const series = [];
+      for (const outcome of outcomes) {
+        const movement = await getLineMovement(db, gameId, market, outcome);
+        if (movement && movement.snapshots.length > 0) {
+          series.push({
+            market_key: market,
+            outcome_key: outcome,
+            points: movement.snapshots,
+            opening_line: movement.openingLine,
+            current_line: movement.currentLine,
+            movement: movement.movement,
+            direction: movement.direction,
+          });
+        }
+      }
+
+      if (series.length > 0) {
+        return c.json({
+          game_id: gameId,
+          series,
+          total_snapshots: series.reduce((sum, s) => sum + s.points.length, 0),
+          source: 'sportsradar',
+          timestamp: new Date().toISOString(),
         });
       }
     }
-    
-    if (series.length > 0) {
-      return c.json({
-        game_id: gameId,
-        series,
-        total_snapshots: series.reduce((sum, s) => sum + s.points.length, 0),
-        source: 'sportsradar',
-        timestamp: new Date().toISOString(),
+
+    // Fallback: Try database snapshots
+    let snapshots = await fetchSnapshotsForGame(db, gameId, {
+      scope,
+      market: market || undefined,
+      bookmaker: bookmaker || undefined,
+      limit: 100,
+    });
+
+    // If no snapshots exist (demo mode), generate simulated history
+    if (snapshots.length === 0) {
+      snapshots = generateDemoSnapshotHistory(gameId, scope, market);
+    }
+
+    // Group by market and outcome for chart-friendly structure
+    const grouped: Record<string, {
+      market_key: string;
+      outcome_key: string;
+      points: { timestamp: string; line: number | null; price: number | null }[];
+    }> = {};
+
+    for (const snap of snapshots) {
+      const key = `${snap.market_key}:${snap.outcome_key}`;
+      if (!grouped[key]) {
+        grouped[key] = {
+          market_key: snap.market_key,
+          outcome_key: snap.outcome_key,
+          points: [],
+        };
+      }
+      grouped[key].points.push({
+        timestamp: snap.captured_at,
+        line: snap.line_value,
+        price: snap.price_american,
       });
     }
-  }
-  
-  // Fallback: Try database snapshots
-  let snapshots = await fetchSnapshotsForGame(db, gameId, {
-    scope,
-    market: market || undefined,
-    bookmaker: bookmaker || undefined,
-    limit: 100,
-  });
-  
-  // If no snapshots exist (demo mode), generate simulated history
-  if (snapshots.length === 0) {
-    snapshots = generateDemoSnapshotHistory(gameId, scope, market);
-  }
-  
-  // Group by market and outcome for chart-friendly structure
-  const grouped: Record<string, {
-    market_key: string;
-    outcome_key: string;
-    points: { timestamp: string; line: number | null; price: number | null }[];
-  }> = {};
-  
-  for (const snap of snapshots) {
-    const key = `${snap.market_key}:${snap.outcome_key}`;
-    if (!grouped[key]) {
-      grouped[key] = {
-        market_key: snap.market_key,
-        outcome_key: snap.outcome_key,
-        points: [],
-      };
+
+    return c.json({
+      game_id: gameId,
+      series: Object.values(grouped),
+      total_snapshots: snapshots.length,
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error) {
+    console.warn("[odds] snapshots lookup failed, using generated history", error);
+    const snapshots = generateDemoSnapshotHistory(gameId, scope, market);
+    const grouped: Record<string, {
+      market_key: string;
+      outcome_key: string;
+      points: { timestamp: string; line: number | null; price: number | null }[];
+    }> = {};
+    for (const snap of snapshots) {
+      const key = `${snap.market_key}:${snap.outcome_key}`;
+      if (!grouped[key]) {
+        grouped[key] = {
+          market_key: snap.market_key,
+          outcome_key: snap.outcome_key,
+          points: [],
+        };
+      }
+      grouped[key].points.push({
+        timestamp: snap.captured_at,
+        line: snap.line_value,
+        price: snap.price_american,
+      });
     }
-    grouped[key].points.push({
-      timestamp: snap.captured_at,
-      line: snap.line_value,
-      price: snap.price_american,
+    return c.json({
+      game_id: gameId,
+      series: Object.values(grouped),
+      total_snapshots: snapshots.length,
+      timestamp: new Date().toISOString(),
     });
   }
-  
-  return c.json({
-    game_id: gameId,
-    series: Object.values(grouped),
-    total_snapshots: snapshots.length,
-    timestamp: new Date().toISOString(),
-  });
 });
 
 /**

@@ -44,6 +44,36 @@ export const API_CACHE_TTL = {
 // In-flight request tracking to deduplicate concurrent requests
 const inFlightRequests = new Map<string, Promise<any>>();
 
+// Track whether we've already ensured the table exists in this isolate.
+let apiCacheTableReady = false;
+
+/**
+ * Auto-create the api_cache table if it doesn't exist.
+ * Called once per isolate lifetime on first cache access.
+ */
+async function ensureApiCacheTable(db: D1Database): Promise<void> {
+  if (apiCacheTableReady) return;
+  try {
+    await db.prepare(`
+      CREATE TABLE IF NOT EXISTS api_cache (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        cache_key TEXT NOT NULL UNIQUE,
+        provider TEXT NOT NULL DEFAULT '',
+        endpoint TEXT NOT NULL DEFAULT '',
+        data_json TEXT NOT NULL DEFAULT '{}',
+        ttl_seconds INTEGER NOT NULL DEFAULT 300,
+        cached_at TEXT NOT NULL DEFAULT (datetime('now')),
+        expires_at TEXT NOT NULL DEFAULT (datetime('now','+300 seconds')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+        hit_count INTEGER NOT NULL DEFAULT 0
+      )
+    `).run();
+    apiCacheTableReady = true;
+  } catch (err) {
+    console.error('[apiCache] Failed to ensure table:', err);
+  }
+}
+
 interface CacheEntry {
   id: number;
   cache_key: string;
@@ -81,6 +111,7 @@ export async function getCachedData<T>(
   cacheKey: string
 ): Promise<T | null> {
   try {
+    await ensureApiCacheTable(db);
     const entry = await db.prepare(`
       SELECT * FROM api_cache 
       WHERE cache_key = ? AND expires_at > datetime('now')
@@ -113,6 +144,7 @@ export async function setCachedData<T>(
   ttlSeconds: number
 ): Promise<void> {
   try {
+    await ensureApiCacheTable(db);
     const dataJson = JSON.stringify(data);
     
     await db.prepare(`

@@ -280,6 +280,7 @@ export default function NASCARDriverPage() {
   const [liveStandings, setLiveStandings] = useState<NascarStandingsPayload | null>(null);
 
   const driver = driverId ? NASCAR_DRIVERS[driverId] : null;
+  const fallbackStanding = driverId ? DRIVER_STANDINGS[driverId] : undefined;
   const mfr = driver ? MANUFACTURERS[driver.manufacturer] : null;
   const coachInsight = driverId ? getCoachGInsight(driverId) : "";
 
@@ -508,7 +509,7 @@ export default function NASCARDriverPage() {
               {/* Quick Stats */}
               <div className="grid grid-cols-4 gap-4 max-w-xl">
                 <div className="text-center p-3 rounded-xl bg-white/5 border border-white/10">
-                  <p className="text-2xl font-bold text-amber-400">{standingRow?.points ?? "N/A"}</p>
+                  <p className="text-2xl font-bold text-amber-400">{standingRow?.points ?? fallbackStanding?.points ?? "N/A"}</p>
                   <p className="text-xs text-white/40">Points</p>
                 </div>
                 <div className="text-center p-3 rounded-xl bg-white/5 border border-white/10">
@@ -516,11 +517,11 @@ export default function NASCARDriverPage() {
                   <p className="text-xs text-white/40">Wins</p>
                 </div>
                 <div className="text-center p-3 rounded-xl bg-white/5 border border-white/10">
-                  <p className="text-2xl font-bold text-cyan-400">{standingRow?.top5 ?? "N/A"}</p>
+                  <p className="text-2xl font-bold text-cyan-400">{standingRow?.top5 ?? fallbackStanding?.top5 ?? "N/A"}</p>
                   <p className="text-xs text-white/40">Top 5</p>
                 </div>
                 <div className="text-center p-3 rounded-xl bg-white/5 border border-white/10">
-                  <p className="text-2xl font-bold text-white">{standingRow?.top10 ?? "N/A"}</p>
+                  <p className="text-2xl font-bold text-white">{standingRow?.top10 ?? fallbackStanding?.top10 ?? "N/A"}</p>
                   <p className="text-xs text-white/40">Top 10</p>
                 </div>
               </div>
@@ -549,7 +550,8 @@ export default function NASCARDriverPage() {
               <img
                 src={COACH_G_AVATAR}
                 alt="Coach G"
-                className="w-14 h-14 rounded-xl object-cover border-2 border-violet-500/30"
+                className="w-14 h-14 rounded-xl object-cover border-2 border-violet-500/30 cursor-pointer transition-transform hover:scale-105"
+                onClick={() => navigate('/scout')}
               />
               <div className="flex-1">
                 <p className="text-white text-lg font-medium mb-3">"{coachInsight}"</p>

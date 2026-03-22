@@ -365,6 +365,21 @@ function formatGameTime(startTime: string): string {
   });
 }
 
+function normalizeLineHistoryMessage(reason: unknown): string {
+  if (typeof reason !== "string") {
+    return "Line history is still syncing from partner books.";
+  }
+  const trimmed = reason.trim();
+  if (!trimmed) {
+    return "Line history is still syncing from partner books.";
+  }
+  // Hide raw provider tokens like "NO_HISTORY" from user-facing UI.
+  if (/^[A-Z0-9_]+$/.test(trimmed)) {
+    return "Line history is still syncing from partner books.";
+  }
+  return trimmed;
+}
+
 // ====================
 // SUB-COMPONENTS
 // ====================
@@ -720,8 +735,7 @@ function BestOddsSection({ game, formatSpread, formatML }: {
         
         setBookOdds(odds);
         setSource(data.source || 'live');
-      } catch (err) {
-        console.log('[BestOdds] Fetch failed, using game odds fallback');
+      } catch {
         // Fallback to game.sportsbooks if available, or generate from base odds
         if (game.sportsbooks?.length) {
           setBookOdds(game.sportsbooks.map(sb => ({
@@ -1463,12 +1477,7 @@ export default function OddsGamePage() {
           });
           setLineHistoryStatus({ synced: true, message: null });
         } else {
-          const reason =
-            typeof data?.fallback_reason === "string"
-              ? data.fallback_reason
-              : typeof data?.fallback_type === "string"
-                ? data.fallback_type
-                : "Line history is still syncing from partner books.";
+          const reason = normalizeLineHistoryMessage(data?.fallback_reason ?? data?.fallback_type);
           setLineHistoryStatus({ synced: false, message: reason });
         }
       } catch (err) {
@@ -1516,7 +1525,7 @@ export default function OddsGamePage() {
     });
   }, [game]);
   
-  // Line movement data - real data from API with mock fallback
+  // Line movement data with graceful local derivation fallback.
   const lineMovementData = useMemo(() => {
     // Format timestamp to readable time
     const formatTime = (timestamp: string, index: number, total: number) => {
@@ -1693,7 +1702,7 @@ export default function OddsGamePage() {
     });
     return notes.slice(0, 5);
   }, [lineMovementData.movements?.spread, lineMovementData.movements?.total, marketSignals.publicBetPct, marketSignals.sharpAction]);
-  const mockLiveFeed = useMemo(
+  const liveFeedItems = useMemo(
     () =>
       liveNotes.map((n, idx) => ({
         id: `odds-live-${idx}`,
@@ -1751,6 +1760,7 @@ export default function OddsGamePage() {
               <div className="flex items-center gap-3 flex-1 min-w-0">
                 <TeamLogo
                   teamCode={game.awayTeamCode || game.awayTeam}
+                  teamName={game.awayTeam}
                   sport={game.sport}
                   size={36}
                   winnerGlow={
@@ -1793,6 +1803,7 @@ export default function OddsGamePage() {
                 </div>
                 <TeamLogo
                   teamCode={game.homeTeamCode || game.homeTeam}
+                  teamName={game.homeTeam}
                   sport={game.sport}
                   size={36}
                   winnerGlow={
@@ -1885,7 +1896,7 @@ export default function OddsGamePage() {
               subtitle="Live Coach G video updates render here when available."
               fallbackText="Live Coach G clip is syncing. We are checking for the next update automatically."
             />
-            <UnifiedPlayFeedPanel items={mockLiveFeed} />
+            <UnifiedPlayFeedPanel items={liveFeedItems} />
           </>
         )}
 
@@ -1990,7 +2001,7 @@ export default function OddsGamePage() {
               <div className="grid grid-cols-2 gap-2 mt-2">
                 <div className="rounded-xl bg-white/[0.02] border border-white/[0.04] p-3 flex items-center justify-between">
                   <div className="flex items-center gap-2">
-                    <TeamLogo teamCode={game.awayTeamCode || game.awayTeam} sport={game.sport} size={24} />
+                    <TeamLogo teamCode={game.awayTeamCode || game.awayTeam} teamName={game.awayTeam} sport={game.sport} size={24} />
                     <span className="text-xs text-white/60 truncate">{game.awayTeam}</span>
                   </div>
                   <span className="text-lg font-bold text-white">
@@ -1999,7 +2010,7 @@ export default function OddsGamePage() {
                 </div>
                 <div className="rounded-xl bg-white/[0.02] border border-white/[0.04] p-3 flex items-center justify-between">
                   <div className="flex items-center gap-2">
-                    <TeamLogo teamCode={game.homeTeamCode || game.homeTeam} sport={game.sport} size={24} />
+                    <TeamLogo teamCode={game.homeTeamCode || game.homeTeam} teamName={game.homeTeam} sport={game.sport} size={24} />
                     <span className="text-xs text-white/60 truncate">{game.homeTeam}</span>
                   </div>
                   <span className="text-lg font-bold text-white">
@@ -2049,11 +2060,6 @@ export default function OddsGamePage() {
             </div>
           )}
         </section>
-        
-        {/* ================================ */}
-        {/* PLACEHOLDER FOR REMAINING SECTIONS */}
-        {/* These will be built in sessions 2 & 3 */}
-        {/* ================================ */}
         
         {/* ================================ */}
         {/* 3. COACH G QUICK INTEL */}

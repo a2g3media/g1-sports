@@ -5,7 +5,9 @@ import {
   Target, 
   Flame,
   ChevronRight,
-  Zap
+  Zap,
+  Calendar,
+  BarChart3
 } from "lucide-react";
 
 // Sport configuration with visual identity
@@ -185,14 +187,14 @@ function SportCard({ sport, index }: { sport: typeof SPORTS[0]; index: number })
 
           {/* Content */}
           <div className="relative p-6 sm:p-8">
-            {/* Sport icon with glow */}
+            {/* Sport identity */}
             <div className="mb-6 flex items-center justify-between">
               <div className="relative">
                 <div 
                   className="absolute inset-0 blur-2xl opacity-40 transition-opacity duration-500 group-hover:opacity-60"
                   style={{ backgroundColor: sport.accent }}
                 />
-                <span className="relative text-5xl sm:text-6xl drop-shadow-lg">
+                <span className="relative text-3xl sm:text-4xl drop-shadow-lg">
                   {sport.icon}
                 </span>
               </div>
@@ -286,11 +288,14 @@ export function SportDirectoryPage() {
                 </span>
               </div>
               <h1 className="text-4xl sm:text-5xl lg:text-6xl font-black tracking-tight text-white">
-                Choose Your
+                Sports Command
                 <span className="block bg-gradient-to-r from-cyan-400 via-blue-400 to-purple-400 bg-clip-text text-transparent">
-                  Arena
+                  Center
                 </span>
               </h1>
+              <p className="mt-2 text-sm text-white/50 max-w-xl">
+                Jump into each league hub with live scores, market context, and Coach G intelligence.
+              </p>
             </div>
 
             {/* Stats */}
@@ -315,6 +320,35 @@ export function SportDirectoryPage() {
               </div>
             </div>
           </div>
+        </motion.div>
+
+        <motion.div
+          initial={{ opacity: 0, y: -10 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ delay: 0.08 }}
+          className="mb-6 grid grid-cols-3 gap-2.5"
+        >
+          <Link
+            to="/games"
+            className="rounded-xl border border-white/10 bg-white/[0.03] px-3 py-2.5 text-xs font-semibold text-white/80 hover:bg-white/[0.06] transition-colors flex items-center gap-2 justify-center"
+          >
+            <Calendar className="h-4 w-4 text-cyan-300" />
+            Games
+          </Link>
+          <Link
+            to="/odds"
+            className="rounded-xl border border-white/10 bg-white/[0.03] px-3 py-2.5 text-xs font-semibold text-white/80 hover:bg-white/[0.06] transition-colors flex items-center gap-2 justify-center"
+          >
+            <BarChart3 className="h-4 w-4 text-emerald-300" />
+            Odds
+          </Link>
+          <Link
+            to="/scout"
+            className="rounded-xl border border-white/10 bg-white/[0.03] px-3 py-2.5 text-xs font-semibold text-white/80 hover:bg-white/[0.06] transition-colors flex items-center gap-2 justify-center"
+          >
+            <Zap className="h-4 w-4 text-violet-300" />
+            Coach G
+          </Link>
         </motion.div>
 
         {/* Sports Grid */}

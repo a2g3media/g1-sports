@@ -8,7 +8,8 @@ type SmokeCheck = {
   allowedStatuses?: number[];
 };
 
-const HEALTH_PATH = "/api/health/sportsradar";
+// Avoid health routes that may touch optional provider tables in local/dev.
+const HEALTH_PATH = "/api/pool-admin/my-pools";
 const BASE_CANDIDATES = [
   process.env.SMOKE_BASE_URL,
   process.env.MONITOR_BASE_URL,
@@ -26,7 +27,9 @@ async function resolveBaseUrl(): Promise<string> {
       const res = await fetch(`${base}${HEALTH_PATH}`, {
         headers: { "X-Demo-Mode": "true" },
       });
-      if (res.ok) return base;
+      // A non-5xx response proves the local server is reachable even if
+      // health route permissions/config differ by environment.
+      if (res.status < 500) return base;
     } catch {
       // keep probing
     }

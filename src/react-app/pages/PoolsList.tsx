@@ -6,9 +6,10 @@
 import { useState, useMemo, useEffect, useCallback, memo } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { ROUTES } from "@/react-app/config/routes";
-import { Search, Plus, UserPlus, Users, Trophy, ChevronRight, Crown, Zap, Medal, AlertTriangle, Compass, Clock3, Sparkles, ShieldCheck, ArrowRight } from "lucide-react";
+import { Search, Plus, UserPlus, Users, Trophy, ChevronRight, Crown, Zap, Medal, AlertTriangle, Compass, Clock3, Sparkles, ShieldCheck, ArrowRight, Share2 } from "lucide-react";
 import { useActiveLeague } from "@/react-app/contexts/ActiveLeagueContext";
 import { useFeatureFlags } from "@/react-app/hooks/useFeatureFlags";
+import { useSubscription } from "@/react-app/hooks/useSubscription";
 import { getSport, POOL_FORMATS } from "@/react-app/data/sports";
 import { cn } from "@/react-app/lib/utils";
 import { formatCurrency } from "@/shared/escrow";
@@ -37,6 +38,7 @@ interface League {
 interface MarketplacePool {
   id: number;
   name: string;
+  state?: string;
   sport_key: string;
   format_key: string;
   member_count: number;
@@ -350,7 +352,7 @@ function PoolsSkeleton() {
 }
 
 // Cinematic Empty state
-function EmptyState() {
+function EmptyState({ canCreatePool }: { canCreatePool: boolean }) {
   return (
     <div className="text-center py-16 px-4">
       <div className="relative w-20 h-20 mx-auto mb-6">
@@ -361,15 +363,19 @@ function EmptyState() {
       </div>
       <h3 className="text-xl font-bold text-white mb-2">No pools yet</h3>
       <p className="text-sm text-white/50 mb-8 max-w-xs mx-auto">
-        Create a pool to compete with friends, or join an existing one with an invite code.
+        {canCreatePool
+          ? "Create a pool to compete with friends, or join an existing one with an invite code."
+          : "Join an existing pool with an invite code to start competing."}
       </p>
       <div className="flex flex-col sm:flex-row gap-3 justify-center">
-        <Link to={ROUTES.CREATE_LEAGUE}>
-          <button className="w-full sm:w-auto px-5 py-2.5 bg-primary text-primary-foreground rounded-xl text-sm font-semibold flex items-center justify-center gap-2 shadow-lg shadow-primary/20">
-            <Plus className="w-4 h-4" />
-            Create Pool
-          </button>
-        </Link>
+        {canCreatePool && (
+          <Link to={ROUTES.CREATE_LEAGUE}>
+            <button className="w-full sm:w-auto px-5 py-2.5 bg-primary text-primary-foreground rounded-xl text-sm font-semibold flex items-center justify-center gap-2 shadow-lg shadow-primary/20">
+              <Plus className="w-4 h-4" />
+              Create Pool
+            </button>
+          </Link>
+        )}
         <Link to={ROUTES.JOIN_LEAGUE}>
           <button className="w-full sm:w-auto px-5 py-2.5 bg-white/10 text-white rounded-xl text-sm font-semibold flex items-center justify-center gap-2 hover:bg-white/15 transition-colors">
             <UserPlus className="w-4 h-4" />
@@ -385,13 +391,16 @@ export function PoolsList() {
   const navigate = useNavigate();
   const { leagues: apiLeagues } = useActiveLeague();
   const { flags, isLoading: isFlagsLoading } = useFeatureFlags();
+  const { effectiveRole, isSuperAdmin } = useSubscription();
   
   const [searchQuery, setSearchQuery] = useState("");
   const [filterStatus, setFilterStatus] = useState<"all" | PoolStatus>("all");
-  const [viewMode, setViewMode] = useState<"my" | "marketplace">("my");
+  const [viewMode, setViewMode] = useState<"my" | "marketplace">("marketplace");
   const [isLoading, setIsLoading] = useState(true);
   const [marketplacePools, setMarketplacePools] = useState<MarketplacePool[]>([]);
   const [marketplaceNotice, setMarketplaceNotice] = useState<string | null>(null);
+  const [lastSharedPoolId, setLastSharedPoolId] = useState<number | null>(null);
+  const canCreatePool = isSuperAdmin || effectiveRole === "pool_admin";
   
   // Load leagues from API
   useEffect(() => {
@@ -408,14 +417,14 @@ export function PoolsList() {
     if (isFlagsLoading) return () => {};
     if (!flags.MARKETPLACE_ENABLED) {
       setMarketplacePools([]);
-      setMarketplaceNotice("Marketplace is disabled by feature flag.");
+      setMarketplaceNotice("Pool Marketplace is not available right now.");
       return () => {
         cancelled = true;
       };
     }
     if (!flags.PUBLIC_POOLS) {
       setMarketplacePools([]);
-      setMarketplaceNotice("Public pools are currently disabled.");
+      setMarketplaceNotice("No public pool listings are available right now.");
       return () => {
         cancelled = true;
       };
@@ -426,11 +435,11 @@ export function PoolsList() {
         if (!res.ok) {
           if (!cancelled) {
             if (res.status === 401) {
-              setMarketplaceNotice("Marketplace requires an authenticated session.");
+              setMarketplaceNotice("Sign in to browse public pool listings.");
             } else if (res.status === 403) {
-              setMarketplaceNotice("Marketplace is blocked by platform feature flags.");
+              setMarketplaceNotice("Pool Marketplace is temporarily unavailable.");
             } else {
-              setMarketplaceNotice(`Marketplace unavailable (HTTP ${res.status}).`);
+              setMarketplaceNotice("Pool Marketplace is temporarily unavailable. Please try again shortly.");
             }
           }
           return;
@@ -475,6 +484,10 @@ export function PoolsList() {
     // Always render at least one visual reference card in local dev.
     return [PREVIEW_MARKETPLACE_POOL];
   }, [marketplaceDiscoveryPools]);
+  const filteredMarketplacePools = useMemo(
+    () => previewMarketplacePools.filter((pool) => pool.name.toLowerCase().includes(searchQuery.toLowerCase())),
+    [previewMarketplacePools, searchQuery],
+  );
   
   // Live pools for highlight carousel
   const livePools = useMemo(() => 
@@ -518,11 +531,6 @@ export function PoolsList() {
     navigate(ROUTES.POOL_HUB(leagueId));
   }, [navigate]);
 
-  const jumpToMarketplace = useCallback(() => {
-    setViewMode("marketplace");
-    document.getElementById("marketplace-section")?.scrollIntoView({ behavior: "smooth", block: "start" });
-  }, []);
-
   useEffect(() => {
     if (window.location.hash !== "#marketplace") return;
     setViewMode("marketplace");
@@ -531,6 +539,26 @@ export function PoolsList() {
     }, 120);
     return () => window.clearTimeout(timer);
   }, [marketplaceDiscoveryPools.length, marketplaceNotice]);
+
+  const handleShareMarketplacePool = useCallback(async (pool: MarketplacePool) => {
+    const shareUrl = `${window.location.origin}${ROUTES.POOL_HUB(pool.id)}#marketplace`;
+    const shareText = `Join me in ${pool.name} on G1 Sports.`;
+    try {
+      if (navigator.share) {
+        await navigator.share({
+          title: pool.name,
+          text: shareText,
+          url: shareUrl,
+        });
+      } else if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(shareUrl);
+      }
+      setLastSharedPoolId(pool.id);
+      window.setTimeout(() => setLastSharedPoolId((current) => (current === pool.id ? null : current)), 2000);
+    } catch {
+      // user cancelled share sheet or clipboard blocked
+    }
+  }, []);
 
   return (
     <div className="min-h-screen pb-24 -mx-4 -mt-4">
@@ -550,23 +578,18 @@ export function PoolsList() {
             </p>
           </div>
           <div className="flex gap-2">
-            <button
-              onClick={jumpToMarketplace}
-              className="px-3 py-2.5 rounded-xl bg-white/10 hover:bg-white/15 transition-colors text-xs font-semibold text-white/90 flex items-center gap-1.5"
-            >
-              <Compass className="w-4 h-4" />
-              Marketplace
-            </button>
             <Link to={ROUTES.JOIN_LEAGUE}>
               <button className="p-2.5 rounded-xl bg-white/10 hover:bg-white/15 transition-colors">
                 <UserPlus className="w-5 h-5 text-white" />
               </button>
             </Link>
-            <Link to={ROUTES.CREATE_LEAGUE}>
-              <button className="p-2.5 rounded-xl bg-primary text-primary-foreground hover:bg-primary/90 transition-colors shadow-lg shadow-primary/20">
-                <Plus className="w-5 h-5" />
-              </button>
-            </Link>
+            {canCreatePool && (
+              <Link to={ROUTES.CREATE_LEAGUE}>
+                <button className="p-2.5 rounded-xl bg-primary text-primary-foreground hover:bg-primary/90 transition-colors shadow-lg shadow-primary/20">
+                  <Plus className="w-5 h-5" />
+                </button>
+              </Link>
+            )}
           </div>
         </div>
 
@@ -589,7 +612,7 @@ export function PoolsList() {
               )}
             >
               <Sparkles className="w-4 h-4" />
-              Marketplace
+              Pool Marketplace
             </button>
           </div>
         </div>
@@ -657,10 +680,10 @@ export function PoolsList() {
                 <div className="relative">
                   <div className="flex items-center gap-2 text-white/85">
                     <Compass className="w-4 h-4 text-blue-300" />
-                    <h2 className="text-sm font-bold uppercase tracking-wide">Commissioner Marketplace</h2>
+                    <h2 className="text-sm font-bold uppercase tracking-wide">Pool Marketplace</h2>
                   </div>
                   <p className="mt-1 text-sm text-white/60 max-w-2xl">
-                    Discover active commissioner-run contests and join before lock. Built for growth, trust, and conversion.
+                    Discover active commissioner-run contests and join before lock.
                   </p>
                   <div className="mt-4 grid grid-cols-2 md:grid-cols-4 gap-2.5">
                     <div className="rounded-xl border border-white/10 bg-white/[0.04] px-3 py-2">
@@ -687,21 +710,18 @@ export function PoolsList() {
 
           {viewMode === "marketplace" ? (
             <>
-              {previewMarketplacePools.length > 0 && (
+              {filteredMarketplacePools.length > 0 && (
                 <div className="mb-6">
                   <div className="grid grid-cols-1 lg:grid-cols-2 gap-3.5 mb-5">
-                    {previewMarketplacePools
-                      .filter((pool) => pool.name.toLowerCase().includes(searchQuery.toLowerCase()))
-                      .map((pool) => {
+                    {filteredMarketplacePools.map((pool) => {
                         const entryCount = Number(pool.contest?.entry_count ?? pool.member_count ?? 0);
                         const entriesMax = Number(pool.contest?.entries_max ?? 0);
                         const hasMax = Number.isFinite(entriesMax) && entriesMax > 0;
                         const fillPct = hasMax ? Math.max(0, Math.min(100, Math.round((entryCount / entriesMax) * 100))) : null;
                         const isLive = String(pool.state || "").toLowerCase() === "live";
                         return (
-                          <button
+                          <div
                             key={`marketplace-${pool.id}`}
-                            onClick={() => handlePoolClick(pool.id)}
                             className="group relative rounded-2xl border border-white/12 bg-gradient-to-br from-[hsl(220,22%,13%)] to-[hsl(220,18%,10%)] p-4 text-left hover:border-blue-400/40 hover:shadow-[0_0_0_1px_rgba(96,165,250,0.25)] transition-all"
                           >
                             <div className="flex items-start justify-between gap-3">
@@ -803,12 +823,25 @@ export function PoolsList() {
                                   PREVIEW
                                 </span>
                               )}
-                              <span className="inline-flex items-center gap-1 rounded-lg border border-blue-400/25 bg-blue-500/10 px-2.5 py-1 text-[11px] font-semibold text-blue-200 group-hover:border-blue-300/40">
-                                View Contest
-                                <ArrowRight className="w-3.5 h-3.5" />
-                              </span>
                             </div>
-                          </button>
+
+                            <div className="mt-3 flex flex-wrap items-center gap-2">
+                              <button
+                                onClick={() => handlePoolClick(pool.id)}
+                                className="inline-flex items-center gap-1 rounded-lg border border-emerald-400/30 bg-emerald-500/10 px-3 py-1.5 text-[11px] font-semibold text-emerald-200 hover:border-emerald-300/50 hover:bg-emerald-500/20"
+                              >
+                                Join Pool
+                                <ArrowRight className="w-3.5 h-3.5" />
+                              </button>
+                              <button
+                                onClick={() => void handleShareMarketplacePool(pool)}
+                                className="inline-flex items-center gap-1 rounded-lg border border-blue-400/25 bg-blue-500/10 px-3 py-1.5 text-[11px] font-semibold text-blue-200 hover:border-blue-300/40 hover:bg-blue-500/20"
+                              >
+                                <Share2 className="w-3.5 h-3.5" />
+                                {lastSharedPoolId === pool.id ? "Link Copied" : "Share Pool"}
+                              </button>
+                            </div>
+                          </div>
                         );
                       })}
                   </div>
@@ -818,20 +851,21 @@ export function PoolsList() {
                 <div className="mb-6 rounded-xl border border-amber-400/20 bg-amber-500/10 p-3 text-xs text-amber-100 flex items-start gap-2">
                   <AlertTriangle className="w-4 h-4 mt-0.5 text-amber-300 shrink-0" />
                   <div>
-                    <p className="font-semibold">Marketplace Notice</p>
+                    <p className="font-semibold">Pool Marketplace Notice</p>
                     <p className="text-amber-100/80">{marketplaceNotice}</p>
-                    <p className="text-amber-100/70 mt-1">
-                      For visibility, ensure <span className="font-semibold">PUBLIC_POOLS</span> and <span className="font-semibold">MARKETPLACE_ENABLED</span> are enabled.
-                    </p>
                   </div>
                 </div>
               )}
-              {previewMarketplacePools.length === 0 && !marketplaceNotice && (
+              {filteredMarketplacePools.length === 0 && !marketplaceNotice && (
                 <div className="mb-6 rounded-2xl border border-white/10 bg-white/[0.03] p-6 text-center">
                   <Compass className="mx-auto mb-2 h-6 w-6 text-white/45" />
-                  <p className="text-sm font-semibold text-white">No listed contests yet</p>
+                  <p className="text-sm font-semibold text-white">
+                    {searchQuery ? "No marketplace pools match your search" : "No listed contests yet"}
+                  </p>
                   <p className="text-xs text-white/55 mt-1">
-                    Commissioners can publish pools from admin settings to appear here.
+                    {searchQuery
+                      ? "Try a broader search or clear filters."
+                      : "Commissioners can publish pools from admin settings to appear here."}
                   </p>
                 </div>
               )}
@@ -839,7 +873,7 @@ export function PoolsList() {
           ) : isLoading ? (
             <PoolsSkeleton />
           ) : leagues.length === 0 ? (
-            <EmptyState />
+            <EmptyState canCreatePool={canCreatePool} />
           ) : filteredLeagues.length === 0 ? (
             <div className="text-center py-16">
               <div className="w-16 h-16 rounded-2xl bg-white/5 flex items-center justify-center mx-auto mb-4">

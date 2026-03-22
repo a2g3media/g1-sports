@@ -242,7 +242,11 @@ export const CoachGBettingIntel = memo(function CoachGBettingIntel(props: CoachG
               <img 
                 src="/assets/coachg/coach-g-avatar.png"
                 alt="Coach G"
-                className="w-full h-full object-cover"
+                className="w-full h-full object-cover cursor-pointer"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  window.location.assign('/scout');
+                }}
               />
             </div>
             <div className="absolute -bottom-0.5 -right-0.5 w-3.5 h-3.5 rounded-full bg-violet-500 border-2 border-[#0a0a0a] flex items-center justify-center">

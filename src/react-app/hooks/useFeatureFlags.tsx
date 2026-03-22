@@ -6,6 +6,8 @@ const { useState, useEffect, createContext, useContext, useCallback } = React;
 interface FeatureFlags {
   PUBLIC_POOLS: boolean;
   MARKETPLACE_ENABLED: boolean;
+  GAME_FAVORITES_ENABLED: boolean;
+  HOME_FAVORITES_RAIL_ENABLED: boolean;
 }
 
 interface FeatureFlagsContextValue {
@@ -18,6 +20,8 @@ interface FeatureFlagsContextValue {
 const defaultFlags: FeatureFlags = {
   PUBLIC_POOLS: false,
   MARKETPLACE_ENABLED: false,
+  GAME_FAVORITES_ENABLED: true,
+  HOME_FAVORITES_RAIL_ENABLED: true,
 };
 
 const FeatureFlagsContext = createContext<FeatureFlagsContextValue>({
@@ -51,6 +55,8 @@ export function FeatureFlagsProvider({ children }: FeatureFlagsProviderProps) {
       setFlags({
         PUBLIC_POOLS: data.PUBLIC_POOLS ?? false,
         MARKETPLACE_ENABLED: data.MARKETPLACE_ENABLED ?? false,
+        GAME_FAVORITES_ENABLED: data.GAME_FAVORITES_ENABLED ?? true,
+        HOME_FAVORITES_RAIL_ENABLED: data.HOME_FAVORITES_RAIL_ENABLED ?? true,
       });
     } catch (err) {
       console.error("Failed to fetch feature flags:", err);

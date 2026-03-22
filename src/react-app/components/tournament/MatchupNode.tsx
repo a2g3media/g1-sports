@@ -4,12 +4,7 @@ import type { BracketViewMode, LiveBracketMatchup } from "@/react-app/lib/ncaabT
 import { cn } from "@/react-app/lib/utils";
 
 function statusClass(matchup: LiveBracketMatchup, mode: BracketViewMode): string {
-  if (matchup.state === "overtime") {
-    return mode === "live"
-      ? "border-fuchsia-300/70 bg-fuchsia-500/10 shadow-[0_0_34px_rgba(217,70,239,0.22)]"
-      : "border-fuchsia-300/40 bg-fuchsia-500/5";
-  }
-  if (matchup.state === "live" || matchup.state === "overtime") {
+  if (matchup.state === "live") {
     return mode === "live"
       ? "border-cyan-300/60 bg-cyan-500/10 shadow-[0_0_30px_rgba(56,189,248,0.2)]"
       : "border-cyan-300/35 bg-cyan-500/5";
@@ -64,7 +59,7 @@ export function MatchupNode({
         isClassic && "rounded-md border-white/20 bg-[#111625]",
         statusClass(matchup, mode),
         highlighted && "ring-2 ring-cyan-300/60",
-        (matchup.state === "live" || matchup.state === "overtime") && mode === "live" && "motion-safe:animate-pulse"
+        matchup.state === "live" && mode === "live" && "motion-safe:animate-pulse"
       )}
       aria-label={`Open ${matchup.topTeam.name} versus ${matchup.bottomTeam.name}`}
     >
@@ -76,7 +71,7 @@ export function MatchupNode({
           <span
             className={cn(
               "rounded-full px-2 py-0.5 font-mono text-[10px] font-bold tracking-wide",
-              matchup.state === "live" || matchup.state === "overtime"
+              matchup.state === "live"
                 ? "bg-red-500/20 text-red-200"
                 : matchup.state === "final"
                   ? "bg-emerald-500/20 text-emerald-200"

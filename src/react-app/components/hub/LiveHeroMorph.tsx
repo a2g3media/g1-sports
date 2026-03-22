@@ -25,11 +25,12 @@ interface LiveHeroMorphProps {
   games: HeroGame[];
   loading?: boolean;
   onActiveIndexChange?: (index: number) => void;
+  buildGameUrl?: (gameId: string) => string;
 }
 
 const ROTATION_INTERVAL = 8000; // 8 seconds per game
 
-export function LiveHeroMorph({ sportKey, games, loading, onActiveIndexChange }: LiveHeroMorphProps) {
+export function LiveHeroMorph({ sportKey, games, loading, onActiveIndexChange, buildGameUrl }: LiveHeroMorphProps) {
   const [activeIndex, setActiveIndex] = useState(0);
   const [isPaused, setIsPaused] = useState(false);
 
@@ -91,7 +92,7 @@ export function LiveHeroMorph({ sportKey, games, loading, onActiveIndexChange }:
 
   const isLive = activeGame.status === "LIVE";
   const isFinal = activeGame.status === "FINAL";
-  const matchUrl = toGameDetailPath(sportKey, activeGame.id);
+  const matchUrl = buildGameUrl ? buildGameUrl(activeGame.id) : toGameDetailPath(sportKey, activeGame.id);
 
   return (
     <div 

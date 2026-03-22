@@ -33,6 +33,20 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+async function withTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number
+): Promise<{ timedOut: boolean; value: T | null }> {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const timeoutPromise = new Promise<null>((resolve) => {
+    timer = setTimeout(() => resolve(null), timeoutMs);
+  });
+  const result = (await Promise.race([promise, timeoutPromise])) as T | null;
+  if (timer) clearTimeout(timer);
+  if (result === null) return { timedOut: true, value: null };
+  return { timedOut: false, value: result };
+}
+
 function parseRetryAfterSeconds(headerValue: string | null): number | null {
   if (!headerValue) return null;
   const asInt = Number.parseInt(headerValue, 10);
@@ -369,6 +383,16 @@ mmaRouter.get("/schedule", async (c) => {
 
 mmaRouter.get("/event/:eventId", async (c) => {
   const requestedId = c.req.param("eventId");
+  const normalizedNumeric = numericIdFromUrn(requestedId);
+  if (!normalizedNumeric || normalizedNumeric.length < 6) {
+    return c.json(
+      {
+        error: "Invalid event id",
+        source: "sportradar",
+      },
+      400
+    );
+  }
   const requestedUrn = requestedId.startsWith("sr:sport_event:")
     ? requestedId
     : `sr:sport_event:${requestedId}`;
@@ -391,10 +415,42 @@ mmaRouter.get("/event/:eventId", async (c) => {
   }
 
   try {
-    const result = await fetchSportsRadarMma(
-      `sport_events/${encodeURIComponent(requestedUrn)}/summary`,
-      apiKey
+    const timed = await withTimeout(
+      fetchSportsRadarMma(
+        `sport_events/${encodeURIComponent(requestedUrn)}/summary`,
+        apiKey
+      ),
+      6500
     );
+    if (timed.timedOut) {
+      if (cached) {
+        return c.json({
+          ...cached.value,
+          source_stale: true,
+          retry_after_seconds: 15,
+        });
+      }
+      return c.json({
+        event: {
+          eventId: numericIdFromUrn(requestedUrn),
+          name: "MMA Bout",
+          shortName: "MMA",
+          dateTime: new Date().toISOString(),
+          status: "scheduled",
+          venue: null,
+          city: null,
+          state: null,
+          country: null,
+          active: true,
+        },
+        fights: [],
+        fightCount: 0,
+        source: "sportradar",
+        source_degraded: true,
+        retry_after_seconds: 15,
+      });
+    }
+    const result = timed.value!;
     if (!result.ok) {
       const status = result.status === 429 ? 429 : result.status || 502;
       if (cached) {

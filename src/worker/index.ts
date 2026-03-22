@@ -25,6 +25,18 @@ import {
 
 const app = new Hono<{ Bindings: Env }>();
 
+// Consistent JSON 404 shape across all API routes.
+app.notFound((c) => {
+  return c.json(
+    {
+      error: "Not found",
+      path: c.req.path,
+      method: c.req.method,
+    },
+    404
+  );
+});
+
 // Global error guard so transient upstream fetch failures don't crash the dev overlay.
 app.onError((err, c) => {
   console.error("[Worker] Unhandled error:", err);
@@ -81,6 +93,7 @@ app.route("/api/watchlist", watchlistRouter);
 
 // Mount watchboards API routes (multi-board command center)
 app.route("/api/watchboards", watchboardsRouter);
+app.route("/api/favorites", favoritesRouter);
 
 // Mount bet tickets API routes (ticket tracking system)
 // Note: Routes handle auth internally by reading x-user-id header from frontend
@@ -259,7 +272,14 @@ app.route("/api/player", playerProfileRouter);
 app.get("/api/oauth/google/redirect_url", async (c) => {
   const authConfig = getMochaAuthConfig(c);
   if (!authConfig) {
-    return c.json({ error: "Mocha auth is not configured for local development" }, 503);
+    return c.json(
+      {
+        redirectUrl: null,
+        config_required: true,
+        error: "Mocha auth is not configured for local development",
+      },
+      200
+    );
   }
 
   const redirectUrl = await getOAuthRedirectUrl("google", authConfig);
@@ -269,15 +289,15 @@ app.get("/api/oauth/google/redirect_url", async (c) => {
 
 // Exchange OAuth code for session token
 app.post("/api/sessions", async (c) => {
-  const authConfig = getMochaAuthConfig(c);
-  if (!authConfig) {
-    return c.json({ error: "Mocha auth is not configured for local development" }, 503);
-  }
-
-  const body = await c.req.json();
+  const body = await c.req.json().catch(() => ({} as { code?: string }));
 
   if (!body.code) {
     return c.json({ error: "No authorization code provided" }, 400);
+  }
+
+  const authConfig = getMochaAuthConfig(c);
+  if (!authConfig) {
+    return c.json({ error: "Mocha auth is not configured for local development" }, 503);
   }
 
   const sessionToken = await exchangeCodeForSessionToken(body.code, authConfig);
@@ -512,10 +532,9 @@ const DEMO_USER_ID = "demo-user-001";
 async function leagueDemoOrAuthMiddleware(c: any, next: () => Promise<void>) {
   const isDemoMode = c.req.header("X-Demo-Mode") === "true";
   if (isDemoMode) {
-    await next();
-    return;
+    return next();
   }
-  await authMiddleware(c, next);
+  return authMiddleware(c, next);
 }
 
 // Helper to get user ID (supports demo mode) for league routes
@@ -596,7 +615,8 @@ app.post("/api/leagues", async (c) => {
   if (!user) return c.json({ error: "Unauthorized" }, 401);
 
   const body = await c.req.json();
-  const { name, sportKey, formatKey, poolTypeKey, season, entryFeeCents, isPaymentRequired, rules, isPublic } = body;
+  const { name, sportKey, formatKey, poolTypeKey, season, entryFeeCents, isPaymentRequired, rules, isPublic,
+    entryMode, allowMultipleEntries, maxEntriesPerUser, requiredEntries, missedPickPolicy, allowLateJoins, allowLatePicks, picksPerPeriod, hidePicksUntilLock } = body;
   
   // Check if trying to create a public pool - only allowed if PUBLIC_POOLS flag is enabled
   let poolIsPublic = false;
@@ -618,6 +638,7 @@ app.post("/api/leagues", async (c) => {
   }
 
   const { normalizeFormatKey, getCanonicalPoolType } = await import("./services/poolEngineService");
+  const { buildPoolRuleConfig } = await import("../shared/poolRuleConfig");
   const { isSupportedPoolTypeKey, getPoolTypeByKey, validatePoolTypeRules } = await import("../shared/poolTypeCatalog");
   const normalizedFormatKey = normalizeFormatKey(poolTypeKey || formatKey);
   if (!isSupportedPoolTypeKey(normalizedFormatKey)) {
@@ -633,6 +654,27 @@ app.post("/api/leagues", async (c) => {
   }
   const poolTypeDefinition = getPoolTypeByKey(normalizedFormatKey);
 
+  const resolvedEntryMode: "single" | "optional" | "required" =
+    entryMode === "required" || entryMode === "optional" || entryMode === "single"
+      ? entryMode
+      : allowMultipleEntries === true
+        ? (requiredEntries != null && Number(requiredEntries) > 1 ? "required" : "optional")
+        : "single";
+
+  const canonicalRuleConfig = buildPoolRuleConfig(normalizedFormatKey, {
+    ...(rules && typeof rules === "object" ? rules : {}),
+    entry: {
+      mode: resolvedEntryMode,
+      max_entries_per_user: Math.max(1, Number(maxEntriesPerUser) || (allowMultipleEntries ? 3 : 1)),
+      required_entries: Math.max(1, Number(requiredEntries) || 1),
+      entry_naming: "custom",
+    },
+    missed_pick_behavior: typeof missedPickPolicy === "string" ? missedPickPolicy : undefined,
+    allow_late_joins: allowLateJoins !== undefined ? allowLateJoins !== false : undefined,
+    allow_late_picks: allowLatePicks !== undefined ? allowLatePicks === true : undefined,
+    picks_per_period: picksPerPeriod ?? undefined,
+  });
+
   const normalizedRules = {
     lockType: rules?.lockType || "game_start",
     visibilityType: rules?.visibilityType || "after_lock",
@@ -642,7 +684,21 @@ app.post("/api/leagues", async (c) => {
     poolTemplate: poolTypeDefinition?.template || null,
     scheduleType: poolTypeDefinition?.schedule_type || null,
     commissionerOptions: poolTypeDefinition?.commissioner_options || null,
-    ...rules,
+    entryMode: canonicalRuleConfig.entry.mode,
+    allowMultipleEntries: canonicalRuleConfig.entry.mode !== "single",
+    maxEntriesPerUser: canonicalRuleConfig.entry.max_entries_per_user,
+    requiredEntries: canonicalRuleConfig.entry.mode === "required" ? canonicalRuleConfig.entry.required_entries : null,
+    missedPickPolicy: canonicalRuleConfig.missed_pick_behavior,
+    allowLateJoins: canonicalRuleConfig.allow_late_joins,
+    allowLatePicks: canonicalRuleConfig.allow_late_picks,
+    picksPerPeriod: canonicalRuleConfig.picks_per_period,
+    hidePicksUntilLock: hidePicksUntilLock !== false,
+    entry: canonicalRuleConfig.entry,
+    missed_pick_behavior: canonicalRuleConfig.missed_pick_behavior,
+    allow_late_joins: canonicalRuleConfig.allow_late_joins,
+    allow_late_picks: canonicalRuleConfig.allow_late_picks,
+    picks_per_period: canonicalRuleConfig.picks_per_period,
+    ...(rules && typeof rules === "object" ? rules : {}),
   };
   if (!getCanonicalPoolType(normalizedFormatKey)) {
     return c.json({ error: `No evaluator mapping for format key: ${formatKey}` }, 400);
@@ -814,6 +870,117 @@ app.get("/api/leagues/:id/rules-engine", leagueDemoOrAuthMiddleware, async (c) =
   return c.json(payload);
 });
 
+// Get server-side rules acceptance status (auditable acceptance record)
+app.get("/api/leagues/:id/rules-acceptance", leagueDemoOrAuthMiddleware, async (c) => {
+  const userId = getLeagueUserId(c);
+  if (!userId) return c.json({ error: "Unauthorized" }, 401);
+
+  const leagueId = c.req.param("id");
+  const isDemoMode = c.req.header("X-Demo-Mode") === "true";
+  if (isDemoMode) {
+    return c.json({ accepted: true, accepted_at: null, rule_hash: null });
+  }
+
+  const membership = await c.env.DB.prepare(`
+    SELECT role FROM league_members WHERE league_id = ? AND user_id = ? AND invite_status = 'joined'
+  `).bind(leagueId, userId).first();
+  if (!membership) {
+    return c.json({ error: "Not a member of this league" }, 403);
+  }
+
+  let acceptance: {
+    accepted_at: string | null;
+    rule_hash: string | null;
+    rule_snapshot_json: string | null;
+  } | null = null;
+  try {
+    acceptance = await c.env.DB.prepare(`
+      SELECT accepted_at, rule_hash, rule_snapshot_json
+      FROM league_rule_acceptance
+      WHERE league_id = ? AND user_id = ?
+      LIMIT 1
+    `).bind(leagueId, userId).first<{
+      accepted_at: string | null;
+      rule_hash: string | null;
+      rule_snapshot_json: string | null;
+    }>();
+  } catch {
+    // Graceful fallback before migration 92 is applied.
+    return c.json({
+      accepted: false,
+      accepted_at: null,
+      rule_hash: null,
+      has_snapshot: false,
+      storage_ready: false,
+    });
+  }
+
+  return c.json({
+    accepted: Boolean(acceptance),
+    accepted_at: acceptance?.accepted_at || null,
+    rule_hash: acceptance?.rule_hash || null,
+    has_snapshot: Boolean(acceptance?.rule_snapshot_json),
+  });
+});
+
+// Record server-side rules acceptance for compliance/dispute audit
+app.post("/api/leagues/:id/rules-acceptance", leagueDemoOrAuthMiddleware, async (c) => {
+  const userId = getLeagueUserId(c);
+  if (!userId) return c.json({ error: "Unauthorized" }, 401);
+
+  const leagueId = c.req.param("id");
+  const isDemoMode = c.req.header("X-Demo-Mode") === "true";
+  if (isDemoMode) {
+    return c.json({ success: true, accepted_at: new Date().toISOString(), demo_mode: true });
+  }
+
+  const membership = await c.env.DB.prepare(`
+    SELECT role FROM league_members WHERE league_id = ? AND user_id = ? AND invite_status = 'joined'
+  `).bind(leagueId, userId).first();
+  if (!membership) {
+    return c.json({ error: "Not a member of this league" }, 403);
+  }
+
+  const body = await c.req.json().catch(() => ({} as Record<string, unknown>));
+  const ruleHash = String(body?.rule_hash || "").trim() || null;
+  const snapshotRaw = body?.rule_snapshot;
+  const ruleSnapshotJson = snapshotRaw ? JSON.stringify(snapshotRaw) : null;
+
+  let saved: { accepted_at: string | null; rule_hash: string | null } | null = null;
+  try {
+    await c.env.DB.prepare(`
+      INSERT INTO league_rule_acceptance (league_id, user_id, accepted_at, rule_hash, rule_snapshot_json, created_at, updated_at)
+      VALUES (?, ?, CURRENT_TIMESTAMP, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+      ON CONFLICT(league_id, user_id) DO UPDATE SET
+        accepted_at = CURRENT_TIMESTAMP,
+        rule_hash = excluded.rule_hash,
+        rule_snapshot_json = excluded.rule_snapshot_json,
+        updated_at = CURRENT_TIMESTAMP
+    `).bind(leagueId, userId, ruleHash, ruleSnapshotJson).run();
+
+    saved = await c.env.DB.prepare(`
+      SELECT accepted_at, rule_hash
+      FROM league_rule_acceptance
+      WHERE league_id = ? AND user_id = ?
+      LIMIT 1
+    `).bind(leagueId, userId).first<{ accepted_at: string | null; rule_hash: string | null }>();
+  } catch {
+    return c.json({
+      success: false,
+      accepted_at: null,
+      rule_hash: null,
+      storage_ready: false,
+      message: "Rules acceptance storage is not ready. Apply migration 92.",
+    }, 503);
+  }
+
+  return c.json({
+    success: true,
+    accepted_at: saved?.accepted_at || null,
+    rule_hash: saved?.rule_hash || null,
+  });
+});
+
 // PUBLIC POOLS - List discoverable pools (only when PUBLIC_POOLS flag is enabled)
 app.get("/api/leagues/public", authMiddleware, async (c) => {
   const user = c.get("user");
@@ -870,12 +1037,14 @@ app.get("/api/leagues/invite/:code", authMiddleware, async (c) => {
   `).bind(league.id, user.id).first();
 
   const rawRules = typeof league.rules_json === "string" ? league.rules_json : "{}";
+  const { deserializePoolRuleConfig } = await import("../shared/poolRuleConfig");
   let parsedRules: Record<string, unknown> = {};
   try {
     parsedRules = JSON.parse(rawRules);
   } catch {
     parsedRules = {};
   }
+  const canonicalRules = deserializePoolRuleConfig(String(league.format_key || "pickem"), rawRules);
   const joinRequirements = {
     approvalRequired: parsedRules.joinApprovalRequired === true,
     requireEmail: parsedRules.requireJoinEmail === true,
@@ -884,19 +1053,17 @@ app.get("/api/leagues/invite/:code", authMiddleware, async (c) => {
     notifyAdminsOnRequest: parsedRules.joinNotifyAdminsOnRequest !== false,
     notifyUsersOnStatusChange: parsedRules.joinNotifyUsersOnStatusChange !== false,
   };
-  const allowMultipleEntries =
-    parsedRules.allow_multiple_entries === true || parsedRules.allowMultipleEntries === true;
-  const rawMaxEntries = Number(
-    parsedRules.max_entries_per_user ?? parsedRules.maxEntriesPerUser ?? (allowMultipleEntries ? 3 : 1),
-  );
-  const maxEntriesPerUser = Number.isFinite(rawMaxEntries)
-    ? Math.min(20, Math.max(1, Math.floor(rawMaxEntries)))
-    : 1;
+  const entryMode = canonicalRules.entry.mode;
+  const allowMultipleEntries = entryMode !== "single";
+  const maxEntriesPerUser = Math.max(1, Number(canonicalRules.entry.max_entries_per_user || 1));
+  const requiredEntries = Math.max(1, Number(canonicalRules.entry.required_entries || 1));
   const entryPackageOptions = Array.isArray(parsedRules.entry_package_options)
     ? parsedRules.entry_package_options
     : Array.isArray(parsedRules.entryPackageOptions)
       ? parsedRules.entryPackageOptions
-      : [1];
+      : entryMode === "required"
+        ? [requiredEntries]
+        : Array.from({ length: maxEntriesPerUser }, (_, i) => i + 1);
   const requirePaymentBeforeEntry =
     parsedRules.require_payment_before_entry === true || parsedRules.requirePaymentBeforeEntry === true;
 
@@ -916,8 +1083,10 @@ app.get("/api/leagues/invite/:code", authMiddleware, async (c) => {
     membershipStatus: membership?.invite_status || null,
     joinRequirements,
     entrySettings: {
+      entryMode,
       allowMultipleEntries,
       maxEntriesPerUser,
+      requiredEntries,
       entryPackageOptions,
       requirePaymentBeforeEntry,
     },
@@ -952,8 +1121,8 @@ app.post("/api/leagues/join", authMiddleware, async (c) => {
   }
 
   const league = await c.env.DB.prepare(`
-    SELECT id, name, rules_json FROM leagues WHERE invite_code = ? AND is_active = 1
-  `).bind(inviteCode.toUpperCase()).first<{ id: number; name: string; rules_json: string | null }>();
+    SELECT id, name, format_key, rules_json FROM leagues WHERE invite_code = ? AND is_active = 1
+  `).bind(inviteCode.toUpperCase()).first<{ id: number; name: string; format_key: string; rules_json: string | null }>();
 
   if (!league) {
     return c.json({ error: "Invalid invite code" }, 404);
@@ -974,27 +1143,24 @@ app.post("/api/leagues/join", authMiddleware, async (c) => {
   } catch {
     parsedRules = {};
   }
+  const { deserializePoolRuleConfig } = await import("../shared/poolRuleConfig");
+  const canonicalRules = deserializePoolRuleConfig(league.format_key, league.rules_json || "{}");
   const joinApprovalRequired = parsedRules.joinApprovalRequired === true;
   const requireJoinEmail = parsedRules.requireJoinEmail === true;
   const requireJoinPhone = parsedRules.requireJoinPhone === true;
   const joinAutoApproveWhenProfileComplete = parsedRules.joinAutoApproveWhenProfileComplete === true;
   const joinNotifyAdminsOnRequest = parsedRules.joinNotifyAdminsOnRequest !== false;
   const joinNotifyUsersOnStatusChange = parsedRules.joinNotifyUsersOnStatusChange !== false;
-  const allowMultipleEntries =
-    parsedRules.allow_multiple_entries === true || parsedRules.allowMultipleEntries === true;
-  const rawMaxEntries = Number(
-    parsedRules.max_entries_per_user ?? parsedRules.maxEntriesPerUser ?? (allowMultipleEntries ? 3 : 1),
-  );
-  const maxEntriesPerUser = Number.isFinite(rawMaxEntries)
-    ? Math.min(20, Math.max(1, Math.floor(rawMaxEntries)))
-    : 1;
+  const entryMode = canonicalRules.entry.mode;
+  const allowMultipleEntries = entryMode !== "single";
+  const maxEntriesPerUser = Math.max(1, Number(canonicalRules.entry.max_entries_per_user || 1));
+  const requiredEntries = Math.max(1, Number(canonicalRules.entry.required_entries || 1));
   const normalizedRequestedEntries = Number.isFinite(Number(requestedEntries))
     ? Math.max(1, Math.floor(Number(requestedEntries)))
     : 1;
-  const finalRequestedEntries = Math.min(
-    allowMultipleEntries ? maxEntriesPerUser : 1,
-    normalizedRequestedEntries,
-  );
+  const finalRequestedEntries = entryMode === "required"
+    ? requiredEntries
+    : Math.min(allowMultipleEntries ? maxEntriesPerUser : 1, normalizedRequestedEntries);
 
   const userProfile = await c.env.DB.prepare(`
     SELECT email, phone FROM users WHERE id = ?
@@ -2037,8 +2203,9 @@ app.get("/api/leagues/:id/my-entries/history", authMiddleware, async (c) => {
     const resolvedEntryId = row.entry_id ?? primaryEntryId;
     const periodId = row.period_id;
     const epKey = `${resolvedEntryId}:${periodId}`;
-    const scored = row.winner && row.event_status && (row.event_status.toUpperCase() === "FINAL" || row.event_status.toUpperCase() === "FINAL_OT");
-    const isCorrect = scored && row.pick_value === row.winner;
+    const upperStatus = row.event_status ? row.event_status.toUpperCase() : "";
+    const scored = row.winner && (upperStatus === "FINAL" || upperStatus === "FINAL_OT" || upperStatus === "COMPLETED");
+    const isCorrect = scored && row.is_correct === 1;
     const points = isCorrect ? Number(row.points_earned || 0) : 0;
 
     const prevByPeriod = pointsByEntryPeriod.get(epKey) || { points: 0, correct: 0, total: 0 };
@@ -2252,26 +2419,28 @@ app.get("/api/leagues/:id/my-entries/history", authMiddleware, async (c) => {
       }
 
       const upsetRows = await c.env.DB.prepare(`
-        SELECT p.event_id, p.pick_value, COUNT(*) as pick_count, e.winner
+        SELECT 
+          p.event_id,
+          e.winner,
+          COUNT(*) as total_picks,
+          SUM(CASE WHEN p.is_correct = 1 THEN 1 ELSE 0 END) as winner_count
         FROM picks p
         INNER JOIN events e ON e.id = p.event_id
         WHERE p.league_id = ? AND p.period_id = ?
           AND (UPPER(e.status) = 'FINAL' OR UPPER(e.status) = 'FINAL_OT')
           AND e.winner IS NOT NULL
-        GROUP BY p.event_id, p.pick_value
+        GROUP BY p.event_id, e.winner
       `).bind(leagueId, latestPeriod).all<{
         event_id: number;
-        pick_value: string;
-        pick_count: number;
         winner: string;
+        total_picks: number;
+        winner_count: number;
       }>();
       const upsetByEvent = new Map<number, { winner: string; total: number; winnerCount: number }>();
       for (const row of upsetRows.results || []) {
         const current = upsetByEvent.get(row.event_id) || { winner: row.winner, total: 0, winnerCount: 0 };
-        current.total += Number(row.pick_count || 0);
-        if (row.pick_value === row.winner) {
-          current.winnerCount += Number(row.pick_count || 0);
-        }
+        current.total += Number(row.total_picks || 0);
+        current.winnerCount += Number(row.winner_count || 0);
         upsetByEvent.set(row.event_id, current);
       }
       let bestUpset: { winner: string; againstPct: number } | null = null;
@@ -2528,7 +2697,12 @@ app.post("/api/leagues/:id/picks", authMiddleware, async (c) => {
 
   const { getTemplateForPoolType } = await import("../shared/poolTypeCatalog");
   const { validateRuleEngineSubmission } = await import("../shared/poolRuleEngine");
+  const { deserializePoolRuleConfig } = await import("../shared/poolRuleConfig");
+  const { validatePick: validatePickEdge } = await import("../shared/edgeCaseEngine");
+
   const template = getTemplateForPoolType(league.format_key);
+  const poolConfig = deserializePoolRuleConfig(league.format_key, league.rules_json);
+
   const ruleValidationErrors = validateRuleEngineSubmission({
     picks,
     eligibleEventIds,
@@ -2539,20 +2713,67 @@ app.post("/api/leagues/:id/picks", authMiddleware, async (c) => {
     return c.json({ error: ruleValidationErrors[0], details: ruleValidationErrors }, 400);
   }
 
-  // Validate each pick - game must exist and not be locked
-  for (const pick of picks) {
-    const event = await c.env.DB.prepare(`
-      SELECT id, start_at, status FROM events WHERE id = ? AND sport_key = ? AND period_id = ?
-    `).bind(pick.event_id, league.sport_key, period_id).first<{ id: number; start_at: string; status: string }>();
+  // Gather lock/start state for all period events in a single query
+  const { results: eventRows } = await c.env.DB.prepare(`
+    SELECT id, start_at, status FROM events WHERE sport_key = ? AND period_id = ?
+  `).bind(league.sport_key, period_id).all<{ id: number; start_at: string; status: string }>();
 
+  const eventMap = new Map((eventRows || []).map((e) => [e.id, e]));
+  const lockedEventIds = new Set<string>();
+  const startedEventIds = new Set<string>();
+  for (const ev of eventRows || []) {
+    if (ev.start_at <= now || !isScheduledEventStatus(ev.status)) {
+      lockedEventIds.add(String(ev.id));
+      startedEventIds.add(String(ev.id));
+    }
+  }
+
+  // Load previously used teams for survivor reuse enforcement
+  const usedTeams: string[] = [];
+  if (template === "survivor" || template === "last_man_standing") {
+    const { results: priorPicks } = await c.env.DB.prepare(`
+      SELECT pick_value FROM picks
+      WHERE league_id = ? AND user_id = ? AND entry_id = ? AND period_id != ? AND is_locked = 1
+    `).bind(leagueId, user.id, activeEntry.id, period_id).all<{ pick_value: string }>();
+    for (const pp of priorPicks || []) usedTeams.push(pp.pick_value);
+  }
+
+  // Determine the max confidence rank for this period
+  const totalEligible = eligibleEventIds.size > 0 ? eligibleEventIds.size : (eventRows || []).length;
+
+  // Run edge-case-aware validation on each pick
+  const existingValidatedPicks: Array<{ event_id: string; pick_value: string; confidence_rank?: number; entry_id?: number }> = [];
+  for (const pick of picks) {
+    const event = eventMap.get(pick.event_id);
     if (!event) {
       return c.json({ error: `Invalid event: ${pick.event_id}` }, 400);
     }
 
-    // Check if game is locked (started or not scheduled)
-    if (event.start_at <= now || !isScheduledEventStatus(event.status)) {
-      return c.json({ error: `Game ${pick.event_id} is already locked` }, 400);
+    const edgeResult = validatePickEdge(
+      { event_id: String(pick.event_id), pick_value: pick.pick_value, confidence_rank: pick.confidence_rank, entry_id: activeEntry.id },
+      {
+        config: poolConfig,
+        template: template || league.format_key,
+        period_id,
+        existing_picks: existingValidatedPicks,
+        used_teams: usedTeams,
+        eligible_event_ids: eligibleEventIds.size > 0 ? eligibleEventIds : new Set((eventRows || []).map((e) => String(e.id))),
+        locked_event_ids: lockedEventIds,
+        started_event_ids: startedEventIds,
+        max_confidence_rank: totalEligible,
+      },
+    );
+
+    if (!edgeResult.valid) {
+      return c.json({ error: edgeResult.errors[0], details: edgeResult.errors }, 400);
     }
+
+    existingValidatedPicks.push({
+      event_id: String(pick.event_id),
+      pick_value: pick.pick_value,
+      confidence_rank: pick.confidence_rank,
+      entry_id: activeEntry.id,
+    });
   }
 
   // Delete existing unlocked picks for this period
@@ -3030,20 +3251,45 @@ app.post("/api/leagues/:id/survivor-process-result", authMiddleware, async (c) =
 
   // Get all member entries that need processing for this period
   const { results: entries } = await c.env.DB.prepare(`
-    SELECT se.*, p.pick_value, e.winner
+    SELECT se.*, p.pick_value, p.is_correct as pick_is_correct, e.winner,
+           e.status as event_status, e.home_score, e.away_score
     FROM survivor_entries se
     INNER JOIN picks p ON p.user_id = se.user_id AND p.league_id = se.league_id AND p.period_id = ?
     INNER JOIN events e ON p.event_id = e.id
     WHERE se.league_id = ? AND se.is_eliminated = 0
-    AND (e.status = 'final' OR e.status = 'final_ot')
+    AND UPPER(e.status) IN ('FINAL','FINAL_OT','COMPLETED','CANCELED','CANCELLED')
   `).bind(period_id, leagueId).all();
 
   let eliminatedCount = 0;
   let livesLostCount = 0;
   const now = new Date().toISOString();
 
+  const { deserializePoolRuleConfig: deserializeSurvivor } = await import("../shared/poolRuleConfig");
+  const { handleCanceledGame: handleCanceledSurvivor, handleTie: handleTieSurvivor } = await import("../shared/edgeCaseEngine");
+  const survivorConfig = deserializeSurvivor("survivor", league.rules_json);
+
   for (const entry of entries) {
-    const isCorrect = entry.pick_value === entry.winner;
+    const evStatus = ((entry.event_status as string) || "").toUpperCase();
+
+    // Canceled games never eliminate in survivor
+    if (evStatus === "CANCELED" || evStatus === "CANCELLED") {
+      const cancelResult = handleCanceledSurvivor(survivorConfig, "survivor", true, true);
+      if (!cancelResult.affects_elimination) continue;
+    }
+
+    // Tied games use configured tie handling
+    const homeScore = entry.home_score as number | null;
+    const awayScore = entry.away_score as number | null;
+    if (homeScore !== null && awayScore !== null && homeScore === awayScore) {
+      const tieResult = handleTieSurvivor(survivorConfig, "survivor");
+      if (!tieResult.affects_elimination) continue;
+    }
+
+    if (entry.pick_is_correct === null || entry.pick_is_correct === undefined) {
+      // Survivor processing should only use deterministic graded outcomes.
+      continue;
+    }
+    const isCorrect = (entry.pick_is_correct as number) === 1;
 
     if (!isCorrect) {
       const currentLives = entry.lives_remaining as number;
@@ -3249,8 +3495,11 @@ app.get("/api/leagues/:id/standings", authMiddleware, async (c) => {
     return c.json({ error: "League not found" }, 404);
   }
 
-  const { pointsForCorrectPick, isFinalEventStatus, getCanonicalPoolType } = await import("./services/poolEngineService");
+  const { isFinalEventStatus, getCanonicalPoolType } = await import("./services/poolEngineService");
+  const { deserializePoolRuleConfig } = await import("../shared/poolRuleConfig");
+  const { gradePick: gradePickStandings } = await import("./services/scoringEngine");
   const canonicalLeaguePoolType = getCanonicalPoolType(league.format_key) || league.format_key;
+  const standingsConfig = deserializePoolRuleConfig(league.format_key, league.rules_json);
 
   const { results: members } = await c.env.DB.prepare(`
     SELECT lm.user_id, u.display_name, u.email, u.avatar_url
@@ -3288,15 +3537,16 @@ app.get("/api/leagues/:id/standings", authMiddleware, async (c) => {
     avatar_url: string | null;
   }>();
 
-  // Get all picks with event results
+  // Get all picks with event results (including fields needed by gradePick)
   const { results: allPicks } = await c.env.DB.prepare(`
     SELECT 
-      p.user_id, p.entry_id, p.event_id, p.period_id, p.pick_value, p.confidence_rank, p.is_correct, p.points_earned,
-      e.winner, e.status as event_status
+      p.id as pick_id, p.user_id, p.entry_id, p.event_id, p.period_id, p.pick_value, p.confidence_rank, p.is_correct, p.points_earned,
+      e.winner, e.status as event_status, e.home_team, e.away_team, e.home_score, e.away_score, e.start_at, e.spread
     FROM picks p
     LEFT JOIN events e ON p.event_id = e.id
     WHERE p.league_id = ?
   `).bind(leagueId).all<{
+    pick_id: number;
     user_id: number;
     entry_id: number | null;
     event_id: number;
@@ -3307,6 +3557,12 @@ app.get("/api/leagues/:id/standings", authMiddleware, async (c) => {
     points_earned: number | null;
     winner: string | null;
     event_status: string | null;
+    home_team: string | null;
+    away_team: string | null;
+    home_score: number | null;
+    away_score: number | null;
+    start_at: string | null;
+    spread: number | null;
   }>();
 
   interface EntryStats {
@@ -3358,21 +3614,51 @@ app.get("/api/leagues/:id/standings", authMiddleware, async (c) => {
     if (!stats) continue;
     const periodId = pick.period_id;
 
-    if (isFinalEventStatus(pick.event_status) && pick.winner) {
+    if (isFinalEventStatus(pick.event_status)) {
       stats.total_picks++;
-      const isCorrect = pick.pick_value === pick.winner;
+
+      // Use pre-scored values if available, otherwise grade on-the-fly
+      let isCorrect: boolean;
+      let points: number;
+
+      if (pick.is_correct !== null && pick.points_earned !== null) {
+        isCorrect = pick.is_correct === 1;
+        points = pick.points_earned;
+      } else {
+        const gradeResult = gradePickStandings({
+          pick_id: pick.pick_id,
+          entry_id: resolvedEntryId,
+          user_id: String(pick.user_id),
+          event_id: pick.event_id,
+          pick_value: pick.pick_value,
+          confidence_rank: pick.confidence_rank,
+          event_status: pick.event_status || "FINAL",
+          event_started: Boolean(pick.start_at && new Date(pick.start_at) < new Date()),
+          home_team: pick.home_team || "",
+          away_team: pick.away_team || "",
+          home_score: pick.home_score,
+          away_score: pick.away_score,
+          winner: pick.winner,
+          spread: pick.spread,
+        }, standingsConfig, league.format_key);
+
+        if (gradeResult.result === "pending") continue;
+        isCorrect = gradeResult.result === "win";
+        points = gradeResult.points;
+
+        if (gradeResult.affects_elimination) {
+          stats.is_eliminated = true;
+        }
+      }
+
       if (isCorrect) {
         stats.correct_picks++;
-        const points = pointsForCorrectPick(
-          { formatKey: league.format_key, rulesJson: league.rules_json },
-          pick.confidence_rank ?? null,
-        );
         stats.total_points += points;
         stats.period_points[periodId] = (stats.period_points[periodId] || 0) + points;
         stats.streak.push(1);
       } else {
         stats.streak.push(0);
-        if (canonicalLeaguePoolType === "survivor") {
+        if (canonicalLeaguePoolType === "survivor" || canonicalLeaguePoolType === "last_man_standing") {
           stats.is_eliminated = true;
         }
       }
@@ -3513,14 +3799,19 @@ app.post("/api/leagues/:id/score", authMiddleware, async (c) => {
     return c.json({ error: "League not found" }, 404);
   }
 
-  const { pointsForCorrectPick } = await import("./services/poolEngineService");
+  const { gradePick } = await import("./services/scoringEngine");
+  const { deserializePoolRuleConfig } = await import("../shared/poolRuleConfig");
 
-  // Get unscored picks with final event results
+  const config = deserializePoolRuleConfig(league.format_key, league.rules_json);
+
   const { results: unscoredPicks } = await c.env.DB.prepare(`
-    SELECT p.id, p.user_id, p.entry_id, p.period_id, p.pick_value, p.confidence_rank, e.winner
+    SELECT p.id, p.user_id, p.entry_id, p.period_id, p.pick_value, p.confidence_rank,
+           e.winner, e.status as event_status, e.home_team, e.away_team,
+           e.home_score, e.away_score, e.start_at, e.spread
     FROM picks p
     INNER JOIN events e ON p.event_id = e.id
-    WHERE p.league_id = ? AND p.is_correct IS NULL AND UPPER(e.status) = 'FINAL' AND e.winner IS NOT NULL
+    WHERE p.league_id = ? AND p.is_correct IS NULL
+      AND (UPPER(e.status) IN ('FINAL','COMPLETED','CANCELED','CANCELLED','POSTPONED','DELAYED'))
   `).bind(leagueId).all<{
     id: number;
     user_id: number;
@@ -3528,25 +3819,46 @@ app.post("/api/leagues/:id/score", authMiddleware, async (c) => {
     period_id: string;
     pick_value: string;
     confidence_rank: number | null;
-    winner: string;
+    winner: string | null;
+    event_status: string;
+    home_team: string;
+    away_team: string;
+    home_score: number | null;
+    away_score: number | null;
+    start_at: string | null;
+    spread: number | null;
   }>();
 
   let scored = 0;
   for (const pick of unscoredPicks) {
-    const isCorrect = pick.pick_value === pick.winner;
-    let pointsEarned = 0;
+    const gradeInput: PickGradeInput = {
+      pick_id: pick.id,
+      entry_id: pick.entry_id || 0,
+      user_id: String(pick.user_id),
+      event_id: pick.id,
+      pick_value: pick.pick_value,
+      confidence_rank: pick.confidence_rank,
+      event_status: pick.event_status || "FINAL",
+      event_started: Boolean(pick.start_at && new Date(pick.start_at) < new Date()),
+      home_team: pick.home_team || "",
+      away_team: pick.away_team || "",
+      home_score: pick.home_score,
+      away_score: pick.away_score,
+      winner: pick.winner,
+      spread: pick.spread,
+    };
 
-    if (isCorrect) {
-      pointsEarned = pointsForCorrectPick(
-        { formatKey: league.format_key, rulesJson: league.rules_json },
-        (pick.confidence_rank as number | null) ?? null,
-      );
-    }
+    const result = gradePick(gradeInput, config, league.format_key);
+
+    if (result.result === "pending") continue;
+
+    const isCorrect = result.result === "win" ? 1 : 0;
+    const pointsEarned = result.points;
 
     await c.env.DB.prepare(`
       UPDATE picks SET is_correct = ?, points_earned = ?, is_locked = 1, updated_at = CURRENT_TIMESTAMP
       WHERE id = ?
-    `).bind(isCorrect ? 1 : 0, pointsEarned, pick.id).run();
+    `).bind(isCorrect, pointsEarned, pick.id).run();
 
     if (pick.entry_id) {
       await writePoolEntryEvent(c.env.DB, {
@@ -3557,8 +3869,11 @@ app.post("/api/leagues/:id/score", authMiddleware, async (c) => {
         eventType: "pick_scored",
         payload: {
           pickId: pick.id,
-          isCorrect,
+          isCorrect: isCorrect === 1,
           pointsEarned,
+          result: result.result,
+          edgeAction: result.edge_action,
+          reason: result.reason,
           winner: pick.winner,
           pickValue: pick.pick_value,
         },
@@ -3568,13 +3883,65 @@ app.post("/api/leagues/:id/score", authMiddleware, async (c) => {
     scored++;
   }
 
+  // --- Missed Pick Enforcement ---
+  const { handleMissedPick } = await import("../shared/edgeCaseEngine");
+  let missedPicksPenalized = 0;
+
+  const scoredPeriods = [...new Set(unscoredPicks.map((p) => p.period_id))];
+  for (const periodId of scoredPeriods) {
+    const { results: periodFinalEvents } = await c.env.DB.prepare(`
+      SELECT id FROM events
+      WHERE sport_key = (SELECT sport_key FROM leagues WHERE id = ?) AND period_id = ?
+        AND UPPER(status) IN ('FINAL','COMPLETED')
+    `).bind(leagueId, periodId).all<{ id: number }>();
+
+    const totalGamesInPeriod = periodFinalEvents.length;
+    if (totalGamesInPeriod === 0) continue;
+
+    const { results: entryRows } = await c.env.DB.prepare(`
+      SELECT pe.id as entry_id, pe.user_id FROM pool_entries pe
+      INNER JOIN league_members lm ON lm.user_id = pe.user_id AND lm.league_id = pe.league_id
+      WHERE pe.league_id = ? AND lm.invite_status = 'joined'
+    `).bind(leagueId).all<{ entry_id: number; user_id: number }>();
+
+    for (const entry of entryRows || []) {
+      const pickCount = await c.env.DB.prepare(`
+        SELECT COUNT(*) as cnt FROM picks
+        WHERE league_id = ? AND entry_id = ? AND period_id = ?
+      `).bind(leagueId, entry.entry_id, periodId).first<{ cnt: number }>();
+
+      const expectedPicks = config.picks_per_period === "all" ? totalGamesInPeriod : Math.min(Number(config.picks_per_period), totalGamesInPeriod);
+      const actualPicks = pickCount?.cnt || 0;
+      const missedCount = Math.max(0, expectedPicks - actualPicks);
+
+      if (missedCount > 0) {
+        const missedResult = handleMissedPick(config, league.format_key);
+        missedPicksPenalized += missedCount;
+
+        await writePoolEntryEvent(c.env.DB, {
+          poolEntryId: entry.entry_id,
+          leagueId,
+          userId: entry.user_id,
+          periodId,
+          eventType: "missed_pick_penalty",
+          payload: {
+            missedCount,
+            action: missedResult.action,
+            reason: missedResult.reason,
+            affectsElimination: missedResult.affects_elimination,
+          },
+        });
+      }
+    }
+  }
+
   // Log scoring event
   await c.env.DB.prepare(`
     INSERT INTO event_log (event_type, league_id, user_id, actor_id, entity_type, entity_id, payload_json)
     VALUES ('picks_scored', ?, ?, ?, 'league', ?, ?)
-  `).bind(leagueId, user.id, user.id, leagueId, JSON.stringify({ picksScored: scored })).run();
+  `).bind(leagueId, user.id, user.id, leagueId, JSON.stringify({ picksScored: scored, missedPicksPenalized })).run();
 
-  return c.json({ success: true, picksScored: scored });
+  return c.json({ success: true, picksScored: scored, missedPicksPenalized });
 });
 
 // Get audit log (owner/admin only)
@@ -3997,19 +4364,31 @@ app.get("/api/analytics", authMiddleware, async (c) => {
 
   const leagueIdList = leagueIds.join(",");
 
-  // Get all picks with results
+  // Get all picks with results (including fields for gradePick fallback)
   const { results: allPicks } = await c.env.DB.prepare(`
     SELECT 
       p.id, p.user_id, p.league_id, p.event_id, p.period_id, p.pick_value, 
-      p.confidence_rank, p.is_correct, p.points_earned, p.created_at,
+      p.confidence_rank, p.is_correct, p.points_earned, p.created_at, p.entry_id,
       e.winner, e.status as event_status, e.home_team, e.away_team, e.start_at,
-      l.name as league_name, l.sport_key, l.format_key
+      e.home_score, e.away_score, e.spread,
+      l.name as league_name, l.sport_key, l.format_key, l.rules_json
     FROM picks p
     LEFT JOIN events e ON p.event_id = e.id
     LEFT JOIN leagues l ON p.league_id = l.id
     WHERE p.user_id = ? AND p.league_id IN (${leagueIdList})
     ORDER BY p.created_at DESC
   `).bind(user.id).all();
+
+  const { gradePick: gradePickAnalytics } = await import("./services/scoringEngine");
+  const { deserializePoolRuleConfig: deserializeAnalytics } = await import("../shared/poolRuleConfig");
+  const analyticsConfigCache = new Map<string, ReturnType<typeof deserializeAnalytics>>();
+  function getAnalyticsConfig(formatKey: string, rulesJson: unknown) {
+    const key = `${formatKey}:${String(rulesJson || "")}`;
+    if (!analyticsConfigCache.has(key)) {
+      analyticsConfigCache.set(key, deserializeAnalytics(formatKey, rulesJson as string | null));
+    }
+    return analyticsConfigCache.get(key)!;
+  }
 
   // Filter by time range
   const now = new Date();
@@ -4034,14 +4413,43 @@ app.get("/api/analytics", authMiddleware, async (c) => {
   const confidenceData: { rank: number; correct: boolean }[] = [];
 
   for (const pick of filteredPicks) {
-    // Only count finished games
-    if (pick.event_status === "final" || pick.event_status === "final_ot") {
+    const evStatus = (pick.event_status as string || "").toLowerCase();
+    if (evStatus === "final" || evStatus === "final_ot" || evStatus === "completed" || evStatus === "canceled" || evStatus === "cancelled" || evStatus === "postponed") {
+      // Use pre-scored values if available; otherwise grade via hardened engine
+      let isCorrect: boolean;
+      let points: number;
+
+      if (pick.is_correct !== null && pick.is_correct !== undefined) {
+        isCorrect = (pick.is_correct as number) === 1;
+        points = (pick.points_earned as number) || 0;
+      } else {
+        const cfg = getAnalyticsConfig(pick.format_key as string, pick.rules_json);
+        const gradeResult = gradePickAnalytics({
+          pick_id: pick.id as number,
+          entry_id: (pick.entry_id as number) || 0,
+          user_id: String(pick.user_id),
+          event_id: pick.event_id as number,
+          pick_value: pick.pick_value as string,
+          confidence_rank: (pick.confidence_rank as number | null) ?? null,
+          event_status: pick.event_status as string || "FINAL",
+          event_started: Boolean(pick.start_at && new Date(pick.start_at as string) < new Date()),
+          home_team: (pick.home_team as string) || "",
+          away_team: (pick.away_team as string) || "",
+          home_score: (pick.home_score as number | null) ?? null,
+          away_score: (pick.away_score as number | null) ?? null,
+          winner: (pick.winner as string | null) ?? null,
+          spread: (pick.spread as number | null) ?? null,
+        }, cfg, pick.format_key as string);
+
+        if (gradeResult.result === "pending") continue;
+        isCorrect = gradeResult.result === "win";
+        points = gradeResult.points;
+      }
+
       totalPicks++;
-      const isCorrect = pick.pick_value === pick.winner;
-      
       if (isCorrect) {
         correctPicks++;
-        totalPoints += (pick.points_earned as number) || 1;
+        totalPoints += points;
         streakResults.push(1);
       } else {
         streakResults.push(0);
@@ -4052,7 +4460,7 @@ app.get("/api/analytics", authMiddleware, async (c) => {
       if (!periodPoints[periodKey]) {
         periodPoints[periodKey] = { points: 0, league: pick.league_name as string };
       }
-      periodPoints[periodKey].points += isCorrect ? ((pick.points_earned as number) || 1) : 0;
+      periodPoints[periodKey].points += isCorrect ? points : 0;
 
       // Sport breakdown
       const sport = pick.sport_key as string;
@@ -4066,7 +4474,7 @@ app.get("/api/analytics", authMiddleware, async (c) => {
       formatStats[format].picks++;
       if (isCorrect) {
         formatStats[format].correct++;
-        formatStats[format].points += (pick.points_earned as number) || 1;
+        formatStats[format].points += points;
       }
 
       // Team analysis
@@ -4135,10 +4543,13 @@ app.get("/api/analytics", authMiddleware, async (c) => {
       p.league_id === league.id && (p.event_status === "final" || p.event_status === "final_ot")
     );
     
-    const leagueCorrect = leaguePicks.filter((p: Record<string, unknown>) => p.pick_value === p.winner).length;
-    const leaguePoints = leaguePicks.reduce((sum: number, p: Record<string, unknown>) => 
-      sum + (p.pick_value === p.winner ? ((p.points_earned as number) || 1) : 0), 0
-    );
+    const leagueCorrect = leaguePicks.filter((p: Record<string, unknown>) =>
+      p.is_correct !== null && p.is_correct !== undefined && (p.is_correct as number) === 1
+    ).length;
+    const leaguePoints = leaguePicks.reduce((sum: number, p: Record<string, unknown>) => {
+      const correct = p.is_correct !== null && p.is_correct !== undefined && (p.is_correct as number) === 1;
+      return sum + (correct ? ((p.points_earned as number) || 0) : 0);
+    }, 0);
 
     // Get rank in this league
     const { results: standings } = await c.env.DB.prepare(`
@@ -4171,13 +4582,36 @@ app.get("/api/analytics", authMiddleware, async (c) => {
   // Weekly performance (aggregate by period)
   const periodData: Record<string, { points: number; correct: number; total: number }> = {};
   for (const pick of filteredPicks) {
-    if (pick.event_status === "final" || pick.event_status === "final_ot") {
+    const evStat = (pick.event_status as string || "").toLowerCase();
+    if (evStat === "final" || evStat === "final_ot" || evStat === "completed") {
       const period = pick.period_id as string;
       if (!periodData[period]) periodData[period] = { points: 0, correct: 0, total: 0 };
       periodData[period].total++;
-      if (pick.pick_value === pick.winner) {
+
+      let pickCorrect: boolean;
+      let pickPts: number;
+      if (pick.is_correct !== null && pick.is_correct !== undefined) {
+        pickCorrect = (pick.is_correct as number) === 1;
+        pickPts = (pick.points_earned as number) || 0;
+      } else {
+        const cfg = getAnalyticsConfig(pick.format_key as string, pick.rules_json);
+        const gr = gradePickAnalytics({
+          pick_id: pick.id as number, entry_id: (pick.entry_id as number) || 0,
+          user_id: String(pick.user_id), event_id: pick.event_id as number,
+          pick_value: pick.pick_value as string, confidence_rank: (pick.confidence_rank as number | null) ?? null,
+          event_status: pick.event_status as string || "FINAL",
+          event_started: Boolean(pick.start_at && new Date(pick.start_at as string) < new Date()),
+          home_team: (pick.home_team as string) || "", away_team: (pick.away_team as string) || "",
+          home_score: (pick.home_score as number | null) ?? null, away_score: (pick.away_score as number | null) ?? null,
+          winner: (pick.winner as string | null) ?? null, spread: (pick.spread as number | null) ?? null,
+        }, cfg, pick.format_key as string);
+        pickCorrect = gr.result === "win";
+        pickPts = gr.points;
+      }
+
+      if (pickCorrect) {
         periodData[period].correct++;
-        periodData[period].points += (pick.points_earned as number) || 1;
+        periodData[period].points += pickPts;
       }
     }
   }
@@ -4222,18 +4656,45 @@ app.get("/api/analytics", authMiddleware, async (c) => {
     }))
     .sort((a, b) => b.picks - a.picks);
 
-  // Recent picks (last 20)
-  const recentPicks = filteredPicks.slice(0, 20).map((pick: Record<string, unknown>) => ({
-    id: pick.id,
-    leagueName: pick.league_name,
-    period: pick.period_id,
-    pickValue: pick.pick_value,
-    result: pick.event_status === "final" || pick.event_status === "final_ot"
-      ? (pick.pick_value === pick.winner ? "win" : "loss")
-      : "pending",
-    points: pick.pick_value === pick.winner ? ((pick.points_earned as number) || 1) : 0,
-    date: (pick.start_at as string)?.split("T")[0] || (pick.created_at as string)?.split("T")[0],
-  }));
+  // Recent picks (last 20) — use pre-scored values or gradePick fallback
+  const recentPicks = filteredPicks.slice(0, 20).map((pick: Record<string, unknown>) => {
+    const evSt = ((pick.event_status as string) || "").toLowerCase();
+    const isFinal = evSt === "final" || evSt === "final_ot" || evSt === "completed";
+
+    let result: string = "pending";
+    let pts = 0;
+
+    if (isFinal) {
+      if (pick.is_correct !== null && pick.is_correct !== undefined) {
+        result = (pick.is_correct as number) === 1 ? "win" : "loss";
+        pts = (pick.points_earned as number) || 0;
+      } else {
+        const cfg = getAnalyticsConfig(pick.format_key as string, pick.rules_json);
+        const gr = gradePickAnalytics({
+          pick_id: pick.id as number, entry_id: (pick.entry_id as number) || 0,
+          user_id: String(pick.user_id), event_id: pick.event_id as number,
+          pick_value: pick.pick_value as string, confidence_rank: (pick.confidence_rank as number | null) ?? null,
+          event_status: pick.event_status as string || "FINAL",
+          event_started: true,
+          home_team: (pick.home_team as string) || "", away_team: (pick.away_team as string) || "",
+          home_score: (pick.home_score as number | null) ?? null, away_score: (pick.away_score as number | null) ?? null,
+          winner: (pick.winner as string | null) ?? null, spread: (pick.spread as number | null) ?? null,
+        }, cfg, pick.format_key as string);
+        result = gr.result === "win" ? "win" : gr.result === "push" ? "push" : gr.result === "void" ? "void" : "loss";
+        pts = gr.points;
+      }
+    }
+
+    return {
+      id: pick.id,
+      leagueName: pick.league_name,
+      period: pick.period_id,
+      pickValue: pick.pick_value,
+      result,
+      points: pts,
+      date: (pick.start_at as string)?.split("T")[0] || (pick.created_at as string)?.split("T")[0],
+    };
+  });
 
   // Team analysis (top 10)
   const teamAnalysis = Object.entries(teamStats)
@@ -6044,6 +6505,7 @@ import { initProviders } from "./services/providers";
 import { oddsRouter } from "./routes/odds";
 import { trackerPicksRouter } from "./routes/tracker-picks";
 import { watchlistRouter } from "./routes/watchlist";
+import favoritesRouter from "./routes/favorites";
 import { alertsRouter } from "./routes/alerts";
 import { pushRouter } from "./routes/push";
 import { adminRouter } from "./routes/admin";
@@ -6249,6 +6711,121 @@ function getFallbackResponse(persona: PersonaKey, message: string): string {
   return "I'm Big G, your admin helper. 👔 I can advise on league management best practices: handling payments, resolving disputes, member management, using the audit log, and optimizing your pool setup. Remember, I provide recommendations only - all actions must be taken through the proper interfaces. How can I help you run a better pool?";
 }
 
+// ============ Pool History — Week-by-Week Summary ============
+
+app.get("/api/leagues/:id/pool-history/weeks", authMiddleware, async (c) => {
+  const user = c.get("user");
+  if (!user) return c.json({ error: "Unauthorized" }, 401);
+
+  const leagueId = c.req.param("id");
+
+  const membership = await c.env.DB.prepare(
+    `SELECT role FROM league_members WHERE league_id = ? AND user_id = ? AND invite_status = 'joined'`
+  ).bind(leagueId, user.id).first();
+  if (!membership) return c.json({ error: "Not a member" }, 403);
+
+  const league = await c.env.DB.prepare(
+    `SELECT id, name, sport_key, format_key, rules_json FROM leagues WHERE id = ?`
+  ).bind(leagueId).first<{ id: number; name: string; sport_key: string; format_key: string; rules_json: string | null }>();
+  if (!league) return c.json({ error: "League not found" }, 404);
+
+  const { results: periodRows } = await c.env.DB.prepare(`
+    SELECT DISTINCT period_id FROM picks WHERE league_id = ? ORDER BY period_id ASC
+  `).bind(leagueId).all<{ period_id: string }>();
+
+  const periodIds = (periodRows || []).map((r) => r.period_id);
+
+  const weeks: Array<{
+    periodId: string;
+    totalPicks: number;
+    correctPicks: number;
+    averageAccuracy: number;
+    participantCount: number;
+    topScorer: { name: string; points: number } | null;
+    mostPopularPick: { value: string; percentage: number } | null;
+    biggestUpset: string | null;
+    leaderboardSnapshot: Array<{ rank: number; name: string; points: number; correct: number; total: number }>;
+    yourSummary: { correct: number; total: number; points: number; rank: number | null } | null;
+  }> = [];
+
+  for (const periodId of periodIds) {
+    const { results: pickStats } = await c.env.DB.prepare(`
+      SELECT
+        COUNT(*) as total_picks,
+        SUM(CASE WHEN p.is_correct = 1 THEN 1 ELSE 0 END) as correct_picks,
+        COUNT(DISTINCT p.user_id) as participant_count
+      FROM picks p
+      LEFT JOIN events e ON e.id = p.event_id
+      WHERE p.league_id = ? AND p.period_id = ?
+        AND (UPPER(e.status) IN ('FINAL','FINAL_OT','COMPLETED') OR e.status IS NULL)
+    `).bind(leagueId, periodId).all<{ total_picks: number; correct_picks: number; participant_count: number }>();
+
+    const stats = pickStats?.[0] || { total_picks: 0, correct_picks: 0, participant_count: 0 };
+    const totalPicks = Number(stats.total_picks || 0);
+    const correctPicks = Number(stats.correct_picks || 0);
+    const participantCount = Number(stats.participant_count || 0);
+    const averageAccuracy = totalPicks > 0 ? Math.round((correctPicks / totalPicks) * 1000) / 10 : 0;
+
+    const { results: popularPick } = await c.env.DB.prepare(`
+      SELECT pick_value, COUNT(*) as cnt FROM picks
+      WHERE league_id = ? AND period_id = ?
+      GROUP BY pick_value ORDER BY cnt DESC LIMIT 1
+    `).bind(leagueId, periodId).all<{ pick_value: string; cnt: number }>();
+    const mostPopularPick = popularPick?.[0]
+      ? { value: popularPick[0].pick_value, percentage: totalPicks > 0 ? Math.round((Number(popularPick[0].cnt) / totalPicks) * 1000) / 10 : 0 }
+      : null;
+
+    const { results: leaderboardRows } = await c.env.DB.prepare(`
+      SELECT sh.rank, COALESCE(u.display_name, u.email) as name, sh.total_points, sh.correct_picks, sh.total_picks
+      FROM standings_history sh
+      LEFT JOIN users u ON u.id = sh.user_id
+      WHERE sh.league_id = ? AND sh.period_id = ?
+      ORDER BY sh.rank ASC LIMIT 10
+    `).bind(leagueId, periodId).all<{ rank: number; name: string; total_points: number; correct_picks: number; total_picks: number }>();
+
+    const leaderboardSnapshot = (leaderboardRows || []).map((r) => ({
+      rank: Number(r.rank), name: r.name || "Unknown", points: Number(r.total_points || 0),
+      correct: Number(r.correct_picks || 0), total: Number(r.total_picks || 0),
+    }));
+
+    const topScorer = leaderboardSnapshot[0]
+      ? { name: leaderboardSnapshot[0].name, points: leaderboardSnapshot[0].points }
+      : null;
+
+    const upsetRow = await c.env.DB.prepare(`
+      SELECT e.winner, COUNT(*) as total, SUM(CASE WHEN p.is_correct = 1 THEN 1 ELSE 0 END) as winner_count
+      FROM picks p INNER JOIN events e ON e.id = p.event_id
+      WHERE p.league_id = ? AND p.period_id = ?
+        AND (UPPER(e.status) = 'FINAL' OR UPPER(e.status) = 'FINAL_OT') AND e.winner IS NOT NULL
+      GROUP BY p.event_id, e.winner HAVING total > 0
+      ORDER BY (1.0 - CAST(SUM(CASE WHEN p.is_correct = 1 THEN 1 ELSE 0 END) AS REAL) / COUNT(*)) DESC
+      LIMIT 1
+    `).bind(leagueId, periodId).first<{ winner: string; total: number; winner_count: number }>();
+    let biggestUpset: string | null = null;
+    if (upsetRow && upsetRow.total > 0) {
+      const againstPct = Math.round((1 - Number(upsetRow.winner_count) / Number(upsetRow.total)) * 100);
+      if (againstPct > 50) biggestUpset = `${upsetRow.winner} (${againstPct}% picked against)`;
+    }
+
+    const yourRow = await c.env.DB.prepare(`
+      SELECT sh.rank, sh.total_points, sh.correct_picks, sh.total_picks
+      FROM standings_history sh WHERE sh.league_id = ? AND sh.period_id = ? AND sh.user_id = ?
+      LIMIT 1
+    `).bind(leagueId, periodId, user.id).first<{ rank: number; total_points: number; correct_picks: number; total_picks: number }>();
+    const yourSummary = yourRow
+      ? { correct: Number(yourRow.correct_picks || 0), total: Number(yourRow.total_picks || 0), points: Number(yourRow.total_points || 0), rank: Number(yourRow.rank || 0) }
+      : null;
+
+    weeks.push({ periodId, totalPicks, correctPicks, averageAccuracy, participantCount, topScorer, mostPopularPick, biggestUpset, leaderboardSnapshot, yourSummary });
+  }
+
+  return c.json({
+    league: { id: league.id, name: league.name, sport_key: league.sport_key, format_key: league.format_key },
+    weeks,
+    totalPeriods: weeks.length,
+  });
+});
+
 // ============ Standings History Routes ============
 
 // Get standings history for a league (for charts)
@@ -6418,30 +6995,53 @@ app.post("/api/leagues/:id/standings/snapshot", authMiddleware, async (c) => {
   }
 
   // Get all picks with results up to and including this period
+  const { gradePick: gradePickSnapshot } = await import("./services/scoringEngine");
+  const { deserializePoolRuleConfig: deserializeSnapshot } = await import("../shared/poolRuleConfig");
+  const snapshotConfig = deserializeSnapshot(league.format_key, league.rules_json);
+
   const { results: allPicks } = await c.env.DB.prepare(`
     SELECT 
-      p.user_id, p.pick_value, p.confidence_rank, p.period_id,
-      e.winner, e.status as event_status
+      p.id as pick_id, p.user_id, p.entry_id, p.pick_value, p.confidence_rank, p.period_id,
+      p.is_correct, p.points_earned,
+      e.winner, e.status as event_status, e.home_team, e.away_team,
+      e.home_score, e.away_score, e.start_at, e.spread
     FROM picks p
     LEFT JOIN events e ON p.event_id = e.id
-    WHERE p.league_id = ? AND (e.status = 'final' OR e.status = 'final_ot')
+    WHERE p.league_id = ? AND UPPER(e.status) IN ('FINAL','COMPLETED','FINAL_OT')
     AND p.period_id <= ?
   `).bind(leagueId, period_id).all();
 
   for (const pick of allPicks) {
     const userId = pick.user_id as number;
     if (!memberStats[userId]) continue;
-    
+
     memberStats[userId].total_picks++;
-    const isCorrect = pick.pick_value === pick.winner;
-    
+
+    let isCorrect: boolean;
+    let pts: number;
+
+    if (pick.is_correct !== null && pick.is_correct !== undefined) {
+      isCorrect = (pick.is_correct as number) === 1;
+      pts = (pick.points_earned as number) || 0;
+    } else {
+      const gr = gradePickSnapshot({
+        pick_id: pick.pick_id as number, entry_id: (pick.entry_id as number) || 0,
+        user_id: String(userId), event_id: pick.pick_id as number,
+        pick_value: pick.pick_value as string,
+        confidence_rank: (pick.confidence_rank as number | null) ?? null,
+        event_status: (pick.event_status as string) || "FINAL",
+        event_started: true,
+        home_team: (pick.home_team as string) || "", away_team: (pick.away_team as string) || "",
+        home_score: (pick.home_score as number | null) ?? null, away_score: (pick.away_score as number | null) ?? null,
+        winner: (pick.winner as string | null) ?? null, spread: (pick.spread as number | null) ?? null,
+      }, snapshotConfig, league.format_key);
+      isCorrect = gr.result === "win";
+      pts = gr.points;
+    }
+
     if (isCorrect) {
       memberStats[userId].correct_picks++;
-      if (league.format_key === "confidence" && pick.confidence_rank) {
-        memberStats[userId].total_points += pick.confidence_rank as number;
-      } else {
-        memberStats[userId].total_points += pointsPerWin;
-      }
+      memberStats[userId].total_points += pts;
     }
   }
 
@@ -7469,6 +8069,10 @@ export default {
         SPORTSRADAR_API_KEY: env.SPORTSRADAR_API_KEY, // PRIMARY provider
         DB: env.DB 
       });
+      // Ensure core D1 tables exist (non-blocking, errors are swallowed)
+      if (env.DB) {
+        import('./services/dbBootstrap').then(m => m.ensureCoreTables(env.DB)).catch(() => {});
+      }
       providersInitialized = true;
     }
     

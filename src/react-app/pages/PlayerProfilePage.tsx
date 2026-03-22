@@ -15,6 +15,7 @@ import {
 import { cn } from "@/react-app/lib/utils";
 import { useDemoAuth } from "@/react-app/contexts/DemoAuthContext";
 import { useWatchboards } from "@/react-app/hooks/useWatchboards";
+import FavoriteEntityButton from "@/react-app/components/FavoriteEntityButton";
 
 // ============================================
 // TYPES
@@ -273,34 +274,48 @@ function PlayerHero({
           </div>
           
           {/* Follow Player Button */}
-          <button
-            onClick={onFollowClick}
-            disabled={isLoading}
-            className={cn(
-              "inline-flex items-center gap-2 px-5 py-2.5 rounded-xl font-semibold text-sm transition-all",
-              isLoading && "opacity-60 cursor-not-allowed",
-              isFollowing 
-                ? "bg-amber-500/20 text-amber-400 border border-amber-500/30 hover:bg-amber-500/30"
-                : "bg-gradient-to-r from-blue-500 to-cyan-500 text-white shadow-lg shadow-blue-500/25 hover:shadow-blue-500/40 hover:scale-[1.02]"
-            )}
-          >
-            {isLoading ? (
-              <>
-                <div className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
-                {isFollowing ? 'Unfollowing...' : 'Following...'}
-              </>
-            ) : isFollowing ? (
-              <>
-                <Bell className="w-4 h-4" />
-                Following
-              </>
-            ) : (
-              <>
-                <Plus className="w-4 h-4" />
-                Follow Player
-              </>
-            )}
-          </button>
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              onClick={onFollowClick}
+              disabled={isLoading}
+              className={cn(
+                "inline-flex items-center gap-2 px-5 py-2.5 rounded-xl font-semibold text-sm transition-all",
+                isLoading && "opacity-60 cursor-not-allowed",
+                isFollowing
+                  ? "bg-amber-500/20 text-amber-400 border border-amber-500/30 hover:bg-amber-500/30"
+                  : "bg-gradient-to-r from-blue-500 to-cyan-500 text-white shadow-lg shadow-blue-500/25 hover:shadow-blue-500/40 hover:scale-[1.02]"
+              )}
+            >
+              {isLoading ? (
+                <>
+                  <div className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+                  {isFollowing ? "Unfollowing..." : "Following..."}
+                </>
+              ) : isFollowing ? (
+                <>
+                  <Bell className="w-4 h-4" />
+                  Following
+                </>
+              ) : (
+                <>
+                  <Plus className="w-4 h-4" />
+                  Follow Player
+                </>
+              )}
+            </button>
+            <FavoriteEntityButton
+              type="player"
+              entityId={player.espnId || player.displayName}
+              sport={String(player.sport || "").toLowerCase()}
+              metadata={{
+                player_name: player.displayName,
+                team_name: player.teamName,
+                team_code: player.teamAbbr,
+                sport: String(player.sport || "").toLowerCase(),
+              }}
+              label="Favorite"
+            />
+          </div>
         </div>
       </div>
     </div>
@@ -1126,7 +1141,11 @@ User question: ${userMessage}`;
           <img 
             src="/assets/coachg/coach-g-avatar.png"
             alt="Coach G"
-            className="w-10 h-10 rounded-full"
+            className="w-10 h-10 rounded-full cursor-pointer transition-transform hover:scale-105"
+            onClick={(e) => {
+              e.stopPropagation();
+              window.location.assign('/scout');
+            }}
           />
           <div>
             <h3 className="font-semibold text-white flex items-center gap-1.5">
@@ -1265,7 +1284,7 @@ export default function PlayerProfilePage() {
   // Watchboard hook for follow functionality
   const { 
     isPlayerFollowed, 
-    followPlayer, 
+    followPlayer,
     unfollowPlayerByName
   } = useWatchboards();
   

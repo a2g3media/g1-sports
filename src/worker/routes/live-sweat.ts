@@ -39,15 +39,14 @@ const liveSweatDemoOrAuthMiddleware = async (
       created_at: new Date().toISOString(),
       updated_at: new Date().toISOString(),
     } as MochaUser);
-    await next();
-    return;
+    return next();
   }
-  await authMiddlewareFn(c as any, next);
+  return authMiddlewareFn(c as any, next);
 };
 
 // GET /api/live-sweat/:leagueId - Get live sweat data for a survivor pool
 app.get("/:leagueId", async (c, next) => {
-  await liveSweatDemoOrAuthMiddleware(c, next, authMiddleware);
+  return liveSweatDemoOrAuthMiddleware(c, next, authMiddleware);
 }, async (c) => {
   const leagueId = parseInt(c.req.param("leagueId"), 10);
   const period = c.req.query("period") || "current";

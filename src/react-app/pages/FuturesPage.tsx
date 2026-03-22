@@ -274,7 +274,8 @@ export function FuturesPage() {
                 <img 
                   src={COACH_G_AVATAR} 
                   alt="Coach G" 
-                  className="w-12 h-12 rounded-full border-2 border-violet-500/30 object-cover"
+                  className="w-12 h-12 rounded-full border-2 border-violet-500/30 object-cover cursor-pointer transition-transform hover:scale-105"
+                  onClick={() => window.location.assign('/scout')}
                 />
                 <div className="flex-1">
                   <div className="flex items-center gap-2 mb-1">

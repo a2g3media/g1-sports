@@ -24,10 +24,9 @@ function getUserId(c: AppContext): string | null {
 async function demoOrAuthMiddleware(c: AppContext, next: () => Promise<void>) {
   const isDemoMode = c.req.header("X-Demo-Mode") === "true";
   if (isDemoMode) {
-    await next();
-    return;
+    return next();
   }
-  await authMiddleware(c, next);
+  return authMiddleware(c, next);
 }
 
 // =====================================================

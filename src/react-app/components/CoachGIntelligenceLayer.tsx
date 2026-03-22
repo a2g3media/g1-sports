@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
-import { Brain, Sparkles } from "lucide-react";
+import { Sparkles } from "lucide-react";
 import { cn } from "@/react-app/lib/utils";
 import { CoachGExternalLinkIcon } from "@/react-app/components/CoachGExternalLinkIcon";
 import { toGameDetailPath } from "@/react-app/lib/gameRoutes";
@@ -45,6 +45,7 @@ interface Payload {
       projection?: number;
       edge_score?: number;
     }>;
+    alerts?: string[];
   };
 }
 
@@ -66,6 +67,39 @@ function inferSurface(pathname: string): string {
   if (pathname.startsWith("/watchboard")) return "watchboards";
   if (pathname.startsWith("/alerts")) return "alerts";
   return "global";
+}
+
+function cleanText(value: unknown): string {
+  return String(value || "").replace(/\s+/g, " ").trim();
+}
+
+function buildSurfaceSummary(surface: string, gameId?: string): string {
+  const gameLabel = gameId ? `Game ${gameId}` : "this slate";
+  if (surface === "game") return `Coach G is tracking ${gameLabel} and refreshing the latest line signals.`;
+  if (surface === "watchboards") return "Coach G is prioritizing your watchboard and surfacing the strongest movement first.";
+  if (surface === "odds") return "Coach G is scanning market movement and highlighting the cleanest edges.";
+  if (surface === "home") return "Coach G is building your live market brief for today.";
+  return "Coach G is refreshing market context and preparing your next read.";
+}
+
+function normalizeActionables(payload: Payload | null): string[] {
+  if (!payload) return [];
+  const direct = Array.isArray(payload.actionable_intel)
+    ? payload.actionable_intel.map((item) => cleanText(item)).filter(Boolean)
+    : [];
+  if (direct.length > 0) return direct.slice(0, 3);
+
+  const fromSignals = Array.isArray(payload.intelligence_payload?.sharp_signals)
+    ? payload.intelligence_payload.sharp_signals
+      .map((s) => cleanText(s?.summary))
+      .filter(Boolean)
+    : [];
+  if (fromSignals.length > 0) return fromSignals.slice(0, 3);
+
+  const fromAlerts = Array.isArray(payload.intelligence_payload?.alerts)
+    ? payload.intelligence_payload.alerts.map((a) => cleanText(a)).filter(Boolean)
+    : [];
+  return fromAlerts.slice(0, 3);
 }
 
 interface CoachGIntelligenceLayerProps {
@@ -218,6 +252,8 @@ export function CoachGIntelligenceLayer({
   const linePrediction = payload?.line_prediction;
   const topPropEdge = payload?.player_prop_edges?.[0];
   const sharpCount = payload?.sharp_radar?.length || 0;
+  const actionableItems = normalizeActionables(payload);
+  const summaryText = cleanText(payload?.summary) || buildSurfaceSummary(surface, gameId);
   const createVideo = async () => {
     if (!gameId || videoBusy) return;
     setVideoBusy(true);
@@ -247,12 +283,12 @@ export function CoachGIntelligenceLayer({
         linePrediction?.projected_line !== null &&
         linePrediction?.projected_line !== undefined
           ? `${linePrediction.current_line.toFixed(1)} -> ${linePrediction.projected_line.toFixed(1)}`
-          : "Line projection pending";
+          : "Projection calibrating";
       const confidence =
         linePrediction?.confidence !== null &&
         linePrediction?.confidence !== undefined
           ? `${Math.round(linePrediction.confidence)}% conf`
-          : "--";
+          : "Updating confidence";
       return {
         label: "Line Prediction",
         value: lineText,
@@ -263,7 +299,7 @@ export function CoachGIntelligenceLayer({
       return {
         label: "Sharp Alerts",
         value: `${sharpCount} active`,
-        sub: topSignal?.message || "No major watchboard alerts right now",
+        sub: topSignal?.message || "No major watchboard shift detected yet",
       };
     }
     return {
@@ -271,11 +307,11 @@ export function CoachGIntelligenceLayer({
       value:
         topPropEdge?.player && topPropEdge?.prop
           ? `${topPropEdge.player} ${topPropEdge.prop}`
-          : "No elevated prop edge yet",
+          : "Prop edge still forming",
       sub:
         topPropEdge?.edge_score !== null && topPropEdge?.edge_score !== undefined
           ? `Edge ${Math.round(topPropEdge.edge_score)}`
-          : "Waiting for stronger market signal",
+          : topSignal?.message || "Monitoring books for the next clear signal",
     };
   })();
 
@@ -289,14 +325,11 @@ export function CoachGIntelligenceLayer({
     >
       <div className="flex items-center justify-between gap-3">
         <div className="min-w-0">
-          <div className="flex items-center gap-2 text-xs text-violet-300">
-            <Brain className="h-3.5 w-3.5" />
-            <span className="font-semibold uppercase tracking-wide">Coach G V2 Intelligence Engine</span>
-          </div>
+          <div className="sr-only">Coach G Intelligence</div>
           <p className={cn("mt-1 truncate text-sm text-white/90", compact && "text-xs")}>
-            {payload?.summary || "Scanning real-time markets and context..."}
+            {summaryText}
           </p>
-          {loading && !payload?.summary && (
+          {loading && !cleanText(payload?.summary) && (
             <p className="mt-1 text-[11px] text-white/55">Syncing Coach G intelligence...</p>
           )}
           {topSignal?.message && (
@@ -307,9 +340,9 @@ export function CoachGIntelligenceLayer({
               {(topSignal.icon || "📡")} {topSignal.message}
             </p>
           )}
-          {payload?.actionable_intel && payload.actionable_intel.length > 0 && (
+          {actionableItems.length > 0 && (
             <div className="mt-2 flex flex-wrap gap-1.5">
-              {payload.actionable_intel.slice(0, 2).map((item, i) => (
+              {actionableItems.slice(0, 2).map((item, i) => (
                 <span
                   key={`${item}-${i}`}
                   className="rounded-md border border-cyan-400/20 bg-cyan-500/10 px-2 py-1 text-[10px] text-cyan-100"

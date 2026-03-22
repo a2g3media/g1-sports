@@ -71,6 +71,10 @@ interface UserSettingRow {
   setting_key?: string | null;
   setting_value?: string | null;
 }
+interface FavoriteRow {
+  type?: string | null;
+  entity_id?: string | null;
+}
 type QueryResults<T> = { results?: T[] };
 type SnapshotRow = {
   market_key?: string | null;
@@ -873,6 +877,17 @@ export async function getUserContext(db: Db, userId: string | null): Promise<Use
     WHERE user_id = ? AND data_scope = 'PROD'
       AND setting_key IN ('favorite_sports', 'followed_teams', 'followed_players')
   `).bind(userId).all() as QueryResults<UserSettingRow>;
+  let favorites: QueryResults<FavoriteRow> = { results: [] };
+  try {
+    favorites = await db.prepare(`
+      SELECT type, entity_id
+      FROM favorites
+      WHERE user_id = ? AND type IN ('team', 'player')
+    `).bind(userId).all() as QueryResults<FavoriteRow>;
+  } catch {
+    // Backward-compatible fallback for environments without favorites table yet.
+    favorites = { results: [] };
+  }
 
   const map = new Map<string, string>();
   for (const row of (settings.results || [])) {
@@ -887,12 +902,22 @@ export async function getUserContext(db: Db, userId: string | null): Promise<Use
       return [];
     }
   };
+  const favoriteTeamIds = (favorites.results || [])
+    .filter((r) => String(r.type || "").toLowerCase() === "team")
+    .map((r) => String(r.entity_id || "").trim())
+    .filter(Boolean);
+  const favoritePlayerIds = (favorites.results || [])
+    .filter((r) => String(r.type || "").toLowerCase() === "player")
+    .map((r) => String(r.entity_id || "").trim())
+    .filter(Boolean);
+  const mergedTeams = Array.from(new Set([...parse("followed_teams"), ...favoriteTeamIds]));
+  const mergedPlayers = Array.from(new Set([...parse("followed_players"), ...favoritePlayerIds]));
 
   const built: UserContext = {
     userId,
-    favoriteTeams: parse("followed_teams"),
+    favoriteTeams: mergedTeams,
     favoriteSports: parse("favorite_sports"),
-    trackedPlayers: parse("followed_players"),
+    trackedPlayers: mergedPlayers,
     watchboards: [],
     preferredMarkets: ["spread", "moneyline", "total", "props"],
     riskProfile: null,

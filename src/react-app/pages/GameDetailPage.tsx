@@ -6,13 +6,13 @@
  */
 
 import { useState, useEffect, useCallback, memo, useMemo, useRef, type ReactNode } from "react";
-import { useParams, useNavigate, useSearchParams } from "react-router-dom";
+import { useParams, useNavigate, useSearchParams, useLocation } from "react-router-dom";
 import { 
   ArrowLeft, Loader2, TrendingUp, TrendingDown, DollarSign, 
   Building2, Clock, Activity,
   AlertCircle, Info, Users, History, HeartPulse,
   Trophy, Minus, ListOrdered, Zap, Volume2, VolumeX, Target, Plus, Check,
-  FileText, RefreshCw, Sparkles, AlertTriangle, Lock, Video
+  FileText, RefreshCw, Sparkles, AlertTriangle, Lock, Video, ChevronLeft, ChevronRight, ArrowRightLeft
 } from "lucide-react";
 import { Button } from "@/react-app/components/ui/button";
 import { Badge } from "@/react-app/components/ui/badge";
@@ -24,18 +24,30 @@ import { useSoundEffects } from "@/react-app/hooks/useSoundEffects";
 import { useWatchboards } from "@/react-app/hooks/useWatchboards";
 import { useCoachGPreview } from "@/react-app/hooks/useCoachGPreview";
 import { useIsPro } from "@/react-app/hooks/useGZSubscription";
+import { useFeatureFlags } from "@/react-app/hooks/useFeatureFlags";
 import MMAEventDetail from "@/react-app/components/MMAEventDetail";
 import GolfTournamentDetail from "@/react-app/components/GolfTournamentDetail";
 import { PropMovementPanel } from "@/react-app/components/PropMovementChart";
 import { ShotChart } from "@/react-app/components/ShotChart";
 import { MiniShotCourt, parseShotLocation, ShotLocation } from "@/react-app/components/MiniShotCourt";
 import { AddToWatchboardModal } from "@/react-app/components/AddToWatchboardModal";
+import FavoriteEntityButton from "@/react-app/components/FavoriteEntityButton";
 import { OddsIntelligencePanel } from "@/react-app/components/odds/OddsIntelligencePanel";
 import { CoachGSpotlightCard } from "@/react-app/components/CoachGSpotlightCard";
 import { CoachGAvatar } from "@/react-app/components/CoachGAvatar";
 import { PlayerPhoto } from "@/react-app/components/PlayerPhoto";
 import { TeamLogo } from "@/react-app/components/TeamLogo";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/react-app/components/ui/dropdown-menu";
 import { getMarketPeriodLabels } from "@/react-app/lib/marketPeriodLabels";
+import { getAllSoccerLeagues, getSoccerLeagueMeta } from "@/react-app/lib/soccerLeagueMeta";
+import { toGameDetailPath } from "@/react-app/lib/gameRoutes";
 
 // ====================
 // TYPES
@@ -74,10 +86,10 @@ interface SportsbookLine {
 
 interface LineHistoryPoint {
   timestamp: string;
-  spread: number;
-  total: number;
-  mlHome?: number;
-  mlAway?: number;
+  spread: number | null;
+  total: number | null;
+  mlHome?: number | null;
+  mlAway?: number | null;
 }
 
 interface PlayByPlayEvent {
@@ -223,6 +235,8 @@ interface PlayerProp {
   player_name: string;
   player_id?: number;
   team?: string;
+  home_team?: string;
+  away_team?: string;
   sportsbook?: string;
   prop_type: string;
   line_value: number;
@@ -258,6 +272,7 @@ const TABS: { id: TabId; label: string; icon: typeof Activity }[] = [
   { id: 'box-score', label: 'Box Score', icon: Users },
   { id: 'play-by-play', label: 'Play By Play', icon: ListOrdered },
 ];
+
 
 const TAB_META: Record<TabId, { subtitle: string; accent: "blue" | "green" | "red" | "amber" | "violet" }> = {
   overview: { subtitle: "Snapshot intelligence and core game context.", accent: "blue" },
@@ -385,6 +400,8 @@ function normalizeGameProps(
     playerId?: string;
     type?: string;
     line?: number;
+    home_team?: string;
+    away_team?: string;
     overOdds?: number;
     underOdds?: number;
     bookName?: string;
@@ -394,7 +411,7 @@ function normalizeGameProps(
 
   return props
     .map((prop, idx) => {
-      const playerName = prop.player_name || prop.playerName || '';
+      const playerName = (prop.player_name || prop.playerName || '').trim();
       const propType = prop.prop_type || prop.type || '';
       const lineValue = prop.line_value ?? prop.line;
       if (!playerName || !propType || lineValue === undefined || lineValue === null) return null;
@@ -410,6 +427,8 @@ function normalizeGameProps(
         player_name: playerName,
         player_id: parsedPlayerId,
         team: prop.team,
+        home_team: typeof prop.home_team === 'string' ? prop.home_team : undefined,
+        away_team: typeof prop.away_team === 'string' ? prop.away_team : undefined,
         sportsbook: prop.sportsbook || prop.bookmaker || prop.bookName,
         prop_type: propType,
         line_value: Number(lineValue),
@@ -626,7 +645,7 @@ const TabsWithScrollFade = memo(function TabsWithScrollFade({
         ))}
       </div>
       <p className="mt-2 flex items-center gap-2 px-1 text-[11px] md:text-xs text-[#9CA3AF]">
-        <span className="inline-block h-1.5 w-1.5 rounded-full bg-cyan-300 shadow-[0_0_10px_rgba(34,211,238,0.8)] animate-pulse" />
+        <span className="inline-block h-1.5 w-1.5 rounded-full bg-cyan-300/80" />
         Switch views instantly: lines, books, props, H2H, injuries, and more.
       </p>
     </div>
@@ -740,6 +759,7 @@ const GameHeroPanel = memo(function GameHeroPanel({
           <div className="flex items-center gap-3">
             <TeamLogo
               teamCode={game.awayTeam || "AWY"}
+              teamName={awayName}
               sport={game.sport}
               size={96}
               winnerGlow={awayWon}
@@ -777,6 +797,7 @@ const GameHeroPanel = memo(function GameHeroPanel({
             </div>
             <TeamLogo
               teamCode={game.homeTeam || "HOM"}
+              teamName={homeName}
               sport={game.sport}
               size={96}
               winnerGlow={homeWon}
@@ -882,7 +903,18 @@ const BettingIntelligencePanel = memo(function BettingIntelligencePanel({ game }
   const spreadNow = game.odds?.spread;
   const spreadOpen = game.odds?.openSpread;
   const spreadMove = spreadNow !== undefined && spreadOpen !== undefined ? spreadNow - spreadOpen : 0;
-  const topProps = (game.props || []).slice(0, 3);
+  const topProps = useMemo(() => {
+    const seen = new Set<string>();
+    const out: PlayerProp[] = [];
+    for (const prop of game.props || []) {
+      const key = `${(prop.player_name || '').trim().toLowerCase()}|${String(prop.prop_type || '').trim().toLowerCase()}|${Number(prop.line_value)}`;
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      out.push(prop);
+      if (out.length >= 3) break;
+    }
+    return out;
+  }, [game.props]);
   const publicLean =
     game.publicBetHome !== undefined && game.publicBetAway !== undefined
       ? game.publicBetHome >= game.publicBetAway
@@ -1191,10 +1223,40 @@ const LineMovementTab = memo(function LineMovementTab({ game }: { game: GameData
     );
   }
 
-  const firstPoint = history[0];
-  const lastPoint = history[history.length - 1];
-  const spreadChange = lastPoint.spread - firstPoint.spread;
-  const totalChange = lastPoint.total - firstPoint.total;
+  const spreadPoints = history.filter((point) => point.spread !== null);
+  const totalPoints = history.filter((point) => point.total !== null);
+  const firstSpreadPoint = spreadPoints[0];
+  const lastSpreadPoint = spreadPoints[spreadPoints.length - 1];
+  const firstTotalPoint = totalPoints[0];
+  const lastTotalPoint = totalPoints[totalPoints.length - 1];
+  const spreadChange =
+    spreadPoints.length >= 2 &&
+    firstSpreadPoint &&
+    lastSpreadPoint &&
+    firstSpreadPoint.spread !== null &&
+    lastSpreadPoint.spread !== null
+      ? lastSpreadPoint.spread - firstSpreadPoint.spread
+      : null;
+  const totalChange =
+    totalPoints.length >= 2 &&
+    firstTotalPoint &&
+    lastTotalPoint &&
+    firstTotalPoint.total !== null &&
+    lastTotalPoint.total !== null
+      ? lastTotalPoint.total - firstTotalPoint.total
+      : null;
+  const spreadChangeResolved =
+    spreadChange !== null
+      ? spreadChange
+      : (game.odds?.spread !== undefined && game.odds?.openSpread !== undefined
+        ? game.odds.spread - game.odds.openSpread
+        : null);
+  const totalChangeResolved =
+    totalChange !== null
+      ? totalChange
+      : (game.odds?.total !== undefined && game.odds?.openTotal !== undefined
+        ? game.odds.total - game.odds.openTotal
+        : null);
 
   return (
     <div className="space-y-4">
@@ -1206,33 +1268,45 @@ const LineMovementTab = memo(function LineMovementTab({ game }: { game: GameData
       />
       {/* Movement Summary */}
       <div className="grid grid-cols-2 gap-3">
-        <GlassCard className="p-5 border border-white/[0.05] bg-[#16202B] transition-all hover:-translate-y-0.5 hover:shadow-[0_10px_24px_rgba(0,0,0,0.30)]" glow={spreadChange !== 0 ? (spreadChange > 0 ? 'emerald' : 'red') : undefined}>
+        <GlassCard className="p-5 border border-white/[0.05] bg-[#16202B] transition-all hover:-translate-y-0.5 hover:shadow-[0_10px_24px_rgba(0,0,0,0.30)]" glow={spreadChangeResolved && spreadChangeResolved !== 0 ? (spreadChangeResolved > 0 ? 'emerald' : 'red') : undefined}>
           <div className="mb-2 text-[10px] uppercase tracking-wide text-[#6B7280]">Spread Movement</div>
           <div className="flex items-center gap-2">
-            <span className="text-2xl font-bold text-[#E5E7EB]">{spreadChange > 0 ? '+' : ''}{spreadChange.toFixed(1)}</span>
-            {spreadChange !== 0 && (
-              spreadChange > 0 
+            <span className="text-2xl font-bold text-[#E5E7EB]">
+              {spreadChangeResolved === null ? "—" : `${spreadChangeResolved > 0 ? '+' : ''}${spreadChangeResolved.toFixed(1)}`}
+            </span>
+            {spreadChangeResolved !== null && spreadChangeResolved !== 0 && (
+              spreadChangeResolved > 0 
                 ? <TrendingUp className="w-5 h-5 text-emerald-400" />
                 : <TrendingDown className="w-5 h-5 text-red-400" />
             )}
           </div>
           <div className="mt-1 text-xs text-[#9CA3AF]">
-            {formatSpread(firstPoint.spread)} → {formatSpread(lastPoint.spread)}
+            {firstSpreadPoint && lastSpreadPoint
+              ? `${formatSpread(firstSpreadPoint.spread)} → ${formatSpread(lastSpreadPoint.spread)}`
+              : (game.odds?.openSpread !== undefined && game.odds?.spread !== undefined
+                ? `${formatSpread(game.odds.openSpread)} → ${formatSpread(game.odds.spread)}`
+                : "Insufficient spread points")}
           </div>
         </GlassCard>
         
-        <GlassCard className="p-5 border border-white/[0.05] bg-[#16202B] transition-all hover:-translate-y-0.5 hover:shadow-[0_10px_24px_rgba(0,0,0,0.30)]" glow={totalChange !== 0 ? (totalChange > 0 ? 'emerald' : 'red') : undefined}>
+        <GlassCard className="p-5 border border-white/[0.05] bg-[#16202B] transition-all hover:-translate-y-0.5 hover:shadow-[0_10px_24px_rgba(0,0,0,0.30)]" glow={totalChangeResolved && totalChangeResolved !== 0 ? (totalChangeResolved > 0 ? 'emerald' : 'red') : undefined}>
           <div className="mb-2 text-[10px] uppercase tracking-wide text-[#6B7280]">Total Movement</div>
           <div className="flex items-center gap-2">
-            <span className="text-2xl font-bold text-[#E5E7EB]">{totalChange > 0 ? '+' : ''}{totalChange.toFixed(1)}</span>
-            {totalChange !== 0 && (
-              totalChange > 0 
+            <span className="text-2xl font-bold text-[#E5E7EB]">
+              {totalChangeResolved === null ? "—" : `${totalChangeResolved > 0 ? '+' : ''}${totalChangeResolved.toFixed(1)}`}
+            </span>
+            {totalChangeResolved !== null && totalChangeResolved !== 0 && (
+              totalChangeResolved > 0 
                 ? <TrendingUp className="w-5 h-5 text-emerald-400" />
                 : <TrendingDown className="w-5 h-5 text-red-400" />
             )}
           </div>
           <div className="mt-1 text-xs text-[#9CA3AF]">
-            {firstPoint.total} → {lastPoint.total}
+            {firstTotalPoint && lastTotalPoint && firstTotalPoint.total !== null && lastTotalPoint.total !== null
+              ? `${firstTotalPoint.total} → ${lastTotalPoint.total}`
+              : (game.odds?.openTotal !== undefined && game.odds?.total !== undefined
+                ? `${game.odds.openTotal} → ${game.odds.total}`
+                : "Insufficient total points")}
           </div>
         </GlassCard>
       </div>
@@ -1251,7 +1325,8 @@ const LineMovementTab = memo(function LineMovementTab({ game }: { game: GameData
                   month: 'short',
                   day: 'numeric',
                   hour: 'numeric',
-                  minute: '2-digit'
+                  minute: '2-digit',
+                  second: '2-digit'
                 })}
               </div>
               <div className="flex items-center gap-4">
@@ -1261,7 +1336,7 @@ const LineMovementTab = memo(function LineMovementTab({ game }: { game: GameData
                 </div>
                 <div className="text-center">
                   <div className="text-[10px] text-[#6B7280] uppercase">Total</div>
-                  <div className="text-sm font-semibold text-[#E5E7EB]">{point.total}</div>
+                  <div className="text-sm font-semibold text-[#E5E7EB]">{point.total ?? "—"}</div>
                 </div>
               </div>
             </div>
@@ -2123,8 +2198,23 @@ const InjuriesTab = memo(function InjuriesTab({
     );
   }
 
-  const homeInjuries = injuries?.injuries?.home || [];
-  const awayInjuries = injuries?.injuries?.away || [];
+  const homeRawInjuries = injuries?.injuries?.home || [];
+  const awayRawInjuries = injuries?.injuries?.away || [];
+  const isInjuryRelevantStatus = (status: string) => {
+    const s = String(status || "").toLowerCase().trim();
+    if (!s) return false;
+    if (s.includes("out")) return true;
+    if (s.includes("doubtful")) return true;
+    if (s.includes("questionable")) return true;
+    if (s.includes("probable")) return true;
+    if (s.includes("day-to-day") || s.includes("day to day")) return true;
+    if (s.includes("injured") || s.includes("injury")) return true;
+    if (s.includes("ir") || s.includes("injured reserve")) return true;
+    if (s.includes("suspended") || s.includes("suspension")) return true;
+    return false;
+  };
+  const homeInjuries = homeRawInjuries.filter((inj) => isInjuryRelevantStatus(inj.status));
+  const awayInjuries = awayRawInjuries.filter((inj) => isInjuryRelevantStatus(inj.status));
 
   if (!homeInjuries.length && !awayInjuries.length) {
     return (
@@ -2136,39 +2226,77 @@ const InjuriesTab = memo(function InjuriesTab({
     );
   }
 
-  const getStatusColor = (status: string) => {
+  const getStatusTone = (status: string) => {
     const s = status.toLowerCase();
-    if (s.includes('out')) return 'text-red-400 bg-red-500/20';
-    if (s.includes('doubtful')) return 'text-orange-400 bg-orange-500/20';
-    if (s.includes('questionable')) return 'text-amber-400 bg-amber-500/20';
-    if (s.includes('probable') || s.includes('day-to-day')) return 'text-yellow-400 bg-yellow-500/20';
-    return 'text-[#9CA3AF] bg-white/10';
+    if (s.includes("out")) return "border-red-500/28 bg-red-500/10 text-red-300";
+    if (s.includes("doubtful")) return "border-orange-500/28 bg-orange-500/10 text-orange-300";
+    if (s.includes("questionable")) return "border-amber-500/28 bg-amber-500/10 text-amber-300";
+    if (s.includes("probable") || s.includes("day-to-day")) return "border-yellow-500/28 bg-yellow-500/10 text-yellow-300";
+    return "border-white/12 bg-white/[0.03] text-[#9CA3AF]";
   };
 
-  const InjuryList = ({ injuryList, teamName }: { injuryList: Injury[]; teamName: string }) => (
-    <GlassCard className="p-4 border border-red-500/20 bg-[#121821]">
-      <SectionHeader icon={HeartPulse} title={`${teamName} (${injuryList.length})`} subtitle="Player availability and risk status." accent="red" />
-      <div className="space-y-2">
-        {injuryList.map((inj, idx) => (
-          <div 
-            key={idx}
-            className="flex items-start justify-between rounded-xl border border-white/[0.05] bg-white/[0.02] p-3 transition-all hover:-translate-y-0.5 hover:bg-red-500/[0.08]"
-          >
-            <div className="flex-1">
-              <div className="flex items-center gap-2">
-                <span className="text-sm font-medium text-[#E5E7EB]">{inj.playerName}</span>
-                <span className="text-xs text-[#6B7280]">{inj.position}</span>
-              </div>
-              <div className="mt-1 text-xs text-[#9CA3AF]">{inj.injury || 'Undisclosed'}</div>
-            </div>
-            <Badge className={cn("text-[10px]", getStatusColor(inj.status))}>
-              {inj.status.toUpperCase()}
-            </Badge>
+  const getStatusPriority = (status: string) => {
+    const s = String(status || "").toLowerCase();
+    if (s.includes("out")) return 0;
+    if (s.includes("doubtful")) return 1;
+    if (s.includes("questionable")) return 2;
+    if (s.includes("probable") || s.includes("day-to-day")) return 3;
+    return 4;
+  };
+
+  const InjuryList = ({ injuryList, teamName }: { injuryList: Injury[]; teamName: string }) => {
+    const sortedInjuries = [...injuryList].sort((a, b) => {
+      const byStatus = getStatusPriority(a.status) - getStatusPriority(b.status);
+      if (byStatus !== 0) return byStatus;
+      return String(a.playerName || "").localeCompare(String(b.playerName || ""));
+    });
+    const severeCount = injuryList.filter((inj) => {
+      const s = String(inj.status || "").toLowerCase();
+      return s.includes("out") || s.includes("doubtful");
+    }).length;
+
+    return (
+      <GlassCard className="border border-white/8 bg-[#121821] p-4">
+        <div className="mb-2 flex items-center justify-between">
+          <div className="flex items-center gap-2 min-w-0">
+            <HeartPulse className="h-3.5 w-3.5 text-red-300/70" />
+            <span className="truncate text-sm font-semibold text-[#E5E7EB]">{teamName}</span>
           </div>
-        ))}
-      </div>
-    </GlassCard>
-  );
+          <div className="flex items-center gap-1.5 text-[10px]">
+            <span className="rounded-md border border-white/10 bg-white/[0.03] px-1.5 py-0.5 text-[#9CA3AF]">
+              {injuryList.length} listed
+            </span>
+            {severeCount > 0 && (
+              <span className="rounded-md border border-red-500/25 bg-red-500/10 px-1.5 py-0.5 text-red-300">
+                {severeCount} high risk
+              </span>
+            )}
+          </div>
+        </div>
+        <div className="overflow-hidden rounded-xl border border-white/[0.06] bg-white/[0.015] divide-y divide-white/[0.05]">
+          {sortedInjuries.map((inj, idx) => (
+            <div
+              key={idx}
+              className="grid grid-cols-[1fr_auto] items-start gap-3 px-3 py-2.5"
+            >
+              <div className="min-w-0">
+                <div className="flex items-center gap-2">
+                  <span className="truncate text-sm font-medium text-[#E5E7EB]">{inj.playerName}</span>
+                  <span className="rounded border border-white/10 bg-white/[0.025] px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-[#9CA3AF]">
+                    {inj.position || "N/A"}
+                  </span>
+                </div>
+                <p className="mt-0.5 truncate text-[11px] text-[#9CA3AF]">{inj.injury || "Undisclosed"}</p>
+              </div>
+              <Badge className={cn("h-5 rounded-md border px-2 text-[10px] font-semibold uppercase tracking-wide", getStatusTone(inj.status))}>
+                {inj.status || "Unknown"}
+              </Badge>
+            </div>
+          ))}
+        </div>
+      </GlassCard>
+    );
+  };
 
   return (
     <div className="space-y-4">
@@ -2178,6 +2306,11 @@ const InjuriesTab = memo(function InjuriesTab({
         subtitle="Monitor risk before lock and during live windows."
         accent="red"
       />
+      <div className="rounded-xl border border-white/10 bg-white/[0.02] px-3 py-2 text-[11px] text-[#9CA3AF]">
+        <span className="font-medium text-[#E5E7EB]">{getTeamName(false)}</span> {awayInjuries.length} listed
+        <span className="mx-2 text-white/25">•</span>
+        <span className="font-medium text-[#E5E7EB]">{getTeamName(true)}</span> {homeInjuries.length} listed
+      </div>
       {awayInjuries.length > 0 && (
         <InjuryList injuryList={awayInjuries} teamName={getTeamName(false)} />
       )}
@@ -2195,6 +2328,11 @@ const PlayerPropsTab = memo(function PlayerPropsTab({
   isLoading,
   gameId,
   sport,
+  homeTeamCode,
+  awayTeamCode,
+  homeTeamName,
+  awayTeamName,
+  boxScore,
   propsSource,
   propsFallbackReason
 }: { 
@@ -2202,13 +2340,18 @@ const PlayerPropsTab = memo(function PlayerPropsTab({
   isLoading: boolean;
   gameId: string;
   sport: string;
+  homeTeamCode?: string;
+  awayTeamCode?: string;
+  homeTeamName?: string;
+  awayTeamName?: string;
+  boxScore?: BoxScoreData | null;
   propsSource?: 'event' | 'competition' | 'placeholder' | 'none';
   propsFallbackReason?: string | null;
 }) {
   const { addProp, isPropInWatchboard, activeBoard } = useWatchboards();
   const [addedProps, setAddedProps] = useState<Set<string>>(new Set());
   const [marketFilter, setMarketFilter] = useState<string>('ALL');
-  const [teamFilter, setTeamFilter] = useState<string>('ALL');
+  const [teamFilter, setTeamFilter] = useState<'ALL' | 'HOME' | 'AWAY'>('ALL');
   const [sortBy, setSortBy] = useState<'edge' | 'line' | 'name'>('edge');
 
   // Format prop type display
@@ -2271,19 +2414,86 @@ const PlayerPropsTab = memo(function PlayerPropsTab({
     return ['ALL', ...Array.from(set).sort()];
   }, [props]);
 
-  const teamOptions = useMemo(() => {
-    const set = new Set<string>();
-    for (const prop of props || []) {
-      if (prop.team?.trim()) set.add(prop.team.trim());
+  const normalizeTeamToken = (value: string) => value.toLowerCase().replace(/[^a-z0-9]/g, '');
+  const normalizePlayerToken = (value: string) => {
+    const trimmed = String(value || "").trim();
+    const reordered = trimmed.includes(",")
+      ? (() => {
+          const [last, first] = trimmed.split(",", 2).map((part) => part.trim());
+          return first && last ? `${first} ${last}` : trimmed;
+        })()
+      : trimmed;
+    return reordered
+      .normalize("NFD")
+      .replace(/[\u0300-\u036f]/g, "")
+      .toLowerCase()
+      .replace(/[.,'’`-]/g, " ")
+      .replace(/\b(jr|sr|ii|iii|iv|v)\b/g, "")
+      .replace(/\s+/g, " ")
+      .trim();
+  };
+  const buildTeamTokens = useCallback((name: string, code: string) => {
+    const tokens = new Set<string>();
+    const add = (v: string) => {
+      const t = normalizeTeamToken(v || '');
+      if (t) tokens.add(t);
+    };
+    add(name);
+    add(code);
+    const parts = String(name || '').split(/\s+/).map((p) => p.trim()).filter(Boolean);
+    if (parts.length > 0) add(parts[0]);
+    if (parts.length > 1) add(parts[parts.length - 1]);
+    if (parts.length > 2) add(parts.slice(-2).join(' '));
+    return tokens;
+  }, []);
+  const homeTeamTokens = useMemo(
+    () => buildTeamTokens(homeTeamName || '', homeTeamCode || ''),
+    [buildTeamTokens, homeTeamCode, homeTeamName]
+  );
+  const awayTeamTokens = useMemo(
+    () => buildTeamTokens(awayTeamName || '', awayTeamCode || ''),
+    [awayTeamCode, awayTeamName, buildTeamTokens]
+  );
+  const homeRosterPlayerTokens = useMemo(
+    () =>
+      new Set(
+        (boxScore?.homePlayers || [])
+          .map((p) => normalizePlayerToken(p.name))
+          .filter(Boolean)
+      ),
+    [boxScore?.homePlayers]
+  );
+  const awayRosterPlayerTokens = useMemo(
+    () =>
+      new Set(
+        (boxScore?.awayPlayers || [])
+          .map((p) => normalizePlayerToken(p.name))
+          .filter(Boolean)
+      ),
+    [boxScore?.awayPlayers]
+  );
+  const inferPropTeamSide = useCallback((propTeam: string | undefined): 'HOME' | 'AWAY' | 'OTHER' => {
+    const token = normalizeTeamToken(propTeam || '');
+    if (token) {
+      for (const t of homeTeamTokens) {
+        if (token.includes(t) || t.includes(token)) return 'HOME';
+      }
+      for (const t of awayTeamTokens) {
+        if (token.includes(t) || t.includes(token)) return 'AWAY';
+      }
     }
-    return ['ALL', ...Array.from(set).sort((a, b) => a.localeCompare(b))];
-  }, [props]);
+    return 'OTHER';
+  }, [awayTeamTokens, homeTeamTokens]);
 
-  useEffect(() => {
-    if (teamFilter !== 'ALL' && !teamOptions.includes(teamFilter)) {
-      setTeamFilter('ALL');
-    }
-  }, [teamFilter, teamOptions]);
+  const teamPills = useMemo(() => {
+    const homeLabel = homeTeamName || homeTeamCode || 'Home';
+    const awayLabel = awayTeamName || awayTeamCode || 'Away';
+    return [
+      { key: 'ALL' as const, label: 'All Players', teamCode: '', teamName: '' },
+      { key: 'HOME' as const, label: homeLabel, teamCode: homeTeamCode || homeLabel.slice(0, 3).toUpperCase(), teamName: homeLabel },
+      { key: 'AWAY' as const, label: awayLabel, teamCode: awayTeamCode || awayLabel.slice(0, 3).toUpperCase(), teamName: awayLabel },
+    ];
+  }, [awayTeamCode, awayTeamName, homeTeamCode, homeTeamName]);
 
   const handleAddProp = async (prop: PlayerProp, selection: 'Over' | 'Under', odds: number | null) => {
     const propKey = `${prop.player_name}-${prop.prop_type}-${selection}`;
@@ -2327,11 +2537,28 @@ const PlayerPropsTab = memo(function PlayerPropsTab({
   }
 
   // Group props by player
-  const filteredProps = (props || []).filter((prop) => {
-    if (teamFilter !== 'ALL' && (prop.team || '') !== teamFilter) return false;
-    if (marketFilter === 'ALL') return true;
-    return formatPropType(prop.prop_type) === marketFilter;
+  const baseFilteredProps = (props || []).filter((prop) => {
+    if (marketFilter !== 'ALL' && formatPropType(prop.prop_type) !== marketFilter) return false;
+    return true;
   });
+  const sideFilteredProps = baseFilteredProps.filter((prop) => {
+    if (teamFilter !== 'ALL') {
+      let side = inferPropTeamSide(prop.team);
+      if (side === 'OTHER') {
+        const playerToken = normalizePlayerToken(prop.player_name);
+        if (playerToken) {
+          if (homeRosterPlayerTokens.has(playerToken)) side = 'HOME';
+          else if (awayRosterPlayerTokens.has(playerToken)) side = 'AWAY';
+        }
+      }
+      if (side !== teamFilter) return false;
+    }
+    return true;
+  });
+  const filteredProps = (teamFilter !== 'ALL' && sideFilteredProps.length === 0)
+    ? baseFilteredProps
+    : sideFilteredProps;
+  const teamSplitUnavailable = teamFilter !== 'ALL' && sideFilteredProps.length === 0;
 
   const propsByPlayer = filteredProps.reduce((acc, prop) => {
     const key = prop.player_name;
@@ -2366,8 +2593,8 @@ const PlayerPropsTab = memo(function PlayerPropsTab({
   const sourceLabel = (() => {
     if (propsSource === 'event') return 'Event props';
     if (propsSource === 'competition') return 'Competition props';
-    if (propsSource === 'placeholder') return 'Placeholder props';
-    return 'Unknown source';
+    if (propsSource === 'placeholder') return 'Baseline props';
+    return 'Props feed';
   })();
 
   return (
@@ -2427,18 +2654,27 @@ const PlayerPropsTab = memo(function PlayerPropsTab({
         <div className="space-y-3">
           <div className="flex flex-wrap items-center gap-2">
             <div className="text-xs text-slate-400 mr-1">Teams:</div>
-            {teamOptions.map((team) => (
+            {teamPills.map((team) => (
               <button
-                key={team}
-                onClick={() => setTeamFilter(team)}
+                key={team.key}
+                onClick={() => setTeamFilter(team.key)}
                 className={cn(
-                  "px-2.5 py-1 rounded-full text-xs border transition-colors",
-                  teamFilter === team
-                    ? "bg-emerald-500/20 border-emerald-500/40 text-emerald-300"
+                  "inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs border transition-colors",
+                  teamFilter === team.key
+                    ? "bg-emerald-500/20 border-emerald-500/40 text-emerald-300 shadow-[0_0_16px_rgba(16,185,129,0.18)]"
                     : "bg-white/[0.02] border-white/[0.05] text-[#9CA3AF] hover:bg-white/[0.05]"
                 )}
               >
-                {team}
+                {team.key !== 'ALL' && (
+                  <TeamLogo
+                    teamCode={team.teamCode}
+                    teamName={team.teamName}
+                    sport={sport}
+                    size={16}
+                    className="rounded-full"
+                  />
+                )}
+                <span>{team.label}</span>
               </button>
             ))}
           </div>
@@ -2473,6 +2709,11 @@ const PlayerPropsTab = memo(function PlayerPropsTab({
           </div>
         </div>
         </div>
+        {teamSplitUnavailable && (
+          <div className="mt-2 text-[11px] text-amber-300/80">
+            Team split is temporarily unavailable for this feed; showing all players.
+          </div>
+        )}
       </GlassCard>
 
       {rankingRow.length > 0 && (
@@ -2501,27 +2742,63 @@ const PlayerPropsTab = memo(function PlayerPropsTab({
       
       {groupedEntries.map(([playerName, playerProps]) => (
         <GlassCard key={playerName} className="border border-white/[0.05] bg-[#121821] p-4 shadow-[0_0_22px_rgba(255,255,255,0.06)] transition-all hover:-translate-y-0.5">
-          <div className="flex items-center gap-3 mb-3">
-            <PlayerPhoto playerName={playerName} sport={sport.toLowerCase()} size={42} />
-            <div className="min-w-0">
-              <h3 className="truncate text-sm font-semibold text-[#E5E7EB]">{playerName}</h3>
-              {playerProps[0]?.team && (
-                <span className="text-xs text-slate-500">{playerProps[0].team}</span>
-              )}
-            </div>
-            {playerProps[0]?.team && (
-              <Badge className="ml-auto text-[10px] bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">
-                {playerProps.length} markets
-              </Badge>
-            )}
-          </div>
-          
-          <div className="space-y-2">
-            {playerProps.map((prop, idx) => {
+          {(() => {
+            const groupedByMarket = playerProps.reduce((acc, prop) => {
+              const key = formatPropType(String(prop.prop_type || "unknown")).toLowerCase();
+              if (!acc[key]) acc[key] = [];
+              acc[key].push(prop);
+              return acc;
+            }, {} as Record<string, PlayerProp[]>);
+            const marketCards = Object.values(groupedByMarket)
+              .filter((rows) => rows.length > 0)
+              .map((rows) => {
+                const sortedRows = [...rows]
+                  .sort((a, b) => (a.sportsbook || '').localeCompare(b.sportsbook || ''))
+                  .filter((row, idx, all) => {
+                    const key = `${row.sportsbook || "book"}|${row.line_value}|${row.over_odds ?? ""}|${row.under_odds ?? ""}`;
+                    return all.findIndex((candidate) => (
+                      `${candidate.sportsbook || "book"}|${candidate.line_value}|${candidate.over_odds ?? ""}|${candidate.under_odds ?? ""}`
+                    ) === key) === idx;
+                  });
+                // Representative row for main action buttons/card metrics.
+                const primary = sortedRows[0];
+                return {
+                  primary,
+                  rows: sortedRows,
+                };
+              });
+
+            return (
+              <>
+                <div className="flex items-center gap-3 mb-3">
+                  <PlayerPhoto
+                    playerName={playerName}
+                    sport={sport.toLowerCase()}
+                    size={42}
+                    showRing={true}
+                    ringColor="ring-white/15"
+                  />
+                  <div className="min-w-0">
+                    <h3 className="truncate text-sm font-semibold text-[#E5E7EB]">{playerName}</h3>
+                    {playerProps[0]?.team && (
+                      <span className="text-xs text-slate-500">{playerProps[0].team}</span>
+                    )}
+                  </div>
+                  {playerProps[0]?.team && (
+                    <Badge className="ml-auto text-[10px] bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">
+                      {marketCards.length} markets
+                    </Badge>
+                  )}
+                </div>
+                
+                <div className="space-y-2">
+                  {marketCards.map(({ primary: prop, rows: marketRows }, idx) => {
               const overKey = `${prop.player_name}-${prop.prop_type}-Over`;
               const underKey = `${prop.player_name}-${prop.prop_type}-Under`;
+              const watchKey = `${prop.player_name}-${prop.prop_type}-Track`;
               const overAdded = addedProps.has(overKey) || isPropInWatchboard(gameId, prop.player_name, prop.prop_type, 'Over');
               const underAdded = addedProps.has(underKey) || isPropInWatchboard(gameId, prop.player_name, prop.prop_type, 'Under');
+              const trackedInWatchboard = addedProps.has(watchKey) || isPropInWatchboard(gameId, prop.player_name, prop.prop_type);
               const insight = buildInsight(prop);
               const edgeColor = insight.edge >= 0 ? "text-emerald-300" : "text-rose-300";
               const confidenceStars = Array.from({ length: 5 }, (_, i) => i < insight.confidence);
@@ -2530,7 +2807,7 @@ const PlayerPropsTab = memo(function PlayerPropsTab({
               
               return (
                 <div 
-                  key={idx}
+                  key={`${prop.player_name}-${prop.prop_type}-${idx}`}
                   className="rounded-xl border border-white/[0.05] bg-white/[0.02] p-3 transition-all hover:-translate-y-0.5 hover:bg-white/[0.06]"
                 >
                   <div className="flex items-center justify-between gap-3">
@@ -2574,6 +2851,36 @@ const PlayerPropsTab = memo(function PlayerPropsTab({
                     </div>
                     
                     <div className="flex items-center gap-2">
+                    {/* Track button */}
+                    <button
+                      onClick={async () => {
+                        if (trackedInWatchboard) return;
+                        const res = await addProp({
+                          game_id: gameId,
+                          player_name: prop.player_name,
+                          player_id: prop.player_id?.toString() || undefined,
+                          team: prop.team || undefined,
+                          sport: sport,
+                          prop_type: prop.prop_type,
+                          line_value: prop.line_value,
+                          selection: 'Track',
+                          added_from: 'game_detail_track',
+                        });
+                        if (res.success) {
+                          setAddedProps(prev => new Set(prev).add(watchKey));
+                        }
+                      }}
+                      disabled={trackedInWatchboard}
+                      className={cn(
+                        "flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium transition-all",
+                        trackedInWatchboard
+                          ? "bg-cyan-500/20 text-cyan-300 cursor-default"
+                          : "bg-cyan-500/10 text-cyan-300 hover:bg-cyan-500/20"
+                      )}
+                    >
+                      {trackedInWatchboard ? <Check className="w-3.5 h-3.5" /> : <Plus className="w-3.5 h-3.5" />}
+                      <span>Watchboard</span>
+                    </button>
                     {/* Over button */}
                     <button
                       onClick={() => handleAddProp(prop, 'Over', prop.over_odds || null)}
@@ -2644,11 +2951,10 @@ const PlayerPropsTab = memo(function PlayerPropsTab({
                   </div>
 
                   {(() => {
-                    const bookRows = playerProps
-                      .filter((candidate) => candidate.prop_type === prop.prop_type)
+                    const bookRows = marketRows
                       .filter((candidate) => Boolean(candidate.sportsbook))
                       .sort((aBook, bBook) => (aBook.sportsbook || '').localeCompare(bBook.sportsbook || ''));
-                    if (bookRows.length <= 1) return null;
+                    if (bookRows.length === 0) return null;
                     return (
                       <div className="mt-3 rounded-lg border border-white/[0.05] bg-white/[0.02] p-2">
                         <div className="mb-1 text-[10px] text-[#6B7280]">Book-by-book lines</div>
@@ -2677,8 +2983,11 @@ const PlayerPropsTab = memo(function PlayerPropsTab({
                   />
                 </div>
               );
-            })}
-          </div>
+                  })}
+                </div>
+              </>
+            );
+          })()}
         </GlassCard>
       ))}
     </div>
@@ -3513,6 +3822,7 @@ const LiveHeroScoreboard = memo(function LiveHeroScoreboard({
           <div className="flex items-center gap-2">
             <TeamLogo
               teamCode={game.awayTeam || "AWY"}
+              teamName={awayDisplay}
               sport={game.sport}
               size={52}
               className="drop-shadow-[0_10px_14px_rgba(0,0,0,0.45)]"
@@ -3532,6 +3842,7 @@ const LiveHeroScoreboard = memo(function LiveHeroScoreboard({
             <p className="truncate text-sm font-semibold tracking-wide text-[#E5E7EB]">{homeDisplay}</p>
             <TeamLogo
               teamCode={game.homeTeam || "HOM"}
+              teamName={homeDisplay}
               sport={game.sport}
               size={52}
               className="drop-shadow-[0_10px_14px_rgba(0,0,0,0.45)]"
@@ -3862,6 +4173,7 @@ const FinalHeroPanel = memo(function FinalHeroPanel({
               <div className="pointer-events-none absolute inset-[-6px] rounded-full bg-violet-400/18 blur-md" />
               <TeamLogo
                 teamCode={game.awayTeam || "AWY"}
+                teamName={getTeamName(false)}
                 sport={game.sport}
                 size={64}
                 winnerGlow={awayWon}
@@ -3886,6 +4198,7 @@ const FinalHeroPanel = memo(function FinalHeroPanel({
               <div className="pointer-events-none absolute inset-[-6px] rounded-full bg-violet-400/18 blur-md" />
               <TeamLogo
                 teamCode={game.homeTeam || "HOM"}
+                teamName={getTeamName(true)}
                 sport={game.sport}
                 size={64}
                 winnerGlow={homeWon}
@@ -3939,12 +4252,14 @@ export function GameDetailPage() {
   const league = params.sportKey || params.league;
   const gameId = params.matchId || params.gameId;
   const navigate = useNavigate();
+  const location = useLocation();
   const { lookups: teamLookups } = useTeamLookup();
+  const { flags } = useFeatureFlags();
   
   const [game, setGame] = useState<GameData | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [searchParams] = useSearchParams();
+  const [searchParams, setSearchParams] = useSearchParams();
   
   // Detect ?view=odds (or other tab) from URL - used when coming from Odds Board
   const initialTab = useMemo((): TabId => {
@@ -3986,6 +4301,16 @@ export function GameDetailPage() {
     const parts = gameId.split('_');
     return parts.length >= 2 ? parts[1].toLowerCase() : null;
   }, [gameId]);
+  const isSoccerContext = useMemo(() => {
+    const from = String(searchParams.get("from") || "").toLowerCase();
+    const inferredSport = String(srSport || params.sportKey || league || game?.sport || "").toLowerCase();
+    return (
+      inferredSport === "soccer" ||
+      gameId?.startsWith("sr:sport_event:") === true ||
+      location.pathname.includes("/sports/soccer/") ||
+      from.startsWith("soccer")
+    );
+  }, [searchParams, srSport, params.sportKey, league, game?.sport, gameId, location.pathname]);
   const [sportsbooksLoaded, setSportsbooksLoaded] = useState(false);
   const [lineHistoryLoaded, setLineHistoryLoaded] = useState(false);
   const [isLiveOdds, setIsLiveOdds] = useState(false);
@@ -3998,6 +4323,38 @@ export function GameDetailPage() {
   const [playByPlay, setPlayByPlay] = useState<PlayByPlayData | null>(null);
   const [lastPlay, setLastPlay] = useState<PlayByPlayEvent | null>(null);
   const [lastPlayUpdated, setLastPlayUpdated] = useState<Date | null>(null);
+  const [soccerAdjacentGames, setSoccerAdjacentGames] = useState<{
+    loading: boolean;
+    prevId: string | null;
+    nextId: string | null;
+    prevLabel: string | null;
+    nextLabel: string | null;
+  }>({
+    loading: false,
+    prevId: null,
+    nextId: null,
+    prevLabel: null,
+    nextLabel: null,
+  });
+  const [sportAdjacentGames, setSportAdjacentGames] = useState<{
+    loading: boolean;
+    prevId: string | null;
+    nextId: string | null;
+    prevLabel: string | null;
+    nextLabel: string | null;
+  }>({
+    loading: false,
+    prevId: null,
+    nextId: null,
+    prevLabel: null,
+    nextLabel: null,
+  });
+
+  // Reset per-game loaded flags when navigating to a different game.
+  useEffect(() => {
+    setSportsbooksLoaded(false);
+    setLineHistoryLoaded(false);
+  }, [fullGameId]);
 
   const mergeHeroOddsFromOddsApi = useCallback((prevOdds: OddsData | undefined, oddsData: any): OddsData => {
     const parse = (val: unknown): number | undefined => {
@@ -4027,9 +4384,86 @@ export function GameDetailPage() {
       openMoneylineHome: parse(oddsData?.openMoneylineHome) ?? prevOdds?.openMoneylineHome,
     };
   }, []);
+  const reconcileLineHistoryWithOdds = useCallback(
+    (history: LineHistoryPoint[] | undefined, odds: OddsData | undefined): LineHistoryPoint[] => {
+      const base = Array.isArray(history) ? history : [];
+      if (base.length === 0 || !odds) return base;
+      const last = base[base.length - 1];
+      if (!last) return base;
+
+      const nextSpread = typeof odds.spread === "number" ? odds.spread : (last.spread ?? null);
+      const nextTotal = typeof odds.total === "number" ? odds.total : (last.total ?? null);
+      const nextMlHome = typeof odds.mlHome === "number" ? odds.mlHome : (last.mlHome ?? null);
+      const nextMlAway = typeof odds.mlAway === "number" ? odds.mlAway : (last.mlAway ?? null);
+
+      const same =
+        last.spread === nextSpread &&
+        last.total === nextTotal &&
+        (last.mlHome ?? null) === nextMlHome &&
+        (last.mlAway ?? null) === nextMlAway;
+
+      if (same) return base;
+      return [
+        ...base,
+        {
+          timestamp: new Date().toISOString(),
+          spread: nextSpread,
+          total: nextTotal,
+          mlHome: nextMlHome,
+          mlAway: nextMlAway,
+        },
+      ];
+    },
+    []
+  );
+
+  const backButtonLabel = useMemo(() => {
+    const from = String(searchParams.get("from") || "").toLowerCase();
+    const fromLeagueId = String(searchParams.get("fromLeagueId") || "").trim();
+    const fromTeamId = String(searchParams.get("fromTeamId") || "").trim();
+    if (isSoccerContext) {
+      if (fromLeagueId) return "League Home";
+      if (fromTeamId) return "Team Page";
+      if (from === "soccer-directory" || from === "soccer-hub" || from === "soccer") return "Soccer Home";
+      return "Soccer Home";
+    }
+    return srSport?.toUpperCase() || league?.toUpperCase() || "Games & Odds";
+  }, [searchParams, isSoccerContext, srSport, league]);
+  const fromLeagueIdParam = String(searchParams.get("fromLeagueId") || "").trim();
+  const fromTeamIdParam = String(searchParams.get("fromTeamId") || "").trim();
+  const hasScopedSoccerContext = Boolean(fromLeagueIdParam || fromTeamIdParam);
+  const canUseAllSoccerToday = !hasScopedSoccerContext;
+  const soccerNavScope = searchParams.get("soccerNavScope") === "all" ? "all" : "context";
+  const isAllSoccerTodayMode = isSoccerContext && soccerNavScope === "all" && canUseAllSoccerToday;
+  const uiStyleParam = String(searchParams.get("uiStyle") || "").toLowerCase();
+  const isLuxuryLivePreset = uiStyleParam === "luxury_live" || uiStyleParam === "live";
+  const soccerLeagueOptions = useMemo(() => getAllSoccerLeagues(), []);
+  const currentSoccerScopeLabel = useMemo(() => {
+    if (!isSoccerContext) return "";
+    if (isAllSoccerTodayMode) return "All Soccer Today";
+    if (fromLeagueIdParam) {
+      const meta = getSoccerLeagueMeta(fromLeagueIdParam);
+      return meta.short || meta.name || "This League";
+    }
+    if (fromTeamIdParam) return "This Team";
+    return "Soccer";
+  }, [isSoccerContext, isAllSoccerTodayMode, fromLeagueIdParam, fromTeamIdParam]);
+  const currentSportScopeLabel = useMemo(() => {
+    if (isSoccerContext) return currentSoccerScopeLabel;
+    const base = String(game?.sport || srSport || params.sportKey || league || "SPORT").toUpperCase();
+    return `${base} Today`;
+  }, [isSoccerContext, currentSoccerScopeLabel, game?.sport, srSport, params.sportKey, league]);
+  const shouldUseLuxuryUtilityPod = useMemo(() => {
+    const rawSport = String(game?.sport || srSport || params.sportKey || league || "").toUpperCase();
+    const normalizedSport = rawSport === "CBB" ? "NCAAB" : rawSport === "CFB" ? "NCAAF" : rawSport;
+    return new Set(["NBA", "NHL", "MLB", "NFL", "NCAAB", "NCAAF"]).has(normalizedSport);
+  }, [game?.sport, srSport, params.sportKey, league]);
+  const activeAdjacentGames = isSoccerContext ? soccerAdjacentGames : sportAdjacentGames;
 
   const handleBackToList = useCallback(() => {
     const from = String(searchParams.get("from") || "").toLowerCase();
+    const fromLeagueId = String(searchParams.get("fromLeagueId") || "").trim();
+    const fromTeamId = String(searchParams.get("fromTeamId") || "").trim();
     if (from === "ncaab-march-command") {
       navigate("/sports/ncaab/tournament/march-madness");
       return;
@@ -4046,8 +4480,24 @@ export function GameDetailPage() {
       navigate("/sports/ncaab");
       return;
     }
-    const backSport = srSport || params.sportKey?.toLowerCase() || league?.toLowerCase();
-    if (backSport === 'soccer') {
+    if (params.sportKey) {
+      navigate(`/sports/${params.sportKey.toLowerCase()}`);
+      return;
+    }
+    const backSport = (srSport || params.sportKey || league || game?.sport || "").toLowerCase();
+    if (isSoccerContext) {
+      if (fromLeagueId) {
+        navigate(`/sports/soccer/league/${encodeURIComponent(fromLeagueId)}`);
+        return;
+      }
+      if (fromTeamId) {
+        navigate(`/sports/soccer/team/${encodeURIComponent(fromTeamId)}`);
+        return;
+      }
+      if (from === 'soccer-directory' || from === 'soccer-hub' || from === 'soccer') {
+        navigate('/sports/soccer');
+        return;
+      }
       navigate('/sports/soccer');
       return;
     }
@@ -4060,7 +4510,34 @@ export function GameDetailPage() {
       return;
     }
     navigate('/games');
-  }, [navigate, searchParams, srSport, params.sportKey, league]);
+  }, [navigate, searchParams, srSport, params.sportKey, league, game?.sport, isSoccerContext]);
+
+  const navigateToSoccerGame = useCallback((targetId: string | null) => {
+    if (!targetId) return;
+    const from = String(searchParams.get("from") || "").trim();
+    const fromLeagueId = String(searchParams.get("fromLeagueId") || "").trim();
+    const fromTeamId = String(searchParams.get("fromTeamId") || "").trim();
+    const scopeAll = canUseAllSoccerToday && searchParams.get("soccerNavScope") === "all";
+    const nextParams = new URLSearchParams();
+    if (from) nextParams.set("from", from);
+    if (scopeAll) {
+      nextParams.set("soccerNavScope", "all");
+    } else {
+      if (fromLeagueId) nextParams.set("fromLeagueId", fromLeagueId);
+      if (fromTeamId) nextParams.set("fromTeamId", fromTeamId);
+    }
+    const qs = nextParams.toString();
+    navigate(`/sports/soccer/match/${encodeURIComponent(targetId)}${qs ? `?${qs}` : ""}`);
+  }, [navigate, searchParams, canUseAllSoccerToday]);
+  const navigateToAdjacentGame = useCallback((targetId: string | null) => {
+    if (!targetId) return;
+    if (isSoccerContext) {
+      navigateToSoccerGame(targetId);
+      return;
+    }
+    const sportKey = String(game?.sport || srSport || params.sportKey || league || "").toLowerCase();
+    navigate(toGameDetailPath(sportKey, targetId));
+  }, [isSoccerContext, navigateToSoccerGame, game?.sport, srSport, params.sportKey, league, navigate]);
 
   // Fetch play-by-play data
   const fetchPlayByPlay = useCallback(async () => {
@@ -4101,6 +4578,52 @@ export function GameDetailPage() {
       if (!silent) setBoxScoreLoading(false);
     }
   }, [fullGameId]);
+
+  const fetchGameProps = useCallback(async (targetGameId: string, targetSport?: string) => {
+    const gameIdForProps = String(targetGameId || '').trim();
+    if (!gameIdForProps) return;
+    const sportForProps = String(targetSport || league || '').toUpperCase();
+
+    try {
+      const qs = new URLSearchParams({
+        sport: sportForProps || 'ALL',
+        game_id: gameIdForProps,
+        limit: '500',
+        fresh: '1',
+      });
+      const res = await fetch(`/api/sports-data/props/today?${qs.toString()}`, {
+        credentials: 'include',
+        cache: 'no-store',
+      });
+      if (!res.ok) return;
+
+      const data = await res.json();
+      const normalized = normalizeGameProps(
+        Array.isArray(data?.props) ? data.props : []
+      );
+
+      setGame((prev) => {
+        if (!prev) return prev;
+        if (normalized.length === 0 && Array.isArray(prev.props) && prev.props.length > 0) {
+          return {
+            ...prev,
+            propsFallbackReason: prev.propsFallbackReason || data?.fallback_reason || null,
+          };
+        }
+        return {
+          ...prev,
+          props: normalized,
+          propsSource: normalized.length > 0 ? 'event' : 'none',
+          propsFallbackReason:
+            normalized.length > 0
+              ? null
+              : (data?.fallback_reason || 'No player props available for this game yet'),
+        };
+      });
+    } catch (err) {
+      console.error('[GameDetailPage] Failed to fetch game-scoped props:', err);
+    }
+  }, [league]);
 
   // Fetch game data
   const fetchGame = useCallback(async () => {
@@ -4193,15 +4716,21 @@ export function GameDetailPage() {
           venue: data.game?.venue,
           broadcast: data.game?.broadcast,
           odds: hasOdds ? gameOdds ?? prev?.odds : prev?.odds,
-          // Preserve previously loaded sportsbooks/lineHistory during refresh
+          // Preserve previously loaded sportsbooks only for the SAME game.
           sportsbooks: (() => {
             const normalized = normalizeSportsbookLines(data.sportsbooks);
             if (normalized.length > 0) return normalized;
             const transformed = transformOddsToSportsbooks(data.odds || data.game?.odds_array || []);
             if (transformed.length > 0) return transformed;
-            return prev?.sportsbooks || [];
+            const resolvedId = String(data.game?.id || gameId || '');
+            return prev?.id === resolvedId ? (prev?.sportsbooks || []) : [];
           })(),
-          lineHistory: data.lineHistory?.length ? data.lineHistory : (prev?.lineHistory || []),
+          // Preserve previously loaded line history only for the SAME game.
+          lineHistory: (() => {
+            if (data.lineHistory?.length) return data.lineHistory;
+            const resolvedId = String(data.game?.id || gameId || '');
+            return prev?.id === resolvedId ? (prev?.lineHistory || []) : [];
+          })(),
           publicBetHome: data.game?.publicBetHome,
           publicBetAway: data.game?.publicBetAway,
           coachSignal: data.game?.coachSignal,
@@ -4217,6 +4746,13 @@ export function GameDetailPage() {
           propsFallbackReason: data.propsFallbackReason || data.game?.propsFallbackReason || null,
         }));
         setError(null);
+
+        // Lite game payload can omit props; fetch strict game-scoped props explicitly.
+        const resolvedGameId = String(data.game?.id || data.game?.game_id || fullGameId || '');
+        const resolvedSport = String(data.game?.sport || league || '');
+        if (resolvedGameId) {
+          void fetchGameProps(resolvedGameId, resolvedSport);
+        }
         
         // Fetch opening odds in background so initial page render is not blocked.
         fetch(`/api/games/${fullGameId}/odds`, { credentials: 'include', cache: 'no-store' })
@@ -4225,11 +4761,15 @@ export function GameDetailPage() {
             if (!oddsData) return;
             setGame((prev) => {
               if (!prev) return prev;
+              const mergedOdds = mergeHeroOddsFromOddsApi(prev.odds, oddsData);
               return {
                 ...prev,
-                odds: mergeHeroOddsFromOddsApi(prev.odds, oddsData),
+                odds: mergedOdds,
+                lineHistory: reconcileLineHistoryWithOdds(prev.lineHistory, mergedOdds),
               };
             });
+            // Force line-history refresh against latest odds baseline.
+            setLineHistoryLoaded(false);
           })
           .catch(() => {
             // Ignore opening odds fetch errors
@@ -4271,12 +4811,258 @@ export function GameDetailPage() {
     } finally {
       setIsLoading(false);
     }
-  }, [fullGameId]);
+  }, [fetchGameProps, fullGameId, gameId, isSportsRadarGame, league]);
 
   // Initial fetch
   useEffect(() => {
     fetchGame();
   }, [fetchGame]);
+
+  useEffect(() => {
+    if (!isSoccerContext || !game) {
+      setSoccerAdjacentGames({ loading: false, prevId: null, nextId: null, prevLabel: null, nextLabel: null });
+      return;
+    }
+
+    const fromLeagueId = String(searchParams.get("fromLeagueId") || "").trim();
+    const fromTeamId = String(searchParams.get("fromTeamId") || "").trim();
+    const scopeAll = canUseAllSoccerToday && searchParams.get("soccerNavScope") === "all";
+
+    const normalizeId = (value: string): string => {
+      let raw = decodeURIComponent(String(value || "").trim()).replace(/^soccer_/, "");
+      if (raw.startsWith("sr_")) {
+        const parts = raw.split("_");
+        if (parts.length >= 3) raw = `sr:sport_event:${parts.slice(2).join("_")}`;
+      }
+      // Some payloads can be double-prefixed (sr:sport_event:sr:sport_event:xxx)
+      while (raw.startsWith("sr:sport_event:sr:sport_event:")) {
+        raw = raw.replace("sr:sport_event:sr:sport_event:", "sr:sport_event:");
+      }
+      return raw;
+    };
+    const eventKey = (value: string): string => {
+      const normalized = normalizeId(value);
+      const marker = "sr:sport_event:";
+      if (normalized.startsWith(marker)) return normalized.slice(marker.length).toLowerCase();
+      return normalized.toLowerCase();
+    };
+
+    const dateKey = (() => {
+      const raw = String(game.startTime || "");
+      if (!raw) return "";
+      const d = new Date(raw);
+      return Number.isNaN(d.getTime()) ? "" : d.toISOString().slice(0, 10);
+    })();
+
+    if (!dateKey) {
+      setSoccerAdjacentGames({ loading: false, prevId: null, nextId: null, prevLabel: null, nextLabel: null });
+      return;
+    }
+
+    let cancelled = false;
+    setSoccerAdjacentGames((prev) => ({ ...prev, loading: true }));
+
+    const loadAdjacent = async () => {
+      try {
+        type Row = { id: string; key: string; ts: number; preview: string };
+        const rows: Row[] = [];
+        const buildPreview = (match: any, ts: number): string => {
+          const home = String(
+            match?.homeTeam?.name ||
+            match?.homeTeamName ||
+            match?.home_team_name ||
+            match?.homeTeam ||
+            ""
+          ).trim();
+          const away = String(
+            match?.awayTeam?.name ||
+            match?.awayTeamName ||
+            match?.away_team_name ||
+            match?.awayTeam ||
+            ""
+          ).trim();
+          const matchup = home && away ? `${home} vs ${away}` : String(match?.matchup || match?.name || "Match").trim();
+          const localTime = new Date(ts).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+          return `${matchup} • ${localTime}`;
+        };
+        if (!scopeAll && fromLeagueId) {
+          const res = await fetch(`/api/soccer/schedule/${encodeURIComponent(fromLeagueId)}?filter=all`, { credentials: "include", cache: "no-store" });
+          if (res.ok) {
+            const data = await res.json();
+            for (const m of (Array.isArray(data?.matches) ? data.matches : [])) {
+              const id = String(m?.eventId || "");
+              const ts = new Date(String(m?.startTime || m?.date || "")).getTime();
+              if (!id || Number.isNaN(ts)) continue;
+              if (new Date(ts).toISOString().slice(0, 10) !== dateKey) continue;
+              const normalizedId = normalizeId(id);
+              rows.push({ id: normalizedId, key: eventKey(normalizedId), ts, preview: buildPreview(m, ts) });
+            }
+          }
+        } else if (!scopeAll && fromTeamId) {
+          const res = await fetch(`/api/soccer/team/${encodeURIComponent(fromTeamId)}/schedule`, { credentials: "include", cache: "no-store" });
+          if (res.ok) {
+            const data = await res.json();
+            const combined = [
+              ...(Array.isArray(data?.results) ? data.results : []),
+              ...(Array.isArray(data?.upcoming) ? data.upcoming : []),
+            ];
+            for (const m of combined) {
+              const id = String(m?.eventId || m?.id || "");
+              const ts = new Date(String(m?.startTime || m?.date || "")).getTime();
+              if (!id || Number.isNaN(ts)) continue;
+              if (new Date(ts).toISOString().slice(0, 10) !== dateKey) continue;
+              const normalizedId = normalizeId(id);
+              rows.push({ id: normalizedId, key: eventKey(normalizedId), ts, preview: buildPreview(m, ts) });
+            }
+          }
+        } else {
+          // Soccer-home fallback: derive same-day adjacency from the generic games feed.
+          const res = await fetch(`/api/games?sport=soccer&date=${encodeURIComponent(dateKey)}&includeOdds=0`, {
+            credentials: "include",
+            cache: "no-store",
+          });
+          if (res.ok) {
+            const data = await res.json();
+            const games = Array.isArray(data?.games) ? data.games : [];
+            for (const g of games) {
+              const id = String(g?.id || g?.game_id || "");
+              const ts = new Date(String(g?.start_time || g?.startTime || g?.date || "")).getTime();
+              if (!id || Number.isNaN(ts)) continue;
+              const normalizedId = normalizeId(id);
+              rows.push({ id: normalizedId, key: eventKey(normalizedId), ts, preview: buildPreview(g, ts) });
+            }
+          }
+        }
+
+        const uniq = new Map<string, Row>();
+        for (const r of rows) {
+          if (!uniq.has(r.key)) uniq.set(r.key, r);
+        }
+        const ordered = Array.from(uniq.values()).sort((a, b) => a.ts - b.ts);
+        const current = normalizeId(String(fullGameId || gameId || ""));
+        const currentKey = eventKey(current);
+        let idx = ordered.findIndex((r) => r.key === currentKey);
+        if (idx < 0) {
+          const currentTs = new Date(String(game.startTime || "")).getTime();
+          if (!Number.isNaN(currentTs) && ordered.length > 0) {
+            // Fall back to nearest same-day match by kickoff time.
+            let bestIdx = 0;
+            let bestDiff = Number.POSITIVE_INFINITY;
+            for (let i = 0; i < ordered.length; i++) {
+              const diff = Math.abs(ordered[i].ts - currentTs);
+              if (diff < bestDiff) {
+                bestDiff = diff;
+                bestIdx = i;
+              }
+            }
+            idx = bestIdx;
+          }
+        }
+        const prevRow = idx > 0 ? ordered[idx - 1] : null;
+        const nextRow = idx >= 0 && idx < ordered.length - 1 ? ordered[idx + 1] : null;
+        if (!cancelled) {
+          setSoccerAdjacentGames({
+            loading: false,
+            prevId: prevRow?.id || null,
+            nextId: nextRow?.id || null,
+            prevLabel: prevRow?.preview || null,
+            nextLabel: nextRow?.preview || null,
+          });
+        }
+      } catch {
+        if (!cancelled) {
+          setSoccerAdjacentGames({ loading: false, prevId: null, nextId: null, prevLabel: null, nextLabel: null });
+        }
+      }
+    };
+
+    void loadAdjacent();
+    return () => { cancelled = true; };
+  }, [game, fullGameId, gameId, searchParams, isSoccerContext, canUseAllSoccerToday]);
+  useEffect(() => {
+    if (isSoccerContext || !game) {
+      setSportAdjacentGames({ loading: false, prevId: null, nextId: null, prevLabel: null, nextLabel: null });
+      return;
+    }
+
+    const dateKey = (() => {
+      const raw = String(game.startTime || "");
+      if (!raw) return "";
+      const d = new Date(raw);
+      return Number.isNaN(d.getTime()) ? "" : d.toISOString().slice(0, 10);
+    })();
+    const sportKey = String(game.sport || srSport || params.sportKey || league || "").toLowerCase();
+    if (!dateKey || !sportKey) {
+      setSportAdjacentGames({ loading: false, prevId: null, nextId: null, prevLabel: null, nextLabel: null });
+      return;
+    }
+
+    const normalizeId = (value: string): string => decodeURIComponent(String(value || "").trim());
+    const currentId = normalizeId(String(fullGameId || gameId || game.id || ""));
+    const currentTs = new Date(String(game.startTime || "")).getTime();
+    let cancelled = false;
+    setSportAdjacentGames((prev) => ({ ...prev, loading: true }));
+
+    const loadAdjacent = async () => {
+      try {
+        type Row = { id: string; ts: number; preview: string };
+        const res = await fetch(`/api/games?sport=${encodeURIComponent(sportKey)}&date=${encodeURIComponent(dateKey)}&includeOdds=0`, {
+          credentials: "include",
+          cache: "no-store",
+        });
+        if (!res.ok) {
+          if (!cancelled) setSportAdjacentGames({ loading: false, prevId: null, nextId: null, prevLabel: null, nextLabel: null });
+          return;
+        }
+        const data = await res.json();
+        const games = Array.isArray(data?.games) ? data.games : [];
+        const rows: Row[] = [];
+        for (const g of games) {
+          const id = normalizeId(String(g?.id || g?.game_id || ""));
+          const ts = new Date(String(g?.start_time || g?.startTime || g?.date || "")).getTime();
+          if (!id || Number.isNaN(ts)) continue;
+          const away = String(g?.away_team_name || g?.awayTeam || g?.away_team || "Away").trim();
+          const home = String(g?.home_team_name || g?.homeTeam || g?.home_team || "Home").trim();
+          const localTime = new Date(ts).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+          rows.push({ id, ts, preview: `${away} vs ${home} • ${localTime}` });
+        }
+        const uniq = new Map<string, Row>();
+        for (const r of rows) {
+          if (!uniq.has(r.id)) uniq.set(r.id, r);
+        }
+        const ordered = Array.from(uniq.values()).sort((a, b) => a.ts - b.ts);
+        let idx = ordered.findIndex((r) => r.id === currentId);
+        if (idx < 0 && !Number.isNaN(currentTs) && ordered.length > 0) {
+          let bestIdx = 0;
+          let bestDiff = Number.POSITIVE_INFINITY;
+          for (let i = 0; i < ordered.length; i++) {
+            const diff = Math.abs(ordered[i].ts - currentTs);
+            if (diff < bestDiff) {
+              bestDiff = diff;
+              bestIdx = i;
+            }
+          }
+          idx = bestIdx;
+        }
+        const prevRow = idx > 0 ? ordered[idx - 1] : null;
+        const nextRow = idx >= 0 && idx < ordered.length - 1 ? ordered[idx + 1] : null;
+        if (!cancelled) {
+          setSportAdjacentGames({
+            loading: false,
+            prevId: prevRow?.id || null,
+            nextId: nextRow?.id || null,
+            prevLabel: prevRow?.preview || null,
+            nextLabel: nextRow?.preview || null,
+          });
+        }
+      } catch {
+        if (!cancelled) setSportAdjacentGames({ loading: false, prevId: null, nextId: null, prevLabel: null, nextLabel: null });
+      }
+    };
+
+    void loadAdjacent();
+    return () => { cancelled = true; };
+  }, [isSoccerContext, game, fullGameId, gameId, srSport, params.sportKey, league]);
 
   // Fetch sportsbook odds when tab is selected
   useEffect(() => {
@@ -4321,8 +5107,17 @@ export function GameDetailPage() {
           if (lines.length > 0) {
             setGame(prev => {
               console.log('[Books Tab] Updating game state with', lines.length, 'sportsbooks');
-              return prev ? { ...prev, sportsbooks: lines, odds: mergeHeroOddsFromOddsApi(prev.odds, data) } : null;
+              if (!prev) return prev;
+              const mergedOdds = mergeHeroOddsFromOddsApi(prev.odds, data);
+              return {
+                ...prev,
+                sportsbooks: lines,
+                odds: mergedOdds,
+                lineHistory: reconcileLineHistoryWithOdds(prev.lineHistory, mergedOdds),
+              };
             });
+            // Odds have updated; line movement should re-fetch to stay in sync.
+            setLineHistoryLoaded(false);
           }
           setSportsbooksLoaded(true);
         } else {
@@ -4339,7 +5134,8 @@ export function GameDetailPage() {
 
   // Fetch line history when tab is selected
   useEffect(() => {
-    if (activeTab !== 'line-movement' || !fullGameId || lineHistoryLoaded) return;
+    if (activeTab !== 'line-movement' || !fullGameId) return;
+    if (lineHistoryLoaded && (game?.lineHistory?.length || 0) > 0) return;
     
     const fetchLineHistory = async () => {
       try {
@@ -4360,14 +5156,28 @@ export function GameDetailPage() {
             moneylineAway: number | null;
           }) => ({
             timestamp: h.timestamp,
-            spread: h.spread ?? 0,
-            total: h.total ?? 0,
+            spread: h.spread ?? null,
+            total: h.total ?? null,
             mlHome: h.moneylineHome,
             mlAway: h.moneylineAway,
           }));
           
           if (history.length > 0) {
-            setGame(prev => prev ? { ...prev, lineHistory: history } : null);
+            setGame(prev => {
+              if (!prev) return prev;
+              const prevHistory = Array.isArray(prev.lineHistory) ? prev.lineHistory : [];
+              // Guard against transient backend regressions where a refresh briefly
+              // returns only a single-point history for the same game.
+              const shouldKeepPreviousHistory =
+                prevHistory.length >= 2 &&
+                history.length <= 1;
+              return {
+                ...prev,
+                lineHistory: shouldKeepPreviousHistory
+                  ? prevHistory
+                  : reconcileLineHistoryWithOdds(history, prev.odds),
+              };
+            });
           }
           setLineHistoryLoaded(true);
         }
@@ -4377,11 +5187,11 @@ export function GameDetailPage() {
     };
     
     fetchLineHistory();
-  }, [activeTab, fullGameId, lineHistoryLoaded]);
+  }, [activeTab, fullGameId, lineHistoryLoaded, game?.lineHistory?.length, reconcileLineHistoryWithOdds]);
 
   // Fetch box score when tab is selected
   useEffect(() => {
-    if (activeTab !== "box-score" || !fullGameId) return;
+    if ((activeTab !== "box-score" && activeTab !== "props") || !fullGameId) return;
     if (hasBoxScoreData(boxScore)) return;
     void fetchBoxScore();
   }, [activeTab, fetchBoxScore, fullGameId]);
@@ -4543,8 +5353,6 @@ export function GameDetailPage() {
     const abbr = isHome ? game?.homeTeam : game?.awayTeam;
     return abbr || (isHome ? 'HOME' : 'AWAY');
   }, [game, teamInfo]);
-  const activeTabConfig = useMemo(() => TABS.find((tab) => tab.id === activeTab), [activeTab]);
-  const activeTabMeta = TAB_META[activeTab];
   const hasPropsTab = true;
   const viewMode = useMemo<ViewMode>(() => deriveViewMode(game?.status || "SCHEDULED"), [game?.status]);
   const previousModeRef = useRef<ViewMode | null>(null);
@@ -4755,26 +5563,278 @@ export function GameDetailPage() {
       
       <div className="relative z-10">
         {/* Header */}
-        <div className="px-4 md:px-6 pt-4 md:pt-5 flex items-center justify-between mb-4 md:mb-5">
-          <button
-            onClick={handleBackToList}
-            className="flex items-center gap-2 rounded-xl bg-[#121821]/85 px-3 py-2 text-[#9CA3AF] backdrop-blur-sm transition-all hover:bg-[#16202B] hover:text-[#E5E7EB]"
-          >
-            <ArrowLeft className="h-4 w-4" />
-            <span className="text-sm font-medium">{srSport?.toUpperCase() || league?.toUpperCase() || 'Games & Odds'}</span>
-          </button>
-          
-          <button
-            onClick={() => setShowWatchboardModal(true)}
-            className="flex items-center gap-2 px-3 py-2 rounded-xl bg-amber-500/20 text-amber-400 hover:bg-amber-500/30 hover:text-amber-300 transition-all"
-          >
-            <Plus className="h-4 w-4" />
-            <span className="text-sm font-medium">Watchboard</span>
-          </button>
+        <div className="relative px-4 md:px-6 pt-4 md:pt-5 mb-4 md:mb-5">
+          <div className="flex items-center gap-2">
+            <button
+              onClick={handleBackToList}
+              className="flex items-center gap-2 rounded-xl border border-white/10 bg-[#121821]/85 px-3 py-2 text-[#9CA3AF] backdrop-blur-sm transition-all hover:border-white/20 hover:bg-[#16202B] hover:text-[#E5E7EB]"
+            >
+              <ArrowLeft className="h-4 w-4" />
+              <span className="text-sm font-medium">{backButtonLabel}</span>
+            </button>
+          </div>
         </div>
 
         {/* State-based intelligence architecture */}
         <div className="px-4 md:px-6 max-w-3xl mx-auto space-y-4">
+          <div
+            className={cn(
+              "relative overflow-hidden rounded-2xl p-2.5 backdrop-blur-sm",
+              isLuxuryLivePreset
+                ? "border border-cyan-300/18 bg-gradient-to-br from-[#172235]/94 via-[#131C2C]/90 to-[#101826]/94 shadow-[0_10px_28px_rgba(0,0,0,0.28),0_0_0_1px_rgba(56,189,248,0.08)]"
+                : "border border-white/10 bg-gradient-to-br from-[#141C28]/90 via-[#121821]/86 to-[#101722]/90 shadow-[0_8px_22px_rgba(0,0,0,0.24)]"
+            )}
+          >
+            <div
+              className={cn(
+                "pointer-events-none absolute inset-0",
+                isLuxuryLivePreset
+                  ? "bg-[radial-gradient(circle_at_18%_12%,rgba(34,211,238,0.12),transparent_42%),radial-gradient(circle_at_86%_82%,rgba(16,185,129,0.10),transparent_38%)]"
+                  : "bg-[radial-gradient(circle_at_18%_12%,rgba(34,211,238,0.08),transparent_40%),radial-gradient(circle_at_86%_82%,rgba(16,185,129,0.07),transparent_36%)]"
+              )}
+            />
+            {(game.status === "LIVE" || isLuxuryLivePreset) && (
+              <div className={cn(
+                "pointer-events-none absolute inset-y-0 -left-1/2 w-1/2 bg-gradient-to-r from-transparent to-transparent animate-scout-shimmer",
+                isLuxuryLivePreset ? "via-white/10" : "via-white/7"
+              )} />
+            )}
+            <div className="flex flex-col gap-2">
+            <div className={cn(
+              "flex items-center justify-between gap-2",
+              isSoccerContext ? "flex-wrap md:flex-nowrap" : "flex-nowrap"
+            )}>
+            <div className={cn(
+              "flex items-center gap-2 min-w-0",
+              !isSoccerContext && "grid w-full grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)]"
+            )}>
+              <button
+                onClick={() => navigateToAdjacentGame(activeAdjacentGames.prevId)}
+                disabled={!activeAdjacentGames.prevId || activeAdjacentGames.loading}
+                className={cn(
+                  "group relative flex h-10 items-center gap-2 rounded-xl border border-white/12 bg-gradient-to-b from-white/[0.07] to-white/[0.02] px-3 text-[#D1D5DB] transition-all duration-200 active:scale-[0.995] disabled:cursor-not-allowed disabled:opacity-45 disabled:hover:scale-100",
+                  !isSoccerContext && "justify-start min-w-0 w-full overflow-hidden",
+                  isLuxuryLivePreset
+                    ? "hover:scale-[1.015] hover:border-cyan-300/40 hover:bg-cyan-500/14 hover:text-cyan-100 hover:shadow-[0_8px_18px_rgba(34,211,238,0.18)]"
+                    : "hover:scale-[1.01] hover:border-cyan-300/30 hover:bg-cyan-500/10 hover:text-cyan-100 hover:shadow-[0_6px_14px_rgba(34,211,238,0.12)]"
+                )}
+                title={activeAdjacentGames.prevLabel || "Previous game"}
+              >
+                <ChevronLeft className="h-4 w-4 shrink-0 transition-transform duration-200 group-hover:-translate-x-0.5" />
+                <span className={cn("text-[11px] font-semibold text-cyan-200/85", !isSoccerContext && "hidden")}>Previous</span>
+                <span className={cn(
+                  "truncate text-[11px] font-medium text-white/85",
+                  isSoccerContext ? "hidden xl:block max-w-[220px]" : "block max-w-[120px] md:max-w-[170px]"
+                )}>
+                  {(activeAdjacentGames.prevLabel?.split(" • ")[0]) || "No previous game"}
+                </span>
+              </button>
+              {!isSoccerContext && shouldUseLuxuryUtilityPod && (
+                <div className="group relative isolate justify-self-center inline-flex items-center gap-2 overflow-hidden rounded-2xl border border-white/10 bg-[#0D1522]/70 px-1.5 py-1 backdrop-blur-sm shadow-[inset_0_1px_0_rgba(255,255,255,0.05),0_8px_18px_rgba(0,0,0,0.22)]">
+                  <span className="pointer-events-none absolute inset-0 opacity-0 transition-opacity duration-500 group-hover:opacity-100">
+                    <span className="absolute -inset-y-2 -left-16 w-20 rotate-12 bg-white/12 blur-[1px] animate-[coach-slide_4.6s_ease-in-out_infinite]" />
+                  </span>
+                  <div className={cn(
+                    "inline-flex h-8 items-center gap-1.5 rounded-lg px-2.5 text-[9px] font-semibold uppercase tracking-[0.12em] text-[#B8C2D3]",
+                    isLuxuryLivePreset
+                      ? "border border-indigo-300/22 bg-gradient-to-r from-indigo-500/12 to-white/[0.02] shadow-[inset_0_1px_0_rgba(255,255,255,0.07)]"
+                      : "border border-white/12 bg-gradient-to-r from-white/[0.06] to-white/[0.02] shadow-[inset_0_1px_0_rgba(255,255,255,0.05)]"
+                  )}>
+                    <span className={cn("inline-block h-1.5 w-1.5 rounded-full", game.status === "LIVE" ? "bg-red-400 animate-pulse" : "bg-indigo-300/80")} />
+                    <span className="tracking-wide">{currentSportScopeLabel}</span>
+                  </div>
+                  {flags.GAME_FAVORITES_ENABLED && (
+                    <FavoriteEntityButton
+                      type="game"
+                      entityId={fullGameId}
+                      sport={String(game.sport || "").toLowerCase()}
+                      metadata={{
+                        home_team: getTeamDisplayName(true),
+                        away_team: getTeamDisplayName(false),
+                        home_code: game.homeTeam,
+                        away_code: game.awayTeam,
+                        status: game.status,
+                      }}
+                      label="Favorite"
+                      compact
+                      className={cn(
+                        "h-8 w-8 rounded-full border-white/12 bg-gradient-to-b from-white/[0.07] to-white/[0.02] p-0 text-[#D1D5DB] ring-1 ring-white/10 shadow-[inset_0_1px_0_rgba(255,255,255,0.08)]",
+                        isLuxuryLivePreset
+                          ? "hover:scale-[1.015] hover:border-violet-300/35 hover:bg-violet-500/14 hover:text-violet-100 hover:shadow-[0_8px_18px_rgba(139,92,246,0.18)]"
+                          : "hover:scale-[1.01] hover:border-violet-300/25 hover:bg-violet-500/10 hover:text-violet-100 hover:shadow-[0_6px_14px_rgba(139,92,246,0.12)]"
+                      )}
+                    />
+                  )}
+                  <button
+                    onClick={() => setShowWatchboardModal(true)}
+                    title="Add to Watch"
+                    aria-label="Add to Watch"
+                    className={cn(
+                      "flex h-8 items-center gap-1 rounded-full border border-white/12 bg-gradient-to-b from-white/[0.07] to-white/[0.02] px-2 text-[#D1D5DB] ring-1 ring-white/10 shadow-[inset_0_1px_0_rgba(255,255,255,0.08)] transition-all duration-200 active:scale-[0.995]",
+                      isLuxuryLivePreset
+                        ? "hover:scale-[1.015] hover:border-amber-300/40 hover:bg-amber-500/14 hover:text-amber-100 hover:shadow-[0_8px_18px_rgba(245,158,11,0.18)]"
+                        : "hover:scale-[1.01] hover:border-amber-300/30 hover:bg-amber-500/11 hover:text-amber-100 hover:shadow-[0_6px_14px_rgba(245,158,11,0.13)]"
+                    )}
+                  >
+                    <Plus className="h-3.5 w-3.5" />
+                    <span className="text-[10px] font-semibold tracking-wide">Watch +</span>
+                  </button>
+                </div>
+              )}
+              <button
+                onClick={() => navigateToAdjacentGame(activeAdjacentGames.nextId)}
+                disabled={!activeAdjacentGames.nextId || activeAdjacentGames.loading}
+                className={cn(
+                  "group relative flex h-10 items-center gap-2 rounded-xl border border-white/12 bg-gradient-to-b from-white/[0.07] to-white/[0.02] px-3 text-[#D1D5DB] transition-all duration-200 active:scale-[0.995] disabled:cursor-not-allowed disabled:opacity-45 disabled:hover:scale-100",
+                  !isSoccerContext && "justify-end min-w-0 w-full overflow-hidden",
+                  isLuxuryLivePreset
+                    ? "hover:scale-[1.015] hover:border-emerald-300/40 hover:bg-emerald-500/14 hover:text-emerald-100 hover:shadow-[0_8px_18px_rgba(16,185,129,0.18)]"
+                    : "hover:scale-[1.01] hover:border-emerald-300/30 hover:bg-emerald-500/10 hover:text-emerald-100 hover:shadow-[0_6px_14px_rgba(16,185,129,0.12)]"
+                )}
+                title={activeAdjacentGames.nextLabel || "Next game"}
+              >
+                <span className={cn(
+                  "truncate text-[11px] font-medium text-white/85",
+                  isSoccerContext ? "hidden xl:block max-w-[220px]" : "block max-w-[120px] md:max-w-[170px]"
+                )}>
+                  {(activeAdjacentGames.nextLabel?.split(" • ")[0]) || "No next game"}
+                </span>
+                <span className={cn("text-[11px] font-semibold text-emerald-200/85", !isSoccerContext && "hidden")}>Next</span>
+                <ChevronRight className="h-4 w-4 shrink-0 transition-transform duration-200 group-hover:translate-x-0.5" />
+              </button>
+            </div>
+            {isSoccerContext && (
+              <>
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <button
+                      className={cn(
+                        "group flex h-10 items-center gap-2 rounded-xl px-3 text-cyan-100 transition-all duration-200 active:scale-[0.995]",
+                        isLuxuryLivePreset
+                          ? "border border-cyan-300/30 bg-gradient-to-r from-cyan-500/18 via-sky-500/12 to-indigo-500/14 hover:scale-[1.015] hover:border-cyan-200/45 hover:shadow-[0_10px_22px_rgba(56,189,248,0.22)]"
+                          : "border border-cyan-300/22 bg-gradient-to-r from-cyan-500/13 via-sky-500/8 to-indigo-500/10 hover:scale-[1.01] hover:border-cyan-200/35 hover:shadow-[0_8px_18px_rgba(56,189,248,0.16)]"
+                      )}
+                      title="Soccer navigation options"
+                    >
+                      <Sparkles className="h-3.5 w-3.5 text-cyan-200 transition-transform duration-200 group-hover:rotate-12" />
+                      <ArrowRightLeft className="h-4 w-4" />
+                      <span className="text-xs font-semibold tracking-wide">Soccer Navigator</span>
+                    </button>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="end" className="w-60 bg-[#0F1622]/95 border-white/15 text-[#E5E7EB] backdrop-blur-md">
+                    <DropdownMenuLabel className="text-white/55">Navigator Scope</DropdownMenuLabel>
+                    <DropdownMenuItem
+                      onClick={() => {
+                        const next = new URLSearchParams(searchParams);
+                        next.delete("soccerNavScope");
+                        setSearchParams(next, { replace: true });
+                      }}
+                      className="flex items-center justify-between gap-3 cursor-pointer rounded-lg focus:bg-white/10"
+                    >
+                      <div className="min-w-0">
+                        <div className={cn("truncate text-sm", !isAllSoccerTodayMode ? "font-semibold text-cyan-200" : "text-[#E5E7EB]")}>
+                          This League
+                        </div>
+                        <div className="truncate text-[11px] text-white/45">Stay in the current league slate</div>
+                      </div>
+                      {!isAllSoccerTodayMode ? <Check className="h-4 w-4 text-cyan-300 shrink-0" /> : null}
+                    </DropdownMenuItem>
+                    <DropdownMenuItem
+                      onClick={() => {
+                        const next = new URLSearchParams(searchParams);
+                        next.set("soccerNavScope", "all");
+                        setSearchParams(next, { replace: true });
+                      }}
+                      disabled={!canUseAllSoccerToday}
+                      className="flex items-center justify-between gap-3 cursor-pointer rounded-lg focus:bg-white/10"
+                    >
+                      <div className="min-w-0">
+                        <div className={cn("truncate text-sm", isAllSoccerTodayMode ? "font-semibold text-emerald-200" : "text-[#E5E7EB]")}>
+                          All Soccer Today
+                        </div>
+                        <div className="truncate text-[11px] text-white/45">
+                          {canUseAllSoccerToday ? "Rotate across all leagues today" : "Unavailable while browsing a specific league/team"}
+                        </div>
+                      </div>
+                      {isAllSoccerTodayMode ? <Check className="h-4 w-4 text-emerald-300 shrink-0" /> : null}
+                    </DropdownMenuItem>
+                    <DropdownMenuSeparator />
+                    <DropdownMenuLabel className="text-white/55">Switch League</DropdownMenuLabel>
+                    {soccerLeagueOptions.map(({ key, meta }) => {
+                      const isCurrent = key === fromLeagueIdParam;
+                      return (
+                        <DropdownMenuItem
+                          key={key}
+                          onClick={() => navigate(`/sports/soccer/league/${encodeURIComponent(key)}`)}
+                          className="flex items-center justify-between gap-3 cursor-pointer rounded-lg focus:bg-white/10"
+                        >
+                          <div className="min-w-0">
+                            <div className={cn("truncate text-sm", isCurrent ? "font-semibold text-cyan-200" : "text-[#E5E7EB]")}>
+                              {meta.name}
+                            </div>
+                            <div className="truncate text-[11px] text-white/45">{meta.country}</div>
+                          </div>
+                          {isCurrent ? <Check className="h-4 w-4 text-cyan-300 shrink-0" /> : null}
+                        </DropdownMenuItem>
+                      );
+                    })}
+                  </DropdownMenuContent>
+                </DropdownMenu>
+                <div className={cn(
+                  "inline-flex h-10 items-center gap-2 rounded-xl px-3 text-xs font-semibold text-[#AAB3C2]",
+                  isLuxuryLivePreset
+                    ? "border border-cyan-300/20 bg-gradient-to-r from-cyan-500/10 to-white/[0.02] shadow-[inset_0_1px_0_rgba(255,255,255,0.07)]"
+                    : "border border-white/12 bg-gradient-to-r from-white/[0.06] to-white/[0.02] shadow-[inset_0_1px_0_rgba(255,255,255,0.05)]"
+                )}>
+                  <span className={cn("inline-block h-1.5 w-1.5 rounded-full", game.status === "LIVE" ? "bg-red-400 animate-pulse" : "bg-emerald-300/80")} />
+                  <span className="tracking-wide">{currentSoccerScopeLabel}</span>
+                </div>
+              </>
+            )}
+            </div>
+            </div>
+            {isSoccerContext && (
+            <div className="flex items-center justify-end gap-2">
+            {flags.GAME_FAVORITES_ENABLED && (
+              <FavoriteEntityButton
+                type="game"
+                entityId={fullGameId}
+                sport={String(game.sport || "").toLowerCase()}
+                metadata={{
+                  home_team: getTeamDisplayName(true),
+                  away_team: getTeamDisplayName(false),
+                  home_code: game.homeTeam,
+                  away_code: game.awayTeam,
+                  status: game.status,
+                }}
+                label="Favorite"
+                compact
+                className={cn(
+                  "h-8 w-8 rounded-full border-white/12 bg-gradient-to-b from-white/[0.07] to-white/[0.02] p-0 text-[#D1D5DB]",
+                  isLuxuryLivePreset
+                    ? "hover:scale-[1.015] hover:border-violet-300/35 hover:bg-violet-500/14 hover:text-violet-100 hover:shadow-[0_8px_18px_rgba(139,92,246,0.18)]"
+                    : "hover:scale-[1.01] hover:border-violet-300/25 hover:bg-violet-500/10 hover:text-violet-100 hover:shadow-[0_6px_14px_rgba(139,92,246,0.12)]"
+                )}
+              />
+            )}
+            <button
+              onClick={() => setShowWatchboardModal(true)}
+              title="Add to Watch"
+              aria-label="Add to Watch"
+              className={cn(
+                "flex h-8 items-center gap-1 rounded-full border border-white/12 bg-gradient-to-b from-white/[0.07] to-white/[0.02] px-2 text-[#D1D5DB] transition-all duration-200 active:scale-[0.995]",
+                isLuxuryLivePreset
+                  ? "hover:scale-[1.015] hover:border-amber-300/40 hover:bg-amber-500/14 hover:text-amber-100 hover:shadow-[0_8px_18px_rgba(245,158,11,0.18)]"
+                  : "hover:scale-[1.01] hover:border-amber-300/30 hover:bg-amber-500/11 hover:text-amber-100 hover:shadow-[0_6px_14px_rgba(245,158,11,0.13)]"
+              )}
+            >
+              <Plus className="h-3.5 w-3.5" />
+              <span className="text-[10px] font-semibold tracking-wide">Add to Watch</span>
+            </button>
+            </div>
+            )}
+          </div>
+
           {viewMode === "pregame" && (
             <>
               <GameHeroPanel game={game} getTeamName={getTeamDisplayName} />
@@ -4832,12 +5892,7 @@ export function GameDetailPage() {
           {/* Tab Content */}
           <div className="pb-10">
             <GlassCard className="border border-white/[0.05] bg-[#16202B] p-4 shadow-[0_0_28px_rgba(59,130,246,0.09)] md:p-5">
-              <SectionHeader
-                icon={activeTabConfig?.icon || Activity}
-                title={activeTabConfig?.label || "Data"}
-                subtitle={`${activeTabMeta.subtitle} ${dataTabsModeSubtitle}`}
-                accent={activeTabMeta.accent}
-              />
+              <div className="mb-2 text-[11px] text-[#6B7280]">{dataTabsModeSubtitle}</div>
               <div
                 className={cn(
                   "mt-2 md:mt-3 transition-all duration-250 ease-out",
@@ -4862,6 +5917,11 @@ export function GameDetailPage() {
                     isLoading={isLoading}
                     gameId={gameId || ''}
                     sport={game?.sport || ''}
+                    homeTeamCode={game?.homeTeam}
+                    awayTeamCode={game?.awayTeam}
+                    homeTeamName={game?.homeTeamFull || game?.homeTeam}
+                    awayTeamName={game?.awayTeamFull || game?.awayTeam}
+                    boxScore={boxScore}
                     propsSource={game?.propsSource}
                     propsFallbackReason={game?.propsFallbackReason}
                   />

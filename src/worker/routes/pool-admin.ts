@@ -25,10 +25,9 @@ async function poolAdminDemoOrAuthMiddleware(c: Context<{ Bindings: Env }>, next
       created_at: new Date().toISOString(),
       updated_at: new Date().toISOString()
     });
-    await next();
-    return;
+    return next();
   }
-  await authMiddleware(c, next);
+  return authMiddleware(c, next);
 }
 
 // Demo data generators
@@ -346,6 +345,122 @@ function parseCopilotAutomationFromRules(rulesJson: string | null | undefined): 
       periodWrapEnabled: true,
     };
   }
+}
+
+type ActivationCheckKey =
+  | "tie_handling"
+  | "missed_picks"
+  | "canceled_games"
+  | "payout_structure"
+  | "weekly_prizes"
+  | "multi_entry"
+  | "event_map";
+
+type ActivationCheck = {
+  key: ActivationCheckKey;
+  label: string;
+  done: boolean;
+  hint?: string;
+};
+
+function hasAnyKey(source: Record<string, unknown>, keys: string[]): boolean {
+  return keys.some((key) => Object.prototype.hasOwnProperty.call(source, key));
+}
+
+async function evaluateActivationReadiness(
+  db: D1Database,
+  leagueId: string | number,
+  rulesJson: string | null | undefined,
+): Promise<{
+  checks: ActivationCheck[];
+  missing: ActivationCheck[];
+  complete: boolean;
+}> {
+  const parsedRules = (() => {
+    if (!rulesJson) return {} as Record<string, unknown>;
+    try {
+      const parsed = JSON.parse(rulesJson);
+      return parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : {};
+    } catch {
+      return {} as Record<string, unknown>;
+    }
+  })();
+
+  const eventMapRow = await db.prepare(`
+    SELECT COUNT(*) AS count
+    FROM pool_event_map
+    WHERE pool_id = ?
+  `).bind(leagueId).first<{ count: number }>();
+
+  const payoutRow = await db.prepare(`
+    SELECT COUNT(*) AS count
+    FROM payout_config
+    WHERE league_id = ? AND is_active = 1
+  `).bind(leagueId).first<{ count: number }>();
+
+  const hasTieHandling = hasAnyKey(parsedRules, ["tie_handling", "tieHandling", "push_handling", "pushHandling"]);
+  const hasMissedPickHandling = hasAnyKey(parsedRules, ["missed_pick_behavior", "missedPickBehavior", "missedPickPolicy"]);
+  const hasCanceledGameHandling = hasAnyKey(parsedRules, [
+    "canceled_pre_start",
+    "canceled_post_start",
+    "canceled_void",
+    "postponed_handling",
+    "canceledGameHandling",
+  ]);
+  const hasWeeklyPrizeConfig = hasAnyKey(parsedRules, ["weeklyRankRecapEnabled", "weekly_prizes_enabled", "weeklyPayoutsEnabled"]);
+  const hasMultiEntryConfig =
+    hasAnyKey(parsedRules, ["entry", "entryMode", "allowMultipleEntries", "maxEntriesPerUser", "requiredEntries"]) &&
+    (typeof parsedRules.entry !== "object" || parsedRules.entry !== null
+      ? true
+      : hasAnyKey(parsedRules.entry as Record<string, unknown>, ["mode", "max_entries_per_user", "required_entries", "entry_naming"]));
+
+  const checks: ActivationCheck[] = [
+    {
+      key: "tie_handling",
+      label: "Tie handling configured",
+      done: hasTieHandling,
+      hint: "Set tie handling in Rule Config before publishing.",
+    },
+    {
+      key: "missed_picks",
+      label: "Missed pick behavior configured",
+      done: hasMissedPickHandling,
+      hint: "Set missed pick behavior in Rule Config before publishing.",
+    },
+    {
+      key: "canceled_games",
+      label: "Canceled/postponed game behavior configured",
+      done: hasCanceledGameHandling,
+      hint: "Set canceled/postponed game behavior in Rule Config before publishing.",
+    },
+    {
+      key: "payout_structure",
+      label: "Payout structure configured",
+      done: Number(payoutRow?.count || 0) > 0,
+      hint: "Configure payouts in the Payouts tab before publishing.",
+    },
+    {
+      key: "weekly_prizes",
+      label: "Weekly prize/recap policy configured",
+      done: hasWeeklyPrizeConfig,
+      hint: "Configure weekly recap/prize policy in Settings before publishing.",
+    },
+    {
+      key: "multi_entry",
+      label: "Multi-entry settings configured",
+      done: hasMultiEntryConfig,
+      hint: "Configure entry mode and limits in Rule Config before publishing.",
+    },
+    {
+      key: "event_map",
+      label: "Event eligibility map configured",
+      done: Number(eventMapRow?.count || 0) > 0,
+      hint: "Set event eligibility map for the current period before publishing.",
+    },
+  ];
+
+  const missing = checks.filter((check) => !check.done);
+  return { checks, missing, complete: missing.length === 0 };
 }
 
 async function createInAppNotification(
@@ -4639,6 +4754,17 @@ poolAdminRouter.get("/:leagueId/marketplace-listing", authMiddleware, async (c) 
     return c.json({ error: "Pool admin access required" }, 403);
   }
 
+  const league = await db.prepare(`
+    SELECT rules_json
+    FROM leagues
+    WHERE id = ?
+    LIMIT 1
+  `).bind(leagueId).first<{ rules_json: string | null }>();
+  if (!league) {
+    return c.json({ error: "Pool not found" }, 404);
+  }
+  const activationReadiness = await evaluateActivationReadiness(db, leagueId, league.rules_json);
+
   const listing = await db.prepare(`
     SELECT league_id, listing_status, category_key, is_featured, listing_fee_cents, listed_at, updated_at
     FROM pool_marketplace_listings
@@ -4663,6 +4789,7 @@ poolAdminRouter.get("/:leagueId/marketplace-listing", authMiddleware, async (c) 
         listing_fee_cents: 0,
         listed_at: null,
       },
+      activation_readiness: activationReadiness,
     });
   }
 
@@ -4671,6 +4798,7 @@ poolAdminRouter.get("/:leagueId/marketplace-listing", authMiddleware, async (c) 
       ...listing,
       is_featured: listing.is_featured === 1,
     },
+    activation_readiness: activationReadiness,
   });
 });
 
@@ -4702,20 +4830,30 @@ poolAdminRouter.patch("/:leagueId/marketplace-listing", authMiddleware, async (c
   const listingFeesEnabled = await flags.isEnabled("LISTING_FEES_ENABLED");
   const effectiveFee = listingFeesEnabled ? Math.max(0, Math.round(listingFeeCents)) : 0;
 
-  if (listingStatus === "listed") {
-    const leagueVisibility = await db.prepare(`
-      SELECT is_public
+  const leagueVisibility = await db.prepare(`
+      SELECT is_public, rules_json
       FROM leagues
       WHERE id = ?
       LIMIT 1
-    `).bind(leagueId).first<{ is_public: number }>();
+    `).bind(leagueId).first<{ is_public: number; rules_json: string | null }>();
     if (!leagueVisibility) {
       return c.json({ error: "Pool not found" }, 404);
     }
+
+  if (listingStatus === "listed") {
     if (Number(leagueVisibility.is_public || 0) !== 1) {
       return c.json({
         error: "Pool must be public before it can be listed in marketplace.",
         requires_public_pool: true,
+      }, 400);
+    }
+
+    const activationReadiness = await evaluateActivationReadiness(db, leagueId, leagueVisibility.rules_json);
+    if (!activationReadiness.complete) {
+      return c.json({
+        error: "Pool configuration is incomplete. Complete required admin configuration before publishing.",
+        requires_configuration: true,
+        activation_readiness: activationReadiness,
       }, 400);
     }
   }
@@ -4858,6 +4996,430 @@ poolAdminRouter.patch("/:leagueId/visibility", authMiddleware, async (c) => {
     is_public: isPublic,
     message: isPublic ? "Pool is now public and discoverable" : "Pool is now private (invite-only)"
   });
+});
+
+// ═══════════════════════════════════════════════════════════════
+// PAYOUT ENGINE ROUTES
+// ═══════════════════════════════════════════════════════════════
+
+import {
+  loadPayoutConfig,
+  savePayoutConfig,
+  runPayoutCalculation,
+  approvePayouts,
+  markPayoutsPaid,
+  voidPayouts,
+  getPayoutSummary,
+  recordCalcuttaOwnership,
+  loadCalcuttaOwnerships,
+} from "../services/payoutService";
+import {
+  getAdminSettingsFields,
+  deserializePoolRuleConfig,
+  serializePoolRuleConfig,
+  buildPoolRuleConfig,
+  validatePoolRuleConfig,
+  type AdminSettingsGroup,
+} from "../../shared/poolRuleConfig";
+import { executeRecalculation } from "../services/scoringEngine";
+import {
+  getWeeklyLeaderboard,
+  getSeasonLeaderboard,
+  getSurvivalLeaderboard,
+  getBundleLeaderboard,
+} from "../services/poolLeaderboardService";
+
+// GET /:leagueId/payouts — Get payout summary
+poolAdminRouter.get("/:leagueId/payouts", authMiddleware, async (c) => {
+  const user = c.get("user");
+  if (!user) return c.json({ error: "Unauthorized" }, 401);
+  const leagueId = c.req.param("leagueId");
+  const db = c.env.DB;
+  const { isAdmin } = await checkPoolAdmin(db, leagueId, user.id);
+  if (!isAdmin) return c.json({ error: "Pool admin access required" }, 403);
+
+  const summary = await getPayoutSummary(db, Number(leagueId));
+  return c.json(summary);
+});
+
+// GET /:leagueId/payouts/config — Get payout config
+poolAdminRouter.get("/:leagueId/payouts/config", authMiddleware, async (c) => {
+  const user = c.get("user");
+  if (!user) return c.json({ error: "Unauthorized" }, 401);
+  const leagueId = c.req.param("leagueId");
+  const db = c.env.DB;
+  const { isAdmin } = await checkPoolAdmin(db, leagueId, user.id);
+  if (!isAdmin) return c.json({ error: "Pool admin access required" }, 403);
+
+  const config = await loadPayoutConfig(db, Number(leagueId));
+  return c.json(config);
+});
+
+// PUT /:leagueId/payouts/config — Save payout config
+poolAdminRouter.put("/:leagueId/payouts/config", authMiddleware, async (c) => {
+  const user = c.get("user");
+  if (!user) return c.json({ error: "Unauthorized" }, 401);
+  const leagueId = c.req.param("leagueId");
+  const db = c.env.DB;
+  const { isAdmin, role } = await checkPoolAdmin(db, leagueId, user.id);
+  if (!isAdmin) return c.json({ error: "Pool admin access required" }, 403);
+
+  const { buckets, total_pool_cents } = await c.req.json();
+  if (!Array.isArray(buckets)) return c.json({ error: "buckets must be an array" }, 400);
+
+  await savePayoutConfig(db, Number(leagueId), buckets, Number(total_pool_cents) || 0);
+  await logAuditEvent(db, {
+    actorUserId: user.id, actorRole: role || "admin",
+    entityType: "league", entityId: Number(leagueId),
+    actionType: "payout_config_updated",
+    summary: `Payout config updated: ${buckets.length} bucket(s)`,
+    detailsJson: { buckets_count: buckets.length, total_pool_cents },
+  });
+
+  return c.json({ success: true });
+});
+
+// POST /:leagueId/payouts/calculate — Run payout calculation
+poolAdminRouter.post("/:leagueId/payouts/calculate", authMiddleware, async (c) => {
+  const user = c.get("user");
+  if (!user) return c.json({ error: "Unauthorized" }, 401);
+  const leagueId = c.req.param("leagueId");
+  const db = c.env.DB;
+  const { isAdmin } = await checkPoolAdmin(db, leagueId, user.id);
+  if (!isAdmin) return c.json({ error: "Pool admin access required" }, 403);
+
+  const { period_id, dry_run } = await c.req.json();
+  const distribution = await runPayoutCalculation(db, Number(leagueId), period_id, dry_run !== false);
+  return c.json(distribution);
+});
+
+// POST /:leagueId/payouts/approve — Approve pending payouts
+poolAdminRouter.post("/:leagueId/payouts/approve", authMiddleware, async (c) => {
+  const user = c.get("user");
+  if (!user) return c.json({ error: "Unauthorized" }, 401);
+  const leagueId = c.req.param("leagueId");
+  const db = c.env.DB;
+  const { isAdmin, role } = await checkPoolAdmin(db, leagueId, user.id);
+  if (!isAdmin) return c.json({ error: "Pool admin access required" }, 403);
+
+  const { bucket_type, period_id } = await c.req.json();
+  const count = await approvePayouts(db, Number(leagueId), String(user.id), bucket_type, period_id);
+
+  await logAuditEvent(db, {
+    actorUserId: user.id, actorRole: role || "admin",
+    entityType: "league", entityId: Number(leagueId),
+    actionType: "payouts_approved", summary: `${count} payout(s) approved`,
+    detailsJson: { count, bucket_type, period_id },
+  });
+
+  return c.json({ success: true, approved_count: count });
+});
+
+// POST /:leagueId/payouts/mark-paid — Mark payouts as paid
+poolAdminRouter.post("/:leagueId/payouts/mark-paid", authMiddleware, async (c) => {
+  const user = c.get("user");
+  if (!user) return c.json({ error: "Unauthorized" }, 401);
+  const leagueId = c.req.param("leagueId");
+  const db = c.env.DB;
+  const { isAdmin } = await checkPoolAdmin(db, leagueId, user.id);
+  if (!isAdmin) return c.json({ error: "Pool admin access required" }, 403);
+
+  const { payout_ids } = await c.req.json();
+  if (!Array.isArray(payout_ids)) return c.json({ error: "payout_ids must be an array" }, 400);
+
+  const count = await markPayoutsPaid(db, payout_ids);
+  return c.json({ success: true, paid_count: count });
+});
+
+// POST /:leagueId/payouts/void — Void payouts
+poolAdminRouter.post("/:leagueId/payouts/void", authMiddleware, async (c) => {
+  const user = c.get("user");
+  if (!user) return c.json({ error: "Unauthorized" }, 401);
+  const leagueId = c.req.param("leagueId");
+  const db = c.env.DB;
+  const { isAdmin, role } = await checkPoolAdmin(db, leagueId, user.id);
+  if (!isAdmin) return c.json({ error: "Pool admin access required" }, 403);
+
+  const { reason, bucket_type, period_id } = await c.req.json();
+  const count = await voidPayouts(db, Number(leagueId), reason || "Admin voided", bucket_type, period_id);
+
+  await logAuditEvent(db, {
+    actorUserId: user.id, actorRole: role || "admin",
+    entityType: "league", entityId: Number(leagueId),
+    actionType: "payouts_voided", summary: `${count} payout(s) voided`,
+    detailsJson: { count, reason, bucket_type, period_id },
+  });
+
+  return c.json({ success: true, voided_count: count });
+});
+
+// ═══════════════════════════════════════════════════════════════
+// ADMIN CONFIG ENGINE ROUTES
+// ═══════════════════════════════════════════════════════════════
+
+// GET /:leagueId/rule-config — Get full resolved rule config
+poolAdminRouter.get("/:leagueId/rule-config", authMiddleware, async (c) => {
+  const user = c.get("user");
+  if (!user) return c.json({ error: "Unauthorized" }, 401);
+  const leagueId = c.req.param("leagueId");
+  const db = c.env.DB;
+  const { isAdmin } = await checkPoolAdmin(db, leagueId, user.id);
+  if (!isAdmin) return c.json({ error: "Pool admin access required" }, 403);
+
+  const league = await db.prepare("SELECT format_key, rules_json FROM leagues WHERE id = ?").bind(leagueId).first<{ format_key: string; rules_json: string | null }>();
+  if (!league) return c.json({ error: "League not found" }, 404);
+
+  const config = deserializePoolRuleConfig(league.format_key, league.rules_json);
+  const fields = getAdminSettingsFields(league.format_key);
+  const validation = validatePoolRuleConfig(config);
+
+  return c.json({ config, fields, validation_errors: validation, template: league.format_key });
+});
+
+// PUT /:leagueId/rule-config — Update rule config
+poolAdminRouter.put("/:leagueId/rule-config", authMiddleware, async (c) => {
+  const user = c.get("user");
+  if (!user) return c.json({ error: "Unauthorized" }, 401);
+  const leagueId = c.req.param("leagueId");
+  const db = c.env.DB;
+  const { isAdmin, role } = await checkPoolAdmin(db, leagueId, user.id);
+  if (!isAdmin) return c.json({ error: "Pool admin access required" }, 403);
+
+  const league = await db.prepare("SELECT format_key, rules_json FROM leagues WHERE id = ?").bind(leagueId).first<{ format_key: string; rules_json: string | null }>();
+  if (!league) return c.json({ error: "League not found" }, 404);
+
+  const overrides = await c.req.json();
+  const newConfig = buildPoolRuleConfig(league.format_key, overrides);
+  const errors = validatePoolRuleConfig(newConfig);
+
+  if (errors.length > 0) {
+    return c.json({ error: "Validation failed", validation_errors: errors }, 400);
+  }
+
+  await db.prepare("UPDATE leagues SET rules_json = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?")
+    .bind(serializePoolRuleConfig(newConfig), leagueId).run();
+
+  await logAuditEvent(db, {
+    actorUserId: user.id, actorRole: role || "admin",
+    entityType: "league", entityId: Number(leagueId),
+    actionType: "rule_config_updated", summary: "Pool rule config updated",
+    detailsJson: { changed_keys: Object.keys(overrides) },
+  });
+
+  return c.json({ success: true, config: newConfig });
+});
+
+// GET /:leagueId/admin-settings-fields — Get grouped admin fields
+poolAdminRouter.get("/:leagueId/admin-settings-fields", authMiddleware, async (c) => {
+  const user = c.get("user");
+  if (!user) return c.json({ error: "Unauthorized" }, 401);
+  const leagueId = c.req.param("leagueId");
+  const db = c.env.DB;
+  const { isAdmin } = await checkPoolAdmin(db, leagueId, user.id);
+  if (!isAdmin) return c.json({ error: "Pool admin access required" }, 403);
+
+  const league = await db.prepare("SELECT format_key FROM leagues WHERE id = ?").bind(leagueId).first<{ format_key: string }>();
+  if (!league) return c.json({ error: "League not found" }, 404);
+
+  const fields = getAdminSettingsFields(league.format_key);
+  const groups: Record<AdminSettingsGroup, typeof fields> = {
+    structure: fields.filter((f) => f.group === "structure"),
+    rules: fields.filter((f) => f.group === "rules"),
+    scoring: fields.filter((f) => f.group === "scoring"),
+    payouts: fields.filter((f) => f.group === "payouts"),
+    visibility: fields.filter((f) => f.group === "visibility"),
+  };
+
+  return c.json({ groups, template: league.format_key });
+});
+
+// ═══════════════════════════════════════════════════════════════
+// RECALCULATION ROUTES
+// ═══════════════════════════════════════════════════════════════
+
+// POST /:leagueId/recalculate — Safe recalculation
+poolAdminRouter.post("/:leagueId/recalculate", authMiddleware, async (c) => {
+  const user = c.get("user");
+  if (!user) return c.json({ error: "Unauthorized" }, 401);
+  const leagueId = c.req.param("leagueId");
+  const db = c.env.DB;
+  const { isAdmin, role } = await checkPoolAdmin(db, leagueId, user.id);
+  if (!isAdmin) return c.json({ error: "Pool admin access required" }, 403);
+
+  const { period_id, trigger, dry_run } = await c.req.json();
+
+  const result = await executeRecalculation(c.env, {
+    league_id: Number(leagueId),
+    period_id: period_id || undefined,
+    trigger: trigger || "admin_override",
+    dry_run: dry_run !== false,
+    triggered_by: String(user.id),
+  });
+
+  if (!dry_run) {
+    await logAuditEvent(db, {
+      actorUserId: user.id, actorRole: role || "admin",
+      entityType: "league", entityId: Number(leagueId),
+      actionType: "recalculation_executed",
+      summary: `Recalculation: ${result.affected_picks} picks, ${result.affected_entries} entries`,
+      detailsJson: result,
+    });
+  }
+
+  return c.json(result);
+});
+
+// GET /:leagueId/recalculation-log — View recalculation history
+poolAdminRouter.get("/:leagueId/recalculation-log", authMiddleware, async (c) => {
+  const user = c.get("user");
+  if (!user) return c.json({ error: "Unauthorized" }, 401);
+  const leagueId = c.req.param("leagueId");
+  const db = c.env.DB;
+  const { isAdmin } = await checkPoolAdmin(db, leagueId, user.id);
+  if (!isAdmin) return c.json({ error: "Pool admin access required" }, 403);
+
+  const logs = await db.prepare(`
+    SELECT id, period_id, trigger_type, triggered_by, is_dry_run, affected_entries, affected_picks, status, started_at, completed_at, created_at
+    FROM recalculation_log
+    WHERE league_id = ?
+    ORDER BY created_at DESC
+    LIMIT 50
+  `).bind(leagueId).all();
+
+  return c.json({ logs: logs.results || [] });
+});
+
+// ═══════════════════════════════════════════════════════════════
+// POOL LEADERBOARD ROUTES
+// ═══════════════════════════════════════════════════════════════
+
+// GET /:leagueId/leaderboard — Multi-view leaderboard
+poolAdminRouter.get("/:leagueId/leaderboard", authMiddleware, async (c) => {
+  const user = c.get("user");
+  if (!user) return c.json({ error: "Unauthorized" }, 401);
+  const leagueId = c.req.param("leagueId");
+  const db = c.env.DB;
+
+  const view = c.req.query("view") || "season";
+  const periodId = c.req.query("period_id") || "";
+  const limit = Number(c.req.query("limit")) || 100;
+
+  const league = await db.prepare("SELECT format_key, rules_json FROM leagues WHERE id = ?").bind(leagueId).first<{ format_key: string; rules_json: string | null }>();
+  if (!league) return c.json({ error: "League not found" }, 404);
+
+  const config = deserializePoolRuleConfig(league.format_key, league.rules_json);
+  const userId = String(user.id);
+
+  switch (view) {
+    case "weekly":
+      if (!periodId) return c.json({ error: "period_id required for weekly view" }, 400);
+      return c.json(await getWeeklyLeaderboard(db, Number(leagueId), periodId, userId, limit));
+    case "survival":
+      return c.json(await getSurvivalLeaderboard(db, Number(leagueId), userId, limit));
+    case "bundle":
+      return c.json(await getBundleLeaderboard(db, Number(leagueId), userId, limit));
+    case "season":
+    default:
+      return c.json(await getSeasonLeaderboard(db, Number(leagueId), userId, config.drop_worst_periods, config.best_x_periods, limit));
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// CALCUTTA ROUTES
+// ═══════════════════════════════════════════════════════════════
+
+// GET /:leagueId/calcutta/ownerships — Get ownership ledger
+poolAdminRouter.get("/:leagueId/calcutta/ownerships", authMiddleware, async (c) => {
+  const user = c.get("user");
+  if (!user) return c.json({ error: "Unauthorized" }, 401);
+  const leagueId = c.req.param("leagueId");
+  const db = c.env.DB;
+
+  const ownerships = await loadCalcuttaOwnerships(db, Number(leagueId));
+  return c.json({ ownerships });
+});
+
+// POST /:leagueId/calcutta/record-ownership — Record an auction result
+poolAdminRouter.post("/:leagueId/calcutta/record-ownership", authMiddleware, async (c) => {
+  const user = c.get("user");
+  if (!user) return c.json({ error: "Unauthorized" }, 401);
+  const leagueId = c.req.param("leagueId");
+  const db = c.env.DB;
+  const { isAdmin } = await checkPoolAdmin(db, leagueId, user.id);
+  if (!isAdmin) return c.json({ error: "Pool admin access required" }, 403);
+
+  const { team_id, team_name, user_id, ownership_pct, price_paid_cents, acquired_via } = await c.req.json();
+  if (!team_id || !user_id) return c.json({ error: "team_id and user_id required" }, 400);
+
+  await recordCalcuttaOwnership(
+    db, Number(leagueId), team_id, team_name || team_id,
+    user_id, Number(ownership_pct) || 100, Number(price_paid_cents) || 0,
+    acquired_via || "auction",
+  );
+
+  return c.json({ success: true });
+});
+
+// ═══════════════════════════════════════════════════════════════
+// BUNDLE POOL ROUTES
+// ═══════════════════════════════════════════════════════════════
+
+// GET /:leagueId/bundle/children — Get child pools
+poolAdminRouter.get("/:leagueId/bundle/children", authMiddleware, async (c) => {
+  const user = c.get("user");
+  if (!user) return c.json({ error: "Unauthorized" }, 401);
+  const leagueId = c.req.param("leagueId");
+  const db = c.env.DB;
+
+  const children = await db.prepare(`
+    SELECT bp.child_league_id, bp.weight, bp.is_active,
+           l.name, l.sport_key, l.format_key
+    FROM bundle_pools bp
+    JOIN leagues l ON bp.child_league_id = l.id
+    WHERE bp.parent_league_id = ?
+    ORDER BY bp.child_league_id
+  `).bind(leagueId).all();
+
+  return c.json({ children: children.results || [] });
+});
+
+// POST /:leagueId/bundle/add-child — Add a child pool to bundle
+poolAdminRouter.post("/:leagueId/bundle/add-child", authMiddleware, async (c) => {
+  const user = c.get("user");
+  if (!user) return c.json({ error: "Unauthorized" }, 401);
+  const leagueId = c.req.param("leagueId");
+  const db = c.env.DB;
+  const { isAdmin } = await checkPoolAdmin(db, leagueId, user.id);
+  if (!isAdmin) return c.json({ error: "Pool admin access required" }, 403);
+
+  const { child_league_id, weight } = await c.req.json();
+  if (!child_league_id) return c.json({ error: "child_league_id required" }, 400);
+
+  await db.prepare(`
+    INSERT INTO bundle_pools (parent_league_id, child_league_id, weight)
+    VALUES (?, ?, ?)
+    ON CONFLICT(parent_league_id, child_league_id) DO UPDATE SET weight = excluded.weight, is_active = 1
+  `).bind(leagueId, child_league_id, Number(weight) || 1.0).run();
+
+  return c.json({ success: true });
+});
+
+// DELETE /:leagueId/bundle/remove-child — Remove a child pool
+poolAdminRouter.delete("/:leagueId/bundle/remove-child", authMiddleware, async (c) => {
+  const user = c.get("user");
+  if (!user) return c.json({ error: "Unauthorized" }, 401);
+  const leagueId = c.req.param("leagueId");
+  const db = c.env.DB;
+  const { isAdmin } = await checkPoolAdmin(db, leagueId, user.id);
+  if (!isAdmin) return c.json({ error: "Pool admin access required" }, 403);
+
+  const { child_league_id } = await c.req.json();
+  if (!child_league_id) return c.json({ error: "child_league_id required" }, 400);
+
+  await db.prepare(`UPDATE bundle_pools SET is_active = 0 WHERE parent_league_id = ? AND child_league_id = ?`)
+    .bind(leagueId, child_league_id).run();
+
+  return c.json({ success: true });
 });
 
 export { poolAdminRouter };

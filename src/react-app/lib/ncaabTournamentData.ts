@@ -648,9 +648,11 @@ function readCompetitorField(
     return target.record ?? target.summary ?? target.team_record;
   }
   if (field === "abbr") {
-    return target.abbreviation ?? target.abbr ?? target.alias ?? target.team?.abbreviation;
+    const team = (target.team ?? {}) as Record<string, unknown>;
+    return target.abbreviation ?? target.abbr ?? target.alias ?? team.abbreviation;
   }
-  return target.name ?? target.displayName ?? target.teamName ?? target.team?.displayName;
+  const team = (target.team ?? {}) as Record<string, unknown>;
+  return target.name ?? target.displayName ?? target.teamName ?? team.displayName;
 }
 
 function parseRoundFromProvider(g: Record<string, unknown>, tournament: TournamentKey, dayNum: number | null): string {

@@ -482,7 +482,7 @@ export function HubSchedule({ sportKey, games: propGames, loading: propLoading }
             </h3>
             <p className="text-white/40 text-sm max-w-xs mx-auto mb-5">
               {sportKey.toUpperCase() === 'NFL' || sportKey.toUpperCase() === 'NCAAF'
-                ? "Check back on game day for live action and betting insights."
+                ? "Offseason board is active. Use date controls for recent results and check back on game day for live action."
                 : "No games scheduled for this date. Try another day."
               }
             </p>

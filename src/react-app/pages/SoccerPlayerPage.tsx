@@ -397,7 +397,10 @@ export default function SoccerPlayerPage() {
               recentMatches.map((match) => (
                 <Link
                   key={match.eventId}
-                  to={buildSoccerMatchUrl(match.eventId)}
+                  to={buildSoccerMatchUrl(match.eventId, {
+                    fromTeamId: teamIdForNav || undefined,
+                    from: "soccer-player",
+                  })}
                   className="flex items-center gap-4 px-4 py-3 hover:bg-white/[0.03] transition-colors group"
                 >
                   <div className="w-16 text-xs text-white/40 text-center">

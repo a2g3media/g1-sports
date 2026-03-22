@@ -895,6 +895,7 @@ export function useWatchboards() {
     prop_type?: string;
     prop_line?: number;
     prop_selection?: string;
+    board_id?: number;
   }): Promise<{ success: boolean; error?: string }> => {
     if (isAuthenticated && user) {
       try {
@@ -919,7 +920,7 @@ export function useWatchboards() {
     } else {
       // Guest mode
       const playersMap = getGuestPlayers();
-      const boardId = state.activeBoard?.id || 1;
+      const boardId = player.board_id || state.activeBoard?.id || 1;
       const current = playersMap[boardId] || [];
       
       // Check if already following
@@ -932,10 +933,13 @@ export function useWatchboards() {
             : p
         );
         setGuestPlayers(playersMap);
-        setState(prev => ({
-          ...prev,
-          players: playersMap[boardId].filter(p => p.is_active),
-        }));
+        setState(prev => {
+          if (prev.activeBoard?.id !== boardId) return prev;
+          return {
+            ...prev,
+            players: playersMap[boardId].filter(p => p.is_active),
+          };
+        });
         return { success: true };
       }
       
@@ -962,10 +966,13 @@ export function useWatchboards() {
       playersMap[boardId] = [...current, newPlayer];
       setGuestPlayers(playersMap);
       
-      setState(prev => ({
-        ...prev,
-        players: [...prev.players, newPlayer],
-      }));
+      setState(prev => {
+        if (prev.activeBoard?.id !== boardId) return prev;
+        return {
+          ...prev,
+          players: [...prev.players, newPlayer],
+        };
+      });
       
       return { success: true };
     }

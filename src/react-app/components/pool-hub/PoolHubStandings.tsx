@@ -1,4 +1,5 @@
 import { useState, useMemo } from "react";
+import { useQuery } from "@tanstack/react-query";
 import { Trophy, TrendingUp, TrendingDown, Minus, Medal, Skull } from "lucide-react";
 import { useDemoAuth } from "@/react-app/contexts/DemoAuthContext";
 import { getDemoStandingsForLeague, getDemoPeriodsForLeague } from "@/react-app/data/demo-leagues";
@@ -16,6 +17,27 @@ interface PoolHubStandingsProps {
   league: League;
 }
 
+interface StandingsRow {
+  user_id: number;
+  entry_id: number;
+  entry_name?: string;
+  display_name: string;
+  total_points: number;
+  is_eliminated?: boolean;
+  rank: number;
+  previous_rank?: number | null;
+}
+
+interface PeriodResult {
+  period_id: string;
+  standings: StandingsRow[];
+}
+
+interface StandingsResponse {
+  standings: StandingsRow[];
+  periodResults?: PeriodResult[];
+}
+
 function getOrdinal(n: number): string {
   const s = ["th", "st", "nd", "rd"];
   const v = n % 100;
@@ -28,13 +50,23 @@ export function PoolHubStandings({ league }: PoolHubStandingsProps) {
   
   const isSurvivor = league.format_key === "survivor" || 
                      league.format_key === "survivor_reentry";
+
+  const standingsQuery = useQuery({
+    queryKey: ["pool-hub-standings", league.id],
+    enabled: !isDemoMode,
+    queryFn: async () => {
+      const res = await fetch(`/api/leagues/${league.id}/standings`, { credentials: "include" });
+      if (!res.ok) throw new Error("Failed to load standings");
+      return res.json() as Promise<StandingsResponse>;
+    },
+  });
   
-  // Get standings - use demo data in demo mode
+  // Get standings - use demo data in demo mode, API data otherwise.
   const standings = useMemo(() => {
     if (isDemoMode) {
       const demoStandings = getDemoStandingsForLeague(league.id);
       return demoStandings.map(s => ({
-        id: s.user_id,
+        id: `${s.user_id}`,
         rank: s.rank,
         name: s.display_name,
         points: s.total_points,
@@ -45,27 +77,44 @@ export function PoolHubStandings({ league }: PoolHubStandingsProps) {
         initials: s.display_name.split(' ').map(n => n[0]).join(''),
       }));
     }
-    
-    // Default mock data
-    return [
-      { id: 1, rank: 1, name: "Mike S.", points: 156, weeklyPoints: 12, delta: 0, isYou: false, isEliminated: false, initials: "MS" },
-      { id: 2, rank: 2, name: "Sarah K.", points: 148, weeklyPoints: 14, delta: 2, isYou: false, isEliminated: false, initials: "SK" },
-      { id: 3, rank: 3, name: "You", points: 142, weeklyPoints: 10, delta: -1, isYou: true, isEliminated: false, initials: "YO" },
-      { id: 4, rank: 4, name: "John D.", points: 138, weeklyPoints: 11, delta: 1, isYou: false, isEliminated: false, initials: "JD" },
-      { id: 5, rank: 5, name: "Emma R.", points: 134, weeklyPoints: 9, delta: -2, isYou: false, isEliminated: false, initials: "ER" },
-      { id: 6, rank: 6, name: "Alex M.", points: 128, weeklyPoints: 8, delta: 0, isYou: false, isEliminated: false, initials: "AM" },
-      { id: 7, rank: 7, name: "Chris P.", points: 122, weeklyPoints: 7, delta: 1, isYou: false, isEliminated: false, initials: "CP" },
-      { id: 8, rank: 8, name: "Taylor W.", points: 115, weeklyPoints: 6, delta: -1, isYou: false, isEliminated: false, initials: "TW" },
-    ];
-  }, [league.id, isDemoMode]);
+
+    const periodMap = new Map<string, Map<number, number>>();
+    for (const period of standingsQuery.data?.periodResults || []) {
+      const pointsByEntry = new Map<number, number>();
+      for (const row of period.standings || []) {
+        pointsByEntry.set(row.entry_id, Number(row.total_points || 0));
+      }
+      periodMap.set(period.period_id, pointsByEntry);
+    }
+
+    return (standingsQuery.data?.standings || []).map((row) => {
+      const periodPoints = selectedWeek === "all"
+        ? Number(row.total_points || 0)
+        : Number(periodMap.get(selectedWeek)?.get(row.entry_id) || 0);
+      const delta = row.previous_rank ? row.previous_rank - row.rank : 0;
+      const entryLabel = row.entry_name?.trim();
+      const displayName = entryLabel ? `${row.display_name} - ${entryLabel}` : row.display_name;
+      return {
+        id: `${row.user_id}:${row.entry_id}`,
+        rank: row.rank,
+        name: displayName,
+        points: Number(row.total_points || 0),
+        weeklyPoints: periodPoints,
+        delta,
+        isYou: false,
+        isEliminated: Boolean(row.is_eliminated),
+        initials: displayName.split(" ").map((n) => n[0]).join("").slice(0, 2),
+      };
+    });
+  }, [league.id, isDemoMode, selectedWeek, standingsQuery.data]);
   
   // Available periods - use demo data in demo mode
   const periods = useMemo(() => {
     if (isDemoMode) {
       return getDemoPeriodsForLeague(league.id);
     }
-    return Array.from({ length: 14 }, (_, i) => `Week ${i + 1}`);
-  }, [league.id, isDemoMode]);
+    return (standingsQuery.data?.periodResults || []).map((p) => p.period_id);
+  }, [league.id, isDemoMode, standingsQuery.data]);
   
   // Current user stats
   const currentUser = standings.find(s => s.isYou);
@@ -104,6 +153,15 @@ export function PoolHubStandings({ league }: PoolHubStandingsProps) {
       
       {/* Standings Table */}
       <div className="card-elevated overflow-hidden">
+        {!isDemoMode && standingsQuery.isLoading && (
+          <div className="p-4 text-sm text-muted-foreground">Loading standings...</div>
+        )}
+        {!isDemoMode && standingsQuery.isError && (
+          <div className="p-4 text-sm text-destructive">Unable to load standings right now.</div>
+        )}
+        {!isDemoMode && !standingsQuery.isLoading && standings.length === 0 && (
+          <div className="p-4 text-sm text-muted-foreground">No standings available yet.</div>
+        )}
         <div className="overflow-x-auto">
           <table className="w-full">
             <thead>

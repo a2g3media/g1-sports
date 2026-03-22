@@ -143,27 +143,26 @@ const generateDemoAuditTimeline = () => ({
 adminRouter.use("*", async (c, next) => {
   // Allow demo mode to bypass auth entirely
   if (isDemoMode(c)) {
-    await next();
-    return;
+    return next();
   }
   // Otherwise require real auth + super admin
   // Use sequential middleware pattern
   let authPassed = false;
   let adminPassed = false;
   
-  await authMiddleware(c, async () => {
+  const authResult = await authMiddleware(c, async () => {
     authPassed = true;
   });
   
-  if (!authPassed) return;
+  if (!authPassed) return authResult as Response;
   
-  await superAdminMiddleware(c, async () => {
+  const superAdminResult = await superAdminMiddleware(c, async () => {
     adminPassed = true;
   });
   
-  if (!adminPassed) return;
+  if (!adminPassed) return superAdminResult as Response;
   
-  await next();
+  return next();
 });
 
 // ============ Overview (Executive Health Dashboard) ============

@@ -273,9 +273,34 @@ export function PoolAdminSettings() {
       setCategoryKey(typeof listing.category_key === "string" ? listing.category_key : "");
       setIsFeatured(!!listing.is_featured);
       setListingFeeCents(Number(listing.listing_fee_cents || 0));
-      return listing;
+      return payload as {
+        listing: {
+          listing_status?: string;
+          category_key?: string | null;
+          is_featured?: boolean;
+          listing_fee_cents?: number;
+        };
+        activation_readiness?: {
+          checks?: Array<{ key: string; label: string; done: boolean; hint?: string }>;
+          missing?: Array<{ key: string; label: string; done: boolean; hint?: string }>;
+          complete?: boolean;
+        };
+      };
     },
   });
+
+  const activationReadiness = useMemo(() => {
+    const payload = listingQuery.data as
+      | {
+          activation_readiness?: {
+            checks?: Array<{ key: string; label: string; done: boolean; hint?: string }>;
+            missing?: Array<{ key: string; label: string; done: boolean; hint?: string }>;
+            complete?: boolean;
+          };
+        }
+      | undefined;
+    return payload?.activation_readiness || null;
+  }, [listingQuery.data]);
 
   const saveEventMap = useMutation({
     mutationFn: async () => {
@@ -619,6 +644,21 @@ export function PoolAdminSettings() {
               </CardDescription>
             </CardHeader>
             <CardContent className="space-y-3">
+              {activationReadiness && (
+                <div className="rounded-md border px-3 py-2">
+                  <p className="text-sm font-medium">Activation Gate</p>
+                  <p className="text-xs text-muted-foreground">
+                    Pool cannot be listed until required admin configuration is complete.
+                  </p>
+                  <div className="mt-2 flex flex-wrap gap-2">
+                    {(activationReadiness.checks || []).map((check) => (
+                      <Badge key={check.key} variant={check.done ? "default" : "outline"}>
+                        {check.done ? "Ready" : "Missing"} - {check.label}
+                      </Badge>
+                    ))}
+                  </div>
+                </div>
+              )}
               <div className="space-y-2">
                 {launchChecklist.checks.map((check) => (
                   <div key={check.id} className="flex items-start justify-between gap-3 rounded-md border px-3 py-2">

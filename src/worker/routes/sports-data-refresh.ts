@@ -23,13 +23,21 @@ import {
 } from '../services/sports-data/internalScheduler';
 import {
   getSportsRadarProvider,
-  fetchPropsCached
+  fetchPropsCached,
+  fetchStandingsCached,
+  fetchTeamProfileCached,
 } from '../services/sports-data/sportsRadarProvider';
-import { getCacheStats as getD1CacheStats, clearExpiredCache, clearProviderCache } from '../services/apiCacheService';
+import {
+  getCacheStats as getD1CacheStats,
+  clearExpiredCache,
+  clearProviderCache,
+  getCachedData,
+  setCachedData,
+} from '../services/apiCacheService';
 import { fetchLiveScores, initSportsRadarGameProvider } from '../services/providers/sportsRadarGameProvider';
 import type { SportKey as ProviderSportKey } from '../services/providers/types';
-import { fetchGamesWithFallback, getActiveProviderName, getPartnerAlerts, getProviderConfigs, getProviderTelemetry } from '../services/providers';
-import { fetchSportsRadarOdds } from '../services/sportsRadarOddsService';
+import { fetchGameWithFallback, fetchGamesWithFallback, getActiveProviderName, getPartnerAlerts, getProviderConfigs, getProviderTelemetry } from '../services/providers';
+import { fetchSportsRadarOdds, fetchGamePlayerProps } from '../services/sportsRadarOddsService';
 import { getEasternDateStringOffset, getTodayEasternDateString } from '../services/dateUtils';
 
 type Bindings = {
@@ -3259,6 +3267,575 @@ app.get('/sportsradar/player-props/:sport', async (c) => {
     testResult: result,
     apiKeyConfigured: !!playerPropsKey
   });
+});
+
+function buildPropIsolationIdCandidates(rawGameId: string): Set<string> {
+  const trimmed = String(rawGameId || "").trim();
+  const out = new Set<string>();
+  if (!trimmed) return out;
+
+  out.add(trimmed);
+
+  if (trimmed.startsWith("soccer_sr:sport_event:")) {
+    out.add(trimmed.replace(/^soccer_/, ""));
+  }
+  if (trimmed.startsWith("sr:sport_event:")) {
+    out.add(trimmed.replace(/^sr:sport_event:/, ""));
+  } else if (trimmed.startsWith("sr_")) {
+    const parts = trimmed.split("_");
+    if (parts.length >= 3) {
+      out.add(`sr:sport_event:${parts.slice(2).join("_")}`);
+    }
+  }
+  if (trimmed.includes("-") && trimmed.length >= 30 && !trimmed.startsWith("sr:sport_event:")) {
+    out.add(`sr:sport_event:${trimmed}`);
+  }
+
+  for (const item of Array.from(out)) {
+    if (item.startsWith("sr:sport_event:")) {
+      out.add(item.replace(/^sr:sport_event:/, ""));
+    }
+  }
+  return out;
+}
+
+function extractPropIsolationIds(row: Record<string, unknown>): string[] {
+  const ids = [
+    row.game_id,
+    row.provider_game_id,
+    row.provider_event_id,
+    row.event_id,
+    row.eventId,
+    row.providerEventId,
+    row.providerGameId,
+    row.gameId,
+  ];
+  return ids.map((value) => String(value || "").trim()).filter(Boolean);
+}
+
+function isRowMappedToRequestedGame(
+  row: Record<string, unknown>,
+  requestedCandidates: Set<string>
+): boolean {
+  const rowIds = extractPropIsolationIds(row);
+  if (rowIds.length === 0) return false;
+  for (const rowId of rowIds) {
+    const rowCandidates = buildPropIsolationIdCandidates(rowId);
+    for (const candidate of rowCandidates) {
+      if (requestedCandidates.has(candidate)) return true;
+    }
+  }
+  return false;
+}
+
+function normalizeTeamMatchToken(value: unknown): string {
+  return String(value || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+function rowMatchesRequestedTeams(
+  row: Record<string, unknown>,
+  homeToken: string,
+  awayToken: string
+): boolean {
+  if (!homeToken || !awayToken) return false;
+  const rowHome = normalizeTeamMatchToken(row.home_team);
+  const rowAway = normalizeTeamMatchToken(row.away_team);
+  if (!rowHome || !rowAway) return false;
+  return (rowHome === homeToken && rowAway === awayToken)
+    || (rowHome === awayToken && rowAway === homeToken);
+}
+
+function normalizeTeamToken(value: unknown): string {
+  return String(value || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+function normalizePlayerToken(value: unknown): string {
+  const trimmed = String(value || '').trim();
+  const reordered = trimmed.includes(',')
+    ? (() => {
+      const [last, first] = trimmed.split(',', 2).map((part) => part.trim());
+      return first && last ? `${first} ${last}` : trimmed;
+    })()
+    : trimmed;
+  return reordered
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[.,'’`-]/g, ' ')
+    .replace(/\b(jr|sr|ii|iii|iv|v)\b/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function teamMatchesName(team: any, fullName: string): boolean {
+  const target = normalizeTeamToken(fullName);
+  if (!target) return false;
+  const market = String(team?.market || '');
+  const name = String(team?.name || '');
+  const alias = String(team?.alias || '');
+  const full = normalizeTeamToken(`${market} ${name}`.trim());
+  const aliasNorm = normalizeTeamToken(alias);
+  return Boolean(
+    (full && (full.includes(target) || target.includes(full)))
+    || (aliasNorm && aliasNorm === target)
+  );
+}
+
+const DATA_SPORT_KEY_MAP: Record<string, string> = {
+  nba: 'NBA',
+  nfl: 'NFL',
+  mlb: 'MLB',
+  nhl: 'NHL',
+  ncaab: 'NCAAB',
+  ncaaf: 'NCAAF',
+};
+
+// GET /api/sports-data/props/today - Unified props feed for frontend pages
+app.get('/props/today', async (c) => {
+  const db = c.env.DB;
+  const requestedSport = String(c.req.query('sport') || 'ALL').trim().toUpperCase();
+  const requestedDate = String(c.req.query('date') || getTodayEasternDateString()).trim();
+  const requestedGameIdRaw = String(c.req.query('game_id') || c.req.query('event_id') || '').trim();
+  const requestedGameId = requestedGameIdRaw || null;
+  const gameIdCandidates = requestedGameId ? buildPropIsolationIdCandidates(requestedGameId) : null;
+  const requestedLimitRaw = Number(c.req.query('limit') || '');
+  const requestedOffsetRaw = Number(c.req.query('offset') || '');
+  const defaultLimit = requestedSport === 'ALL' ? 1200 : 3000;
+  const limit = Number.isFinite(requestedLimitRaw) && requestedLimitRaw > 0
+    ? Math.min(Math.floor(requestedLimitRaw), 5000)
+    : defaultLimit;
+  const offset = Number.isFinite(requestedOffsetRaw) && requestedOffsetRaw >= 0
+    ? Math.floor(requestedOffsetRaw)
+    : 0;
+
+  // Use dedicated player props key when present, otherwise fallback chain.
+  const playerPropsKey = c.env.SPORTSRADAR_PLAYER_PROPS_KEY
+    || c.env.SPORTSRADAR_PROPS_KEY
+    || c.env.SPORTSRADAR_API_KEY;
+  if (!playerPropsKey) {
+    return c.json({
+      date: requestedDate,
+      sport: requestedSport,
+      requested_game_id: requestedGameId,
+      props_isolation_applied: Boolean(requestedGameId),
+      props: [],
+      count: 0,
+      fallback_reason: requestedGameId ? 'No player props available for this game_id/event_id' : null,
+      errors: ['SportsRadar Player Props API key not configured'],
+    }, 200);
+  }
+
+  const allowedSports = ['NBA', 'NCAAB', 'NHL', 'MLB', 'NFL'] as const;
+  const sportsToFetch = requestedSport === 'ALL'
+    ? [...allowedSports]
+    : (allowedSports.includes(requestedSport as any) ? [requestedSport as (typeof allowedSports)[number]] : []);
+
+  if (sportsToFetch.length === 0) {
+    return c.json({
+      date: requestedDate,
+      sport: requestedSport,
+      requested_game_id: requestedGameId,
+      props_isolation_applied: Boolean(requestedGameId),
+      props: [],
+      count: 0,
+      fallback_reason: requestedGameId ? 'No player props available for this game_id/event_id' : null,
+      errors: [`Unsupported sport: ${requestedSport}`],
+    }, 200);
+  }
+
+  const forceFresh = ['1', 'true', 'yes'].includes(String(c.req.query('fresh') || '').toLowerCase());
+  const cacheKey = `props_today_v4:${requestedSport}:${requestedDate}`;
+  const backupCacheKey = `props_today_v4_backup:${requestedSport}:${requestedDate}`;
+  let requestedGameTeamTokens: { home: string; away: string } | null = null;
+  let requestedGameTeamLabels: { home: string; away: string } | null = null;
+  let requestedGameRosterLookup = new Map<string, string>();
+  let resolvedRequestedGameSport = requestedSport;
+  if (requestedGameId) {
+    try {
+      const gameResult = await fetchGameWithFallback(requestedGameId);
+      const game = gameResult.data?.game;
+      const homeName = String(game?.home_team_name || game?.homeTeam || game?.home_team || '').trim();
+      const awayName = String(game?.away_team_name || game?.awayTeam || game?.away_team || '').trim();
+      const home = normalizeTeamMatchToken(homeName);
+      const away = normalizeTeamMatchToken(awayName);
+      const gameSport = String(game?.sport || '').trim().toLowerCase();
+      if (gameSport) {
+        resolvedRequestedGameSport = gameSport.toUpperCase();
+      }
+      if (home && away) {
+        requestedGameTeamTokens = { home, away };
+        requestedGameTeamLabels = {
+          home: homeName || 'Home',
+          away: awayName || 'Away',
+        };
+      }
+
+      const dataSport = DATA_SPORT_KEY_MAP[gameSport];
+      const standingsKey = c.env.SPORTSRADAR_API_KEY || playerPropsKey;
+      if (requestedGameTeamLabels && db && standingsKey && dataSport) {
+        try {
+          const standings = await fetchStandingsCached(db, dataSport as any, standingsKey);
+          const teams = Array.isArray(standings?.teams) ? standings.teams : [];
+          const homeTeam = teams.find((team: any) => teamMatchesName(team, requestedGameTeamLabels!.home));
+          const awayTeam = teams.find((team: any) => teamMatchesName(team, requestedGameTeamLabels!.away));
+          const [homeProfile, awayProfile] = await Promise.all([
+            homeTeam?.id ? fetchTeamProfileCached(db, dataSport as any, String(homeTeam.id), standingsKey) : null,
+            awayTeam?.id ? fetchTeamProfileCached(db, dataSport as any, String(awayTeam.id), standingsKey) : null,
+          ]);
+          const addRoster = (roster: unknown, teamLabel: string) => {
+            if (!Array.isArray(roster)) return;
+            for (const p of roster) {
+              if (!p || typeof p !== 'object') continue;
+              const player = p as Record<string, unknown>;
+              const token = normalizePlayerToken(player.full_name || player.name || '');
+              if (token) requestedGameRosterLookup.set(token, teamLabel);
+            }
+          };
+          addRoster((homeProfile as any)?.roster, requestedGameTeamLabels.home);
+          addRoster((awayProfile as any)?.roster, requestedGameTeamLabels.away);
+        } catch {
+          // Non-fatal: fallback to team-name matching only.
+        }
+      }
+    } catch {
+      // Non-fatal: keep strict ID matching even if team-token enrichment fails.
+    }
+  }
+  const applyGameIsolation = (base: any) => {
+    const allRows = Array.isArray(base?.props) ? base.props : [];
+    if (!requestedGameId || !gameIdCandidates || gameIdCandidates.size === 0) {
+      return {
+        ...base,
+        requested_game_id: null,
+        props_isolation_applied: false,
+        unfiltered_total_count: allRows.length,
+      };
+    }
+    let matchStrategy: 'id' | 'teams' = 'id';
+    let isolatedRows = allRows.filter((row) =>
+      row && typeof row === 'object'
+        ? isRowMappedToRequestedGame(row as Record<string, unknown>, gameIdCandidates)
+        : false
+    );
+    if (isolatedRows.length === 0 && requestedGameTeamTokens) {
+      const teamMatchedRows = allRows.filter((row) =>
+        row && typeof row === 'object'
+          ? rowMatchesRequestedTeams(
+            row as Record<string, unknown>,
+            requestedGameTeamTokens!.home,
+            requestedGameTeamTokens!.away
+          )
+          : false
+      );
+      if (teamMatchedRows.length > 0) {
+        isolatedRows = teamMatchedRows;
+        matchStrategy = 'teams';
+      }
+    }
+    const normalizedRows = isolatedRows.map((row) => {
+      const record = (row && typeof row === 'object') ? (row as Record<string, unknown>) : {};
+      const providerGameId = String(record.provider_game_id || record.game_id || '').trim() || null;
+      const providerEventId = String(record.provider_event_id || record.event_id || record.game_id || '').trim() || null;
+      const existingTeam = String(record.team || '').trim();
+      const playerToken = normalizePlayerToken(record.player_name || '');
+      const rosterTeam = playerToken ? requestedGameRosterLookup.get(playerToken) : undefined;
+      const inferredTeam = existingTeam || rosterTeam || '';
+      return {
+        ...record,
+        game_id: requestedGameId,
+        sport: resolvedRequestedGameSport,
+        team: inferredTeam || null,
+        provider_game_id: providerGameId,
+        provider_event_id: providerEventId,
+      };
+    });
+    return {
+      ...base,
+      requested_game_id: requestedGameId,
+      props_isolation_applied: true,
+      unfiltered_total_count: allRows.length,
+      props_isolation_match_strategy: matchStrategy,
+      props: normalizedRows,
+      fallback_reason: normalizedRows.length === 0 ? 'No player props available for this game_id/event_id' : null,
+    };
+  };
+  const paginatePayload = (base: any) => {
+    const scopedBase = applyGameIsolation(base);
+    const allRows = Array.isArray(scopedBase?.props) ? scopedBase.props : [];
+    const paged = allRows.slice(offset, offset + limit);
+    const hasMore = offset + paged.length < allRows.length;
+    return {
+      ...scopedBase,
+      count: paged.length,
+      total_count: allRows.length,
+      limit,
+      offset,
+      has_more: hasMore,
+      next_offset: hasMore ? offset + paged.length : null,
+      props: paged,
+    };
+  };
+  const hasUsableRows = (payload: any): boolean => {
+    const rows = Array.isArray(payload?.props) ? payload.props : [];
+    return rows.length > 0;
+  };
+  const isDegradedPayload = (payload: any): boolean => {
+    const errors = Array.isArray(payload?.errors) ? payload.errors : [];
+    return errors.length > 0;
+  };
+  if (!forceFresh) {
+    try {
+      const cached = await getCachedData<any>(db, cacheKey);
+      if (cached && Array.isArray(cached.props)) {
+        return c.json(paginatePayload({
+          ...cached,
+          cached: true,
+        }), 200);
+      }
+    } catch {
+      // fail open and compute fresh payload
+    }
+  }
+
+  const { golfKey, propsKey } = getSportsRadarKeys(c.env);
+  const provider = getSportsRadarProvider(golfKey, propsKey);
+  const nowIso = new Date().toISOString();
+  
+  const fetchSportProps = async (sport: string): Promise<{ rows: Array<Record<string, unknown>>; errors: string[] }> => {
+    const rows: Array<Record<string, unknown>> = [];
+    const rowErrors: string[] = [];
+    const dedupe = new Set<string>();
+    const sportLower = sport.toLowerCase();
+    const eventRows: Array<{ gameId: string; home: string; away: string }> = [];
+    try {
+      // Build game/event list from odds slate so we probe every active game for props.
+      const oddsMap = await fetchSportsRadarOdds(
+        sportLower,
+        c.env.SPORTSRADAR_API_KEY || playerPropsKey,
+        db,
+        requestedDate,
+        c.env.SPORTSRADAR_ODDS_KEY || undefined
+      );
+      const seenGameIds = new Set<string>();
+      for (const odds of oddsMap.values()) {
+        const gameId = String((odds as any)?.gameId || '').trim();
+        if (!gameId || seenGameIds.has(gameId)) continue;
+        if (!gameId.startsWith('sr:sport_event:')) continue;
+        seenGameIds.add(gameId);
+        eventRows.push({
+          gameId,
+          home: String((odds as any)?.homeTeam || ''),
+          away: String((odds as any)?.awayTeam || ''),
+        });
+      }
+    } catch (err) {
+      rowErrors.push(`${sport}: failed to build event list from odds map (${String(err)})`);
+    }
+
+    // Event-level fetches give materially better coverage than competition rollups.
+    if (eventRows.length > 0) {
+      const batchSize = 10;
+      for (let i = 0; i < eventRows.length; i += batchSize) {
+        const chunk = eventRows.slice(i, i + batchSize);
+        const settled = await Promise.allSettled(
+          chunk.map(async (eventRow) => {
+            const props = await fetchGamePlayerProps(
+              eventRow.gameId,
+              sportLower,
+              eventRow.home,
+              eventRow.away,
+              playerPropsKey,
+              'SCHEDULED'
+            );
+            return { eventRow, props };
+          })
+        );
+
+        for (const item of settled) {
+          if (item.status !== 'fulfilled') {
+            rowErrors.push(`${sport}: event props fetch failed (${String(item.reason)})`);
+            continue;
+          }
+          const { eventRow, props } = item.value;
+          for (let j = 0; j < props.length; j++) {
+            const p = props[j] as any;
+            const playerName = String(p.player_name || '').trim();
+            const propType = String(p.prop_type || 'Unknown').trim();
+            const sportsbook = String(p.sportsbook || 'SportsRadar').trim();
+            const lineValue = Number(p.line ?? 0);
+            const uniq = `${sport}|${eventRow.gameId}|${playerName}|${propType}|${sportsbook}|${lineValue}`;
+            if (dedupe.has(uniq)) continue;
+            dedupe.add(uniq);
+            rows.push({
+              id: `${sport}:${eventRow.gameId}:${playerName || 'unknown'}:${propType}:${j}`,
+              game_id: eventRow.gameId,
+              provider_game_id: eventRow.gameId,
+              provider_event_id: eventRow.gameId,
+              sport,
+              player_name: playerName,
+              player_id: null,
+              team: null,
+              prop_type: propType,
+              line_value: lineValue,
+              open_line_value: null,
+              movement: null,
+              last_updated: nowIso,
+              odds_american: p.over_odds === undefined || p.over_odds === null
+                ? null
+                : Number(p.over_odds),
+              home_team: eventRow.home || null,
+              away_team: eventRow.away || null,
+              line: lineValue,
+              over_odds: Number(p.over_odds ?? -110),
+              under_odds: Number(p.under_odds ?? -110),
+              sportsbook,
+              market_name: '',
+              trend: null,
+              source: 'sportsradar',
+            });
+          }
+        }
+      }
+      return { rows, errors: rowErrors };
+    }
+
+    // Fallback path: competition-wide props (useful when event list is empty).
+    const fallback = await fetchPropsCached(db, provider, sport as any, playerPropsKey);
+    if (Array.isArray(fallback.errors) && fallback.errors.length > 0) {
+      rowErrors.push(...fallback.errors.map((e) => `${sport}: ${e}`));
+    }
+    for (let i = 0; i < fallback.props.length; i++) {
+      const p = fallback.props[i] as any;
+      const providerGameId = String(p.providerGameId || '').trim();
+      if (!providerGameId) continue;
+      const playerName = String(p.playerName || '').trim();
+      const propType = String(p.propType || 'Unknown').trim();
+      const sportsbook = String(p.sportsbook || 'SportsRadar').trim();
+      const lineValue = Number(p.lineValue ?? 0);
+      const uniq = `${sport}|${providerGameId}|${playerName}|${propType}|${sportsbook}|${lineValue}`;
+      if (dedupe.has(uniq)) continue;
+      dedupe.add(uniq);
+      rows.push({
+        id: `${sport}:${providerGameId}:${playerName || 'unknown'}:${propType}:${i}`,
+        game_id: providerGameId,
+        provider_game_id: providerGameId,
+        provider_event_id: providerGameId,
+        sport,
+        player_name: playerName,
+        player_id: p.playerId ? String(p.playerId) : null,
+        team: p.team ? String(p.team) : '',
+        prop_type: propType,
+        line_value: lineValue,
+        open_line_value: p.openLineValue === undefined ? null : Number(p.openLineValue),
+        movement: p.openLineValue !== undefined && p.openLineValue !== null
+          ? Number(p.lineValue ?? 0) - Number(p.openLineValue)
+          : null,
+        last_updated: nowIso,
+        odds_american: p.oddsAmerican === undefined || p.oddsAmerican === null
+          ? null
+          : Number(p.oddsAmerican),
+        home_team: p.homeTeam ? String(p.homeTeam) : null,
+        away_team: p.awayTeam ? String(p.awayTeam) : null,
+        line: lineValue,
+        over_odds: Number(p.oddsAmerican ?? -110),
+        under_odds: Number(p.oddsAmerican ?? -110),
+        sportsbook,
+        market_name: p.marketName ? String(p.marketName) : '',
+        trend: p.trend ? String(p.trend) : null,
+        source: 'sportsradar',
+      });
+    }
+    return { rows, errors: rowErrors };
+  };
+
+  const buildPayloadForSports = async (targetSports: string[], requestSportLabel: string) => {
+    const settledBySport = await Promise.allSettled(
+      targetSports.map((sport) => fetchSportProps(sport))
+    );
+
+    const out: Array<Record<string, unknown>> = [];
+    const errors: string[] = [];
+    for (let idx = 0; idx < settledBySport.length; idx++) {
+      const settled = settledBySport[idx];
+      const sport = targetSports[idx];
+      if (settled.status !== 'fulfilled') {
+        errors.push(`${sport}: ${String(settled.reason)}`);
+        continue;
+      }
+      out.push(...settled.value.rows);
+      errors.push(...settled.value.errors);
+    }
+
+    return {
+      date: requestedDate,
+      sport: requestSportLabel,
+      sports: targetSports,
+      count: out.length,
+      props: out,
+      errors,
+      cached: false,
+    };
+  };
+
+  const payload = await buildPayloadForSports([...sportsToFetch], requestedSport);
+
+  // Reliability guardrail: do not replace known-good payload with empty/error payload.
+  // If current fetch is degraded or empty, serve last known good snapshot when available.
+  if (isDegradedPayload(payload) || !hasUsableRows(payload)) {
+    try {
+      const backup = await getCachedData<any>(db, backupCacheKey);
+      if (backup && hasUsableRows(backup)) {
+        return c.json(paginatePayload({
+          ...backup,
+          cached: true,
+          source_stale: true,
+          fallback_reason: 'Served last known good props snapshot while upstream feed is empty/degraded',
+          degraded: true,
+          upstream_errors: Array.isArray(payload?.errors) ? payload.errors : [],
+        }), 200);
+      }
+    } catch {
+      // fail open and return fresh payload below
+    }
+  }
+
+  try {
+    await setCachedData(db, cacheKey, 'sportsradar', 'props/today', payload, 60);
+  } catch {
+    // non-fatal: serve fresh payload even if cache write fails
+  }
+
+  if (hasUsableRows(payload)) {
+    try {
+      // Keep a longer-lived good snapshot for stale fallback.
+      await setCachedData(db, backupCacheKey, 'sportsradar', 'props/today', payload, 60 * 60);
+    } catch {
+      // non-fatal
+    }
+  }
+
+  // Background warm-cache for ALL payload so subsequent "All" views are instant.
+  if (!forceFresh && requestedSport !== 'ALL') {
+    const allCacheKey = `props_today_v4:ALL:${requestedDate}`;
+    const waitUntil = (c as any)?.executionCtx?.waitUntil?.bind((c as any).executionCtx);
+    const warmTask = (async () => {
+      try {
+        const existingAll = await getCachedData<any>(db, allCacheKey);
+        if (existingAll && Array.isArray(existingAll.props)) return;
+        const allPayload = await buildPayloadForSports([...allowedSports], 'ALL');
+        await setCachedData(db, allCacheKey, 'sportsradar', 'props/today', allPayload, 60);
+      } catch {
+        // Non-fatal background task.
+      }
+    })();
+    if (waitUntil) {
+      waitUntil(warmTask);
+    } else {
+      void warmTask;
+    }
+  }
+
+  return c.json(paginatePayload(payload), 200);
 });
 
 // GET /api/sports-data/sportsradar/competition-props/:sport - Fetch all props for a competition

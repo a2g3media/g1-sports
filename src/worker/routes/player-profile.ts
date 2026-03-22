@@ -660,14 +660,23 @@ async function fetchPlayerHealth(
 // SPORTSRADAR PLAYER PROPS API
 // ============================================
 
-// Competition ID mapping for SportsRadar Player Props
-const SR_COMPETITION_IDS: Record<string, string> = {
-  'NBA': 'sr:competition:132',
-  'NFL': 'sr:competition:1',
-  'MLB': 'sr:competition:109',
-  'NHL': 'sr:competition:234',
-  'NCAAB': 'sr:competition:233',
-  'NCAAF': 'sr:competition:298',
+// Competition ID mapping for SportsRadar Player Props (oddscomparison-player-props product).
+// These IDs are specific to the Odds Comparison product family and differ from the
+// Sports Data API. Verified 2026-03-20.
+const SR_COMPETITION_IDS: Record<string, string[]> = {
+  'NBA': ['sr:competition:132'],
+  'NFL': ['sr:competition:31'],
+  'MLB': ['sr:competition:109'],
+  'NHL': ['sr:competition:234'],
+  'NCAAB': [
+    'sr:competition:28370',  // NCAA Div I Championship (March Madness)
+    'sr:competition:648',    // NCAA Regular Season
+    'sr:competition:24135',  // NIT
+  ],
+  'NCAAF': [
+    'sr:competition:27653',  // NCAA Regular Season
+    'sr:competition:27625',  // NCAA FBS Post Season
+  ],
 };
 
 interface PlayerProp {
@@ -688,77 +697,103 @@ async function fetchPlayerPropsFromSportsRadar(
     return [];
   }
   
-  const competitionId = SR_COMPETITION_IDS[sport];
-  if (!competitionId) {
+  const competitionIds = SR_COMPETITION_IDS[sport];
+  if (!competitionIds || competitionIds.length === 0) {
     console.log(`[SportsRadar Props] Unknown sport: ${sport}`);
     return [];
   }
   
   try {
-    // SportsRadar Player Props endpoint
-    const url = `https://api.sportradar.com/oddscomparison-player-props/production/v2/en/competitions/${encodeURIComponent(competitionId)}/players_props.json?api_key=${apiKey}`;
-    
-    console.log(`[SportsRadar Props] Fetching props for ${playerName} in ${sport}`);
-    
-    const response = await fetch(url, {
-      headers: { 'Accept': 'application/json' }
-    });
-    
-    if (!response.ok) {
-      console.log(`[SportsRadar Props] API error: ${response.status}`);
-      return [];
-    }
-    
-    const data = await response.json() as any;
     const props: PlayerProp[] = [];
     const playerLower = playerName.toLowerCase();
-    
-    // Parse player props from response
-    const sportEvents = data.sport_events || [];
-    
-    for (const event of sportEvents) {
-      const markets = event.markets || [];
+
+    // Try each competition ID until we find props for this player.
+    for (const competitionId of competitionIds) {
+      const url = `https://api.sportradar.com/oddscomparison-player-props/production/v2/en/competitions/${encodeURIComponent(competitionId)}/players_props.json?api_key=${apiKey}`;
       
-      for (const market of markets) {
-        const books = market.books || [];
-        if (books.length === 0) continue;
-        
-        const book = books[0]; // Use first sportsbook
-        const outcomes = book.outcomes || [];
-        
-        // Find outcomes for this player
-        for (const outcome of outcomes) {
-          const outcomeName = (outcome.name || '').toLowerCase();
-          if (!outcomeName.includes(playerLower)) continue;
-          
-          // Extract prop type from market name
+      console.log(`[SportsRadar Props] Fetching props for ${playerName} in ${sport} (${competitionId})`);
+      
+      const response = await fetch(url, {
+        headers: { 'Accept': 'application/json' }
+      });
+      
+      if (!response.ok) {
+        console.log(`[SportsRadar Props] API error ${response.status} for ${competitionId}`);
+        continue;
+      }
+      
+      const data = await response.json() as any;
+    
+    // Parse player props from response.
+    // Primary schema: competition_sport_events_players_props[].players_props[].
+    const competitionEvents = data.competition_sport_events_players_props || [];
+    for (const event of competitionEvents) {
+      const playersProps = event.players_props || [];
+      for (const row of playersProps) {
+        const rowPlayerName = String(row?.player?.name || row?.name || '').toLowerCase();
+        if (!rowPlayerName || !rowPlayerName.includes(playerLower)) continue;
+        const markets = row.markets || [];
+        for (const market of markets) {
           const marketName = market.name || '';
           const propType = mapSportsRadarPropType(marketName);
-          
-          if (propType && outcome.line !== undefined) {
-            // Find the corresponding over/under
-            const overOutcome = outcomes.find((o: any) => 
-              o.name?.toLowerCase().includes(playerLower) && 
-              o.type?.toLowerCase() === 'over'
-            );
-            const underOutcome = outcomes.find((o: any) => 
-              o.name?.toLowerCase().includes(playerLower) && 
-              o.type?.toLowerCase() === 'under'
-            );
-            
-            if (overOutcome || underOutcome) {
-              props.push({
-                type: propType,
-                line: outcome.line || overOutcome?.line || underOutcome?.line || 0,
-                overOdds: overOutcome?.odds ? decimalToAmerican(overOutcome.odds) : -110,
-                underOdds: underOutcome?.odds ? decimalToAmerican(underOutcome.odds) : -110,
-                sportsbook: book.name || 'SportsRadar',
-              });
-            }
-          }
+          if (!propType) continue;
+          const book = (market.books || [])
+            .filter((candidate: any) => Array.isArray(candidate?.outcomes) && candidate.outcomes.length > 0)
+            .sort((a: any, b: any) => (b.outcomes?.length || 0) - (a.outcomes?.length || 0))[0];
+          if (!book) continue;
+          const outcomes = book.outcomes || [];
+          const overOutcome = outcomes.find((o: any) => (o.type || '').toLowerCase().includes('over'));
+          const underOutcome = outcomes.find((o: any) => (o.type || '').toLowerCase().includes('under'));
+          const lineValue = overOutcome?.line ?? underOutcome?.line ?? overOutcome?.total ?? underOutcome?.total;
+          if (lineValue === undefined || lineValue === null) continue;
+          props.push({
+            type: propType,
+            line: Number(lineValue) || 0,
+            overOdds: overOutcome?.odds ? decimalToAmerican(overOutcome.odds) : -110,
+            underOdds: underOutcome?.odds ? decimalToAmerican(underOutcome.odds) : -110,
+            sportsbook: book.name || 'SportsRadar',
+          });
         }
       }
     }
+
+      // Legacy schema fallback: sport_events[].markets[] with player name embedded in outcome names.
+      const legacyEvents = data.sport_events || [];
+      for (const event of legacyEvents) {
+        const markets = event.markets || [];
+        for (const market of markets) {
+          const books = market.books || [];
+          if (books.length === 0) continue;
+          const book = books
+            .filter((candidate: any) => Array.isArray(candidate?.outcomes) && candidate.outcomes.length > 0)
+            .sort((a: any, b: any) => (b.outcomes?.length || 0) - (a.outcomes?.length || 0))[0];
+          if (!book) continue;
+          const outcomes = book.outcomes || [];
+          const overOutcome = outcomes.find((o: any) =>
+            (o.name || '').toLowerCase().includes(playerLower) && (o.type || '').toLowerCase() === 'over'
+          );
+          const underOutcome = outcomes.find((o: any) =>
+            (o.name || '').toLowerCase().includes(playerLower) && (o.type || '').toLowerCase() === 'under'
+          );
+          if (!overOutcome && !underOutcome) continue;
+          const marketName = market.name || '';
+          const propType = mapSportsRadarPropType(marketName);
+          if (!propType) continue;
+          const lineValue = overOutcome?.line ?? underOutcome?.line;
+          if (lineValue === undefined || lineValue === null) continue;
+          props.push({
+            type: propType,
+            line: Number(lineValue) || 0,
+            overOdds: overOutcome?.odds ? decimalToAmerican(overOutcome.odds) : -110,
+            underOdds: underOutcome?.odds ? decimalToAmerican(underOutcome.odds) : -110,
+            sportsbook: book.name || 'SportsRadar',
+          });
+        }
+      }
+
+      // If we found props in this competition, stop searching others.
+      if (props.length > 0) break;
+    } // end competitionIds loop
     
     console.log(`[SportsRadar Props] Found ${props.length} props for ${playerName}`);
     return props;

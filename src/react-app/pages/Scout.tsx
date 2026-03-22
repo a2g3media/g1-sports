@@ -189,19 +189,18 @@ const QuickActionButton = memo(function QuickActionButton({
 
 export default function Scout() {
   const navigate = useNavigate();
-  const { triggerAutoOpenScout } = useGlobalAI();
+  const { openChat } = useGlobalAI();
   const [inputValue, setInputValue] = useState("");
 
   const handleAsk = () => {
     if (inputValue.trim()) {
-      triggerAutoOpenScout();
+      openChat(inputValue.trim());
       setInputValue("");
     }
   };
 
   const handlePromptClick = (prompt: string) => {
-    setInputValue(prompt);
-    triggerAutoOpenScout();
+    openChat(prompt);
   };
 
   return (
@@ -295,7 +294,7 @@ export default function Scout() {
               <InsightCard
                 key={insight.id}
                 insight={insight}
-                onClick={() => triggerAutoOpenScout()}
+                onClick={() => openChat(`Give me the latest edge on ${insight.title}.`)}
               />
             ))}
           </div>

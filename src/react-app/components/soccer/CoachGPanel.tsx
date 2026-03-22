@@ -134,7 +134,8 @@ export function CoachGPanel({ leagueId, teamId, matchId }: CoachGPanelProps) {
               <img 
                 src="/assets/coachg/coach-g-avatar.png"
                 alt="Coach G"
-                className="w-full h-full object-cover"
+                className="w-full h-full object-cover cursor-pointer transition-transform hover:scale-105"
+                onClick={() => navigate('/scout')}
               />
             </div>
             {/* Live indicator */}

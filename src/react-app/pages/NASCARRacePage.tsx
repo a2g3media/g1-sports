@@ -550,7 +550,13 @@ export default function NASCARRacePage() {
     if (!fallbackRace && !liveRace) return null;
     if (!fallbackRace) return liveRace;
     if (!liveRace) return fallbackRace;
-    const verifiedResults = hasVerifiedNascarRaceResults(liveRace.raceResults) ? liveRace.raceResults : undefined;
+    const normalizedLiveResults = (liveRace.raceResults || []).map((row) => ({
+      position: Number(row.position),
+      driverName: String(row.driverName || ""),
+      points: row.points ?? null,
+      status: row.status,
+    }));
+    const verifiedResults = hasVerifiedNascarRaceResults(normalizedLiveResults) ? liveRace.raceResults : undefined;
     const verifiedWinner = liveRace.winner
       || (verifiedResults ? resolveDriverIdFromName(verifiedResults.find((row) => row.position === 1)?.driverName || "") : undefined);
     return {

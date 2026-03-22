@@ -1,7 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { AlertCircle, Calendar, ChevronRight, Loader2, MessageSquare, TrendingUp } from "lucide-react";
-import { CoachGIntelligenceLayer } from "@/react-app/components/CoachGIntelligenceLayer";
 
 type MMAEvent = {
   eventId: string;
@@ -104,7 +103,6 @@ export default function MMAHubPage() {
           </p>
         </div>
 
-        <CoachGIntelligenceLayer surface="games" compact />
 
         <div className="rounded-xl border border-violet-500/20 bg-violet-500/10 p-4">
           <div className="flex items-center gap-2 text-violet-300 text-sm font-semibold">

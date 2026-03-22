@@ -5,6 +5,7 @@ import SoccerPageHeader, { buildTeamBreadcrumbs } from "@/react-app/components/s
 import { useSoccerBackNavigation, buildSoccerMatchUrl, buildSoccerPlayerUrl } from "@/react-app/hooks/useSoccerBackNavigation";
 import { getEspnPlayerPhoto, fetchPlayerPhotos } from "@/react-app/lib/espnSoccer";
 import TeamCrest from "@/react-app/components/soccer/TeamCrest";
+import FavoriteEntityButton from "@/react-app/components/FavoriteEntityButton";
 
 import { CoachGPanel } from "@/react-app/components/soccer/CoachGPanel";
 import { SectionErrorBoundary } from "@/react-app/components/ErrorBoundary";
@@ -452,6 +453,21 @@ function SoccerTeamPageContent() {
                       </div>
                     </div>
                   )}
+                  <div className="pt-2 flex justify-center md:justify-start">
+                    <FavoriteEntityButton
+                      type="team"
+                      entityId={team.id || teamId || team.name}
+                      sport="soccer"
+                      league={standing?.leagueName || "soccer"}
+                      metadata={{
+                        team_name: team.name,
+                        team_code: team.abbreviation || null,
+                        sport: "soccer",
+                        country: team.country || null,
+                      }}
+                      label="Favorite Team"
+                    />
+                  </div>
                 </div>
               </div>
             </div>
@@ -542,7 +558,7 @@ function SoccerTeamPageContent() {
                         return (
                           <Link
                             key={match.eventId}
-                            to={buildSoccerMatchUrl(match.eventId, { fromTeamId: teamId })}
+                            to={buildSoccerMatchUrl(match.eventId, { fromTeamId: teamId, from: "soccer-team" })}
                             className="flex items-center gap-3 px-4 py-3 hover:bg-white/[0.03] transition-colors group"
                           >
                             {/* Date */}
@@ -600,7 +616,7 @@ function SoccerTeamPageContent() {
                         return (
                           <Link
                             key={match.eventId}
-                            to={buildSoccerMatchUrl(match.eventId, { fromTeamId: teamId })}
+                            to={buildSoccerMatchUrl(match.eventId, { fromTeamId: teamId, from: "soccer-team" })}
                             className="flex items-center gap-3 px-4 py-3 hover:bg-white/[0.03] transition-colors group"
                           >
                             {/* Date */}

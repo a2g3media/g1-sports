@@ -132,13 +132,23 @@ export const SOCCER_COMPETITIONS: Record<string, { id: string; name: string; cou
 };
 
 // Competition IDs for SportsRadar Player Props API
-const COMPETITION_IDS: Record<string, string> = {
-  'NBA': 'sr:competition:132',      // NBA
-  'NFL': 'sr:competition:1',        // NFL
-  'MLB': 'sr:competition:109',      // MLB
-  'NHL': 'sr:competition:234',      // NHL
-  'NCAAB': 'sr:competition:233',    // NCAA Basketball
-  'NCAAF': 'sr:competition:298',    // NCAA Football
+// Competition IDs for Odds Comparison products (player-props, prematch, liveodds).
+// These differ from the Sports Data API competition IDs.
+// Verified against live odds API 2026-03-20.
+const COMPETITION_IDS: Record<string, string[]> = {
+  'NBA': ['sr:competition:132'],
+  'NFL': ['sr:competition:31'],
+  'MLB': ['sr:competition:109'],
+  'NHL': ['sr:competition:234'],
+  'NCAAB': [
+    'sr:competition:28370',  // NCAA Div I Championship (March Madness)
+    'sr:competition:648',    // NCAA Regular Season
+    'sr:competition:24135',  // NIT
+  ],
+  'NCAAF': [
+    'sr:competition:27653',  // NCAA Regular Season
+    'sr:competition:27625',  // NCAA FBS Post Season
+  ],
 };
 
 // ============================================
@@ -2257,20 +2267,31 @@ export class SportsRadarProvider implements OddsProviderInterface {
         }
       }
       
-      // URL: /{sport}/production/{version}/en/seasons/{year}/REG/standings.json
-      const url = `${sportConfig.base}/${sportConfig.version}/en/seasons/${year}/REG/standings.json?api_key=${apiKey}`;
-      
-      console.log(`[SportsRadar] Fetching standings for ${sport} season ${year}:`, url.replace(/api_key=.*/, 'api_key=***'));
-      
-      const response = await this.fetchWithRetry(url);
-      
-      if (!response.ok) {
-        const errorMsg = `Standings API: HTTP ${response.status}`;
-        errors.push(errorMsg);
+      const yearCandidates = Array.from(
+        new Set(
+          [year, (year as number) - 1, (year as number) + 1].filter(
+            (candidate): candidate is number => Number.isFinite(candidate)
+          )
+        )
+      );
+
+      let data: any = null;
+      for (const candidateYear of yearCandidates) {
+        const url = `${sportConfig.base}/${sportConfig.version}/en/seasons/${candidateYear}/REG/standings.json?api_key=${apiKey}`;
+        console.log(
+          `[SportsRadar] Fetching standings for ${sport} season ${candidateYear}:`,
+          url.replace(/api_key=.*/, 'api_key=***')
+        );
+        const response = await this.fetchWithRetry(url);
+        if (response.ok) {
+          data = await response.json() as any;
+          break;
+        }
+        errors.push(`Standings API ${candidateYear}: HTTP ${response.status}`);
+      }
+      if (!data) {
         return { conferences: [], divisions: [], teams: [], errors };
       }
-      
-      const data = await response.json() as any;
       
       providerHealth.successfulCalls++;
       providerHealth.lastSuccessfulCall = new Date().toISOString();
@@ -2970,33 +2991,57 @@ export class SportsRadarProvider implements OddsProviderInterface {
     const errors: string[] = [];
     const props: NormalizedProp[] = [];
     
-    const competitionId = COMPETITION_IDS[sport];
-    if (!competitionId) {
+    const competitionIds = COMPETITION_IDS[sport];
+    if (!competitionIds || competitionIds.length === 0) {
       errors.push(`No competition ID mapping for ${sport}`);
       return { props, rawEvents: 0, rawProps: 0, errors };
     }
     
     try {
-      console.log(`[SportsRadar] Fetching player props for ${sport} competition ${competitionId}`);
-
-      const urls = buildPlayerPropsUrls(
-        'en',
-        `competitions/${competitionId}/players_props.json?api_key=${playerPropsApiKey}`,
-        this.config.accessLevel
-      );
-      let response: Response | null = null;
+      // Iterate through all mapped competition IDs and aggregate events.
+      // Some sports (NCAAB/NCAAF) can have data split across multiple comps.
       let lastErrorText = '';
-      for (const url of urls) {
-        const current = await this.fetchWithRetry(url);
-        if (current.ok) {
-          response = current;
-          break;
+      const aggregatedEvents: any[] = [];
+      const seenEventIds = new Set<string>();
+      for (const competitionId of competitionIds) {
+        console.log(`[SportsRadar] Fetching player props for ${sport} competition ${competitionId}`);
+
+        const urls = buildPlayerPropsUrls(
+          'en',
+          `competitions/${competitionId}/players_props.json?api_key=${playerPropsApiKey}`,
+          this.config.accessLevel
+        );
+        let response: Response | null = null;
+        for (const url of urls) {
+          const current = await this.fetchWithRetry(url);
+          if (current.ok) {
+            response = current;
+            break;
+          }
+          const body = await current.text().catch(() => '');
+          lastErrorText = `HTTP ${current.status} - ${body.substring(0, 200)}`;
         }
-        const body = await current.text().catch(() => '');
-        lastErrorText = `HTTP ${current.status} - ${body.substring(0, 200)}`;
+        if (!response) {
+          errors.push(`Player Props API ${competitionId}: ${lastErrorText || 'No successful endpoint response'}`);
+          continue;
+        }
+
+        try {
+          const data = await response.json() as any;
+          const sportEvents = data.competition_sport_events_players_props || [];
+          for (const eventData of sportEvents) {
+            const eventId = String(eventData?.sport_event?.id || '');
+            if (!eventId || seenEventIds.has(eventId)) continue;
+            seenEventIds.add(eventId);
+            aggregatedEvents.push(eventData);
+          }
+          console.log(`[SportsRadar] ${sport} ${competitionId}: ${sportEvents.length} events (${aggregatedEvents.length} unique aggregated)`);
+        } catch (parseErr) {
+          errors.push(`Player Props API ${competitionId}: parse error ${String(parseErr)}`);
+        }
       }
 
-      if (!response) {
+      if (aggregatedEvents.length === 0) {
         const errorMsg = `Player Props API: ${lastErrorText || 'No successful endpoint response'}`;
         errors.push(errorMsg);
         providerHealth.failedCalls++;
@@ -3004,11 +3049,9 @@ export class SportsRadarProvider implements OddsProviderInterface {
         providerHealth.lastErrorTime = new Date().toISOString();
         return { props, rawEvents: 0, rawProps: 0, errors };
       }
-      
-      const data = await response.json() as any;
-      
+
       // Response structure: competition_sport_events_players_props[]
-      const sportEvents = data.competition_sport_events_players_props || [];
+      const sportEvents = aggregatedEvents;
       let rawPropsCount = 0;
       
       console.log(`[SportsRadar] Got ${sportEvents.length} events with player props`);
@@ -3178,30 +3221,33 @@ export class SportsRadarProvider implements OddsProviderInterface {
     data: any;
     error: string | null;
   }> {
-    const competitionId = COMPETITION_IDS[sport];
-    if (!competitionId) {
+    const competitionIds = COMPETITION_IDS[sport];
+    if (!competitionIds || competitionIds.length === 0) {
       return { success: false, status: null, data: null, error: `No competition ID for ${sport}` };
     }
     
     try {
       console.log(`[SportsRadar] Testing Player Props API for ${sport}`);
 
-      const urls = buildPlayerPropsUrls(
-        'en',
-        `competitions/${competitionId}/players_props.json?api_key=${playerPropsApiKey}`,
-        this.config.accessLevel
-      );
       let response: Response | null = null;
       let status: number | null = null;
-      for (const url of urls) {
-        const current = await fetch(url, {
-          headers: { 'Accept': 'application/json' }
-        });
-        status = current.status;
-        if (current.ok) {
-          response = current;
-          break;
+      for (const competitionId of competitionIds) {
+        const urls = buildPlayerPropsUrls(
+          'en',
+          `competitions/${competitionId}/players_props.json?api_key=${playerPropsApiKey}`,
+          this.config.accessLevel
+        );
+        for (const url of urls) {
+          const current = await fetch(url, {
+            headers: { 'Accept': 'application/json' }
+          });
+          status = current.status;
+          if (current.ok) {
+            response = current;
+            break;
+          }
         }
+        if (response) break;
       }
 
       if (!response || !response.ok) {

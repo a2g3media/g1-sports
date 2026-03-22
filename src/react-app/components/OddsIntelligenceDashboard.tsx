@@ -163,6 +163,21 @@ function SourceBadge({ label }: { label: string }) {
   );
 }
 
+function ModuleModeBadge({ interactive }: { interactive: boolean }) {
+  return (
+    <span
+      className={cn(
+        "px-2 py-0.5 rounded-full border text-[10px] font-medium",
+        interactive
+          ? "bg-cyan-500/10 border-cyan-500/30 text-cyan-300"
+          : "bg-slate-800/70 border-slate-600/50 text-slate-400"
+      )}
+    >
+      {interactive ? "tap to open game" : "info only"}
+    </span>
+  );
+}
+
 // Helpers
 const getTeamAbbr = (team: string | TeamData): string => {
   if (typeof team === 'string') return team;
@@ -586,7 +601,8 @@ export function OddsIntelligenceDashboard({
                 <img 
                   src={COACH_G_AVATAR} 
                   alt="Coach G" 
-                  className="w-14 h-14 rounded-xl object-cover shadow-lg shadow-violet-500/30 border-2 border-violet-500/50"
+                  className="w-14 h-14 rounded-xl object-cover shadow-lg shadow-violet-500/30 border-2 border-violet-500/50 cursor-pointer transition-transform hover:scale-105"
+                  onClick={() => navigate('/scout')}
                 />
                 <div className="absolute -bottom-1 -right-1 w-5 h-5 rounded-full bg-emerald-500 border-2 border-slate-900 flex items-center justify-center">
                   <span className="text-[8px] text-white font-bold">AI</span>
@@ -876,10 +892,11 @@ export function OddsIntelligenceDashboard({
           </div>
           <div>
             <h3 className="text-base font-bold text-white">Sharp Radar</h3>
-            <p className="text-[10px] text-slate-500">Biggest market signals right now</p>
+            <p className="text-[10px] text-slate-500">Opening-to-current spread shifts with verified context</p>
           </div>
-          <div className="ml-auto">
-            <SourceBadge label={hasSplitData ? "source: odds-slate + split-feed" : "source: odds-slate spread"} />
+          <div className="ml-auto flex items-center gap-1.5">
+            <SourceBadge label={hasSplitData ? "source: verified pricing + market splits" : "source: verified pricing"} />
+            <ModuleModeBadge interactive />
           </div>
         </div>
         
@@ -890,10 +907,10 @@ export function OddsIntelligenceDashboard({
         ) : (
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
           {sharpSignals.slice(0, 6).map((signal) => (
-            <div
+            <button
               key={signal.gameId}
               onClick={() => navigate(toOddsGamePath(signal.sport.toLowerCase(), signal.gameId))}
-              className="relative p-4 rounded-xl bg-slate-800/50 border border-slate-700/50 hover:border-cyan-500/40 hover:bg-slate-800/70 transition-all cursor-pointer group"
+              className="relative w-full text-left p-4 rounded-xl bg-slate-800/50 border border-slate-700/50 hover:border-cyan-500/40 hover:bg-slate-800/70 transition-all cursor-pointer group"
             >
               {/* Signal badge */}
               <div className={cn(
@@ -942,9 +959,9 @@ export function OddsIntelligenceDashboard({
               
               <div className="flex items-center gap-1.5 text-[10px] text-cyan-400/80">
                 <Zap className="w-3 h-3" />
-                <span>{signal.handlePct != null && signal.ticketsPct != null ? `Split feed (${signal.splitSide || 'side'})` : "Opening to current line movement"}</span>
+                <span>{signal.handlePct != null && signal.ticketsPct != null ? `Market split edge (${signal.splitSide || 'side'})` : "Opening to current line movement"}</span>
               </div>
-            </div>
+            </button>
           ))}
         </div>
         )}
@@ -958,10 +975,11 @@ export function OddsIntelligenceDashboard({
           </div>
           <div>
             <h3 className="text-base font-bold text-white">Smart Money Tracker</h3>
-            <p className="text-[10px] text-slate-500">Largest verified line moves</p>
+            <p className="text-[10px] text-slate-500">Ticket vs handle pressure by side</p>
           </div>
-          <div className="ml-auto">
-            <SourceBadge label="source: split-feed only" />
+          <div className="ml-auto flex items-center gap-1.5">
+            <SourceBadge label="source: market splits" />
+            <ModuleModeBadge interactive={false} />
           </div>
         </div>
         
@@ -974,7 +992,7 @@ export function OddsIntelligenceDashboard({
           {smartMoney.map((entry, idx) => (
             <div
               key={entry.gameId}
-              className="flex items-center justify-between p-3.5 rounded-xl bg-slate-800/40 border border-slate-700/40 hover:border-emerald-500/30 transition-colors"
+              className="flex items-center justify-between p-3.5 rounded-xl bg-slate-800/40 border border-slate-700/40"
             >
               <div className="flex items-center gap-3">
                 <div className={cn(
@@ -1010,10 +1028,11 @@ export function OddsIntelligenceDashboard({
           </div>
           <div>
             <h3 className="text-base font-bold text-white">Value Bets</h3>
-            <p className="text-[10px] text-slate-500">Biggest player prop line moves today</p>
+            <p className="text-[10px] text-slate-500">Projection edge vs current book line</p>
           </div>
-          <div className="ml-auto">
+          <div className="ml-auto flex items-center gap-1.5">
             <SourceBadge label={hasProjectionData ? "source: projection-service" : "source: props-feed movement"} />
+            <ModuleModeBadge interactive />
           </div>
         </div>
         
@@ -1024,7 +1043,7 @@ export function OddsIntelligenceDashboard({
         ) : (
         <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
           {valueBets.map((bet) => (
-            <div
+            <button
               key={`${bet.gameId || 'props'}-${bet.teams}-${bet.betType}`}
               onClick={() => {
                 if (bet.gameId) {
@@ -1034,7 +1053,7 @@ export function OddsIntelligenceDashboard({
                   navigate('/props');
                 }
               }}
-              className="relative p-4 rounded-xl bg-gradient-to-br from-amber-500/5 to-yellow-500/5 border border-amber-500/20 hover:border-amber-500/40 transition-all cursor-pointer group"
+              className="relative w-full text-left p-4 rounded-xl bg-gradient-to-br from-amber-500/5 to-yellow-500/5 border border-amber-500/20 hover:border-amber-500/40 transition-all cursor-pointer group"
             >
               <div className="absolute -top-1 -right-1 px-2 py-0.5 rounded-full bg-emerald-500/90 text-white text-[10px] font-bold shadow-lg">
                 {bet.edge.toFixed(1)}
@@ -1050,7 +1069,7 @@ export function OddsIntelligenceDashboard({
                 <Sparkles className="w-3 h-3" />
                 <span>{bet.confidence ? `${bet.confidence} confidence` : "Edge detected"}</span>
               </div>
-            </div>
+            </button>
           ))}
         </div>
         )}

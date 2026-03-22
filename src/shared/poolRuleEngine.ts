@@ -1,4 +1,5 @@
 import type { PoolTemplateKey } from "./poolTypeCatalog";
+import { buildPoolRuleConfig, type PoolRuleConfig } from "./poolRuleConfig";
 
 export type BaseRuleEngineKey =
   | "pickem"
@@ -21,15 +22,22 @@ export interface PoolRulesPayload {
   dynamic_rules: RuleItem[];
 }
 
+export interface RuleGroupedSection {
+  title: string;
+  items: RuleItem[];
+}
+
 export interface PoolRuleUiPayload {
   overlay_rules: string[];
   full_rules: string[];
+  full_rules_grouped: RuleGroupedSection[];
   inline_messages: string[];
 }
 
 export interface PoolRuleEngineOutput {
   engine: BaseRuleEngineKey;
   mode: string;
+  config: PoolRuleConfig;
   pool_rules: PoolRulesPayload;
   ui: PoolRuleUiPayload;
 }
@@ -118,22 +126,35 @@ export function scorePickFromRuleEngine(args: {
   wasTie?: boolean;
   wasCanceled?: boolean;
   wasPostponed?: boolean;
+  wasPush?: boolean;
 }): number {
   const settings = args.settings || {};
-  if (args.wasCanceled || args.wasPostponed) return 0;
+  const config = buildPoolRuleConfig(args.template || "pickem", settings);
+
+  if (args.wasCanceled) {
+    if (config.canceled_void === "win") return config.scoring.points_per_win;
+    return 0;
+  }
+  if (args.wasPostponed) return 0;
+
   if (!args.isCorrect) return 0;
+
   if (args.wasTie) {
-    const tieHandling = String(settings.tieHandling || settings.tie_handling || "push").toLowerCase();
-    if (tieHandling === "loss" || tieHandling === "zero") return 0;
+    if (config.tie_handling === "loss" || config.tie_handling === "no_action") return 0;
+    if (config.tie_handling === "win") return config.scoring.points_per_win;
+    return 0;
   }
 
-  const pointsPerWin = asNumber(settings.pointsPerWin ?? settings.points_per_win, 1);
+  if (args.wasPush) {
+    return config.scoring.push_value;
+  }
+
   const engine = toBaseEngine(args.template);
   if (engine === "confidence") {
     const rank = Number(args.confidenceRank || 0);
     return Number.isFinite(rank) && rank > 0 ? rank : 0;
   }
-  return pointsPerWin;
+  return config.scoring.points_per_win;
 }
 
 function toBaseEngine(template: PoolTemplateKey | null): BaseRuleEngineKey {
@@ -190,19 +211,17 @@ function fmtPlural(value: number, singular: string, plural: string): string {
   return `${value} ${value === 1 ? singular : plural}`;
 }
 
-function buildEdgeCaseRules(settings: Record<string, unknown>): RuleItem[] {
-  const tieHandling = String(settings.tieHandling || settings.tie_handling || "push").toLowerCase();
-  const canceledHandling = String(settings.canceledGameHandling || settings.canceled_game_handling || "void").toLowerCase();
-  const postponedHandling = String(settings.postponedGameHandling || settings.postponed_game_handling || "carry").toLowerCase();
-  const missedHandling = String(settings.missedPickBehavior || settings.missed_pick_behavior || "zero").toLowerCase();
-  const lateEntryAllowed = asBoolean(settings.allowLateJoins ?? settings.allow_late_joins, false);
-
+function buildEdgeCaseRules(config: PoolRuleConfig): RuleItem[] {
   return [
-    { key: "edge_ties", text: `Ties are scored using '${tieHandling}' handling.` },
-    { key: "edge_canceled", text: `Canceled games use '${canceledHandling}' handling.` },
-    { key: "edge_postponed", text: `Postponed games use '${postponedHandling}' handling.` },
-    { key: "edge_missed", text: `Missed picks use '${missedHandling}' handling.` },
-    { key: "edge_late_entries", text: lateEntryAllowed ? "Late entries are allowed (commissioner rules apply)." : "Late entries are not allowed." },
+    { key: "edge_ties", text: `Ties are scored using '${config.tie_handling}' handling.` },
+    { key: "edge_push", text: `Push (ATS) uses '${config.push_handling}' handling.` },
+    { key: "edge_canceled_pre", text: `Canceled games (before start): ${config.canceled_pre_start.replace(/_/g, " ")}.` },
+    { key: "edge_canceled_post", text: `Canceled games (after start): ${config.canceled_post_start.replace(/_/g, " ")}.` },
+    { key: "edge_canceled_void", text: `Fully voided games: ${config.canceled_void.replace(/_/g, " ")}.` },
+    { key: "edge_postponed", text: `Postponed games: ${config.postponed_handling.replace(/_/g, " ")}.` },
+    { key: "edge_missed", text: `Missed picks: ${config.missed_pick_behavior.replace(/_/g, " ")}.` },
+    { key: "edge_late_entries", text: config.allow_late_joins ? "Late entries are allowed (commissioner rules apply)." : "Late entries are not allowed." },
+    { key: "edge_late_picks", text: config.allow_late_picks ? "Late picks are accepted." : "Late picks are not accepted." },
   ];
 }
 
@@ -424,8 +443,9 @@ function dedupe(values: string[]): string[] {
 export function generatePoolRuleEngineOutput(input: RuleEngineInput): PoolRuleEngineOutput {
   const engine = toBaseEngine(input.template);
   const mode = pickMode(input.scheduleType, "weekly");
+  const config = buildPoolRuleConfig(input.template || "pickem", input.settings);
   const engineRules = buildRuleSet(input, engine);
-  const edgeCaseRules = buildEdgeCaseRules(input.settings);
+  const edgeCaseRules = buildEdgeCaseRules(config);
   const system_rules = dedupe([...engineRules.system_rules.map((r) => r.text), ...edgeCaseRules.map((r) => r.text)]).map((text, idx) => ({
     key: `system_${idx + 1}`,
     text,
@@ -438,6 +458,30 @@ export function generatePoolRuleEngineOutput(input: RuleEngineInput): PoolRuleEn
     key: `dynamic_${idx + 1}`,
     text,
   }));
+
+  // Grouped sections for rich UI
+  const scoringRules: RuleItem[] = [];
+  const eliminationRules: RuleItem[] = [];
+  const overviewRules: RuleItem[] = [];
+
+  for (const rule of system_rules) {
+    if (rule.text.toLowerCase().includes("scor") || rule.text.toLowerCase().includes("point") || rule.text.toLowerCase().includes("confidence")) {
+      scoringRules.push(rule);
+    } else if (rule.text.toLowerCase().includes("eliminat") || rule.text.toLowerCase().includes("life") || rule.text.toLowerCase().includes("surviv") || rule.text.toLowerCase().includes("streak")) {
+      eliminationRules.push(rule);
+    } else {
+      overviewRules.push(rule);
+    }
+  }
+
+  const full_rules_grouped: RuleGroupedSection[] = [
+    { title: "Overview", items: overviewRules.length > 0 ? overviewRules : [{ key: "overview_default", text: `${engine} pool — ${mode} format.` }] },
+    ...(scoringRules.length > 0 ? [{ title: "Scoring", items: scoringRules }] : []),
+    ...(eliminationRules.length > 0 ? [{ title: "Elimination", items: eliminationRules }] : []),
+    { title: "Commissioner Settings", items: commissioner_rules },
+    { title: "Edge Cases", items: edgeCaseRules },
+    ...(dynamic_rules.length > 0 ? [{ title: "Your Status", items: dynamic_rules }] : []),
+  ];
 
   const overlay_rules = dedupe([
     system_rules[0]?.text || "",
@@ -459,6 +503,7 @@ export function generatePoolRuleEngineOutput(input: RuleEngineInput): PoolRuleEn
   return {
     engine,
     mode,
+    config,
     pool_rules: {
       system_rules,
       commissioner_rules,
@@ -467,6 +512,7 @@ export function generatePoolRuleEngineOutput(input: RuleEngineInput): PoolRuleEn
     ui: {
       overlay_rules,
       full_rules,
+      full_rules_grouped,
       inline_messages,
     },
   };

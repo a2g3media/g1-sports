@@ -302,13 +302,13 @@ function buildInitialsAvatarDataUri(name: string): string {
 }
 
 /**
- * Get ESPN player photo URL
+ * Get ESPN player photo URL candidates.
  */
-export function getPlayerPhotoUrl(
+export function getPlayerPhotoUrls(
   playerName: string,
   sport: string = 'nba',
   size: 'small' | 'medium' | 'large' = 'medium'
-): string | null {
+): string[] {
   const lookupKeys = buildPlayerLookupKeys(playerName);
   let espnId: string | undefined;
   for (const key of lookupKeys) {
@@ -316,12 +316,14 @@ export function getPlayerPhotoUrl(
     if (espnId) break;
   }
   
-  if (!espnId) return null;
+  if (!espnId) return [];
   
   const sportPath = SPORT_PATHS[sport.toLowerCase()] || 'nba';
   const dimensions = size === 'small' ? 'w=48&h=35' : size === 'large' ? 'w=160&h=120' : 'w=96&h=70';
-  
-  return `${ESPN_HEADSHOT_BASE}/${sportPath}/players/full/${espnId}.png&${dimensions}&cb=1`;
+  const combinerUrl = `${ESPN_HEADSHOT_BASE}/${sportPath}/players/full/${espnId}.png&${dimensions}&cb=1`;
+  const directUrl = `https://a.espncdn.com/i/headshots/${sportPath}/players/full/${espnId}.png`;
+
+  return [combinerUrl, directUrl];
 }
 
 // Fallback silhouette component
@@ -377,25 +379,37 @@ export function PlayerPhoto({
   ringColor = 'ring-white/20',
 }: PlayerPhotoProps) {
   const [attemptIndex, setAttemptIndex] = useState(0);
+  const [allFailed, setAllFailed] = useState(false);
   
   const photoSize = size < 60 ? 'small' : size > 100 ? 'large' : 'medium';
-  const photoUrl = getPlayerPhotoUrl(playerName, sport, photoSize);
+  const photoUrls = getPlayerPhotoUrls(playerName, sport, photoSize);
   const avatarUrl = useMemo(() => {
     return buildInitialsAvatarDataUri(playerName || 'Player');
   }, [playerName]);
   const candidateUrls = useMemo(
-    () => [photoUrl, avatarUrl].filter((url): url is string => Boolean(url)),
-    [photoUrl, avatarUrl]
+    () => [...photoUrls, avatarUrl].filter((url): url is string => Boolean(url)),
+    [photoUrls, avatarUrl]
   );
 
   useEffect(() => {
     setAttemptIndex(0);
+    setAllFailed(false);
   }, [playerName, sport, size]);
   
   if (candidateUrls.length === 0) {
     return (
       <PlayerSilhouette 
         size={size} 
+        highlight={highlight}
+        className={className}
+      />
+    );
+  }
+
+  if (allFailed) {
+    return (
+      <PlayerSilhouette
+        size={size}
         highlight={highlight}
         className={className}
       />
@@ -414,7 +428,13 @@ export function PlayerPhoto({
       )}
       style={{ width: size, height: size }}
       onError={() => {
-        setAttemptIndex((prev) => Math.min(prev + 1, candidateUrls.length - 1));
+        setAttemptIndex((prev) => {
+          const next = Math.min(prev + 1, candidateUrls.length - 1);
+          if (next === prev) {
+            setAllFailed(true);
+          }
+          return next;
+        });
       }}
       loading="lazy"
     />

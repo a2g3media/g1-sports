@@ -157,6 +157,16 @@ type LiveSnapshotRace = {
   }>;
 };
 
+function normalizeCoverageNotice(reason: unknown): string | null {
+  if (typeof reason !== "string") return null;
+  const cleaned = reason.trim();
+  if (!cleaned) return null;
+  if (/^[A-Z0-9_]+$/.test(cleaned)) {
+    return "Live standings details are still syncing from provider coverage.";
+  }
+  return cleaned;
+}
+
 function resolveDriverIdFromName(name: string): string | null {
   const target = normalizeNascarNameToken(name);
   if (!target) return null;
@@ -536,15 +546,15 @@ export default function NASCARHubPage() {
         const data = await res.json();
         const games = Array.isArray(data?.games) ? data.games : [];
         if (!active || games.length === 0) return;
-        const mapped = games
-          .map(mapApiGameToRace)
-          .filter((race) => race.id.length > 0)
-          .sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
-        const incompleteFinals = mapped.filter((race) => race.status === "completed" && !race.winner);
+        const mapped: RaceScheduleItem[] = games
+          .map((game: any) => mapApiGameToRace(game))
+          .filter((race: RaceScheduleItem) => race.id.length > 0)
+          .sort((a: RaceScheduleItem, b: RaceScheduleItem) => new Date(a.date).getTime() - new Date(b.date).getTime());
+        const incompleteFinals = mapped.filter((race: RaceScheduleItem) => race.status === "completed" && !race.winner);
         if (incompleteFinals.length > 0) {
           console.warn("[NASCAR][validation] Completed races missing winner in hub payload", {
             count: incompleteFinals.length,
-            raceIds: incompleteFinals.map((race) => race.id),
+            raceIds: incompleteFinals.map((race: RaceScheduleItem) => race.id),
           });
         }
         if (mapped.length > 0) {
@@ -970,9 +980,9 @@ export default function NASCARHubPage() {
             title="Driver Standings" 
             subtitle={`${NASCAR_SEASON_YEAR} Cup Series Points`} 
           />
-          {liveStandings?.fallback_reason && (
+          {normalizeCoverageNotice(liveStandings?.fallback_reason) && (
             <div className="mb-3 rounded-xl border border-amber-500/30 bg-amber-500/10 p-3 text-sm text-amber-300">
-              {liveStandings.fallback_reason}
+              {normalizeCoverageNotice(liveStandings?.fallback_reason)}
             </div>
           )}
           {liveStandings?.coverage && (!liveStandings.coverage.top5 || !liveStandings.coverage.top10 || !liveStandings.coverage.points) && (

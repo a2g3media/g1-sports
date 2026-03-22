@@ -788,10 +788,47 @@ function parsePreviewSections(text: string): Record<string, string> {
 
 // ============ Cache Management ============
 
+let ensureCoachGPreviewSchemaPromise: Promise<void> | null = null;
+
+async function ensureCoachGPreviewSchema(db: D1Database): Promise<void> {
+  if (ensureCoachGPreviewSchemaPromise) {
+    await ensureCoachGPreviewSchemaPromise;
+    return;
+  }
+
+  ensureCoachGPreviewSchemaPromise = (async () => {
+    await db.prepare(`
+      CREATE TABLE IF NOT EXISTS coach_g_previews (
+        game_id TEXT PRIMARY KEY,
+        sport TEXT NOT NULL,
+        home_team TEXT NOT NULL,
+        away_team TEXT NOT NULL,
+        game_start_at TEXT NOT NULL,
+        preview_content TEXT NOT NULL,
+        sources_used TEXT NOT NULL DEFAULT '[]',
+        scraped_data TEXT NOT NULL DEFAULT '[]',
+        word_count INTEGER NOT NULL DEFAULT 0,
+        generation_cost_cents INTEGER NOT NULL DEFAULT 0,
+        expires_at TEXT NOT NULL,
+        is_stale INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      )
+    `).run();
+  })();
+
+  try {
+    await ensureCoachGPreviewSchemaPromise;
+  } finally {
+    ensureCoachGPreviewSchemaPromise = null;
+  }
+}
+
 async function getCachedPreview(
   db: D1Database,
   gameId: string
 ): Promise<GamePreview | null> {
+  await ensureCoachGPreviewSchema(db);
   const cached = await db.prepare(`
     SELECT * FROM coach_g_previews 
     WHERE game_id = ? AND expires_at > datetime('now') AND is_stale = 0
@@ -827,6 +864,7 @@ async function cachePreview(
   scrapedData: ScrapedContent[],
   costCents: number
 ): Promise<void> {
+  await ensureCoachGPreviewSchema(db);
   const now = new Date().toISOString();
   
   await db.prepare(`
@@ -867,6 +905,7 @@ export async function generateGamePreview(
   gameId: string,
   forceRefresh: boolean = false
 ): Promise<GamePreview> {
+  await ensureCoachGPreviewSchema(db);
   // Check cache first (unless force refresh)
   if (!forceRefresh) {
     const cached = await getCachedPreview(db, gameId);
@@ -893,46 +932,50 @@ export async function generateGamePreview(
       const parts = gameId.split("_");
       if (parts.length >= 3) providerGameId = parts.slice(2).join("_");
     }
-    const game = providerGameId
-      ? await db.prepare(`
-          SELECT g.*,
-                 o.spread_home as spread,
-                 o.total,
-                 o.moneyline_home as homeML,
-                 o.moneyline_away as awayML
-          FROM sdio_games g
-          LEFT JOIN sdio_odds_current o ON g.id = o.game_id
-          WHERE g.provider_game_id = ?
-          LIMIT 1
-        `).bind(providerGameId).first()
-      : await db.prepare(`
-          SELECT g.*,
-                 o.spread_home as spread,
-                 o.total,
-                 o.moneyline_home as homeML,
-                 o.moneyline_away as awayML
-          FROM sdio_games g
-          LEFT JOIN sdio_odds_current o ON g.id = o.game_id
-          WHERE CAST(g.id AS TEXT) = ? OR g.provider_game_id = ?
-          LIMIT 1
-        `).bind(dbGameId, dbGameId).first();
-    if (game) {
-      gameData = {
-        id: String((game as any).id || gameId),
-        sport: String((game as any).sport || "unknown"),
-        homeTeam: String((game as any).home_team_name || (game as any).home_team || "HOME"),
-        awayTeam: String((game as any).away_team_name || (game as any).away_team || "AWAY"),
-        startAt: String((game as any).start_time || new Date().toISOString()),
-        venue: (game as any).venue ? String((game as any).venue) : undefined,
-        broadcast: (game as any).channel ? String((game as any).channel) : undefined,
-        status: String((game as any).status || "SCHEDULED"),
-        odds: {
-          spread: typeof (game as any).spread === "number" ? (game as any).spread : undefined,
-          total: typeof (game as any).total === "number" ? (game as any).total : undefined,
-          homeML: typeof (game as any).homeML === "number" ? (game as any).homeML : undefined,
-          awayML: typeof (game as any).awayML === "number" ? (game as any).awayML : undefined,
-        },
-      };
+    try {
+      const game = providerGameId
+        ? await db.prepare(`
+            SELECT g.*,
+                   o.spread_home as spread,
+                   o.total,
+                   o.moneyline_home as homeML,
+                   o.moneyline_away as awayML
+            FROM sdio_games g
+            LEFT JOIN sdio_odds_current o ON g.id = o.game_id
+            WHERE g.provider_game_id = ?
+            LIMIT 1
+          `).bind(providerGameId).first()
+        : await db.prepare(`
+            SELECT g.*,
+                   o.spread_home as spread,
+                   o.total,
+                   o.moneyline_home as homeML,
+                   o.moneyline_away as awayML
+            FROM sdio_games g
+            LEFT JOIN sdio_odds_current o ON g.id = o.game_id
+            WHERE CAST(g.id AS TEXT) = ? OR g.provider_game_id = ?
+            LIMIT 1
+          `).bind(dbGameId, dbGameId).first();
+      if (game) {
+        gameData = {
+          id: String((game as any).id || gameId),
+          sport: String((game as any).sport || "unknown"),
+          homeTeam: String((game as any).home_team_name || (game as any).home_team || "HOME"),
+          awayTeam: String((game as any).away_team_name || (game as any).away_team || "AWAY"),
+          startAt: String((game as any).start_time || new Date().toISOString()),
+          venue: (game as any).venue ? String((game as any).venue) : undefined,
+          broadcast: (game as any).channel ? String((game as any).channel) : undefined,
+          status: String((game as any).status || "SCHEDULED"),
+          odds: {
+            spread: typeof (game as any).spread === "number" ? (game as any).spread : undefined,
+            total: typeof (game as any).total === "number" ? (game as any).total : undefined,
+            homeML: typeof (game as any).homeML === "number" ? (game as any).homeML : undefined,
+            awayML: typeof (game as any).awayML === "number" ? (game as any).awayML : undefined,
+          },
+        };
+      }
+    } catch {
+      // Optional legacy table fallback; provider resolution remains primary path.
     }
   }
 
@@ -1162,6 +1205,7 @@ async function buildInternalDataContext(
 // ============ Utility: Mark Preview Stale ============
 
 export async function markPreviewStale(db: D1Database, gameId: string): Promise<void> {
+  await ensureCoachGPreviewSchema(db);
   await db.prepare(`
     UPDATE coach_g_previews SET is_stale = 1, updated_at = datetime('now')
     WHERE game_id = ?
@@ -1171,6 +1215,7 @@ export async function markPreviewStale(db: D1Database, gameId: string): Promise<
 // ============ Utility: Cleanup Expired Previews ============
 
 export async function cleanupExpiredPreviews(db: D1Database): Promise<number> {
+  await ensureCoachGPreviewSchema(db);
   const result = await db.prepare(`
     DELETE FROM coach_g_previews WHERE expires_at < datetime('now', '-1 day')
   `).run();

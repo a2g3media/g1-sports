@@ -1,10 +1,13 @@
-import { memo, useState, useRef, useEffect } from 'react';
+import { memo, useState, useRef, useEffect, type ReactNode } from 'react';
 import { cn } from '@/react-app/lib/utils';
 import { useOddsFormat } from '@/react-app/hooks/useOddsFormat';
 import { getTeamOrCountryLogoUrl } from '@/react-app/lib/teamLogos';
 import { Plus, Check, ChevronDown, TrendingUp, TrendingDown, Minus } from 'lucide-react';
 import { GameContextChip } from './GameContextChip';
 import { CoachGExternalLinkIcon } from './CoachGExternalLinkIcon';
+import FavoriteEntityButton from '@/react-app/components/FavoriteEntityButton';
+import { useFeatureFlags } from '@/react-app/hooks/useFeatureFlags';
+import { useFavorites } from '@/react-app/hooks/useFavorites';
 
 // ====================
 // GAME STATE SYSTEM
@@ -121,6 +124,7 @@ interface ApprovedScoreCardProps {
   onClick?: () => void;
   onWatchClick?: () => void;
   isInWatchboard?: boolean;
+  quickAction?: ReactNode;
   className?: string;
   mode?: 'compact' | 'detail';
   teamInfo?: {
@@ -962,13 +966,18 @@ export const ApprovedScoreCard = memo(function ApprovedScoreCard({
   onClick,
   onWatchClick,
   isInWatchboard,
+  quickAction,
   className,
   mode = 'detail',
 }: ApprovedScoreCardProps) {
   const { formatMoneylineValue, formatSpreadValue } = useOddsFormat();
+  const { flags } = useFeatureFlags();
+  const { isFavorite } = useFavorites();
   const [isExpanded, setIsExpanded] = useState(false);
   const homeTeam = getTeamAbbr(game.homeTeam);
   const awayTeam = getTeamAbbr(game.awayTeam);
+  const homeTeamName = getTeamName(game.homeTeam);
+  const awayTeamName = getTeamName(game.awayTeam);
   
   const formatSpread = (spread: number | undefined | null): string => {
     if (spread === undefined || spread === null) return '-';
@@ -990,6 +999,7 @@ export const ApprovedScoreCard = memo(function ApprovedScoreCard({
   const isLive = gameState === 'LIVE';
   const isScheduled = gameState === 'UPCOMING';
   const isFinal = gameState === 'FINAL';
+  const gameIsFavorite = flags.GAME_FAVORITES_ENABLED ? isFavorite('game', game.id) : false;
   const isCompact = mode === 'compact';
   const isSoccer = (game.sport || '').toUpperCase() === 'SOCCER';
   const isSoccerDraw = isSoccer
@@ -1114,6 +1124,7 @@ export const ApprovedScoreCard = memo(function ApprovedScoreCard({
         "hover:border-slate-500/50 hover:shadow-[0_20px_50px_-12px_rgba(0,0,0,0.7)]",
         // LIVE: subtle whole-card pulse treatment for stronger visibility.
         isLive && liveGlowClasses.ring,
+        isLive && gameIsFavorite && "ring-2 ring-amber-300/60 shadow-[0_0_40px_rgba(251,191,36,0.24)]",
         // FINAL games have slightly increased edge contrast
         isFinal && "ring-1 ring-slate-700/30",
         isSoccerDraw && "ring-2 ring-cyan-300/70 shadow-[0_0_34px_rgba(34,211,238,0.45)]",
@@ -1190,9 +1201,32 @@ export const ApprovedScoreCard = memo(function ApprovedScoreCard({
           )}
         </div>
         <div className={cn("flex items-center gap-2 shrink-0", isCompact && "gap-1")}>
+          {quickAction || (
+            flags.GAME_FAVORITES_ENABLED && (
+              <FavoriteEntityButton
+                type="game"
+                entityId={game.id}
+                sport={String(game.sport || "").toLowerCase()}
+                league={game.league || undefined}
+                metadata={{
+                  game_id: game.id,
+                  home_team: homeTeamName,
+                  away_team: awayTeamName,
+                  home_code: homeTeam,
+                  away_code: awayTeam,
+                  status: game.status,
+                }}
+                compact
+                className={cn(
+                  "border-slate-600/60 bg-slate-950/70 hover:bg-slate-900/90",
+                  gameIsFavorite && "border-amber-300/50 bg-amber-500/15 text-amber-200"
+                )}
+              />
+            )
+          )}
           {/* Game Context Chip - shows key betting signals */}
           {!isCompact && game.gameId && (
-            <GameContextChip gameId={game.gameId} sport={game.sport} homeTeam={getTeamName(game.homeTeam)} awayTeam={getTeamName(game.awayTeam)} />
+            <GameContextChip gameId={game.gameId} sport={game.sport} homeTeam={homeTeamName} awayTeam={awayTeamName} />
           )}
           {!isCompact && onWatchClick && (
             <WatchButton onClick={onWatchClick} isInWatchboard={isInWatchboard} />

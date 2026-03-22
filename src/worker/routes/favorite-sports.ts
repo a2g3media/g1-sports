@@ -39,6 +39,23 @@ const FOLLOWED_PLAYERS_KEY = 'followed_players';
 const USER_LOCALE_KEY = 'user_locale';
 const ONBOARDING_COMPLETE_KEY = 'onboarding_complete';
 
+async function ensureFavoritesTable(db: D1Database): Promise<void> {
+  await db.prepare(`
+    CREATE TABLE IF NOT EXISTS favorites (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id TEXT NOT NULL,
+      type TEXT NOT NULL,
+      entity_id TEXT NOT NULL,
+      sport TEXT,
+      league TEXT,
+      metadata TEXT,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(user_id, type, entity_id)
+    )
+  `).run();
+}
+
 // Regional defaults (matches frontend)
 const REGIONAL_DEFAULTS: Record<string, SportKey[]> = {
   'US': ['nfl', 'nba', 'mlb'],
@@ -76,6 +93,7 @@ favoriteSportsRouter.get('/', demoOrAuthMiddleware, async (c) => {
   const db = c.env.DB;
 
   try {
+    await ensureFavoritesTable(db);
     // Fetch all user settings in one query
     const results = await db.prepare(`
       SELECT setting_key, setting_value 
@@ -101,12 +119,27 @@ favoriteSportsRouter.get('/', demoOrAuthMiddleware, async (c) => {
       ? JSON.parse(settings.get(FAVORITE_SPORTS_KEY)!)
       : [];
     
-    const followedTeams = settings.has(FOLLOWED_TEAMS_KEY)
+    const followedTeamsLegacy = settings.has(FOLLOWED_TEAMS_KEY)
       ? JSON.parse(settings.get(FOLLOWED_TEAMS_KEY)!)
       : [];
-    const followedPlayers = settings.has(FOLLOWED_PLAYERS_KEY)
+    const followedPlayersLegacy = settings.has(FOLLOWED_PLAYERS_KEY)
       ? JSON.parse(settings.get(FOLLOWED_PLAYERS_KEY)!)
       : [];
+
+    const favRows = await db.prepare(`
+      SELECT type, entity_id
+      FROM favorites
+      WHERE user_id = ? AND type IN ('team', 'player')
+    `).bind(user.id).all<{ type: string; entity_id: string }>();
+    const followedTeamsFromFavorites = (favRows.results || [])
+      .filter((r) => String(r.type) === "team")
+      .map((r) => String(r.entity_id));
+    const followedPlayersFromFavorites = (favRows.results || [])
+      .filter((r) => String(r.type) === "player")
+      .map((r) => String(r.entity_id));
+
+    const followedTeams = Array.from(new Set([...(Array.isArray(followedTeamsLegacy) ? followedTeamsLegacy : []), ...followedTeamsFromFavorites]));
+    const followedPlayers = Array.from(new Set([...(Array.isArray(followedPlayersLegacy) ? followedPlayersLegacy : []), ...followedPlayersFromFavorites]));
 
     const locale = settings.get(USER_LOCALE_KEY) || 'US';
     const hasCompletedOnboarding = settings.get(ONBOARDING_COMPLETE_KEY) === 'true';
@@ -144,6 +177,7 @@ favoriteSportsRouter.post('/', authMiddleware, async (c) => {
   const db = c.env.DB;
 
   try {
+    await ensureFavoritesTable(db);
     const body = await c.req.json();
     const { sports, followedTeams, followedPlayers, locale, markOnboardingComplete } = body;
 
@@ -187,6 +221,20 @@ favoriteSportsRouter.post('/', authMiddleware, async (c) => {
         now,
         now
       ).run();
+
+      await db.prepare(`DELETE FROM favorites WHERE user_id = ? AND type = 'team'`).bind(user.id).run();
+      for (const teamIdRaw of followedTeams) {
+        const teamId = String(teamIdRaw || "").trim();
+        if (!teamId) continue;
+        await db.prepare(`
+          INSERT OR IGNORE INTO favorites (user_id, type, entity_id, metadata, updated_at)
+          VALUES (?, 'team', ?, ?, CURRENT_TIMESTAMP)
+        `).bind(
+          user.id,
+          teamId,
+          JSON.stringify({ source: "favorite_sports_sync" })
+        ).run();
+      }
     }
 
     // Upsert followed players if provided
@@ -203,6 +251,20 @@ favoriteSportsRouter.post('/', authMiddleware, async (c) => {
         now,
         now
       ).run();
+
+      await db.prepare(`DELETE FROM favorites WHERE user_id = ? AND type = 'player'`).bind(user.id).run();
+      for (const playerIdRaw of followedPlayers) {
+        const playerId = String(playerIdRaw || "").trim();
+        if (!playerId) continue;
+        await db.prepare(`
+          INSERT OR IGNORE INTO favorites (user_id, type, entity_id, metadata, updated_at)
+          VALUES (?, 'player', ?, ?, CURRENT_TIMESTAMP)
+        `).bind(
+          user.id,
+          playerId,
+          JSON.stringify({ source: "favorite_sports_sync" })
+        ).run();
+      }
     }
 
     // Upsert locale if provided

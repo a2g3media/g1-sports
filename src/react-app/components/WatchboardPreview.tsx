@@ -314,10 +314,10 @@ export const WatchboardPreview = memo(function WatchboardPreview() {
         };
       });
 
-      // Filter to only show boards with active games (not all final)
-      const activeBoards = boardsWithGames.filter(b => b.hasActiveGames && b.games.length > 0);
-
-      setBoards(activeBoards);
+      // Show all boards with games (including final/completed slates)
+      // so recently updated watchboards don't disappear from Home.
+      const boardsToShow = boardsWithGames.filter(b => b.games.length > 0);
+      setBoards(boardsToShow);
     } catch (e) {
       console.error("Error fetching watchboards:", e);
     } finally {

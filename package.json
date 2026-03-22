@@ -60,6 +60,7 @@
     "ops:monitor": "npx tsx scripts/post-launch-monitor.ts",
     "ops:snapshot": "bash scripts/capture-release-snapshot.sh",
     "dev": "vite",
+    "dev:reset": "for p in 5173 5174 5175; do lsof -tiTCP:$p -sTCP:LISTEN; done | xargs kill -9 2>/dev/null || true; vite",
     "dev:clean": "rm -rf node_modules/.vite && vite",
     "knip": "knip",
     "lint": "eslint .",
@@ -75,6 +76,11 @@
     "qa:pools:release:report": "npx tsx scripts/qa-pools-release-report.ts",
     "qa:pools:gates": "npm run qa:pools:evaluators && npm run qa:pools:catalog && npm run qa:pools:ui && npm run qa:pools:api && npm run qa:pools:join && npm run smoke:pools && npm run smoke:routes:deep",
     "smoke:quick": "bash scripts/smoke-quick.sh",
-    "test:nascar-live-snapshot": "npx tsx scripts/test-nascar-live-snapshot.ts"
+    "test:nascar-live-snapshot": "npx tsx scripts/test-nascar-live-snapshot.ts",
+    "qa:hardening": "npx tsx scripts/qa-hardening-tests.ts",
+    "migrate:local": "wrangler d1 execute 019ce56b-b0ff-7056-a2d5-613f9cde7650 --local --file=migrations/91.sql",
+    "migrate:remote": "wrangler d1 execute 019ce56b-b0ff-7056-a2d5-613f9cde7650 --remote --file=migrations/91.sql --config=wrangler.d1.migrations.json",
+    "migrate:local:92": "wrangler d1 execute 019ce56b-b0ff-7056-a2d5-613f9cde7650 --local --file=migrations/92.sql",
+    "migrate:remote:92": "wrangler d1 execute 019ce56b-b0ff-7056-a2d5-613f9cde7650 --remote --file=migrations/92.sql --config=wrangler.d1.migrations.json"
   }
 }

@@ -10,7 +10,7 @@ import { RadioGroup, RadioGroupItem } from "@/react-app/components/ui/radio-grou
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/react-app/components/ui/select";
 import {
   ArrowLeft, ArrowRight, Check, Trophy, Loader2, AlertCircle,
-  Search, X, Star, Users,
+  Search, X, Star, Users, Layers, Plus,
 } from "lucide-react";
 import { Alert, AlertDescription } from "@/react-app/components/ui/alert";
 import { SPORTS, POOL_FORMATS, DEFAULT_RULES, type LeagueRules } from "@/react-app/data/sports";
@@ -37,6 +37,7 @@ interface LeagueData {
   poolTypeKey: string;
   variantKey: string;
   season: string;
+  poolDuration: "weekly" | "season" | "tournament";
   entryFeeCents: number;
   isPaymentRequired: boolean;
   entryMode: "single" | "optional" | "required";
@@ -114,7 +115,7 @@ export function CreateLeague() {
   const [currentStep, setCurrentStep] = useState<Step>("catalog");
   const [league, setLeague] = useState<LeagueData>({
     name: "", sportKey: "", formatKey: "", poolTypeKey: "", variantKey: "",
-    season: "", entryFeeCents: 0, isPaymentRequired: false,
+    season: "2025-2026", poolDuration: "season", entryFeeCents: 0, isPaymentRequired: false,
     entryMode: "single", maxEntriesPerUser: 1, requiredEntries: 3,
     rules: DEFAULT_RULES,
     missedPickPolicy: "loss", allowLateJoins: true, allowLatePicks: false,
@@ -128,6 +129,7 @@ export function CreateLeague() {
   const searchRef = useRef<HTMLInputElement>(null);
   const [isCreating, setIsCreating] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [createdPool, setCreatedPool] = useState<{ id: number; inviteCode: string } | null>(null);
 
   useEffect(() => { try { const r = localStorage.getItem(CATALOG_FAVORITES_KEY); if (r) { const p = JSON.parse(r) as unknown; if (Array.isArray(p)) setFavoriteKeys(p.filter((v): v is string => typeof v === "string")); } } catch { setFavoriteKeys([]); } }, []);
   useEffect(() => { try { localStorage.setItem(CATALOG_FAVORITES_KEY, JSON.stringify(favoriteKeys)); } catch { /* ok */ } }, [favoriteKeys]);
@@ -215,7 +217,7 @@ export function CreateLeague() {
 
   const canProceed = () => {
     if (currentStep === "catalog") return !!league.sportKey && !!league.formatKey;
-    if (currentStep === "details") return !!league.name && !!league.season;
+    if (currentStep === "details") return !!league.name.trim() && !!league.season && !!league.sportKey;
     return true;
   };
 
@@ -246,30 +248,52 @@ export function CreateLeague() {
   const handleCreate = async () => {
     setIsCreating(true); setError(null);
     try {
+      if (!league.name?.trim()) { setError("Pool name is required"); setIsCreating(false); return; }
+      if (!league.sportKey) { setError("Sport is required"); setIsCreating(false); return; }
+
+      const seasonVal = league.season || (selectedSport?.seasons?.[0]) || new Date().getFullYear().toString();
       const headers: HeadersInit = { "Content-Type": "application/json" };
       if (isDemoMode) headers["X-Demo-Mode"] = "true";
-      const response = await fetch("/api/leagues", {
-        method: "POST", headers,
-        body: JSON.stringify({
-          name: league.name, sportKey: league.sportKey, formatKey: league.formatKey,
-          poolTypeKey: league.poolTypeKey || league.formatKey, variantKey: league.variantKey,
-          season: league.season, entryFeeCents: league.entryFeeCents,
-          isPaymentRequired: league.isPaymentRequired, entryMode: league.entryMode,
-          allowMultipleEntries: league.entryMode !== "single",
-          maxEntriesPerUser: league.entryMode === "optional" ? league.maxEntriesPerUser : league.entryMode === "required" ? league.requiredEntries : 1,
-          requiredEntries: league.entryMode === "required" ? league.requiredEntries : null,
-          missedPickPolicy: league.missedPickPolicy,
-          allowLateJoins: league.allowLateJoins, allowLatePicks: league.allowLatePicks,
-          picksPerPeriod: league.picksPerPeriod === "custom" ? league.customPickCount : null,
-          hidePicksUntilLock: league.hidePicksUntilLock,
-          rules: league.rules,
-        }),
-      });
-      if (!response.ok) { const d = await response.json(); throw new Error(d.error || "Failed to create league"); }
+
+      const payload = {
+        name: league.name.trim(),
+        sportKey: league.sportKey,
+        formatKey: league.formatKey,
+        poolTypeKey: league.poolTypeKey || league.formatKey,
+        variantKey: league.variantKey,
+        season: seasonVal,
+        entryFeeCents: league.entryFeeCents,
+        isPaymentRequired: league.isPaymentRequired,
+        entryMode: league.entryMode,
+        allowMultipleEntries: league.entryMode !== "single",
+        maxEntriesPerUser: league.entryMode === "optional" ? league.maxEntriesPerUser : league.entryMode === "required" ? league.requiredEntries : 1,
+        requiredEntries: league.entryMode === "required" ? league.requiredEntries : null,
+        missedPickPolicy: league.missedPickPolicy,
+        allowLateJoins: league.allowLateJoins,
+        allowLatePicks: league.allowLatePicks,
+        picksPerPeriod: league.picksPerPeriod === "custom" ? league.customPickCount : null,
+        hidePicksUntilLock: league.hidePicksUntilLock,
+        rules: {
+          ...league.rules,
+          poolDuration: league.poolDuration,
+        },
+      };
+
+      const response = await fetch("/api/leagues", { method: "POST", headers, body: JSON.stringify(payload) });
+
+      if (!response.ok) {
+        let errorMsg = "Failed to create league";
+        try { const d = await response.json(); errorMsg = d.error || d.message || errorMsg; } catch { /* non-JSON response */ }
+        throw new Error(errorMsg);
+      }
+
       const data = await response.json() as { id: number; inviteCode: string };
-      navigate(`/pool-admin/pools`, { state: { newLeagueId: data.id, inviteCode: data.inviteCode } });
-    } catch (err) { setError(err instanceof Error ? err.message : "Something went wrong"); }
-    finally { setIsCreating(false); }
+      setCreatedPool(data);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Something went wrong. Please try again.");
+    } finally {
+      setIsCreating(false);
+    }
   };
 
   const poolTypeDef = league.selectedPoolTypeDef;
@@ -277,6 +301,35 @@ export function CreateLeague() {
   const isConfidence = league.formatKey === "confidence";
   const isBracket = league.formatKey === "bracket";
   const isSquares = league.formatKey === "squares";
+
+  if (createdPool) {
+    return (
+      <div className="max-w-lg mx-auto py-16 px-4 text-center space-y-6 animate-in fade-in-50 slide-in-from-bottom-4 duration-500">
+        <div className="mx-auto h-16 w-16 rounded-full bg-emerald-500/15 flex items-center justify-center">
+          <Check className="h-8 w-8 text-emerald-500" />
+        </div>
+        <div className="space-y-2">
+          <h1 className="text-2xl font-bold">Pool Created!</h1>
+          <p className="text-muted-foreground">{league.name} is ready to go.</p>
+        </div>
+        <Card className="text-left border-border/60">
+          <CardContent className="pt-6 space-y-3">
+            <div className="flex justify-between text-sm"><span className="text-muted-foreground">Invite Code</span><span className="font-mono font-bold text-lg tracking-wider">{createdPool.inviteCode}</span></div>
+            <div className="flex justify-between text-sm"><span className="text-muted-foreground">Pool Type</span><span className="font-medium">{poolTypeDef?.name || league.formatKey}</span></div>
+            <div className="flex justify-between text-sm"><span className="text-muted-foreground">Duration</span><span className="font-medium capitalize">{league.poolDuration === "weekly" ? "Weekly" : league.poolDuration === "tournament" ? "Tournament" : "Full Season"}</span></div>
+          </CardContent>
+        </Card>
+        <div className="flex flex-col sm:flex-row gap-3 justify-center">
+          <Button onClick={() => navigate("/pool-admin/pools")} className="h-11 gap-2">
+            <Layers className="h-4 w-4" /> Manage Pools
+          </Button>
+          <Button variant="outline" onClick={() => { setCreatedPool(null); setCurrentStep("catalog"); setLeague(prev => ({ ...prev, name: "", selectedPoolTypeDef: null })); }} className="h-11 gap-2">
+            <Plus className="h-4 w-4" /> Create Another
+          </Button>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <PoolAccessGate action="create" variant="replace">
@@ -381,14 +434,30 @@ export function CreateLeague() {
               <Label htmlFor="name">Pool Name</Label>
               <Input id="name" placeholder="e.g., Office NFL Pool 2024" value={league.name} onChange={(e) => setLeague({ ...league, name: e.target.value })} />
             </div>
-            <div className="space-y-2">
-              <Label>Season</Label>
-              <Select value={league.season} onValueChange={(v) => setLeague({ ...league, season: v })}>
-                <SelectTrigger><SelectValue /></SelectTrigger>
-                <SelectContent>
-                  {selectedSport?.seasons.map((s) => <SelectItem key={s} value={s}>{s}</SelectItem>)}
-                </SelectContent>
-              </Select>
+            <div className="grid gap-4 sm:grid-cols-2">
+              <div className="space-y-2">
+                <Label>Season</Label>
+                <Select value={league.season} onValueChange={(v) => setLeague({ ...league, season: v })}>
+                  <SelectTrigger><SelectValue placeholder="Select season" /></SelectTrigger>
+                  <SelectContent>
+                    {(selectedSport?.seasons || ["2025-2026", "2025", "2024-2025", "2024"]).map((s) => <SelectItem key={s} value={s}>{s}</SelectItem>)}
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="space-y-2">
+                <Label>Pool Duration</Label>
+                <Select value={league.poolDuration} onValueChange={(v) => setLeague({ ...league, poolDuration: v as LeagueData["poolDuration"] })}>
+                  <SelectTrigger><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="weekly">Weekly (resets each week)</SelectItem>
+                    <SelectItem value="season">Full Season (cumulative)</SelectItem>
+                    <SelectItem value="tournament">Tournament (bracket/event)</SelectItem>
+                  </SelectContent>
+                </Select>
+                <p className="text-xs text-muted-foreground">
+                  {league.poolDuration === "weekly" ? "Standings reset each week — best for weekly prizes." : league.poolDuration === "season" ? "Points accumulate all season — best for season-long pools." : "Single-event or bracket pool."}
+                </p>
+              </div>
             </div>
             <div className="space-y-2">
               <Label htmlFor="entryFee">Entry Fee (optional)</Label>
@@ -555,7 +624,8 @@ export function CreateLeague() {
                 ["Pool Type", poolTypeDef?.name || league.poolTypeKey],
                 ["Sport", selectedSport?.name || league.sportKey],
                 ["Format", TEMPLATE_LABELS[league.selectedPoolTypeDef?.template || ""] || selectedFormat?.name || league.formatKey],
-                ["Season", league.season],
+                ["Season", league.season || "2025-2026"],
+                ["Pool Duration", league.poolDuration === "weekly" ? "Weekly (resets each week)" : league.poolDuration === "tournament" ? "Tournament" : "Full Season"],
                 ["Entry Fee", league.entryFeeCents > 0 ? `$${(league.entryFeeCents / 100).toFixed(2)}` : "Free"],
                 ["Entry Mode", league.entryMode === "single" ? "Single entry" : league.entryMode === "optional" ? `Optional, up to ${league.maxEntriesPerUser}` : `Mandatory ${league.requiredEntries} entries`],
                 ["Lock Time", league.rules.lockType === "game_start" ? "Each game start" : "First game"],

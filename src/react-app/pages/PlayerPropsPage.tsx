@@ -412,16 +412,16 @@ function PlayerPropCard({
                 <span className="text-xs text-white/40">
                   {PROP_TYPE_LABELS[primaryProp.prop_type] || primaryProp.prop_type}
                 </span>
-                {primaryProp.movement !== null && primaryProp.movement !== 0 && (
+                {primaryProp.movement != null && Number(primaryProp.movement) !== 0 && (
                   <span className={cn(
                     "flex items-center gap-0.5 text-xs",
-                    primaryProp.movement > 0 ? "text-emerald-400" : "text-red-400"
+                    Number(primaryProp.movement) > 0 ? "text-emerald-400" : "text-red-400"
                   )}>
-                    {primaryProp.movement > 0 
+                    {Number(primaryProp.movement) > 0 
                       ? <TrendingUp className="w-3 h-3" />
                       : <TrendingDown className="w-3 h-3" />
                     }
-                    <span>{primaryProp.movement > 0 ? '+' : ''}{primaryProp.movement.toFixed(1)}</span>
+                    <span>{Number(primaryProp.movement) > 0 ? '+' : ''}{Number(primaryProp.movement).toFixed(1)}</span>
                   </span>
                 )}
               </div>
@@ -492,12 +492,12 @@ function PlayerPropCard({
                       {prop.odds_american && (
                         <span className="text-xs text-white/40">{formatOdds(prop.odds_american)}</span>
                       )}
-                      {prop.movement !== null && prop.movement !== 0 && (
+                      {prop.movement != null && Number(prop.movement) !== 0 && (
                         <span className={cn(
                           "text-xs",
-                          prop.movement > 0 ? "text-emerald-400" : "text-red-400"
+                          Number(prop.movement) > 0 ? "text-emerald-400" : "text-red-400"
                         )}>
-                          {prop.movement > 0 ? '+' : ''}{prop.movement.toFixed(1)}
+                          {Number(prop.movement) > 0 ? '+' : ''}{Number(prop.movement).toFixed(1)}
                         </span>
                       )}
                     </div>
@@ -798,11 +798,15 @@ export function PlayerPropsPage() {
   
   const [props, setProps] = useState<PlayerProp[]>([]);
   const [loading, setLoading] = useState(true);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [hasMore, setHasMore] = useState(false);
+  const [nextOffset, setNextOffset] = useState(0);
+  const [feedErrors, setFeedErrors] = useState<string[]>([]);
   const [error, setError] = useState<string | null>(null);
   
   // Filters
   const [searchQuery, setSearchQuery] = useState('');
-  const [selectedSport, setSelectedSport] = useState<string>('ALL');
+  const [selectedSport, setSelectedSport] = useState<string>('NBA');
   const [selectedPropType, setSelectedPropType] = useState<string | null>(null);
   const [selectedGameId, setSelectedGameId] = useState<string>('ALL');
   const [selectedPlayerName, setSelectedPlayerName] = useState<string>('ALL');
@@ -826,43 +830,86 @@ export function PlayerPropsPage() {
     }
   }, []);
 
-  // Fetch props
+  // Pick an initial fast-path sport from favorites when available.
   useEffect(() => {
+    if (favoriteSports.length === 0) return;
+    const mapped = favoriteSports
+      .map((s) => String(s || '').toUpperCase())
+      .find((s) => SPORTS.some((entry) => entry.key === s));
+    if (!mapped) return;
+    setSelectedSport((prev) => (prev === 'NBA' ? mapped : prev));
+  }, [favoriteSports]);
+
+  const fetchPropsPage = useCallback(async (reset: boolean) => {
     if (capabilitiesLoading) return;
     if (!hasProps) {
       setLoading(false);
       return;
     }
-    
-    const fetchData = async () => {
+
+    if (reset) {
       setLoading(true);
       setError(null);
-      
-      try {
-        const res = await fetch('/api/sports-data/props/today', {
-          credentials: 'include',
-        });
-        
-        if (!res.ok) {
-          if (res.status === 404) {
-            setProps([]);
-            return;
-          }
-          throw new Error('Failed to fetch props');
+    } else {
+      setLoadingMore(true);
+    }
+
+    try {
+      const limit = selectedSport === 'ALL' ? 1200 : 3000;
+      const offset = reset ? 0 : nextOffset;
+      const qs = new URLSearchParams({
+        sport: selectedSport || 'ALL',
+        limit: String(limit),
+        offset: String(offset),
+      });
+      const url = `/api/sports-data/props/today?${qs.toString()}`;
+      const res = await fetch(url, { credentials: 'include' });
+      if (!res.ok) {
+        if (res.status === 404) {
+          if (reset) setProps([]);
+          setHasMore(false);
+          setNextOffset(0);
+          return;
         }
-        
-        const data = await res.json();
-        setProps(data.props || []);
-      } catch (err) {
-        console.error('Failed to fetch props:', err);
-        setError('Unable to load player props. Check back when games are scheduled.');
-      } finally {
-        setLoading(false);
+        throw new Error('Failed to fetch props');
       }
-    };
-    
-    fetchData();
-  }, [capabilitiesLoading, hasProps]);
+
+      const data = await res.json();
+      const incoming = Array.isArray(data?.props) ? data.props : [];
+      const incomingErrors = Array.isArray(data?.errors)
+        ? data.errors.filter((msg: unknown): msg is string => typeof msg === 'string')
+        : [];
+      setFeedErrors(incomingErrors);
+      setProps((prev) => {
+        if (reset) return incoming;
+        const seen = new Set(prev.map((p) => String(p.id)));
+        const merged = [...prev];
+        for (const row of incoming) {
+          const key = String((row as any)?.id || '');
+          if (key && seen.has(key)) continue;
+          merged.push(row);
+        }
+        return merged;
+      });
+
+      const hasMoreValue = Boolean(data?.has_more);
+      const next = Number(data?.next_offset);
+      setHasMore(hasMoreValue);
+      setNextOffset(Number.isFinite(next) ? next : offset + incoming.length);
+    } catch (err) {
+      console.error('Failed to fetch props:', err);
+      setFeedErrors([]);
+      setError('Unable to load player props. Check back when games are scheduled.');
+    } finally {
+      setLoading(false);
+      setLoadingMore(false);
+    }
+  }, [capabilitiesLoading, hasProps, selectedSport, nextOffset]);
+
+  // Fetch props
+  useEffect(() => {
+    void fetchPropsPage(true);
+  }, [fetchPropsPage]);
   
   // Show stub if props not available
   if (!capabilitiesLoading && !hasProps) {
@@ -1108,6 +1155,19 @@ export function PlayerPropsPage() {
     }
   }, [selectedPlayerName, availablePlayers]);
 
+  const filteredPropsCount = useMemo(
+    () => groupedProps.reduce((sum, group) => sum + group.props.length, 0),
+    [groupedProps]
+  );
+
+  const filteredGamesCount = useMemo(() => {
+    const ids = new Set<string>();
+    groupedProps.forEach((group) => {
+      group.props.forEach((prop) => ids.add(prop.game_id));
+    });
+    return ids.size;
+  }, [groupedProps]);
+
   return (
     <div className="relative min-h-screen">
       <CinematicBackground />
@@ -1132,71 +1192,101 @@ export function PlayerPropsPage() {
           </div>
         </div>
 
-        {/* Search Bar */}
-        <div className="relative">
-          <Search className="absolute left-4 top-1/2 -translate-y-1/2 w-5 h-5 text-white/30" />
-          <input
-            type="text"
-            placeholder="Search player or team..."
-            value={searchQuery}
-            onChange={(e) => setSearchQuery(e.target.value)}
-            className={cn(
-              "w-full pl-12 pr-10 py-3 rounded-xl",
-              "bg-white/[0.04] border border-white/[0.08]",
-              "text-white placeholder:text-white/30",
-              "focus:outline-none focus:border-blue-500/50 focus:ring-1 focus:ring-blue-500/20",
-              "transition-all text-sm"
+        <div className="rounded-2xl border border-amber-500/20 bg-gradient-to-br from-amber-500/10 via-slate-900/80 to-emerald-500/10 p-4 sm:p-5">
+          <div className="flex items-start justify-between gap-3">
+            <div>
+              <p className="text-[11px] uppercase tracking-wide text-amber-200/80">Props Intel Terminal</p>
+              <p className="mt-1 text-sm text-white/80">
+                Track player lines, movement, and watchboard-ready edges across today's slate.
+              </p>
+            </div>
+            <span className="rounded-full border border-emerald-400/30 bg-emerald-500/15 px-2.5 py-1 text-[10px] font-semibold uppercase tracking-wide text-emerald-200">
+              Live Feed
+            </span>
+          </div>
+          <div className="mt-3 grid grid-cols-3 gap-2.5">
+            <div className="rounded-lg border border-white/10 bg-white/[0.04] px-3 py-2">
+              <p className="text-[10px] uppercase tracking-wide text-white/45">Visible Props</p>
+              <p className="text-base font-bold text-white">{filteredPropsCount}</p>
+            </div>
+            <div className="rounded-lg border border-white/10 bg-white/[0.04] px-3 py-2">
+              <p className="text-[10px] uppercase tracking-wide text-white/45">Players</p>
+              <p className="text-base font-bold text-white">{groupedProps.length}</p>
+            </div>
+            <div className="rounded-lg border border-white/10 bg-white/[0.04] px-3 py-2">
+              <p className="text-[10px] uppercase tracking-wide text-white/45">Games</p>
+              <p className="text-base font-bold text-white">{filteredGamesCount}</p>
+            </div>
+          </div>
+        </div>
+
+        <div className="rounded-xl border border-white/[0.08] bg-white/[0.03] p-3 space-y-3">
+          {/* Search Bar */}
+          <div className="relative">
+            <Search className="absolute left-4 top-1/2 -translate-y-1/2 w-5 h-5 text-white/30" />
+            <input
+              type="text"
+              placeholder="Search player or team..."
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              className={cn(
+                "w-full pl-12 pr-10 py-3 rounded-xl",
+                "bg-white/[0.04] border border-white/[0.08]",
+                "text-white placeholder:text-white/30",
+                "focus:outline-none focus:border-blue-500/50 focus:ring-1 focus:ring-blue-500/20",
+                "transition-all text-sm"
+              )}
+            />
+            {searchQuery && (
+              <button
+                onClick={() => setSearchQuery('')}
+                className="absolute right-4 top-1/2 -translate-y-1/2 p-1 rounded-full hover:bg-white/10"
+              >
+                <X className="w-4 h-4 text-white/40" />
+              </button>
             )}
-          />
-          {searchQuery && (
-            <button
-              onClick={() => setSearchQuery('')}
-              className="absolute right-4 top-1/2 -translate-y-1/2 p-1 rounded-full hover:bg-white/10"
-            >
-              <X className="w-4 h-4 text-white/40" />
-            </button>
-          )}
-        </div>
+          </div>
 
-        {/* Sport Tabs */}
-        <div className="flex gap-2 overflow-x-auto pb-2 -mx-4 px-4 scrollbar-hide">
-          {SPORTS.map((sport) => (
-            <SportTab
-              key={sport.key}
-              sport={sport}
-              active={selectedSport === sport.key}
-              onClick={() => {
-                setSelectedSport(sport.key);
-                setSelectedPropType(null);
-              }}
-            />
-          ))}
-        </div>
-
-        {/* Prop Type Chips */}
-        {availablePropTypes.length > 0 && (
-          <div className="flex gap-2 overflow-x-auto pb-2 -mx-4 px-4 scrollbar-hide">
-            <PropTypeChip
-              type="ALL"
-              active={selectedPropType === null}
-              onClick={() => setSelectedPropType(null)}
-            />
-            {availablePropTypes.slice(0, 8).map(type => (
-              <PropTypeChip
-                key={type}
-                type={type}
-                active={selectedPropType === type}
-                onClick={() => setSelectedPropType(selectedPropType === type ? null : type)}
+          {/* Sport Tabs */}
+          <div className="flex gap-2 overflow-x-auto pb-1 -mx-3 px-3 scrollbar-hide">
+            {SPORTS.map((sport) => (
+              <SportTab
+                key={sport.key}
+                sport={sport}
+                active={selectedSport === sport.key}
+                onClick={() => {
+                  setSelectedSport(sport.key);
+                  setSelectedPropType(null);
+                }}
               />
             ))}
           </div>
-        )}
+
+          {/* Prop Type Chips */}
+          {availablePropTypes.length > 0 && (
+            <div className="flex gap-2 overflow-x-auto pb-1 -mx-3 px-3 scrollbar-hide">
+              <PropTypeChip
+                type="ALL"
+                active={selectedPropType === null}
+                onClick={() => setSelectedPropType(null)}
+              />
+              {availablePropTypes.slice(0, 8).map(type => (
+                <PropTypeChip
+                  key={type}
+                  type={type}
+                  active={selectedPropType === type}
+                  onClick={() => setSelectedPropType(selectedPropType === type ? null : type)}
+                />
+              ))}
+            </div>
+          )}
+        </div>
 
         {/* Real Props Games Today */}
         {realPropsGamesToday.length > 0 && (
           <div className="bg-white/[0.03] border border-white/[0.06] rounded-xl p-3 space-y-2">
             <div className="flex items-center justify-between">
-              <p className="text-xs font-medium text-white/80">Real Props Games Today</p>
+              <p className="text-xs font-medium text-white/80">Live Slate Coverage</p>
               <p className="text-[10px] text-white/45">{realPropsGamesToday.length} games</p>
             </div>
             <select
@@ -1208,7 +1298,7 @@ export function PlayerPropsPage() {
                 "focus:outline-none focus:border-blue-500/50 focus:ring-1 focus:ring-blue-500/20"
               )}
             >
-              <option value="ALL" className="bg-slate-900 text-white">All Real Props Games</option>
+              <option value="ALL" className="bg-slate-900 text-white">All Slate Games</option>
               {realPropsGamesToday.map((game) => (
                 <option key={game.gameId} value={game.gameId} className="bg-slate-900 text-white">
                   {game.label} ({game.count} props)
@@ -1278,7 +1368,7 @@ export function PlayerPropsPage() {
         {hasActiveFilters && (
           <button
             onClick={clearFilters}
-            className="text-xs text-amber-400 hover:underline"
+            className="text-xs text-amber-300 hover:text-amber-200 transition-colors"
           >
             Clear all filters
           </button>
@@ -1286,7 +1376,7 @@ export function PlayerPropsPage() {
 
         {/* Disclaimer */}
         <p className="text-[10px] text-white/25 px-1">
-          For informational purposes only. No wagering functionality.
+          Intelligence view only. No wagering is executed in this product.
         </p>
 
         {/* Loading State */}
@@ -1318,6 +1408,16 @@ export function PlayerPropsPage() {
                 : "No props match your filters"
               }
             </p>
+            {!hasActiveFilters && props.length === 0 && selectedSport !== 'ALL' && (
+              <p className="text-xs text-amber-300/80 mt-2">
+                {`${selectedSport} props are temporarily unavailable right now. Try ALL or another sport.`}
+              </p>
+            )}
+            {!hasActiveFilters && props.length === 0 && feedErrors.length > 0 && (
+              <p className="text-[11px] text-white/40 mt-2">
+                {feedErrors[0]}
+              </p>
+            )}
             {hasActiveFilters && (
               <button
                 onClick={clearFilters}
@@ -1342,6 +1442,23 @@ export function PlayerPropsPage() {
                 onToggleFollow={handleToggleFollowPlayer}
               />
             ))}
+          </div>
+        )}
+
+        {!loading && !error && hasMore && (
+          <div className="pt-2 flex justify-center">
+            <button
+              onClick={() => void fetchPropsPage(false)}
+              disabled={loadingMore}
+              className={cn(
+                "px-4 py-2 rounded-lg text-sm border transition-colors",
+                loadingMore
+                  ? "bg-white/[0.04] border-white/[0.08] text-white/40"
+                  : "bg-white/[0.06] border-white/[0.14] text-white/80 hover:bg-white/[0.1]"
+              )}
+            >
+              {loadingMore ? 'Loading more...' : 'Load more props'}
+            </button>
           </div>
         )}
       </div>

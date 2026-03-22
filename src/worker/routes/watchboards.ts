@@ -13,6 +13,96 @@ type Bindings = {
 
 const watchboardsRouter = new Hono<{ Bindings: Bindings }>();
 
+let ensureWatchboardSchemaPromise: Promise<void> | null = null;
+
+async function ensureWatchboardSchema(db: D1Database): Promise<void> {
+  if (ensureWatchboardSchemaPromise) {
+    await ensureWatchboardSchemaPromise;
+    return;
+  }
+
+  ensureWatchboardSchemaPromise = (async () => {
+    await db.prepare(`
+      CREATE TABLE IF NOT EXISTS watchboards (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id TEXT NOT NULL,
+        name TEXT NOT NULL DEFAULT 'My Watchboard',
+        pinned_game_id TEXT,
+        is_active INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      )
+    `).run();
+
+    await db.prepare(`
+      CREATE TABLE IF NOT EXISTS watchboard_games (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        watchboard_id INTEGER NOT NULL,
+        game_id TEXT NOT NULL,
+        order_index INTEGER NOT NULL DEFAULT 0,
+        added_from TEXT,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      )
+    `).run();
+
+    await db.prepare(`
+      CREATE TABLE IF NOT EXISTS watchboard_props (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        watchboard_id INTEGER NOT NULL,
+        game_id TEXT NOT NULL,
+        player_name TEXT NOT NULL,
+        player_id TEXT,
+        team TEXT,
+        sport TEXT NOT NULL,
+        prop_type TEXT NOT NULL,
+        line_value REAL NOT NULL DEFAULT 0,
+        selection TEXT NOT NULL DEFAULT '',
+        odds_american INTEGER,
+        current_stat_value REAL,
+        order_index INTEGER NOT NULL DEFAULT 0,
+        added_from TEXT,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      )
+    `).run();
+
+    await db.prepare(`
+      CREATE TABLE IF NOT EXISTS watchboard_players (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        watchboard_id INTEGER NOT NULL,
+        user_id TEXT NOT NULL,
+        player_name TEXT NOT NULL,
+        player_id TEXT,
+        sport TEXT NOT NULL,
+        team TEXT,
+        team_abbr TEXT,
+        position TEXT,
+        headshot_url TEXT,
+        prop_type TEXT,
+        prop_line REAL,
+        prop_selection TEXT,
+        current_stat_value REAL,
+        order_index INTEGER NOT NULL DEFAULT 0,
+        is_active INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      )
+    `).run();
+  })();
+
+  try {
+    await ensureWatchboardSchemaPromise;
+  } finally {
+    ensureWatchboardSchemaPromise = null;
+  }
+}
+
+watchboardsRouter.use("*", async (c, next) => {
+  await ensureWatchboardSchema(c.env.DB);
+  return next();
+});
+
 // Types
 interface Watchboard {
   id: number;
@@ -182,46 +272,81 @@ watchboardsRouter.get("/home-preview", async (c) => {
     const boardIds = boards.results.map(b => b.id);
     const placeholders = boardIds.map(() => "?").join(",");
     
-    // Join watchboard_games with sdio_games to get full game data
-    const allGamesWithData = await db
-      .prepare(`
-        SELECT 
-          wg.watchboard_id,
-          wg.game_id,
-          wg.order_index,
-          g.sport,
-          g.home_team AS home_team_code,
-          g.away_team AS away_team_code,
-          g.home_team_name,
-          g.away_team_name,
-          g.score_home AS home_score,
-          g.score_away AS away_score,
-          g.status,
-          g.start_time,
-          g.period AS period_label,
-          g.clock
-        FROM watchboard_games wg
-        LEFT JOIN sdio_games g ON wg.game_id = g.provider_game_id
-        WHERE wg.watchboard_id IN (${placeholders})
-        ORDER BY wg.order_index ASC
-      `)
-      .bind(...boardIds)
-      .all<{
-        watchboard_id: number;
-        game_id: string;
-        order_index: number;
-        sport: string | null;
-        home_team_code: string | null;
-        away_team_code: string | null;
-        home_team_name: string | null;
-        away_team_name: string | null;
-        home_score: number | null;
-        away_score: number | null;
-        status: string | null;
-        start_time: string | null;
-        period_label: string | null;
-        clock: string | null;
-      }>();
+    type HomePreviewRow = {
+      watchboard_id: number;
+      game_id: string;
+      order_index: number;
+      sport: string | null;
+      home_team_code: string | null;
+      away_team_code: string | null;
+      home_team_name: string | null;
+      away_team_name: string | null;
+      home_score: number | null;
+      away_score: number | null;
+      status: string | null;
+      start_time: string | null;
+      period_label: string | null;
+      clock: string | null;
+    };
+
+    // Join watchboard_games with sdio_games to get full game data.
+    // If sdio tables are unavailable, gracefully fall back to IDs-only payload.
+    let allGamesWithData: { results: HomePreviewRow[] } = { results: [] };
+    try {
+      allGamesWithData = await db
+        .prepare(`
+          SELECT 
+            wg.watchboard_id,
+            wg.game_id,
+            wg.order_index,
+            g.sport,
+            g.home_team AS home_team_code,
+            g.away_team AS away_team_code,
+            g.home_team_name,
+            g.away_team_name,
+            g.score_home AS home_score,
+            g.score_away AS away_score,
+            g.status,
+            g.start_time,
+            g.period AS period_label,
+            g.clock
+          FROM watchboard_games wg
+          LEFT JOIN sdio_games g ON wg.game_id = g.provider_game_id
+          WHERE wg.watchboard_id IN (${placeholders})
+          ORDER BY wg.order_index ASC
+        `)
+        .bind(...boardIds)
+        .all<HomePreviewRow>();
+    } catch (error) {
+      console.warn("[Watchboards] home-preview game join unavailable, returning ids only", error);
+      const idsOnly = await db
+        .prepare(`
+          SELECT watchboard_id, game_id, order_index
+          FROM watchboard_games
+          WHERE watchboard_id IN (${placeholders})
+          ORDER BY order_index ASC
+        `)
+        .bind(...boardIds)
+        .all<{ watchboard_id: number; game_id: string; order_index: number }>();
+      allGamesWithData = {
+        results: (idsOnly.results || []).map((row) => ({
+          watchboard_id: row.watchboard_id,
+          game_id: row.game_id,
+          order_index: row.order_index,
+          sport: null,
+          home_team_code: null,
+          away_team_code: null,
+          home_team_name: null,
+          away_team_name: null,
+          home_score: null,
+          away_score: null,
+          status: null,
+          start_time: null,
+          period_label: null,
+          clock: null,
+        })),
+      };
+    }
 
     // Group games by board with full data
     const gamesByBoard: Record<number, { gameIds: string[]; games: Array<{
@@ -944,6 +1069,7 @@ watchboardsRouter.post("/players", async (c) => {
     prop_type?: string;
     prop_line?: number;
     prop_selection?: string;
+    board_id?: number;
   }>();
 
   if (!body.player_name || !body.sport) {
@@ -951,7 +1077,17 @@ watchboardsRouter.post("/players", async (c) => {
   }
 
   try {
-    const board = await getOrCreateDefaultWatchboard(db, userId);
+    let board = await getOrCreateDefaultWatchboard(db, userId);
+    if (body.board_id) {
+      const requestedBoard = await db
+        .prepare("SELECT * FROM watchboards WHERE id = ? AND user_id = ?")
+        .bind(body.board_id, userId)
+        .first<Watchboard>();
+      if (!requestedBoard) {
+        return c.json({ error: "Watchboard not found" }, 404);
+      }
+      board = requestedBoard;
+    }
 
     // Check if already following
     const existing = await db

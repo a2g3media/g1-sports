@@ -121,11 +121,13 @@ export async function buildWeeklyRecap(
   let poolsDeclined = 0;
   
   for (const league of leagues.results) {
-    // Get picks from this week
+    // Get picks from this week (prefer pre-scored is_correct / points_earned)
     const weekPicks = await db.prepare(`
       SELECT 
         p.id,
         p.pick_value,
+        p.is_correct,
+        p.points_earned,
         e.winner,
         e.status,
         p.confidence_rank
@@ -142,12 +144,14 @@ export async function buildWeeklyRecap(
     let points = 0;
     
     for (const pick of weekPicks.results || []) {
-      if (pick.status === 'final' && pick.winner) {
+      if ((pick.status === 'final' || pick.status === 'completed') && pick.winner) {
         total++;
-        if (pick.pick_value === pick.winner) {
+        const pickCorrect = pick.is_correct !== null && pick.is_correct !== undefined
+          ? (pick.is_correct as number) === 1
+          : false;
+        if (pickCorrect) {
           correct++;
-          // Points based on confidence rank if available
-          points += pick.confidence_rank || 1;
+          points += (pick.points_earned as number) || (pick.confidence_rank as number) || 1;
         }
       }
     }

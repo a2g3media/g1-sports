@@ -947,8 +947,7 @@ async function fetchWatchboardsData(userId: string | null): Promise<BoardWithGam
           return status !== 'final' && status !== 'closed';
         }),
       };
-    })
-    .filter((b: BoardWithGames) => b.hasActiveGames && b.games.length > 0);
+    });
 }
 
 async function fetchAlertsData(isDemoMode: boolean): Promise<SharpAlert[]> {

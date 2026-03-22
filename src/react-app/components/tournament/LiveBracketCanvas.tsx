@@ -256,7 +256,7 @@ export function LiveBracketCanvas({
     dragRef.current.active = false;
   };
 
-  const distance = (touches: TouchList) => {
+  const distance = (touches: ArrayLike<{ clientX: number; clientY: number }>) => {
     if (touches.length < 2) return 0;
     const a = touches[0];
     const b = touches[1];

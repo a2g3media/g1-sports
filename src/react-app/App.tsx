@@ -88,6 +88,7 @@ const LiveMode = lazy(() => import("@/react-app/pages/LiveMode").then(m => ({ de
 const AlertCenter = lazyLoad(() => import("@/react-app/pages/AlertCenter"), "AlertCenter");
 const Watchlist = lazyLoad(() => import("@/react-app/pages/Watchlist"), "Watchlist");
 const WatchboardPage = lazyLoad(() => import("@/react-app/pages/WatchboardPage"), "WatchboardPage");
+const MyFavoritesPage = lazyLoad(() => import("@/react-app/pages/MyFavoritesPage"), "default");
 const PlayerProfilePage = lazyLoad(() => import("@/react-app/pages/PlayerProfilePage"), "default");
 
 // Other Pages
@@ -117,7 +118,6 @@ const SportDirectoryPage = lazyLoad(() => import("@/react-app/pages/SportDirecto
 const SportHubPage = lazyLoad(() => import("@/react-app/pages/SportHubPage"), "SportHubPage");
 const SoccerDirectoryPage = lazyLoad(() => import("@/react-app/pages/SoccerDirectoryPage"), "default");
 const SoccerNewsPage = lazyLoad(() => import("@/react-app/pages/SoccerNewsPage"), "default");
-const SoccerMatchCenter = lazyLoad(() => import("@/react-app/pages/SoccerMatchCenter"), "default");
 const SoccerTeamPage = lazyLoad(() => import("@/react-app/pages/SoccerTeamPage"), "default");
 const SoccerLeagueHubPage = lazyLoad(() => import("@/react-app/pages/SoccerLeagueHubPage"), "default");
 const SoccerPlayerPage = lazyLoad(() => import("@/react-app/pages/SoccerPlayerPage"), "default");
@@ -179,6 +179,11 @@ const PoolAdminPayments = lazy(() => import("@/react-app/pages/pool-admin/PoolAd
 const PoolAdminNotifications = lazy(() => import("@/react-app/pages/pool-admin/PoolAdminNotifications"));
 const PoolAdminActivity = lazyLoad(() => import("@/react-app/pages/pool-admin/PoolAdminActivity"), "PoolAdminActivity");
 const PoolAdminSettings = lazyLoad(() => import("@/react-app/pages/pool-admin/PoolAdminSettings"), "PoolAdminSettings");
+const PoolAdminPayouts = lazy(() => import("@/react-app/pages/pool-admin/PoolAdminPayouts"));
+const PoolAdminRuleConfig = lazy(() => import("@/react-app/pages/pool-admin/PoolAdminRuleConfig"));
+const PoolAdminRecalculation = lazy(() => import("@/react-app/pages/pool-admin/PoolAdminRecalculation"));
+const PoolAdminBundles = lazy(() => import("@/react-app/pages/pool-admin/PoolAdminBundles"));
+const PoolAdminCalcutta = lazy(() => import("@/react-app/pages/pool-admin/PoolAdminCalcutta"));
 
 // =====================================================
 // ROUTE COMPONENTS
@@ -287,6 +292,11 @@ function AppRoutes() {
         <Route path="payments" element={<LazyRoute skeleton="table"><PoolAdminPayments /></LazyRoute>} />
         <Route path="notifications" element={<LazyRoute skeleton="admin"><PoolAdminNotifications /></LazyRoute>} />
         <Route path="activity" element={<LazyRoute skeleton="table"><PoolAdminActivity /></LazyRoute>} />
+        <Route path="payouts" element={<LazyRoute skeleton="table"><PoolAdminPayouts /></LazyRoute>} />
+        <Route path="rule-config" element={<LazyRoute skeleton="settings"><PoolAdminRuleConfig /></LazyRoute>} />
+        <Route path="recalculation" element={<LazyRoute skeleton="table"><PoolAdminRecalculation /></LazyRoute>} />
+        <Route path="bundles" element={<LazyRoute skeleton="table"><PoolAdminBundles /></LazyRoute>} />
+        <Route path="calcutta" element={<LazyRoute skeleton="table"><PoolAdminCalcutta /></LazyRoute>} />
         <Route path="settings" element={<LazyRoute skeleton="settings"><PoolAdminSettings /></LazyRoute>} />
       </Route>
       
@@ -335,7 +345,7 @@ function AppRoutes() {
         path="/sports/soccer/match/:matchId"
         element={
           <Layout hideFooter>
-            <LazyRoute skeleton="detail"><SoccerMatchCenter /></LazyRoute>
+            <LazyRoute skeleton="detail"><GameDetailPage /></LazyRoute>
           </Layout>
         }
       />
@@ -1020,6 +1030,16 @@ function AppRoutes() {
           <ProtectedRoute>
             <Layout>
               <LazyRoute skeleton="dashboard"><Watchlist /></LazyRoute>
+            </Layout>
+          </ProtectedRoute>
+        }
+      />
+      <Route
+        path="/favorites"
+        element={
+          <ProtectedRoute>
+            <Layout>
+              <LazyRoute skeleton="dashboard"><MyFavoritesPage /></LazyRoute>
             </Layout>
           </ProtectedRoute>
         }

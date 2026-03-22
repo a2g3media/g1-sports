@@ -12,6 +12,16 @@ const GOLF_API_BASE = 'https://api.sportradar.com/golf';
 const ACCESS_LEVEL = 'production';
 const LANGUAGE = 'en';
 
+type GolfCacheEntry = {
+  data: any;
+  fetchedAt: number;
+  expiresAt: number;
+};
+
+const golfApiCache = new Map<string, GolfCacheEntry>();
+const DEFAULT_CACHE_TTL_MS = 90 * 1000;
+const STALE_WINDOW_MS = 10 * 60 * 1000;
+
 // Helper to get API key
 function getGolfKey(env: Env): string | null {
   return env.SPORTSRADAR_API_KEY || null;
@@ -20,24 +30,62 @@ function getGolfKey(env: Env): string | null {
 // Helper for API calls with rate limit handling
 async function fetchGolfApi(
   url: string,
-  apiKey: string
-): Promise<{ data: any; error: string | null; status?: number }> {
-  try {
-    const response = await fetch(`${url}?api_key=${apiKey}`);
-    
-    if (response.status === 429) {
-      return { data: null, error: 'Rate limited - try again later', status: 429 };
-    }
-    
-    if (!response.ok) {
-      return { data: null, error: `HTTP ${response.status}`, status: response.status };
-    }
-    
-    const data = await response.json();
-    return { data, error: null, status: response.status };
-  } catch (err) {
-    return { data: null, error: String(err) };
+  apiKey: string,
+  cacheKey: string,
+  ttlMs: number = DEFAULT_CACHE_TTL_MS
+): Promise<{ data: any; error: string | null; status?: number; source_stale?: boolean }> {
+  const now = Date.now();
+  const cached = golfApiCache.get(cacheKey);
+  if (cached && now <= cached.expiresAt) {
+    return { data: cached.data, error: null, status: 200 };
   }
+
+  const retries = 2;
+  let lastError = "Unknown golf provider error";
+  let lastStatus: number | undefined;
+  for (let attempt = 0; attempt <= retries; attempt += 1) {
+    try {
+      const response = await fetch(`${url}?api_key=${apiKey}`);
+      lastStatus = response.status;
+      if (response.status === 429 || response.status >= 500) {
+        lastError = response.status === 429 ? 'Rate limited - try again later' : `HTTP ${response.status}`;
+        if (attempt < retries) {
+          await new Promise((resolve) => setTimeout(resolve, 200 * Math.pow(2, attempt)));
+          continue;
+        }
+        break;
+      }
+      if (!response.ok) {
+        lastError = `HTTP ${response.status}`;
+        break;
+      }
+      const data = await response.json();
+      if (data) {
+        golfApiCache.set(cacheKey, {
+          data,
+          fetchedAt: now,
+          expiresAt: now + ttlMs,
+        });
+      }
+      return { data, error: null, status: response.status };
+    } catch (err) {
+      lastError = String(err);
+      if (attempt < retries) {
+        await new Promise((resolve) => setTimeout(resolve, 200 * Math.pow(2, attempt)));
+      }
+    }
+  }
+
+  // Never drop known-good data on provider turbulence.
+  if (cached && now <= cached.expiresAt + STALE_WINDOW_MS) {
+    return {
+      data: cached.data,
+      error: null,
+      status: 200,
+      source_stale: true,
+    };
+  }
+  return { data: null, error: lastError, status: lastStatus };
 }
 
 /**
@@ -54,7 +102,12 @@ golfRouter.get('/schedule', async (c) => {
   const year = new Date().getFullYear();
   const url = `${GOLF_API_BASE}/${ACCESS_LEVEL}/pga/v3/${LANGUAGE}/${year}/tournaments/schedule.json`;
   
-  const { data, error } = await fetchGolfApi(url, apiKey);
+  const { data, error, source_stale } = await fetchGolfApi(
+    url,
+    apiKey,
+    `golf:schedule:${year}`,
+    5 * 60 * 1000
+  );
   
   if (error) {
     return c.json({ error }, error.includes('Rate limited') ? 429 : 500);
@@ -111,6 +164,7 @@ golfRouter.get('/schedule', async (c) => {
     upcoming,
     completed,
     totalTournaments: tournaments.length,
+    ...(source_stale ? { source_stale: true } : {}),
   });
 });
 
@@ -128,7 +182,12 @@ golfRouter.get('/current', async (c) => {
   const year = new Date().getFullYear();
   const url = `${GOLF_API_BASE}/${ACCESS_LEVEL}/pga/v3/${LANGUAGE}/${year}/tournaments/schedule.json`;
   
-  const { data, error } = await fetchGolfApi(url, apiKey);
+  const { data, error, source_stale } = await fetchGolfApi(
+    url,
+    apiKey,
+    `golf:current:${year}`,
+    90 * 1000
+  );
   
   if (error) {
     return c.json({ error }, error.includes('Rate limited') ? 429 : 500);
@@ -166,6 +225,7 @@ golfRouter.get('/current', async (c) => {
     status: current.status === 'inprogress' ? 'in_progress' : 'scheduled',
     isLive: current.status === 'inprogress',
     currentRound: current.current_round || null,
+    ...(source_stale ? { source_stale: true } : {}),
   });
 });
 
@@ -187,7 +247,12 @@ golfRouter.get('/leaderboard/:tournamentId', async (c) => {
   
   const url = `${GOLF_API_BASE}/${ACCESS_LEVEL}/pga/v3/${LANGUAGE}/${year}/tournaments/${rawId}/leaderboard.json`;
   
-  const { data, error } = await fetchGolfApi(url, apiKey);
+  const { data, error, source_stale } = await fetchGolfApi(
+    url,
+    apiKey,
+    `golf:leaderboard:${year}:${rawId}`,
+    75 * 1000
+  );
   
   if (error) {
     return c.json({ error }, error.includes('Rate limited') ? 429 : 500);
@@ -236,6 +301,7 @@ golfRouter.get('/leaderboard/:tournamentId', async (c) => {
     tournament,
     leaderboard,
     totalPlayers: leaderboard.length,
+    ...(source_stale ? { source_stale: true } : {}),
   });
 });
 
@@ -258,7 +324,12 @@ golfRouter.get('/results/:tournamentId', async (c) => {
   // Try summary endpoint for completed tournaments
   const url = `${GOLF_API_BASE}/${ACCESS_LEVEL}/pga/v3/${LANGUAGE}/${year}/tournaments/${rawId}/summary.json`;
   
-  const { data, error } = await fetchGolfApi(url, apiKey);
+  const { data, error, source_stale } = await fetchGolfApi(
+    url,
+    apiKey,
+    `golf:results:${year}:${rawId}`,
+    10 * 60 * 1000
+  );
   
   if (error) {
     return c.json({ error }, error.includes('Rate limited') ? 429 : 500);
@@ -290,6 +361,7 @@ golfRouter.get('/results/:tournamentId', async (c) => {
       score: p.score ?? 0,
       money: p.money ?? 0,
     })),
+    ...(source_stale ? { source_stale: true } : {}),
   });
 });
 

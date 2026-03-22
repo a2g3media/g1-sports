@@ -48,6 +48,11 @@ type Variables = {
 
 const app = new Hono<{ Bindings: Env; Variables: Variables }>();
 
+function getEmailService(c: { env: Partial<Env> }): EmailService | null {
+  const svc = (c.env as Partial<Env> | undefined)?.EMAILS;
+  return svc && typeof svc.send === "function" ? svc : null;
+}
+
 // Apply auth middleware to all routes
 app.use("*", authMiddleware);
 
@@ -113,7 +118,12 @@ app.post("/send-test", async (c) => {
     
     const email = generateWeeklyRecapEmail(recapData);
     
-    const result = await c.env.EMAILS.send({
+    const emails = getEmailService(c);
+    if (!emails) {
+      return c.json({ error: "Email service is not configured in this environment" }, 503);
+    }
+
+    const result = await emails.send({
       to: recapData.userEmail,
       subject: `[TEST] ${email.subject}`,
       html_body: email.html,
@@ -218,6 +228,11 @@ app.post("/trigger-all", async (c) => {
   }
   
   try {
+    const emails = getEmailService(c);
+    if (!emails) {
+      return c.json({ error: "Email service is not configured in this environment" }, 503);
+    }
+
     const url = new URL(c.req.url);
     const appBaseUrl = `${url.protocol}//${url.host}`;
     
@@ -242,7 +257,7 @@ app.post("/trigger-all", async (c) => {
         
         const email = generateWeeklyRecapEmail(recapData);
         
-        const sendResult = await c.env.EMAILS.send({
+        const sendResult = await emails.send({
           to: recipient.email,
           subject: email.subject,
           html_body: email.html,

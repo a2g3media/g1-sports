@@ -25,7 +25,7 @@ const gates: UiGate[] = [
   {
     id: "create-league-icon-format-step",
     file: "src/react-app/pages/CreateLeague.tsx",
-    includes: ["PoolTypeBadgeIcon", "Choose Pool Format"],
+    includes: ["PoolTypeBadgeIcon", "Choose a pool type"],
   },
   {
     id: "pool-admin-settings-marketplace-controls",

@@ -31,6 +31,7 @@ import { PoolHubStandings } from "@/react-app/components/pool-hub/PoolHubStandin
 import { PoolHubMyEntries } from "@/react-app/components/pool-hub/PoolHubMyEntries";
 import { PoolHubAdmin } from "@/react-app/components/pool-hub/PoolHubAdmin";
 import { PoolHubRules } from "@/react-app/components/pool-hub/PoolHubRules";
+import { PoolHubHistory } from "@/react-app/components/pool-hub/PoolHubHistory";
 import { LiveTab } from "@/react-app/components/LiveTab";
 import { FollowButton } from "@/react-app/components/FollowButton";
 import { PoolTypeBadgeIcon } from "@/react-app/components/pools/PoolTypeBadgeIcon";
@@ -266,6 +267,7 @@ export function PoolHub() {
     { id: "overview", label: "Overview", icon: LayoutGrid },
     { id: "picks", label: "Make Picks", icon: Target },
     { id: "entries", label: "My Entries", icon: BarChart3 },
+    { id: "history", label: "History", icon: Clock },
     { id: "rules", label: "Rules", icon: Shield },
     { id: "live", label: "Live Sweat", icon: Flame },
     { id: "everyone", label: "Everyone's Picks", icon: Users },
@@ -381,6 +383,10 @@ export function PoolHub() {
 
             <TabsContent value="entries" className="mt-0 focus-visible:outline-none">
               <PoolHubMyEntries league={league} />
+            </TabsContent>
+
+            <TabsContent value="history" className="mt-0 focus-visible:outline-none">
+              <PoolHubHistory league={league} />
             </TabsContent>
 
             <TabsContent value="rules" className="mt-0 focus-visible:outline-none">

@@ -21,6 +21,7 @@ import {
 } from "@/react-app/components/ui/dropdown-menu";
 import { Skeleton } from "@/react-app/components/ui/skeleton";
 import { EmptyState } from "@/react-app/components/ui/empty-state";
+import { cn } from "@/react-app/lib/utils";
 import { 
   Plus, 
   Search, 

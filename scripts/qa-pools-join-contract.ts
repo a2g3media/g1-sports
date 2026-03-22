@@ -51,8 +51,8 @@ const gates: ContractGate[] = [
     file: "src/react-app/pages/JoinLeague.tsx",
     includes: [
       "Commissioner approval required",
-      "Auto-approval enabled when required profile fields are complete",
       "pending_approval",
+      "awaiting commissioner approval",
     ],
   },
 ];

@@ -7,7 +7,8 @@ type ContractCheck = {
 };
 
 let baseUrl = process.env.SMOKE_BASE_URL || "http://127.0.0.1:8787";
-const HEALTH_PATH = "/api/health/sportsradar";
+// Avoid provider-specific health endpoints in local environments.
+const HEALTH_PATH = "/api/pool-admin/my-pools";
 const BASE_CANDIDATES = [
   process.env.SMOKE_BASE_URL,
   process.env.MONITOR_BASE_URL,
@@ -55,7 +56,7 @@ async function resolveBaseUrl(): Promise<string> {
       const res = await fetch(`${base}${HEALTH_PATH}`, {
         headers: { "X-Demo-Mode": "true" },
       });
-      if (res.ok) return base;
+      if (res.status < 500) return base;
     } catch {
       // keep probing
     }

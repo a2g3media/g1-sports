@@ -14,6 +14,7 @@ import {
 import { cn } from "@/react-app/lib/utils";
 import { getTeamColors } from "@/react-app/lib/teamColors";
 import { motion, AnimatePresence } from "framer-motion";
+import FavoriteEntityButton from "@/react-app/components/FavoriteEntityButton";
 
 // ============================================
 // TYPES
@@ -163,11 +164,13 @@ function CinematicBackground({ color }: { color: string }) {
 function TeamHero({ 
   team, 
   record, 
-  sportKey 
+  sportKey,
+  league,
 }: { 
   team: TeamInfo; 
   record: TeamRecord;
   sportKey: string;
+  league?: string;
 }) {
   void sportKey; // Reserved for sport-specific config
   
@@ -238,6 +241,20 @@ function TeamHero({
               </div>
             </motion.div>
           </div>
+          <FavoriteEntityButton
+            type="team"
+            entityId={team.id || team.abbreviation || team.name}
+            sport={sportKey}
+            league={league}
+            metadata={{
+              team_name: team.name,
+              team_code: team.abbreviation,
+              team_city: team.city,
+              sport: sportKey,
+            }}
+            className="self-start mt-2 sm:mt-0"
+            label="Favorite Team"
+          />
         </div>
 
         {/* Quick Stats Row */}
@@ -721,7 +738,12 @@ export function TeamProfilePage() {
       </div>
 
       {/* Hero */}
-      <TeamHero team={team} record={record} sportKey={sportKey || 'nba'} />
+      <TeamHero
+        team={team}
+        record={record}
+        sportKey={sportKey || "nba"}
+        league={String(team.conference || team.division || "")}
+      />
 
       {/* Content */}
       <div className="px-4 space-y-4 -mt-4 relative z-10">

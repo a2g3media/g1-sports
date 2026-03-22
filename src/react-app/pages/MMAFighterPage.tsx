@@ -439,7 +439,8 @@ export default function MMAFighterPage() {
               <img
                 src={COACH_G_AVATAR}
                 alt="Coach G"
-                className="w-10 h-10 rounded-full object-cover border-2 border-violet-500/30"
+                className="w-10 h-10 rounded-full object-cover border-2 border-violet-500/30 cursor-pointer transition-transform hover:scale-105"
+                onClick={() => navigate('/scout')}
               />
               <div>
                 <h3 className="font-bold text-white">Coach G's Fighter Analysis</h3>
