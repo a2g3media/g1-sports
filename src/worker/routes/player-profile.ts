@@ -552,6 +552,55 @@ interface RecentPerformanceWithOdds {
   lineSource: 'historical' | 'latest_fallback' | 'event_fallback' | 'unavailable';
 }
 
+const NBA_TEAM_ABBR_BY_NAME: Record<string, string> = {
+  'atlanta hawks': 'ATL',
+  'boston celtics': 'BOS',
+  'brooklyn nets': 'BKN',
+  'charlotte hornets': 'CHA',
+  'chicago bulls': 'CHI',
+  'cleveland cavaliers': 'CLE',
+  'dallas mavericks': 'DAL',
+  'denver nuggets': 'DEN',
+  'detroit pistons': 'DET',
+  'golden state warriors': 'GSW',
+  'houston rockets': 'HOU',
+  'indiana pacers': 'IND',
+  'la clippers': 'LAC',
+  'los angeles clippers': 'LAC',
+  'los angeles lakers': 'LAL',
+  'memphis grizzlies': 'MEM',
+  'miami heat': 'MIA',
+  'milwaukee bucks': 'MIL',
+  'minnesota timberwolves': 'MIN',
+  'new orleans pelicans': 'NOP',
+  'new york knicks': 'NYK',
+  'oklahoma city thunder': 'OKC',
+  'orlando magic': 'ORL',
+  'philadelphia 76ers': 'PHI',
+  'phoenix suns': 'PHX',
+  'portland trail blazers': 'POR',
+  'sacramento kings': 'SAC',
+  'san antonio spurs': 'SAS',
+  'toronto raptors': 'TOR',
+  'utah jazz': 'UTA',
+  'washington wizards': 'WAS',
+};
+
+function resolveOpponentAbbrFromName(opponentName: string, sport: string): string {
+  const raw = String(opponentName || '').trim();
+  if (!raw) return '';
+  const upper = raw.toUpperCase();
+  if (/^[A-Z]{2,4}$/.test(upper)) return upper;
+  if (sport === 'NBA' || sport === 'NCAAB') {
+    const key = raw.toLowerCase().replace(/\./g, '').replace(/\s+/g, ' ').trim();
+    const hit = NBA_TEAM_ABBR_BY_NAME[key];
+    if (hit) return hit;
+  }
+  const tokens = raw.split(/\s+/).filter(Boolean);
+  if (tokens.length >= 2) return `${tokens[0][0] || ''}${tokens[tokens.length - 1][0] || ''}`.toUpperCase();
+  return raw.slice(0, 3).toUpperCase();
+}
+
 function normalizeToken(value: unknown): string {
   return String(value || '')
     .toLowerCase()
@@ -1399,15 +1448,23 @@ function buildFallbackMatchupFromGameLog(
     .sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime())[0];
   if (!latest?.opponent) return null;
   const opponentName = String(latest.opponent).trim();
-  const tokens = opponentName.split(/\s+/);
-  const abbr = tokens.length >= 2
-    ? `${tokens[0][0] || ''}${tokens[tokens.length - 1][0] || ''}`.toUpperCase()
-    : opponentName.slice(0, 3).toUpperCase();
+  const abbr = resolveOpponentAbbrFromName(opponentName, sport);
+  const logo = (sport === 'NBA' || sport === 'NCAAB') && abbr
+    ? `https://a.espncdn.com/i/teamlogos/${sport.toLowerCase()}/500/${abbr.toLowerCase()}.png`
+    : undefined;
   return {
     opponent: {
       name: opponentName,
       abbr,
+      logo,
     },
+    upcomingOpponents: abbr ? [{
+      name: opponentName,
+      abbr,
+      logo,
+      gameTime: undefined,
+      venue: undefined,
+    }] : undefined,
     gameTime: undefined,
     venue: undefined,
     defensiveRankings: undefined,
@@ -1845,7 +1902,7 @@ app.get('/:sport/:playerName', async (c) => {
   })();
   const matchupPromise = withTimeout(
     fetchMatchupData(playerInfo.teamAbbr, sport, playerInfo.position),
-    2500,
+    6000,
     null
   );
   const newsPromise = withTimeout(fetchPlayerNews(playerName, sport), 2000, []);

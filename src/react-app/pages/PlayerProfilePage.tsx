@@ -1732,9 +1732,10 @@ export default function PlayerProfilePage() {
         } catch (err: any) {
           const message = String(err?.message || '');
           // Only do an explicit fallback request for 404, and keep it tightly timed.
-          if (message.includes('HTTP 404')) {
+          if (message.includes('HTTP 404') || message.toLowerCase().includes('timeout') || String(err?.name || '') === 'AbortError') {
             const controller = new AbortController();
-            const timer = setTimeout(() => controller.abort(), 2500);
+            const retryTimeoutMs = message.includes('HTTP 404') ? 2500 : 12000;
+            const timer = setTimeout(() => controller.abort(), retryTimeoutMs);
             try {
               const fallbackRes = await fetch(apiUrl, { credentials: 'include', signal: controller.signal });
               if (fallbackRes.ok) {
@@ -1782,6 +1783,33 @@ export default function PlayerProfilePage() {
             return;
           }
           throw new Error('Player not found');
+        }
+
+        // Self-heal stale cached profile payloads that lost matchup logo/upcoming data.
+        const matchup = profileData?.matchup;
+        const upcoming = Array.isArray(matchup?.upcomingOpponents) ? matchup.upcomingOpponents : [];
+        const needsMatchupRefresh =
+          Boolean(matchup)
+          && (
+            !matchup?.opponent?.logo
+            || (!matchup?.gameTime && upcoming.length === 0)
+          );
+        if (needsMatchupRefresh) {
+          try {
+            const freshUrl = `${apiUrl}${apiUrl.includes('?') ? '&' : '?'}fresh=1`;
+            const refreshed = await fetchJsonCached<any>(freshUrl, {
+              cacheKey: `player-api-fresh:${sport.toUpperCase()}:${decodeURIComponent(playerName)}`,
+              ttlMs: 30_000,
+              timeoutMs: 9_000,
+              bypassCache: true,
+              init: { credentials: 'include' },
+            });
+            if (refreshed) {
+              profileData = refreshed;
+            }
+          } catch {
+            // Non-fatal: keep original payload if refresh fails.
+          }
         }
 
         setData(profileData);

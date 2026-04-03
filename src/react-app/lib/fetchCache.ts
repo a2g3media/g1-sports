@@ -35,8 +35,8 @@ export async function fetchJsonCached<T = unknown>(url: string, options: JsonFet
     init,
   } = options;
 
+  const cached = jsonCache.get(cacheKey);
   if (!bypassCache && ttlMs > 0) {
-    const cached = jsonCache.get(cacheKey);
     if (cached && cached.expiresAt > now()) {
       fetchCacheStats.cacheHits += 1;
       return cached.value as T;
@@ -51,10 +51,17 @@ export async function fetchJsonCached<T = unknown>(url: string, options: JsonFet
 
   const request = (async () => {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    const timer = setTimeout(() => controller.abort(new Error(`Request timeout after ${timeoutMs}ms`)), timeoutMs);
+    const initSignal = init?.signal;
+    const signal = (() => {
+      if (initSignal && typeof AbortSignal !== "undefined" && typeof (AbortSignal as any).any === "function") {
+        return (AbortSignal as any).any([controller.signal, initSignal]);
+      }
+      return controller.signal;
+    })();
     fetchCacheStats.networkFetches += 1;
     try {
-      const response = await fetch(url, { ...init, signal: controller.signal });
+      const response = await fetch(url, { ...init, signal });
       if (!response.ok) {
         throw new Error(`HTTP ${response.status}`);
       }
@@ -65,6 +72,18 @@ export async function fetchJsonCached<T = unknown>(url: string, options: JsonFet
       return payload;
     } catch (err) {
       fetchCacheStats.errors += 1;
+      const name = String((err as any)?.name || "");
+      const message = String((err as any)?.message || "");
+      const isAbort = name === "AbortError" || message.toLowerCase().includes("aborted");
+      if (isAbort) {
+        if (cached && cached.value !== undefined) {
+          return cached.value as T;
+        }
+        throw new Error(`Request timeout after ${timeoutMs}ms`);
+      }
+      if (cached && cached.value !== undefined) {
+        return cached.value as T;
+      }
       throw err;
     } finally {
       clearTimeout(timer);
