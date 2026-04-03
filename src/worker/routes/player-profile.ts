@@ -1079,6 +1079,64 @@ async function buildRecentPerformanceWithOdds(
     return hasAny ? { points, rebounds, assists } : null;
   })();
 
+  const extractLinesFromRows = (rows: Array<{ prop_type: string; line_value: number }>) => {
+    const lines = { points: null as number | null, rebounds: null as number | null, assists: null as number | null };
+    for (const row of rows || []) {
+      const type = String(row.prop_type || '');
+      const line = Number(row.line_value);
+      if (!Number.isFinite(line) || line <= 0) continue;
+      if (lines.points === null && (type === 'POINTS' || type.includes('POINT'))) lines.points = line;
+      if (lines.rebounds === null && (type === 'REBOUNDS' || type.includes('REBOUND'))) lines.rebounds = line;
+      if (lines.assists === null && (type === 'ASSISTS' || type.includes('ASSIST'))) lines.assists = line;
+    }
+    const hasAny = [lines.points, lines.rebounds, lines.assists].some((v) => v !== null);
+    return hasAny ? lines : null;
+  };
+
+  const fuzzyNameLineFallback = async (): Promise<{ points: number | null; rebounds: number | null; assists: number | null } | null> => {
+    const firstRaw = String(toDisplayFirstLast(playerNames[0] || '') || '').trim();
+    const words = normalizeWordTokens(firstRaw);
+    const firstToken = words[0] || '';
+    const lastToken = words[words.length - 1] || '';
+    if (firstToken.length < 2 || lastToken.length < 2) return null;
+    try {
+      const firstLike = `%${firstToken}%`;
+      const lastLike = `%${lastToken}%`;
+      const currentSql = `
+        SELECT UPPER(COALESCE(p.prop_type, '')) AS prop_type, p.line_value
+        FROM sdio_props_current p
+        JOIN sdio_games g ON g.id = p.game_id
+        WHERE UPPER(COALESCE(g.sport, '')) = ?
+          AND LOWER(COALESCE(p.player_name, '')) LIKE ?
+          AND LOWER(COALESCE(p.player_name, '')) LIKE ?
+        ORDER BY datetime(COALESCE(p.last_updated, p.updated_at, p.created_at)) DESC
+        LIMIT 200
+      `;
+      const currentRows = await db.prepare(currentSql)
+        .bind(sport.toUpperCase(), firstLike, lastLike)
+        .all<{ prop_type: string; line_value: number }>();
+      const fromCurrent = extractLinesFromRows(currentRows.results || []);
+      if (fromCurrent) return fromCurrent;
+
+      const historySql = `
+        SELECT UPPER(COALESCE(h.prop_type, '')) AS prop_type, h.line_value
+        FROM sdio_props_history h
+        JOIN sdio_games g ON g.id = h.game_id
+        WHERE UPPER(COALESCE(g.sport, '')) = ?
+          AND LOWER(COALESCE(h.player_name, '')) LIKE ?
+          AND LOWER(COALESCE(h.player_name, '')) LIKE ?
+        ORDER BY datetime(COALESCE(h.recorded_at, h.updated_at, h.created_at)) DESC
+        LIMIT 400
+      `;
+      const historyRows = await db.prepare(historySql)
+        .bind(sport.toUpperCase(), firstLike, lastLike)
+        .all<{ prop_type: string; line_value: number }>();
+      return extractLinesFromRows(historyRows.results || []);
+    } catch {
+      return null;
+    }
+  };
+
   const fallbackCurrentLines = async (): Promise<{ points: number | null; rebounds: number | null; assists: number | null } | null> => {
     if (fallbackLatestLines) return fallbackLatestLines;
     if (candidateList.length === 0) return null;
@@ -1094,17 +1152,7 @@ async function buildRecentPerformanceWithOdds(
         LIMIT 100
       `;
       const result = await db.prepare(sql).bind(sport.toUpperCase(), ...candidateList).all<{ prop_type: string; line_value: number }>();
-      const lines = { points: null as number | null, rebounds: null as number | null, assists: null as number | null };
-      for (const row of result.results || []) {
-        const type = String(row.prop_type || '');
-        const line = Number(row.line_value);
-        if (!Number.isFinite(line) || line <= 0) continue;
-        if (lines.points === null && (type === 'POINTS' || type.includes('POINT'))) lines.points = line;
-        if (lines.rebounds === null && (type === 'REBOUNDS' || type.includes('REBOUND'))) lines.rebounds = line;
-        if (lines.assists === null && (type === 'ASSISTS' || type.includes('ASSIST'))) lines.assists = line;
-      }
-      const hasAny = [lines.points, lines.rebounds, lines.assists].some((v) => v !== null);
-      return hasAny ? lines : null;
+      return extractLinesFromRows(result.results || []);
     } catch {
       return null;
     }
@@ -1124,25 +1172,17 @@ async function buildRecentPerformanceWithOdds(
         LIMIT 300
       `;
       const result = await db.prepare(sql).bind(sport.toUpperCase(), ...candidateList).all<{ prop_type: string; line_value: number }>();
-      const lines = { points: null as number | null, rebounds: null as number | null, assists: null as number | null };
-      for (const row of result.results || []) {
-        const type = String(row.prop_type || '');
-        const line = Number(row.line_value);
-        if (!Number.isFinite(line) || line <= 0) continue;
-        if (lines.points === null && (type === 'POINTS' || type.includes('POINT'))) lines.points = line;
-        if (lines.rebounds === null && (type === 'REBOUNDS' || type.includes('REBOUND'))) lines.rebounds = line;
-        if (lines.assists === null && (type === 'ASSISTS' || type.includes('ASSIST'))) lines.assists = line;
-      }
-      const hasAny = [lines.points, lines.rebounds, lines.assists].some((v) => v !== null);
-      return hasAny ? lines : null;
+      return extractLinesFromRows(result.results || []);
     } catch {
       return null;
     }
   };
   const playerHistoryFallback = await historyLinesFallback();
-  const universalFallback = currentLinesFallback || playerHistoryFallback;
+  const fuzzyFallback = await fuzzyNameLineFallback();
+  const universalFallback = currentLinesFallback || playerHistoryFallback || fuzzyFallback;
 
   const out: RecentPerformanceWithOdds[] = [];
+  let carryForwardLines = universalFallback;
   for (let idx = 0; idx < recentGames.length; idx += 1) {
     const g = recentGames[idx];
     const pts = Number(g.stats.PTS ?? g.stats.Points);
@@ -1163,6 +1203,13 @@ async function buildRecentPerformanceWithOdds(
         candidateLines = onDemand;
         lineSource = 'event_fallback';
       }
+    }
+    if (!candidateLines && carryForwardLines) {
+      candidateLines = carryForwardLines;
+      lineSource = 'latest_fallback';
+    }
+    if (candidateLines) {
+      carryForwardLines = candidateLines;
     }
     out.push({
       date: g.date,
