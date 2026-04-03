@@ -2050,18 +2050,14 @@ app.get('/:sport/:playerName', async (c) => {
   }
   
   const effectiveMatchup = matchupData || buildFallbackMatchupFromGameLog(gameLog?.games || [], sport);
-  const recentPerformance = await withTimeout(
-    buildRecentPerformanceWithOdds(
-      c.env.DB,
-      sport,
-      playerNameCandidates,
-      gameLog?.games || [],
-      effectiveProps,
-      sportsRadarPropsKey,
-      playerInfo.teamName
-    ),
-    3000,
-    []
+  const recentPerformance = await buildRecentPerformanceWithOdds(
+    c.env.DB,
+    sport,
+    playerNameCandidates,
+    gameLog?.games || [],
+    effectiveProps,
+    sportsRadarPropsKey,
+    playerInfo.teamName
   );
   const vsOpponent = buildPlayerVsOpponentData(
     sport,

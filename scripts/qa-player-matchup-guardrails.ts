@@ -5,6 +5,7 @@
  * Catch regressions where Player Profile "Matchup Edge" loses
  * - opponent logo
  * - upcoming game / upcoming opponents
+ * - recent performance odds lines unexpectedly all missing
  * - valid NBA team abbreviation format
  *
  * Usage:
@@ -19,6 +20,14 @@ type GuardrailFailure = {
 };
 
 type PlayerProfilePayload = {
+  recentPerformance?: Array<{
+    propLines?: {
+      points?: number | null;
+      rebounds?: number | null;
+      assists?: number | null;
+    };
+    lineSource?: string;
+  }>;
   matchup?: {
     opponent?: {
       name?: string;
@@ -61,6 +70,16 @@ function hasUpcomingSignal(matchup: PlayerProfilePayload["matchup"]): boolean {
   if (isTruthyString(matchup.gameTime)) return true;
   const upcoming = Array.isArray(matchup.upcomingOpponents) ? matchup.upcomingOpponents : [];
   return upcoming.length > 0 && upcoming.some((row) => isTruthyString(row?.gameTime) || isTruthyString(row?.name));
+}
+
+function hasAnyOddsLine(payload: PlayerProfilePayload): boolean {
+  const rows = Array.isArray(payload.recentPerformance) ? payload.recentPerformance : [];
+  if (rows.length === 0) return true;
+  return rows.some((row) => {
+    const lines = row?.propLines;
+    if (!lines) return false;
+    return [lines.points, lines.rebounds, lines.assists].some((v) => typeof v === "number" && Number.isFinite(v) && v > 0);
+  });
 }
 
 async function readJson<T>(url: string): Promise<T> {
@@ -128,6 +147,16 @@ async function main() {
         details: {
           gameTime: matchup.gameTime || null,
           upcomingCount: Array.isArray(matchup.upcomingOpponents) ? matchup.upcomingOpponents.length : 0,
+        },
+      });
+    }
+
+    if (!hasAnyOddsLine(payload)) {
+      failures.push({
+        player,
+        reason: "missing_recent_odds_lines",
+        details: {
+          recentPerformanceCount: Array.isArray(payload.recentPerformance) ? payload.recentPerformance.length : 0,
         },
       });
     }
