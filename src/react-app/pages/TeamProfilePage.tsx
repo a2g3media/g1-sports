@@ -5,7 +5,7 @@
  * Shows team info, stats, roster preview, recent/upcoming games
  */
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useMemo } from "react";
 import { useParams, useNavigate, Link } from "react-router-dom";
 import { 
   ArrowLeft, Trophy, Users, Calendar,
@@ -15,6 +15,8 @@ import { cn } from "@/react-app/lib/utils";
 import { getTeamColors } from "@/react-app/lib/teamColors";
 import { motion, AnimatePresence } from "framer-motion";
 import FavoriteEntityButton from "@/react-app/components/FavoriteEntityButton";
+import { fetchJsonCached } from "@/react-app/lib/fetchCache";
+import { getRouteCache, setRouteCache } from "@/react-app/lib/routeDataCache";
 
 // ============================================
 // TYPES
@@ -60,6 +62,7 @@ interface RosterPlayer {
   name: string;
   position: string;
   jersey: string;
+  status?: string;
   headshot?: string;
   stats?: Record<string, number>;
 }
@@ -78,6 +81,8 @@ interface GameResult {
   oppScore?: number;
   status: 'final' | 'live' | 'scheduled';
   time?: string;
+  spread?: number | null;
+  total?: number | null;
 }
 
 interface TeamStats {
@@ -97,6 +102,52 @@ interface TeamProfileData {
   roster: RosterPlayer[];
   schedule: GameResult[];
   stats: TeamStats;
+  injuries: TeamInjury[];
+  teamH2H: TeamH2HData | null;
+}
+
+interface TeamInjury {
+  id: string;
+  playerName: string;
+  status: string;
+  detail?: string;
+  injuryType?: string;
+  returnDate?: string;
+  headshot?: string;
+}
+
+interface TeamH2HData {
+  window: number;
+  sampleSize: number;
+  teamA: { name: string; alias: string };
+  teamB: { name: string; alias: string };
+  series: { teamAWins: number; teamBWins: number; ties: number };
+  ats: { sampleWithLine: number; teamACovers: number; teamBCovers: number; pushes: number };
+  totals: { sampleWithLine: number; overs: number; unders: number; pushes: number };
+  averages: { marginForTeamA: number | null; combinedTotal: number | null };
+  meetings: Array<{
+    id: string;
+    date: string;
+    homeTeamAlias: string;
+    awayTeamAlias: string;
+    homeScore: number;
+    awayScore: number;
+    teamACoverResult: 'cover' | 'no_cover' | 'push' | null;
+    totalResult: 'over' | 'under' | 'push' | null;
+  }>;
+}
+
+function safeNum(value: unknown): number | undefined {
+  if (value === null || value === undefined) return undefined;
+  if (typeof value === 'string' && value.trim() === '') return undefined;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : undefined;
+}
+
+function normalizePct(value: unknown): number | undefined {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return undefined;
+  return n > 1 ? n / 100 : n;
 }
 
 // ============================================
@@ -266,17 +317,29 @@ function TeamHero({
         >
           <QuickStat 
             label="Conference" 
-            value={record.confWins !== undefined ? `${record.confWins}-${record.confLosses}` : '-'}
+            value={
+              record.confWins !== undefined || record.confLosses !== undefined
+                ? `${record.confWins ?? 0}-${record.confLosses ?? 0}`
+                : '-'
+            }
             icon={<Trophy className="w-4 h-4" />}
           />
           <QuickStat 
             label="Home" 
-            value={record.homeWins !== undefined ? `${record.homeWins}-${record.homeLosses}` : '-'}
+            value={
+              record.homeWins !== undefined || record.homeLosses !== undefined
+                ? `${record.homeWins ?? 0}-${record.homeLosses ?? 0}`
+                : '-'
+            }
             icon={<MapPin className="w-4 h-4" />}
           />
           <QuickStat 
             label="Away" 
-            value={record.awayWins !== undefined ? `${record.awayWins}-${record.awayLosses}` : '-'}
+            value={
+              record.awayWins !== undefined || record.awayLosses !== undefined
+                ? `${record.awayWins ?? 0}-${record.awayLosses ?? 0}`
+                : '-'
+            }
             icon={<Target className="w-4 h-4" />}
           />
         </motion.div>
@@ -355,10 +418,77 @@ function TeamStatsGrid({ stats, sportKey }: { stats: TeamStats; sportKey: string
 
 function RosterPreview({ roster, sportKey }: { roster: RosterPlayer[]; sportKey: string; teamAbbr?: string }) {
   void sportKey;
-  // Show top 6 players
-  const displayRoster = roster.slice(0, 6);
+  const normalizeStatus = (value: string | undefined) => String(value || '').trim().toUpperCase();
+  const statusRank = (value: string | undefined) => {
+    const s = normalizeStatus(value);
+    if (s === 'ACT' || s === 'ACTIVE') return 0;
+    if (s === 'PROBABLE' || s === 'DAY_TO_DAY' || s === 'DTD') return 1;
+    if (s === 'QUESTIONABLE') return 2;
+    if (s === 'GTD') return 3;
+    if (s === 'OUT') return 4;
+    if (s === 'INJ') return 5;
+    if (s === 'TWO-WAY' || s === 'TWOWAY') return 6;
+    return 7;
+  };
+  const primaryPos = (value: string) => {
+    const p = String(value || '').toUpperCase();
+    if (p.includes('PG')) return 'PG';
+    if (p.includes('SG')) return 'SG';
+    if (p.includes('SF')) return 'SF';
+    if (p.includes('PF')) return 'PF';
+    if (p === 'C' || p.includes('-C') || p.includes('C-')) return 'C';
+    if (p.includes('G')) return 'G';
+    if (p.includes('F')) return 'F';
+    return 'UNK';
+  };
+  const posRank = (value: string) => {
+    const p = primaryPos(value);
+    if (p === 'PG') return 0;
+    if (p === 'SG') return 1;
+    if (p === 'SF') return 2;
+    if (p === 'PF') return 3;
+    if (p === 'C') return 4;
+    if (p === 'G') return 5;
+    if (p === 'F') return 6;
+    return 7;
+  };
+  const byRelevance = [...roster].sort((a, b) => {
+    const byStatus = statusRank(a.status) - statusRank(b.status);
+    if (byStatus !== 0) return byStatus;
+    const byPos = posRank(a.position) - posRank(b.position);
+    if (byPos !== 0) return byPos;
+    return a.name.localeCompare(b.name);
+  });
+  const activePool = byRelevance.filter((p) => statusRank(p.status) <= 2);
+  const starters: RosterPlayer[] = [];
+  const used = new Set<string>();
+  const starterSlots = ['PG', 'SG', 'SF', 'PF', 'C'];
+  for (const slot of starterSlots) {
+    const hit = activePool.find((p) => !used.has(p.id) && primaryPos(p.position) === slot);
+    if (hit) {
+      starters.push(hit);
+      used.add(hit.id);
+    }
+  }
+  for (const player of activePool) {
+    if (starters.length >= 5) break;
+    if (used.has(player.id)) continue;
+    starters.push(player);
+    used.add(player.id);
+  }
+  const depth = byRelevance.filter((p) => !used.has(p.id));
+  const prefetchPlayer = (playerName: string) => {
+    const sportUpper = String(sportKey || '').toUpperCase();
+    if (!sportUpper || !playerName) return;
+    void fetchJsonCached(`/api/player/${sportUpper}/${encodeURIComponent(playerName)}`, {
+      cacheKey: `player-api:${sportUpper}:${playerName}`,
+      ttlMs: 45_000,
+      timeoutMs: 4_000,
+      init: { credentials: 'include' },
+    }).catch(() => null);
+  };
   
-  if (displayRoster.length === 0) {
+  if (roster.length === 0) {
     return (
       <div className="bg-card/50 backdrop-blur-sm rounded-xl border border-border/50 p-4">
         <h3 className="text-sm font-semibold text-muted-foreground mb-3 flex items-center gap-2">
@@ -377,52 +507,109 @@ function RosterPreview({ roster, sportKey }: { roster: RosterPlayer[]; sportKey:
       <div className="flex items-center justify-between mb-3">
         <h3 className="text-sm font-semibold text-muted-foreground flex items-center gap-2">
           <Users className="w-4 h-4" />
-          Key Players
+          Full Roster
         </h3>
         <span className="text-xs text-muted-foreground">{roster.length} players</span>
       </div>
       <div className="space-y-2">
-        {displayRoster.map((player) => (
-          <Link
-            key={player.id}
-            to={`/props/player/${sportKey.toUpperCase()}/${encodeURIComponent(player.name)}`}
-            className="flex items-center gap-3 p-2 rounded-lg hover:bg-white/5 transition-colors group"
-          >
-            <div className="relative w-10 h-10 rounded-full bg-muted overflow-hidden flex-shrink-0">
-              {player.headshot ? (
-                <img 
-                  src={player.headshot} 
-                  alt={player.name}
-                  className="w-full h-full object-cover"
-                  onError={(e) => {
-                    const target = e.target as HTMLImageElement;
-                    target.style.display = 'none';
-                  }}
-                />
-              ) : (
-                <div className="w-full h-full flex items-center justify-center text-muted-foreground">
-                  <Users className="w-5 h-5" />
-                </div>
-              )}
+        {starters.length > 0 && (
+          <div className="pb-1">
+            <div className="mb-2 text-[11px] uppercase tracking-wide text-emerald-300/90 font-semibold">
+              Likely Starters / Core
             </div>
-            <div className="flex-1 min-w-0">
-              <div className="font-medium text-sm truncate group-hover:text-primary transition-colors">
-                {player.name}
-              </div>
-              <div className="text-xs text-muted-foreground">
-                #{player.jersey} · {player.position}
-              </div>
+            <div className="space-y-1.5">
+              {starters.map((player) => (
+                <Link
+                  key={player.id}
+                  to={`/props/player/${sportKey.toUpperCase()}/${encodeURIComponent(player.name)}`}
+                  className="flex items-center gap-3 p-2 rounded-lg border border-emerald-300/20 bg-emerald-500/5 hover:bg-emerald-500/10 transition-colors group"
+                  onMouseEnter={() => prefetchPlayer(player.name)}
+                  onFocus={() => prefetchPlayer(player.name)}
+                >
+                  <div className="relative w-10 h-10 rounded-full bg-muted overflow-hidden flex-shrink-0">
+                    {player.headshot ? (
+                      <img
+                        src={player.headshot}
+                        alt={player.name}
+                        className="w-full h-full object-cover"
+                        onError={(e) => {
+                          const target = e.target as HTMLImageElement;
+                          target.style.display = 'none';
+                        }}
+                      />
+                    ) : (
+                      <div className="w-full h-full flex items-center justify-center text-muted-foreground">
+                        <Users className="w-5 h-5" />
+                      </div>
+                    )}
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <div className="font-medium text-sm truncate group-hover:text-primary transition-colors">
+                      {player.name}
+                    </div>
+                    <div className="text-xs text-muted-foreground">
+                      #{player.jersey} · {player.position}
+                    </div>
+                  </div>
+                  <ChevronRight className="w-4 h-4 text-muted-foreground opacity-0 group-hover:opacity-100 transition-opacity" />
+                </Link>
+              ))}
             </div>
-            <ChevronRight className="w-4 h-4 text-muted-foreground opacity-0 group-hover:opacity-100 transition-opacity" />
-          </Link>
-        ))}
+          </div>
+        )}
+
+        {depth.length > 0 && (
+          <div className="pt-1">
+            <div className="mb-2 text-[11px] uppercase tracking-wide text-muted-foreground font-semibold">
+              Bench / Depth
+            </div>
+            <div className="space-y-1.5">
+              {depth.map((player) => (
+                <Link
+                  key={player.id}
+                  to={`/props/player/${sportKey.toUpperCase()}/${encodeURIComponent(player.name)}`}
+                  className="flex items-center gap-3 p-2 rounded-lg hover:bg-white/5 transition-colors group"
+                  onMouseEnter={() => prefetchPlayer(player.name)}
+                  onFocus={() => prefetchPlayer(player.name)}
+                >
+                  <div className="relative w-10 h-10 rounded-full bg-muted overflow-hidden flex-shrink-0">
+                    {player.headshot ? (
+                      <img
+                        src={player.headshot}
+                        alt={player.name}
+                        className="w-full h-full object-cover"
+                        onError={(e) => {
+                          const target = e.target as HTMLImageElement;
+                          target.style.display = 'none';
+                        }}
+                      />
+                    ) : (
+                      <div className="w-full h-full flex items-center justify-center text-muted-foreground">
+                        <Users className="w-5 h-5" />
+                      </div>
+                    )}
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <div className="font-medium text-sm truncate group-hover:text-primary transition-colors">
+                      {player.name}
+                    </div>
+                    <div className="text-xs text-muted-foreground">
+                      #{player.jersey} · {player.position}
+                    </div>
+                  </div>
+                  <ChevronRight className="w-4 h-4 text-muted-foreground opacity-0 group-hover:opacity-100 transition-opacity" />
+                </Link>
+              ))}
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );
 }
 
 function SchedulePreview({ schedule }: { schedule: GameResult[]; teamColor?: string }) {
-  const [tab, setTab] = useState<'recent' | 'upcoming'>('recent');
+  const [tab, setTab] = useState<'recent' | 'upcoming'>('upcoming');
   
   const recentGames = schedule.filter(g => g.status === 'final').slice(-5).reverse();
   const upcomingGames = schedule.filter(g => g.status === 'scheduled').slice(0, 5);
@@ -528,6 +715,440 @@ function SchedulePreview({ schedule }: { schedule: GameResult[]; teamColor?: str
   );
 }
 
+function TeamH2HPreview({ h2h }: { h2h: TeamH2HData | null }) {
+  if (!h2h || h2h.sampleSize === 0) {
+    return (
+      <div className="bg-card/50 backdrop-blur-sm rounded-xl border border-border/50 p-4">
+        <h3 className="text-sm font-semibold text-muted-foreground mb-2 flex items-center gap-2">
+          <Trophy className="w-4 h-4" />
+          Head-to-Head
+        </h3>
+        <p className="text-sm text-muted-foreground text-center py-3">
+          No recent head-to-head sample available
+        </p>
+      </div>
+    );
+  }
+
+  const latest = h2h.meetings[0];
+  const lastScore = latest
+    ? `${latest.awayTeamAlias} ${latest.awayScore} - ${latest.homeScore} ${latest.homeTeamAlias}`
+    : '-';
+
+  return (
+    <div className="bg-card/50 backdrop-blur-sm rounded-xl border border-border/50 p-4">
+      <div className="flex items-center justify-between mb-3">
+        <h3 className="text-sm font-semibold text-muted-foreground flex items-center gap-2">
+          <Trophy className="w-4 h-4" />
+          Head-to-Head ({h2h.sampleSize})
+        </h3>
+        <span className="text-xs text-muted-foreground">
+          L{h2h.window}
+        </span>
+      </div>
+      <div className="grid grid-cols-2 gap-3 mb-3">
+        <div className="rounded-lg bg-white/5 p-3 border border-white/10">
+          <div className="text-xs text-muted-foreground mb-1">Series</div>
+          <div className="text-sm font-semibold">
+            {h2h.teamA.alias} {h2h.series.teamAWins}-{h2h.series.teamBWins} {h2h.teamB.alias}
+          </div>
+        </div>
+        <div className="rounded-lg bg-white/5 p-3 border border-white/10">
+          <div className="text-xs text-muted-foreground mb-1">Avg Margin</div>
+          <div className="text-sm font-semibold">
+            {h2h.averages.marginForTeamA === null
+              ? '-'
+              : `${h2h.averages.marginForTeamA > 0 ? '+' : ''}${h2h.averages.marginForTeamA.toFixed(1)}`}
+          </div>
+        </div>
+      </div>
+      <div className="grid grid-cols-2 gap-3 mb-3">
+        <div className="rounded-lg bg-white/5 p-3 border border-white/10">
+          <div className="text-xs text-muted-foreground mb-1">ATS (lines)</div>
+          <div className="text-sm font-semibold">
+            {h2h.ats.sampleWithLine > 0
+              ? `${h2h.ats.teamACovers}-${h2h.ats.teamBCovers}-${h2h.ats.pushes}`
+              : 'No line sample'}
+          </div>
+        </div>
+        <div className="rounded-lg bg-white/5 p-3 border border-white/10">
+          <div className="text-xs text-muted-foreground mb-1">O/U (lines)</div>
+          <div className="text-sm font-semibold">
+            {h2h.totals.sampleWithLine > 0
+              ? `${h2h.totals.overs}-${h2h.totals.unders}-${h2h.totals.pushes}`
+              : 'No line sample'}
+          </div>
+        </div>
+      </div>
+      <div className="text-xs text-muted-foreground">
+        Latest meeting: {lastScore}
+      </div>
+    </div>
+  );
+}
+
+function TeamMatchupEdgeSection({
+  sportKey,
+  teamAbbr,
+  teamName,
+  schedule,
+  initialH2H,
+}: {
+  sportKey: string;
+  teamAbbr: string;
+  teamName: string;
+  schedule: GameResult[];
+  initialH2H: TeamH2HData | null;
+}) {
+  const recentGames = useMemo(
+    () =>
+      [...schedule]
+        .filter((g) => g.status === 'final')
+        .sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime())
+        .slice(0, 5),
+    [schedule]
+  );
+
+  const opponents = useMemo(() => {
+    const upcoming = schedule
+      .filter((g) => g.status === 'scheduled' || g.status === 'live')
+      .map((g) => g.opponent);
+    const fallback = schedule
+      .filter((g) => g.status === 'final')
+      .map((g) => g.opponent);
+    const merged = [...upcoming, ...fallback];
+    const seen = new Set<string>();
+    const out: Array<{ name: string; abbreviation: string; logo?: string }> = [];
+    for (const opp of merged) {
+      const key = String(opp?.abbreviation || opp?.name || '').trim().toUpperCase();
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      out.push({ name: opp.name, abbreviation: opp.abbreviation, logo: opp.logo });
+    }
+    return out.slice(0, 12);
+  }, [schedule]);
+
+  const [oppIdx, setOppIdx] = useState(0);
+  const [h2h, setH2h] = useState<TeamH2HData | null>(initialH2H);
+
+  useEffect(() => {
+    if (opponents.length === 0) return;
+    if (oppIdx >= opponents.length) setOppIdx(0);
+  }, [oppIdx, opponents.length]);
+
+  useEffect(() => {
+    const selected = opponents[oppIdx];
+    const teamA = String(teamAbbr || '').trim();
+    const sportUpper = String(sportKey || '').toUpperCase();
+    if (!selected || !teamA || !sportUpper) return;
+    const teamB = String(selected.abbreviation || selected.name || '').trim();
+    if (!teamB) return;
+    const initialMatches =
+      initialH2H
+      && String(initialH2H.teamB?.alias || '').toUpperCase() === String(selected.abbreviation || '').toUpperCase();
+    if (initialMatches) {
+      setH2h(initialH2H);
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      const url = `/api/teams/${sportUpper}/h2h?teamA=${encodeURIComponent(teamA)}&teamB=${encodeURIComponent(teamB)}&window=10`;
+      const result = await fetchJsonCached<TeamH2HData>(url, {
+        cacheKey: `team-h2h:${sportUpper}:${teamA}:${teamB}`,
+        ttlMs: 90_000,
+        timeoutMs: 5_000,
+      }).catch(() => null);
+      if (!cancelled) {
+        setH2h(result && Number(result.sampleSize) > 0 ? result : null);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [initialH2H, oppIdx, opponents, sportKey, teamAbbr]);
+
+  const outcomeBadgeTone = (label: 'Cover' | 'No Cover' | 'Push' | 'No Line' | 'Over' | 'Under') =>
+    label === 'Cover' || label === 'Over'
+      ? 'bg-emerald-500 text-white'
+      : label === 'No Cover' || label === 'Under'
+        ? 'bg-rose-500 text-white'
+        : label === 'Push'
+          ? 'bg-slate-500 text-white'
+          : 'bg-amber-500 text-black';
+  const outcomeIcon = (label: 'Cover' | 'No Cover' | 'Push' | 'No Line' | 'Over' | 'Under') =>
+    label === 'Cover' || label === 'Over' ? '▲' : label === 'No Cover' || label === 'Under' ? '▼' : label === 'Push' ? '•' : '○';
+  const outcomeBlockTone = (label: 'Cover' | 'No Cover' | 'Push' | 'No Line' | 'Over' | 'Under') =>
+    label === 'Cover' || label === 'Over'
+      ? 'bg-emerald-500/16 border-emerald-300/30'
+      : label === 'No Cover' || label === 'Under'
+        ? 'bg-rose-500/16 border-rose-300/30'
+        : label === 'Push'
+          ? 'bg-slate-400/16 border-slate-300/25'
+          : 'bg-amber-500/16 border-amber-300/30';
+
+  const lineOutcomes = recentGames.map((game) => {
+    const teamScore = typeof game.teamScore === 'number' && Number.isFinite(game.teamScore) ? game.teamScore : null;
+    const oppScore = typeof game.oppScore === 'number' && Number.isFinite(game.oppScore) ? game.oppScore : null;
+    const spread = typeof game.spread === 'number' && Number.isFinite(game.spread) ? game.spread : null;
+    const total = typeof game.total === 'number' && Number.isFinite(game.total) ? game.total : null;
+    const validScores = teamScore !== null && oppScore !== null;
+    let ats: 'Cover' | 'No Cover' | 'Push' | 'No Line' = 'No Line';
+    let totalOutcome: 'Over' | 'Under' | 'Push' | 'No Line' = 'No Line';
+    if (validScores && spread !== null) {
+      const adjusted = teamScore + spread - oppScore;
+      ats = Math.abs(adjusted) < 0.0001 ? 'Push' : adjusted > 0 ? 'Cover' : 'No Cover';
+    }
+    if (validScores && total !== null) {
+      const combined = teamScore + oppScore;
+      totalOutcome = Math.abs(combined - total) < 0.0001 ? 'Push' : combined > total ? 'Over' : 'Under';
+    }
+    return { game, ats, totalOutcome };
+  });
+
+  const atsSummary = lineOutcomes.reduce(
+    (acc, row) => {
+      if (row.ats === 'Cover') acc.cover += 1;
+      if (row.ats === 'No Cover') acc.noCover += 1;
+      if (row.ats === 'Push') acc.push += 1;
+      return acc;
+    },
+    { cover: 0, noCover: 0, push: 0 }
+  );
+
+  const selectedOpponent = opponents[oppIdx] || null;
+  const fallbackH2H = useMemo(() => {
+    if (!selectedOpponent) return null;
+    const oppKey = String(selectedOpponent.abbreviation || selectedOpponent.name || '').toUpperCase();
+    if (!oppKey) return null;
+    const meetings = [...schedule]
+      .filter((g) => g.status === 'final' && String(g.opponent.abbreviation || '').toUpperCase() === oppKey)
+      .sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime())
+      .slice(0, 10);
+    if (meetings.length === 0) return null;
+
+    let teamAWins = 0;
+    let teamBWins = 0;
+    let ties = 0;
+    let covers = 0;
+    let noCovers = 0;
+    let pushes = 0;
+    let atsSample = 0;
+
+    for (const game of meetings) {
+      const teamScore = typeof game.teamScore === 'number' && Number.isFinite(game.teamScore) ? game.teamScore : null;
+      const oppScore = typeof game.oppScore === 'number' && Number.isFinite(game.oppScore) ? game.oppScore : null;
+      if (teamScore !== null && oppScore !== null) {
+        if (teamScore > oppScore) teamAWins += 1;
+        else if (teamScore < oppScore) teamBWins += 1;
+        else ties += 1;
+      }
+      const spread = typeof game.spread === 'number' && Number.isFinite(game.spread) ? game.spread : null;
+      if (teamScore !== null && oppScore !== null && spread !== null) {
+        atsSample += 1;
+        const adjusted = teamScore + spread - oppScore;
+        if (Math.abs(adjusted) < 0.0001) pushes += 1;
+        else if (adjusted > 0) covers += 1;
+        else noCovers += 1;
+      }
+    }
+
+    return {
+      seriesLabel: `${teamAbbr} ${teamAWins}-${teamBWins}${ties > 0 ? `-${ties}` : ''} ${selectedOpponent.abbreviation}`,
+      atsLabel: atsSample > 0 ? `${covers}-${noCovers}-${pushes}` : 'No Line',
+    };
+  }, [schedule, selectedOpponent, teamAbbr]);
+
+  const h2hSeriesLabel = h2h
+    ? `${h2h.teamA.alias} ${h2h.series.teamAWins}-${h2h.series.teamBWins} ${h2h.teamB.alias}`
+    : (fallbackH2H?.seriesLabel || 'No Matchups Yet');
+  const h2hAtsLabel = h2h && h2h.ats.sampleWithLine > 0
+    ? `${h2h.ats.teamACovers}-${h2h.ats.teamBCovers}-${h2h.ats.pushes}`
+    : (fallbackH2H?.atsLabel || 'No Line');
+
+  return (
+    <div className="rounded-xl border border-cyan-400/15 bg-gradient-to-br from-[#0d1628]/90 via-[#0b1323]/90 to-[#111827]/90 overflow-hidden shadow-[0_0_30px_rgba(34,211,238,0.08)]">
+      <div className="px-4 py-3 border-b border-white/[0.06] bg-white/[0.02] flex items-center justify-between gap-2">
+        <div className="flex items-center gap-2">
+          <Trophy className="w-4 h-4 text-cyan-400" />
+          <h3 className="font-semibold text-white">Team Matchup Edge</h3>
+        </div>
+        {selectedOpponent && (
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => setOppIdx((n) => (n - 1 + opponents.length) % opponents.length)}
+              className="px-2 py-1 rounded border border-cyan-400/30 bg-cyan-500/10 text-cyan-200 text-xs hover:bg-cyan-500/20 transition-colors"
+            >
+              Prev Team
+            </button>
+            <button
+              onClick={() => setOppIdx((n) => (n + 1) % opponents.length)}
+              className="px-2 py-1 rounded border border-cyan-400/30 bg-cyan-500/10 text-cyan-200 text-xs hover:bg-cyan-500/20 transition-colors"
+            >
+              Next Team
+            </button>
+          </div>
+        )}
+      </div>
+      <div className="p-4 space-y-3">
+        <div className="flex items-center gap-2 text-[11px]">
+          <span className="inline-flex items-center rounded-full border border-cyan-300/30 bg-cyan-500/10 px-2 py-0.5 font-medium text-cyan-100">
+            Upcoming: {selectedOpponent ? `${selectedOpponent.name} (${selectedOpponent.abbreviation})` : 'TBD'}
+          </span>
+          <span className="inline-flex items-center rounded-full border border-white/15 bg-white/[0.03] px-2 py-0.5 font-medium text-white/65">
+            Game-by-Game + Cover Checks
+          </span>
+        </div>
+
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+          <div className="rounded-lg bg-white/[0.04] border border-white/[0.07] p-3 text-center">
+            <div className="text-xs text-white/45">L5 ATS</div>
+            <div className="mt-1 text-lg font-bold text-white">{`${atsSummary.cover}-${atsSummary.noCover}-${atsSummary.push}`}</div>
+          </div>
+          <div className="rounded-lg bg-white/[0.04] border border-white/[0.07] p-3 text-center">
+            <div className="text-xs text-white/45">H2H Series</div>
+            <div className="mt-1 text-lg font-bold text-white">
+              {h2hSeriesLabel}
+            </div>
+          </div>
+          <div className="rounded-lg bg-white/[0.04] border border-white/[0.07] p-3 text-center">
+            <div className="text-xs text-white/45">H2H ATS</div>
+            <div className="mt-1 text-lg font-bold text-white">
+              {h2hAtsLabel}
+            </div>
+          </div>
+        </div>
+
+        <div className="space-y-2">
+          {lineOutcomes.length === 0 ? (
+            <div className="rounded-md bg-white/[0.02] border border-white/[0.05] px-3 py-3 text-xs text-white/60">
+              No final games available.
+            </div>
+          ) : (
+            lineOutcomes.map((row, idx) => (
+              <div
+                key={`${row.game.id || row.game.date}-${idx}`}
+                className="group rounded-md bg-white/[0.02] border border-white/[0.05] px-3 py-3 text-xs transition-all duration-200 hover:border-cyan-300/25 hover:bg-white/[0.04] hover:shadow-[0_0_16px_rgba(34,211,238,0.08)] hover:-translate-y-[1px]"
+              >
+                <div className="md:grid md:grid-cols-[1.6fr_1fr] md:items-center md:gap-4">
+                  <div className="min-w-0">
+                    <div className="flex flex-wrap items-center gap-1.5 text-[11px]">
+                      <span className="inline-flex items-center rounded-md border border-indigo-300/30 bg-indigo-500/15 px-1.5 py-0.5 font-semibold text-indigo-100">
+                        {new Date(row.game.date).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}
+                      </span>
+                      <span className="text-white/70">{row.game.homeAway === 'away' ? '@' : 'vs'} {row.game.opponent.abbreviation}</span>
+                      <span
+                        className={cn(
+                          'inline-flex items-center rounded-md px-1.5 py-0.5 font-semibold',
+                          row.game.result === 'W'
+                            ? 'bg-emerald-500/20 text-emerald-200 border border-emerald-300/30'
+                            : row.game.result === 'L'
+                              ? 'bg-rose-500/20 text-rose-200 border border-rose-300/30'
+                              : 'bg-slate-500/20 text-slate-200 border border-slate-300/30'
+                        )}
+                      >
+                        {row.game.result || '-'}
+                      </span>
+                    </div>
+                    <div className="mt-1 text-[12px] text-white/90 font-semibold">
+                      <span className="text-white/60">Final:</span>{' '}
+                      <span className="text-cyan-100">{teamName}</span>{' '}
+                      <span className="text-white">{row.game.teamScore ?? '-'}</span>
+                      <span className="text-white/45 mx-1">-</span>
+                      <span className="text-white">{row.game.oppScore ?? '-'}</span>{' '}
+                      <span className="text-white/75">{row.game.opponent.abbreviation}</span>
+                    </div>
+                    <div className="mt-1 text-[11px] font-medium text-cyan-200/85">
+                      {`Line: Spread ${typeof row.game.spread === 'number' && Number.isFinite(row.game.spread) ? row.game.spread : '-'} | Total ${typeof row.game.total === 'number' && Number.isFinite(row.game.total) ? row.game.total : '-'}`}
+                    </div>
+                  </div>
+                  <div className="relative mt-2 md:mt-0 grid grid-cols-2 divide-x divide-white/[0.08] rounded-md border border-white/[0.05] bg-white/[0.02] overflow-hidden">
+                    <div className="pointer-events-none absolute inset-0 opacity-0 transition-opacity duration-200 group-hover:opacity-100 bg-gradient-to-r from-transparent via-cyan-400/[0.06] to-transparent" />
+                    {([
+                      { key: 'ATS', value: row.ats },
+                      { key: 'TOTAL', value: row.totalOutcome },
+                    ] as const).map((item) => (
+                      <div key={item.key} className={cn('px-2 py-1.5 text-center border transition-colors', outcomeBlockTone(item.value))}>
+                        <div className="text-[9px] uppercase tracking-wide text-white/65">{item.key}</div>
+                        <div className="mt-0.5 text-[11px] font-semibold tracking-wide">
+                          <span className={cn('inline-flex items-center gap-1 rounded-full px-2 py-0.5', outcomeBadgeTone(item.value))}>
+                            <span aria-hidden className="text-[11px] opacity-95">{outcomeIcon(item.value)}</span>
+                            <span>{item.value}</span>
+                          </span>
+                        </div>
+                        <div className="mt-0.5 text-[10px] text-white/62">
+                          {item.key === 'ATS'
+                            ? `Spread ${typeof row.game.spread === 'number' && Number.isFinite(row.game.spread) ? row.game.spread : '-'}`
+                            : `Total ${typeof row.game.total === 'number' && Number.isFinite(row.game.total) ? row.game.total : '-'}`}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            ))
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function InjuriesPreview({ injuries }: { injuries: TeamInjury[] }) {
+  const rows = injuries.slice(0, 8);
+  return (
+    <div className="bg-card/50 backdrop-blur-sm rounded-xl border border-border/50 p-4">
+      <div className="flex items-center justify-between mb-3">
+        <h3 className="text-sm font-semibold text-muted-foreground flex items-center gap-2">
+          <Users className="w-4 h-4" />
+          Injuries
+        </h3>
+        <span className="text-xs text-muted-foreground">{injuries.length} listed</span>
+      </div>
+      {rows.length === 0 ? (
+        <p className="text-sm text-muted-foreground text-center py-4">No reported injuries</p>
+      ) : (
+        <div className="space-y-2">
+          {rows.map((injury) => (
+            <div key={`${injury.id}-${injury.playerName}`} className="flex items-center gap-3 p-2 rounded-lg bg-white/5">
+              <div className="w-9 h-9 rounded-full overflow-hidden bg-muted flex-shrink-0">
+                {injury.headshot ? (
+                  <img
+                    src={injury.headshot}
+                    alt={injury.playerName}
+                    className="w-full h-full object-cover"
+                    onError={(e) => {
+                      const target = e.target as HTMLImageElement;
+                      target.style.display = 'none';
+                    }}
+                  />
+                ) : (
+                  <div className="w-full h-full flex items-center justify-center text-muted-foreground">
+                    <Users className="w-4 h-4" />
+                  </div>
+                )}
+              </div>
+              <div className="min-w-0 flex-1">
+                <div className="text-sm font-medium truncate">{injury.playerName}</div>
+                <div className="text-xs text-muted-foreground truncate">
+                  {[injury.injuryType, injury.detail].filter(Boolean).join(' - ') || 'Status update pending'}
+                </div>
+              </div>
+              <div className="text-right">
+                <div className="text-xs font-semibold text-amber-300">{injury.status || 'Out'}</div>
+                {injury.returnDate && (
+                  <div className="text-[11px] text-muted-foreground">
+                    {new Date(injury.returnDate).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}
+                  </div>
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function LoadingState() {
   return (
     <div className="min-h-screen bg-background">
@@ -586,25 +1207,76 @@ export function TeamProfilePage() {
 
   const fetchTeamData = async () => {
     if (!sportKey || !teamId) return;
+    const cacheKey = `team-profile:v9:${sportKey.toUpperCase()}:${teamId}`;
+    const cached = getRouteCache<TeamProfileData>(cacheKey, 180_000);
+    if (cached) {
+      setData(cached);
+      setLoading(false);
+    }
     
-    setLoading(true);
+    if (!cached) {
+      setLoading(true);
+    }
     setError(null);
     
     try {
-      // Fetch team profile, schedule, and stats in parallel
-      const [profileRes, scheduleRes, statsRes] = await Promise.all([
-        fetch(`/api/teams/${sportKey.toUpperCase()}/${teamId}`),
-        fetch(`/api/teams/${sportKey.toUpperCase()}/${teamId}/schedule`),
-        fetch(`/api/teams/${sportKey.toUpperCase()}/${teamId}/stats`).catch(() => null)
+      const sportUpper = sportKey.toUpperCase();
+      // Fetch team profile, schedule, stats, standings, and sport games in parallel
+      const [profileJson, scheduleJson, statsJson, standingsJson, gamesJson, injuriesJson, splitsJson] = await Promise.all([
+        fetchJsonCached<any>(`/api/teams/${sportUpper}/${teamId}`, {
+          cacheKey: `team-profile:v9:${sportUpper}:${teamId}`,
+          ttlMs: 60_000,
+          timeoutMs: 7_000,
+          init: { credentials: 'include' },
+        }),
+        fetchJsonCached<any>(`/api/teams/${sportUpper}/${teamId}/schedule`, {
+          cacheKey: `team-schedule:v9:${sportUpper}:${teamId}`,
+          ttlMs: 45_000,
+          timeoutMs: 12_000,
+          init: { credentials: 'include' },
+        }).catch(async () => {
+          try {
+            return await fetchJsonCached<any>(`/api/teams/${sportUpper}/${teamId}/schedule?fresh=1`, {
+              cacheKey: `team-schedule:v9-retry:${sportUpper}:${teamId}`,
+              ttlMs: 30_000,
+              timeoutMs: 20_000,
+              init: { credentials: 'include' },
+            });
+          } catch {
+            return { pastGames: [], upcomingGames: [], allGames: [] };
+          }
+        }),
+        fetchJsonCached<any>(`/api/teams/${sportUpper}/${teamId}/stats`, {
+          cacheKey: `team-stats:v9:${sportUpper}:${teamId}`,
+          ttlMs: 120_000,
+          timeoutMs: 4_500,
+          init: { credentials: 'include' },
+        }).catch(() => ({ stats: {}, rankings: {} })),
+        fetchJsonCached<any>(`/api/teams/${sportUpper}/standings`, {
+          cacheKey: `team-standings:v9:${sportUpper}`,
+          ttlMs: 90_000,
+          timeoutMs: 4_500,
+          init: { credentials: 'include' },
+        }).catch(() => ({ teams: [] })),
+        fetchJsonCached<any>(`/api/games?sport=${sportUpper}&includeOdds=1`, {
+          cacheKey: `games-lite:v9:${sportUpper}`,
+          ttlMs: 20_000,
+          timeoutMs: 4_000,
+          init: { credentials: 'include' },
+        }).catch(() => ({ games: [] })),
+        fetchJsonCached<any>(`/api/teams/${sportUpper}/${teamId}/injuries`, {
+          cacheKey: `team-injuries:v9:${sportUpper}:${teamId}`,
+          ttlMs: 45_000,
+          timeoutMs: 4_000,
+          init: { credentials: 'include' },
+        }).catch(() => ({ injuries: [] })),
+        fetchJsonCached<any>(`/api/teams/${sportUpper}/${teamId}/splits`, {
+          cacheKey: `team-splits:v9:${sportUpper}:${teamId}`,
+          ttlMs: 90_000,
+          timeoutMs: 4_000,
+          init: { credentials: 'include' },
+        }).catch(() => ({ splits: null })),
       ]);
-      
-      if (!profileRes.ok) {
-        throw new Error(profileRes.status === 404 ? 'Team not found' : 'Failed to load team data');
-      }
-      
-      const profileJson = await profileRes.json();
-      const scheduleJson = scheduleRes.ok ? await scheduleRes.json() : { pastGames: [], upcomingGames: [] };
-      const statsJson = statsRes && statsRes.ok ? await statsRes.json() : { stats: {}, rankings: {} };
       
       // Transform SportsRadar data to our format
       const teamAlias = profileJson.team?.alias || '';
@@ -628,25 +1300,76 @@ export function TeamProfilePage() {
         division: profileJson.team?.division
       };
       
-      // Transform record from standings or team record
+      // Transform record with standings fallback (profile payload can be sparse for some leagues/seasons).
+      const standingsTeams = Array.isArray(standingsJson?.teams) ? standingsJson.teams : [];
+      const profileTeamId = String(profileJson.team?.id || teamId);
+      const profileAlias = String(profileJson.team?.alias || '').toLowerCase();
+      const profileName = String(profileJson.team?.name || '').toLowerCase();
+      const standingsMatch = standingsTeams.find((row: any) => {
+        const rowId = String(row?.id || '');
+        const rowAlias = String(row?.alias || '').toLowerCase();
+        const rowName = String(row?.name || '').toLowerCase();
+        return rowId === profileTeamId
+          || (profileAlias && rowAlias === profileAlias)
+          || (profileName && rowName === profileName);
+      });
+
       const teamRecord = profileJson.team?.record || {};
-      const record: TeamRecord = {
-        wins: teamRecord.wins || 0,
-        losses: teamRecord.losses || 0,
-        ties: teamRecord.ties,
-        pct: teamRecord.win_pct || (teamRecord.wins / Math.max(1, teamRecord.wins + teamRecord.losses)),
-        confWins: teamRecord.conference?.wins,
-        confLosses: teamRecord.conference?.losses,
-        homeWins: teamRecord.home?.wins,
-        homeLosses: teamRecord.home?.losses,
-        awayWins: teamRecord.away?.wins || teamRecord.road?.wins,
-        awayLosses: teamRecord.away?.losses || teamRecord.road?.losses,
+      const wins = Number(teamRecord.wins ?? standingsMatch?.wins ?? 0);
+      const losses = Number(teamRecord.losses ?? standingsMatch?.losses ?? 0);
+      const ties = Number.isFinite(Number(teamRecord.ties ?? standingsMatch?.ties))
+        ? Number(teamRecord.ties ?? standingsMatch?.ties)
+        : undefined;
+      const confWins = Number.isFinite(Number(teamRecord.conference?.wins ?? standingsMatch?.confWins))
+        ? Number(teamRecord.conference?.wins ?? standingsMatch?.confWins)
+        : undefined;
+      const confLosses = Number.isFinite(Number(teamRecord.conference?.losses ?? standingsMatch?.confLosses))
+        ? Number(teamRecord.conference?.losses ?? standingsMatch?.confLosses)
+        : undefined;
+      const homeWins = Number.isFinite(Number(teamRecord.home?.wins ?? standingsMatch?.homeWins))
+        ? Number(teamRecord.home?.wins ?? standingsMatch?.homeWins)
+        : undefined;
+      const homeLosses = Number.isFinite(Number(teamRecord.home?.losses ?? standingsMatch?.homeLosses))
+        ? Number(teamRecord.home?.losses ?? standingsMatch?.homeLosses)
+        : undefined;
+      const awayWins = Number.isFinite(Number(teamRecord.away?.wins ?? teamRecord.road?.wins ?? standingsMatch?.awayWins))
+        ? Number(teamRecord.away?.wins ?? teamRecord.road?.wins ?? standingsMatch?.awayWins)
+        : undefined;
+      const awayLosses = Number.isFinite(Number(teamRecord.away?.losses ?? teamRecord.road?.losses ?? standingsMatch?.awayLosses))
+        ? Number(teamRecord.away?.losses ?? teamRecord.road?.losses ?? standingsMatch?.awayLosses)
+        : undefined;
+      let record: TeamRecord = {
+        wins,
+        losses,
+        ties,
+        pct: Number(teamRecord.win_pct ?? standingsMatch?.winPct ?? (wins / Math.max(1, wins + losses))),
+        confWins,
+        confLosses,
+        homeWins,
+        homeLosses,
+        awayWins,
+        awayLosses,
         streak: teamRecord.streak?.length ? { 
           type: teamRecord.streak.kind === 'win' ? 'W' : 'L', 
           count: teamRecord.streak.length 
         } : undefined,
+        rank: Number.isFinite(Number(standingsMatch?.rank)) ? Number(standingsMatch?.rank) : undefined,
         playoffSeed: teamRecord.seed
       };
+      const splitOverride = splitsJson?.splits || null;
+      if (splitOverride) {
+        const parseSplitNum = (value: unknown): number | undefined =>
+          Number.isFinite(Number(value)) ? Number(value) : undefined;
+        record = {
+          ...record,
+          confWins: parseSplitNum(splitOverride.confWins) ?? record.confWins,
+          confLosses: parseSplitNum(splitOverride.confLosses) ?? record.confLosses,
+          homeWins: parseSplitNum(splitOverride.homeWins) ?? record.homeWins,
+          homeLosses: parseSplitNum(splitOverride.homeLosses) ?? record.homeLosses,
+          awayWins: parseSplitNum(splitOverride.awayWins) ?? record.awayWins,
+          awayLosses: parseSplitNum(splitOverride.awayLosses) ?? record.awayLosses,
+        };
+      }
       
       // Transform roster
       const roster: RosterPlayer[] = (profileJson.roster || []).map((p: any) => ({
@@ -658,58 +1381,465 @@ export function TeamProfilePage() {
         stats: {}
       }));
       
-      // Transform schedule - combine past and upcoming games
-      const schedule: GameResult[] = [
-        ...(scheduleJson.pastGames || []).map((g: any) => ({
-          id: g.id,
-          date: g.scheduledTime,
+      // Transform schedule - prefer team endpoint; fallback to sport games feed if unavailable.
+      const teamAliasUpper = String(team.abbreviation || '').toUpperCase();
+      const rawGames = Array.isArray(gamesJson?.games) ? gamesJson.games : [];
+      const resolveFeedStatus = (raw: unknown): 'final' | 'live' | 'scheduled' => {
+        const statusRaw = String(raw || '').toUpperCase();
+        if (statusRaw === 'FINAL' || statusRaw === 'COMPLETED' || statusRaw === 'CLOSED' || statusRaw === 'STATUS_FINAL') return 'final';
+        if (statusRaw === 'LIVE' || statusRaw === 'IN_PROGRESS' || statusRaw === 'STATUS_IN_PROGRESS') return 'live';
+        return 'scheduled';
+      };
+      const isBasketballSport = new Set(['NBA', 'NCAAB']).has(sportUpper);
+      const cleanScore = (value: number | undefined, status: 'final' | 'live' | 'scheduled') => {
+        if (value === undefined) return undefined;
+        if (isBasketballSport && status === 'final' && value === 0) return undefined;
+        return value;
+      };
+      const findRawGameMatch = (row: GameResult): any | null => {
+        const rowId = String(row.id || '').trim();
+        const rowDateTs = new Date(row.date).getTime();
+        const oppAbbr = String(row.opponent.abbreviation || '').toUpperCase();
+
+        const byId = rawGames.find((g: any) => {
+          const gid = String(g?.game_id || g?.id || '').trim();
+          const ext = String(g?.external_id || '').trim();
+          return (rowId && (gid === rowId || ext === rowId));
+        });
+        if (byId) return byId;
+
+        return rawGames.find((g: any) => {
+          const homeCode = String(g?.home_team_code || '').toUpperCase();
+          const awayCode = String(g?.away_team_code || '').toUpperCase();
+          const hasTeam = teamAliasUpper && (homeCode === teamAliasUpper || awayCode === teamAliasUpper);
+          const hasOpp = oppAbbr && (homeCode === oppAbbr || awayCode === oppAbbr);
+          if (!hasTeam || !hasOpp) return false;
+          const feedTs = new Date(String(g?.start_time || g?.scheduled || '')).getTime();
+          if (!Number.isFinite(feedTs) || !Number.isFinite(rowDateTs)) return true;
+          return Math.abs(feedTs - rowDateTs) <= 18 * 60 * 60 * 1000;
+        }) || null;
+      };
+      const enrichWithGamesFeed = (row: GameResult): GameResult => {
+        const feed = findRawGameMatch(row);
+        if (!feed) return row;
+        const status = resolveFeedStatus(feed?.status || row.status);
+        const feedHomeScoreRaw = safeNum(feed?.home_score);
+        const feedAwayScoreRaw = safeNum(feed?.away_score);
+        const feedHomeScore = cleanScore(feedHomeScoreRaw, status);
+        const feedAwayScore = cleanScore(feedAwayScoreRaw, status);
+        const isHome = String(feed?.home_team_code || '').toUpperCase() === teamAliasUpper;
+        const teamScore = feedHomeScore !== undefined && feedAwayScore !== undefined
+          ? (isHome ? feedHomeScore : feedAwayScore)
+          : row.teamScore;
+        const oppScore = feedHomeScore !== undefined && feedAwayScore !== undefined
+          ? (isHome ? feedAwayScore : feedHomeScore)
+          : row.oppScore;
+        const spreadHome = safeNum(feed?.spread_home ?? feed?.spreadHome ?? feed?.spread);
+        const teamSpread = spreadHome !== undefined ? (isHome ? spreadHome : -spreadHome) : row.spread;
+        const total = safeNum(feed?.over_under ?? feed?.total);
+        const result = status === 'final' && typeof teamScore === 'number' && typeof oppScore === 'number'
+          ? (teamScore > oppScore ? 'W' : teamScore < oppScore ? 'L' : 'T')
+          : row.result;
+        return {
+          ...row,
+          teamScore,
+          oppScore,
+          spread: teamSpread ?? null,
+          total: total ?? row.total ?? null,
+          status,
+          result,
+        };
+      };
+      const mapTeamScheduleGame = (g: any, forceStatus?: 'scheduled' | 'final' | 'live'): GameResult => {
+        const homeAlias = String(g?.homeTeamAlias || g?.homeTeam?.alias || '').toUpperCase();
+        const awayAlias = String(g?.awayTeamAlias || g?.awayTeam?.alias || '').toUpperCase();
+        const homeName = String(g?.homeTeamName || g?.homeTeam?.name || g?.homeTeam?.displayName || homeAlias);
+        const awayName = String(g?.awayTeamName || g?.awayTeam?.name || g?.awayTeam?.displayName || awayAlias);
+        const isHome = typeof g?.isHome === 'boolean' ? g.isHome : (teamAliasUpper ? homeAlias === teamAliasUpper : true);
+        const homeScoreRaw = safeNum(g?.homeScore);
+        const awayScoreRaw = safeNum(g?.awayScore);
+        const parsedStatus: 'final' | 'live' | 'scheduled' = forceStatus || (() => {
+          const statusRaw = String(g?.status?.name || g?.status || '').toUpperCase();
+          if (
+            statusRaw.includes('FINAL')
+            || statusRaw.includes('CLOSED')
+            || statusRaw.includes('COMPLETED')
+            || statusRaw.includes('POSTPONED')
+            || statusRaw.includes('CANCELED')
+          ) return 'final';
+          if (statusRaw.includes('LIVE') || statusRaw.includes('IN_PROGRESS') || statusRaw.includes('STATUS_IN_PROGRESS')) return 'live';
+          return 'scheduled';
+        })();
+        const homeScore = cleanScore(homeScoreRaw, parsedStatus);
+        const awayScore = cleanScore(awayScoreRaw, parsedStatus);
+        const result = parsedStatus === 'final' && homeScore != null && awayScore != null
+          ? (isHome
+              ? (homeScore > awayScore ? 'W' : homeScore < awayScore ? 'L' : 'T')
+              : (awayScore > homeScore ? 'W' : awayScore < homeScore ? 'L' : 'T'))
+          : undefined;
+        const oppAlias = isHome ? awayAlias : homeAlias;
+        const oppName = isHome ? awayName : homeName;
+        const rawSpread = safeNum(g?.spread);
+        const teamSpread = rawSpread !== undefined ? (isHome ? rawSpread : -rawSpread) : null;
+        return {
+          id: String(g?.id || ''),
+          date: String(g?.scheduledTime || ''),
           opponent: {
-            name: g.isHome ? g.awayTeamName : g.homeTeamName,
-            abbreviation: g.isHome ? g.awayTeamAlias : g.homeTeamAlias,
-            logo: `https://a.espncdn.com/i/teamlogos/${sportKey}/500/${(g.isHome ? g.awayTeamAlias : g.homeTeamAlias)?.toLowerCase()}.png`
+            name: oppName,
+            abbreviation: oppAlias,
+            logo: `https://a.espncdn.com/i/teamlogos/${sportKey}/500/${oppAlias.toLowerCase()}.png`
           },
-          homeAway: g.isHome ? 'home' : 'away',
-          result: g.homeScore !== null && g.awayScore !== null 
-            ? (g.isHome 
-                ? (g.homeScore > g.awayScore ? 'W' : g.homeScore < g.awayScore ? 'L' : 'T')
-                : (g.awayScore > g.homeScore ? 'W' : g.awayScore < g.homeScore ? 'L' : 'T'))
-            : undefined,
-          teamScore: g.isHome ? g.homeScore : g.awayScore,
-          oppScore: g.isHome ? g.awayScore : g.homeScore,
-          status: g.status === 'FINAL' ? 'final' : g.status === 'LIVE' ? 'live' : 'scheduled'
-        })),
-        ...(scheduleJson.upcomingGames || []).map((g: any) => ({
-          id: g.id,
-          date: g.scheduledTime,
-          opponent: {
-            name: g.isHome ? g.awayTeamName : g.homeTeamName,
-            abbreviation: g.isHome ? g.awayTeamAlias : g.homeTeamAlias,
-            logo: `https://a.espncdn.com/i/teamlogos/${sportKey}/500/${(g.isHome ? g.awayTeamAlias : g.homeTeamAlias)?.toLowerCase()}.png`
-          },
-          homeAway: g.isHome ? 'home' : 'away',
-          status: 'scheduled' as const,
-          time: g.scheduledTime ? new Date(g.scheduledTime).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' }) : undefined
-        }))
+          homeAway: isHome ? 'home' : 'away',
+          result,
+          teamScore: isHome ? homeScore : awayScore,
+          oppScore: isHome ? awayScore : homeScore,
+          spread: (() => {
+            const spreadHome = safeNum(g?.spreadHome);
+            return spreadHome !== undefined ? (isHome ? spreadHome : -spreadHome) : teamSpread;
+          })(),
+          total: (() => {
+            const totalLine = safeNum(g?.totalLine);
+            const fallbackTotal = safeNum(g?.total ?? g?.overUnder ?? g?.over_under);
+            return totalLine ?? fallbackTotal ?? null;
+          })(),
+          status: parsedStatus,
+          time: g?.scheduledTime ? new Date(g.scheduledTime).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' }) : undefined,
+        };
+      };
+      const scheduleFromTeamEndpointRaw: GameResult[] = [
+        ...(Array.isArray(scheduleJson.pastGames) ? scheduleJson.pastGames : []).map((g: any) => mapTeamScheduleGame(g)),
+        ...(Array.isArray(scheduleJson.upcomingGames) ? scheduleJson.upcomingGames : []).map((g: any) => mapTeamScheduleGame(g))
       ];
+      const dateKey = (value: string | undefined) => {
+        const ms = new Date(String(value || '')).getTime();
+        if (!Number.isFinite(ms)) return '';
+        return new Date(ms).toISOString().slice(0, 10);
+      };
+      const enrichMissingLinesByDate = async (rows: GameResult[]): Promise<GameResult[]> => {
+        const lineMissing = rows.filter((row) => row.status === 'final' && (row.spread == null || row.total == null));
+        if (lineMissing.length === 0) return rows;
+
+        const days = Array.from(new Set(lineMissing.map((row) => dateKey(row.date)).filter(Boolean))).slice(0, 8);
+        if (days.length === 0) return rows;
+
+        const gamesByDay = new Map<string, any[]>();
+        await Promise.all(
+          days.map(async (day) => {
+            try {
+              const json = await fetchJsonCached<{ games?: any[] }>(
+                `/api/games?sport=${sportUpper}&includeOdds=1&date=${encodeURIComponent(day)}`,
+                {
+                  cacheKey: `games-lite-by-date:${sportUpper}:${day}:v1`,
+                  ttlMs: 120_000,
+                  timeoutMs: 2_400,
+                  init: { credentials: 'include' },
+                }
+              );
+              gamesByDay.set(day, Array.isArray(json?.games) ? json.games : []);
+            } catch {
+              gamesByDay.set(day, []);
+            }
+          })
+        );
+
+        const rowsWithGameMatch = rows.map((row) => {
+          if (row.status !== 'final' || (row.spread != null && row.total != null)) return row;
+          const day = dateKey(row.date);
+          const dayGames = gamesByDay.get(day) || [];
+          if (dayGames.length === 0) return row;
+
+          const rowTs = new Date(row.date).getTime();
+          const oppAbbr = String(row.opponent.abbreviation || '').toUpperCase();
+          const matched = dayGames.find((g: any) => {
+            const homeCode = String(g?.home_team_code || '').toUpperCase();
+            const awayCode = String(g?.away_team_code || '').toUpperCase();
+            const hasTeam = teamAliasUpper && (homeCode === teamAliasUpper || awayCode === teamAliasUpper);
+            const hasOpp = oppAbbr && (homeCode === oppAbbr || awayCode === oppAbbr);
+            if (!hasTeam || !hasOpp) return false;
+            const feedTs = new Date(String(g?.start_time || g?.scheduled || '')).getTime();
+            if (!Number.isFinite(feedTs) || !Number.isFinite(rowTs)) return true;
+            return Math.abs(feedTs - rowTs) <= 18 * 60 * 60 * 1000;
+          });
+          if (!matched) return row;
+          const isHome = String(matched?.home_team_code || '').toUpperCase() === teamAliasUpper;
+          const spreadHome = safeNum(matched?.spread_home ?? matched?.spreadHome ?? matched?.spread);
+          const total = safeNum(matched?.over_under ?? matched?.total);
+          return {
+            ...row,
+            id: String(matched?.game_id || matched?.id || row.id || ''),
+            spread: row.spread ?? (spreadHome !== undefined ? (isHome ? spreadHome : -spreadHome) : null),
+            total: row.total ?? (total ?? null),
+          };
+        });
+
+        const missingAfterDate = rowsWithGameMatch.filter((row) => row.status === 'final' && (row.spread == null || row.total == null));
+        const historyByGameId = new Map<string, { spread?: number | null; total?: number | null }>();
+        const idsNeedingHistory = Array.from(new Set(
+          missingAfterDate
+            .map((row) => String(row.id || '').trim())
+            .filter(Boolean)
+        )).slice(0, 8);
+
+        if (idsNeedingHistory.length > 0) {
+          await Promise.all(
+            idsNeedingHistory.map(async (gameId) => {
+              try {
+                const historyJson = await fetchJsonCached<{ latest?: { spread?: number | null; total?: number | null } }>(
+                  `/api/games/${encodeURIComponent(gameId)}/line-history`,
+                  {
+                    cacheKey: `game-line-history:${gameId}:v2`,
+                    ttlMs: 120_000,
+                    timeoutMs: 2_200,
+                    init: { credentials: 'include' },
+                  }
+                );
+                historyByGameId.set(gameId, {
+                  spread: safeNum(historyJson?.latest?.spread),
+                  total: safeNum(historyJson?.latest?.total),
+                });
+              } catch {
+                historyByGameId.set(gameId, {});
+              }
+            })
+          );
+        }
+
+        const withHistoryFallback = rowsWithGameMatch.map((row) => {
+          if (row.status !== 'final' || (row.spread != null && row.total != null)) return row;
+          const history = historyByGameId.get(String(row.id || '').trim());
+          if (!history) return row;
+          return {
+            ...row,
+            spread: row.spread ?? (history.spread ?? null),
+            total: row.total ?? (history.total ?? null),
+          };
+        });
+
+        // Last-mile NBA fallback: if a row carries an ESPN event id, fetch ESPN summary
+        // directly from browser to recover spread/total when server-side ID mapping misses.
+        if (sportUpper !== 'NBA') return withHistoryFallback;
+        const espnTargets = withHistoryFallback
+          .filter((row) => row.status === 'final' && (row.spread == null || row.total == null) && /^\d{7,}$/.test(String(row.id || '')))
+          .slice(0, 8);
+        if (espnTargets.length === 0) return withHistoryFallback;
+
+        const espnLineById = new Map<string, { spreadHome: number | null; total: number | null }>();
+        const parseEspnNum = (value: unknown): number | null => {
+          if (value === null || value === undefined) return null;
+          if (typeof value === 'string' && value.trim() === '') return null;
+          const n = Number(value);
+          return Number.isFinite(n) ? n : null;
+        };
+        const parseSpreadFromDetails = (value: unknown): number | null => {
+          const text = String(value || '').trim();
+          if (!text) return null;
+          const match = text.match(/([+-]?\d+(?:\.\d+)?)/);
+          if (!match) return null;
+          const n = Number(match[1]);
+          return Number.isFinite(n) ? n : null;
+        };
+
+        await Promise.all(
+          espnTargets.map(async (row) => {
+            const eventId = String(row.id || '').trim();
+            if (!eventId) return;
+            try {
+              const res = await fetch(`https://site.api.espn.com/apis/site/v2/sports/basketball/nba/summary?event=${encodeURIComponent(eventId)}`);
+              if (!res.ok) return;
+              const json: any = await res.json();
+              const line = (Array.isArray(json?.pickcenter) ? json.pickcenter[0] : null)
+                || (Array.isArray(json?.odds) ? json.odds[0] : null)
+                || null;
+              if (!line) return;
+              const spreadHome = parseEspnNum(line?.spread)
+                ?? parseEspnNum(line?.pointSpread?.home)
+                ?? parseEspnNum(line?.pointSpread?.away)
+                ?? parseSpreadFromDetails(line?.details);
+              const total = parseEspnNum(line?.overUnder)
+                ?? parseEspnNum(line?.pointSpread?.total)
+                ?? parseEspnNum(line?.total?.line);
+              espnLineById.set(eventId, { spreadHome, total });
+            } catch {
+              // Best-effort only.
+            }
+          })
+        );
+
+        return withHistoryFallback.map((row) => {
+          if (row.status !== 'final' || (row.spread != null && row.total != null)) return row;
+          const eventId = String(row.id || '').trim();
+          const espnLine = espnLineById.get(eventId);
+          if (!espnLine) return row;
+          const isHome = row.homeAway === 'home';
+          const teamSpread = espnLine.spreadHome != null ? (isHome ? espnLine.spreadHome : -espnLine.spreadHome) : null;
+          return {
+            ...row,
+            spread: row.spread ?? teamSpread,
+            total: row.total ?? (espnLine.total ?? null),
+          };
+        });
+      };
+      const scheduleFromTeamEndpoint = await enrichMissingLinesByDate(scheduleFromTeamEndpointRaw.map(enrichWithGamesFeed));
+      const teamAllGamesFromEndpoint: GameResult[] = (Array.isArray(scheduleJson?.allGames) ? scheduleJson.allGames : [])
+        .map((g: any) => mapTeamScheduleGame(g))
+        .map(enrichWithGamesFeed)
+        .filter((g: GameResult) => Boolean(g.id && g.date));
+      const fallbackSchedule: GameResult[] = rawGames
+        .filter((g: any) => {
+          const homeCode = String(g?.home_team_code || '').toUpperCase();
+          const awayCode = String(g?.away_team_code || '').toUpperCase();
+          return teamAliasUpper && (homeCode === teamAliasUpper || awayCode === teamAliasUpper);
+        })
+        .map((g: any) => {
+          const isHome = String(g?.home_team_code || '').toUpperCase() === teamAliasUpper;
+          const homeScoreRaw = safeNum(g?.home_score);
+          const awayScoreRaw = safeNum(g?.away_score);
+          const statusRaw = String(g?.status || '').toUpperCase();
+          const status: 'final' | 'live' | 'scheduled' =
+            statusRaw === 'FINAL' || statusRaw === 'COMPLETED' || statusRaw === 'CLOSED' || statusRaw === 'STATUS_FINAL'
+              ? 'final'
+              : statusRaw === 'LIVE' || statusRaw === 'IN_PROGRESS'
+                ? 'live'
+                : 'scheduled';
+          const homeScore = cleanScore(homeScoreRaw, status);
+          const awayScore = cleanScore(awayScoreRaw, status);
+          const result = status === 'final' && homeScore != null && awayScore != null
+            ? (isHome
+                ? (homeScore > awayScore ? 'W' : homeScore < awayScore ? 'L' : 'T')
+                : (awayScore > homeScore ? 'W' : awayScore < homeScore ? 'L' : 'T'))
+            : undefined;
+          const rawSpread = safeNum(g?.spread ?? g?.home_spread);
+          const teamSpread = rawSpread !== undefined ? (isHome ? rawSpread : -rawSpread) : null;
+          return {
+            id: String(g?.game_id || ''),
+            date: String(g?.start_time || ''),
+            opponent: {
+              name: String(isHome ? g?.away_team_name : g?.home_team_name || ''),
+              abbreviation: String(isHome ? g?.away_team_code : g?.home_team_code || ''),
+              logo: `https://a.espncdn.com/i/teamlogos/${sportKey}/500/${String(isHome ? g?.away_team_code : g?.home_team_code || '').toLowerCase()}.png`,
+            },
+            homeAway: isHome ? 'home' : 'away',
+            result,
+            teamScore: isHome ? homeScore : awayScore,
+            oppScore: isHome ? awayScore : homeScore,
+            spread: teamSpread,
+            total: safeNum(g?.over_under ?? g?.total) ?? null,
+            status,
+            time: g?.start_time ? new Date(g.start_time).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' }) : undefined,
+          } as GameResult;
+        })
+        .filter((g: any) => g.id && g.date)
+        .sort((a: GameResult, b: GameResult) => new Date(a.date).getTime() - new Date(b.date).getTime());
+      const schedule: GameResult[] = scheduleFromTeamEndpoint.length > 0 ? scheduleFromTeamEndpoint : fallbackSchedule;
+      const h2hOpponent = schedule.find((g) => g.status === 'scheduled' || g.status === 'live')?.opponent
+        || schedule.find((g) => g.status === 'final')?.opponent
+        || null;
+      let teamH2H: TeamH2HData | null = null;
+      if (h2hOpponent?.abbreviation) {
+        try {
+          const h2hUrl = `/api/teams/${sportKey.toUpperCase()}/h2h?teamA=${encodeURIComponent(String(team.abbreviation || team.name || ''))}&teamB=${encodeURIComponent(String(h2hOpponent.abbreviation || h2hOpponent.name || ''))}&window=10`;
+          const h2hJson = await fetchJsonCached<TeamH2HData>(h2hUrl, {
+            cacheKey: `team-h2h:${sportKey.toUpperCase()}:${String(team.abbreviation || team.name || '').toUpperCase()}:${String(h2hOpponent.abbreviation || h2hOpponent.name || '').toUpperCase()}`,
+            ttlMs: 90_000,
+            timeoutMs: 5_000,
+            init: { credentials: 'include' },
+          });
+          if (Number(h2hJson?.sampleSize) > 0) {
+            teamH2H = h2hJson as TeamH2HData;
+          }
+        } catch {
+          // Non-fatal: page continues without H2H block.
+        }
+      }
+
+      // Derive split records when provider sends placeholder 0-0 values.
+      if (
+        (record.confWins === 0 && record.confLosses === 0 && record.wins + record.losses > 0)
+        || (record.homeWins === 0 && record.homeLosses === 0 && record.wins + record.losses > 0)
+        || (record.awayWins === 0 && record.awayLosses === 0 && record.wins + record.losses > 0)
+      ) {
+        const splitSource = teamAllGamesFromEndpoint.length > 0 ? teamAllGamesFromEndpoint : fallbackSchedule;
+        const finals = splitSource.filter((g) => g.status === 'final');
+        if (finals.length > 0) {
+          let homeWinsDerived = 0;
+          let homeLossesDerived = 0;
+          let awayWinsDerived = 0;
+          let awayLossesDerived = 0;
+          let confWinsDerived = 0;
+          let confLossesDerived = 0;
+          const teamConference = String(team.conference || standingsMatch?.conferenceName || '').trim().toLowerCase();
+          const confByAlias = new Map<string, string>();
+          for (const row of standingsTeams) {
+            const alias = String(row?.alias || '').trim().toUpperCase();
+            const conf = String(row?.conferenceName || '').trim().toLowerCase();
+            if (alias && conf) confByAlias.set(alias, conf);
+          }
+          for (const g of finals) {
+            if (!g.result || g.result === 'T') continue;
+            const didWin = g.result === 'W';
+            if (g.homeAway === 'home') {
+              if (didWin) homeWinsDerived += 1;
+              else homeLossesDerived += 1;
+            } else {
+              if (didWin) awayWinsDerived += 1;
+              else awayLossesDerived += 1;
+            }
+            if (teamConference) {
+              const oppConf = confByAlias.get(String(g.opponent.abbreviation || '').toUpperCase());
+              if (oppConf && oppConf === teamConference) {
+                if (didWin) confWinsDerived += 1;
+                else confLossesDerived += 1;
+              }
+            }
+          }
+          record = {
+            ...record,
+            homeWins: (record.homeWins === 0 && record.homeLosses === 0 && (homeWinsDerived + homeLossesDerived) > 0) ? homeWinsDerived : record.homeWins,
+            homeLosses: (record.homeWins === 0 && record.homeLosses === 0 && (homeWinsDerived + homeLossesDerived) > 0) ? homeLossesDerived : record.homeLosses,
+            awayWins: (record.awayWins === 0 && record.awayLosses === 0 && (awayWinsDerived + awayLossesDerived) > 0) ? awayWinsDerived : record.awayWins,
+            awayLosses: (record.awayWins === 0 && record.awayLosses === 0 && (awayWinsDerived + awayLossesDerived) > 0) ? awayLossesDerived : record.awayLosses,
+            confWins: (record.confWins === 0 && record.confLosses === 0 && (confWinsDerived + confLossesDerived) > 0) ? confWinsDerived : record.confWins,
+            confLosses: (record.confWins === 0 && record.confLosses === 0 && (confWinsDerived + confLossesDerived) > 0) ? confLossesDerived : record.confLosses,
+          };
+        }
+      }
+      const injuries: TeamInjury[] = (Array.isArray(injuriesJson?.injuries) ? injuriesJson.injuries : []).map((row: any) => ({
+        id: String(row?.id || ''),
+        playerName: String(row?.playerName || ''),
+        status: String(row?.status || ''),
+        detail: String(row?.detail || ''),
+        injuryType: String(row?.injuryType || ''),
+        returnDate: String(row?.returnDate || ''),
+        headshot: String(row?.headshot || ''),
+      }));
       
       // Transform stats
       const srStats = statsJson.stats || {};
       const rankings = statsJson.rankings || {};
       const stats: TeamStats = {
-        ppg: srStats.pointsPerGame || srStats.goalsPerGame,
-        oppPpg: srStats.oppPointsPerGame || srStats.goalsAgainstPerGame,
+        ppg: safeNum(srStats.pointsPerGame) ?? safeNum(srStats.goalsPerGame) ?? safeNum(standingsMatch?.pointsFor),
+        oppPpg: safeNum(srStats.oppPointsPerGame) ?? safeNum(srStats.goalsAgainstPerGame) ?? safeNum(standingsMatch?.pointsAgainst),
         rpg: srStats.reboundsPerGame,
         apg: srStats.assistsPerGame,
-        fgPct: srStats.fieldGoalPct ? parseFloat(srStats.fieldGoalPct) / 100 : undefined,
-        threePct: srStats.threePointPct ? parseFloat(srStats.threePointPct) / 100 : undefined,
+        fgPct: normalizePct(srStats.fieldGoalPct),
+        threePct: normalizePct(srStats.threePointPct),
         offRank: rankings.offense,
         defRank: rankings.defense
       };
       
-      setData({ team, record, roster, schedule, stats });
+      const hydratedTeam: TeamInfo = {
+        ...team,
+        conference: team.conference || standingsMatch?.conferenceName,
+        division: team.division || standingsMatch?.divisionName,
+      };
+
+      const nextData = { team: hydratedTeam, record, roster, schedule, stats, injuries, teamH2H };
+      setData(nextData);
+      setRouteCache(cacheKey, nextData, 240_000);
     } catch (err: any) {
       console.error('[TeamProfile] Fetch error:', err);
-      setError(err.message || 'Failed to load team data');
+      const msg = String(err?.message || '');
+      setError(msg.includes('404') ? 'Team not found' : (err.message || 'Failed to load team data'));
     } finally {
       setLoading(false);
     }
@@ -722,7 +1852,7 @@ export function TeamProfilePage() {
   if (loading) return <LoadingState />;
   if (error || !data) return <ErrorState message={error || 'Unknown error'} onRetry={fetchTeamData} />;
 
-  const { team, record, roster, schedule, stats } = data;
+  const { team, record, roster, schedule, stats, injuries, teamH2H } = data;
 
   return (
     <div className="min-h-screen bg-background pb-24">
@@ -750,6 +1880,15 @@ export function TeamProfilePage() {
         {/* Stats Grid */}
         <TeamStatsGrid stats={stats} sportKey={sportKey || 'nba'} />
 
+        {/* Matchup Edge (Upcoming + Last 5 + Historical vs Selected Team) */}
+        <TeamMatchupEdgeSection
+          sportKey={sportKey || 'nba'}
+          teamAbbr={team.abbreviation}
+          teamName={team.name}
+          schedule={schedule}
+          initialH2H={teamH2H}
+        />
+
         {/* Roster Preview */}
         <RosterPreview 
           roster={roster} 
@@ -757,11 +1896,8 @@ export function TeamProfilePage() {
           teamAbbr={team.abbreviation}
         />
 
-        {/* Schedule */}
-        <SchedulePreview 
-          schedule={schedule} 
-          teamColor={team.color}
-        />
+        {/* Injuries */}
+        <InjuriesPreview injuries={injuries} />
 
         {/* Venue Info */}
         {team.venue && (

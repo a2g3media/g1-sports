@@ -14,6 +14,7 @@ import { HubLeaders } from "@/react-app/components/hub/HubLeaders";
 import { HubSchedule } from "@/react-app/components/hub/HubSchedule";
 import { PlayerSearch } from "@/react-app/components/PlayerSearch";
 import { Trophy, Users, Calendar, Sparkles } from "lucide-react";
+import { SectionErrorBoundary } from "@/react-app/components/ErrorBoundary";
 
 interface GameData {
   id: string;
@@ -58,6 +59,7 @@ const STANDINGS_SPORTS = ['nba', 'nfl', 'mlb', 'nhl', 'soccer'];
 
 // Sports that support league leaders
 const LEADERS_SPORTS = ['nba', 'nfl', 'mlb', 'nhl', 'soccer', 'golf', 'mma'];
+const SPORT_HUB_GAMES_CACHE_TTL_MS = 90_000;
 
 export function SportHubPage() {
   const { sportKey } = useParams<{ sportKey: string }>();
@@ -90,23 +92,143 @@ export function SportHubPage() {
   // SINGLE fetch for ALL games - stale-while-revalidate pattern
   useEffect(() => {
     let isMounted = true;
+    const cacheKey = `sporthub:lastGames:${apiSportKey}`;
+
+    const fetchWithTimeout = async (url: string, timeoutMs = 5000) => {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
+      try {
+        return await fetch(url, { signal: controller.signal });
+      } finally {
+        clearTimeout(timer);
+      }
+    };
+
+    const loadCached = (): any[] | null => {
+      try {
+        const raw = sessionStorage.getItem(cacheKey);
+        if (!raw) return null;
+        const parsed = JSON.parse(raw) as { ts?: number; games?: any[] };
+        if (!parsed?.ts || !Array.isArray(parsed?.games)) return null;
+        if (Date.now() - parsed.ts > SPORT_HUB_GAMES_CACHE_TTL_MS) return null;
+        return parsed.games;
+      } catch {
+        return null;
+      }
+    };
+
+    const saveCached = (games: any[]) => {
+      try {
+        sessionStorage.setItem(cacheKey, JSON.stringify({ ts: Date.now(), games }));
+      } catch {
+        // ignore cache write failures
+      }
+    };
+
+    const readGames = async (endpoint: string, timeoutMs = 7000): Promise<any[] | null> => {
+      try {
+        const res = await fetchWithTimeout(endpoint, timeoutMs);
+        if (!res.ok) return null;
+        const data = await res.json();
+        return Array.isArray(data?.games) ? data.games : [];
+      } catch {
+        return null;
+      }
+    };
+
+    const readGamesWithRetry = async (
+      endpoint: string,
+      timeoutMs = 7000,
+      attempts = 2,
+      retryOnEmpty = false
+    ): Promise<any[] | null> => {
+      for (let attempt = 0; attempt < attempts; attempt += 1) {
+        const games = await readGames(endpoint, timeoutMs);
+        if (Array.isArray(games)) {
+          if (games.length > 0) return games;
+          if (!retryOnEmpty) return games;
+        }
+      }
+      return null;
+    };
 
     async function fetchAllGames() {
       try {
-        const res = await fetch(`/api/games?sport=${apiSportKey}`);
-        if (res.ok && isMounted) {
-          const data = await res.json();
-          setAllGames(data.games || []);
-          hasFetchedRef.current = true;
+        const todayEt = getDateInEastern(new Date());
+        const [liveFeed, scheduledFeed, datedFeed, fallback] = await Promise.all([
+          readGamesWithRetry(
+            `/api/games/live?sport=${apiSportKey}`,
+            4500,
+            1,
+            false
+          ),
+          readGamesWithRetry(
+            `/api/games/scheduled?sport=${apiSportKey}&hours=42`,
+            6500,
+            1,
+            false
+          ),
+          readGamesWithRetry(
+            `/api/games?sport=${apiSportKey}&date=${encodeURIComponent(todayEt)}&includeOdds=0`,
+            7000,
+            1,
+            false
+          ),
+          readGamesWithRetry(
+          `/api/games?sport=${apiSportKey}&includeOdds=0`,
+          8000,
+          2,
+          true
+          ),
+        ]);
+        const mergedById = new Map<string, any>();
+        const candidateSets = [liveFeed, scheduledFeed, datedFeed, fallback];
+        for (const set of candidateSets) {
+          if (!Array.isArray(set)) continue;
+          for (const game of set) {
+            const key = String(game?.game_id || "").trim();
+            if (key) mergedById.set(key, game);
+          }
+        }
+        const nextGames = Array.from(mergedById.values());
+
+        if (isMounted) {
+          if (nextGames.length > 0) {
+            setAllGames(nextGames);
+            saveCached(nextGames);
+            hasFetchedRef.current = true;
+          } else {
+            const cached = loadCached();
+            if (cached && cached.length > 0) {
+              setAllGames(cached);
+              hasFetchedRef.current = true;
+            } else {
+              setAllGames([]);
+            }
+          }
         }
       } catch (err) {
         console.error('[SportHubPage] Failed to fetch games:', err);
+        if (isMounted) {
+          const cached = loadCached();
+          if (cached && cached.length > 0) {
+            setAllGames(cached);
+            hasFetchedRef.current = true;
+          }
+        }
       } finally {
-        // Only clear initial load after first successful fetch
-        if (isMounted && hasFetchedRef.current) {
+        // Never let first paint hang on slow/empty feeds.
+        if (isMounted) {
           setIsInitialLoad(false);
         }
       }
+    }
+
+    const cached = loadCached();
+    if (cached && cached.length > 0 && isMounted) {
+      setAllGames(cached);
+      hasFetchedRef.current = true;
+      setIsInitialLoad(false);
     }
 
     fetchAllGames();
@@ -119,7 +241,7 @@ export function SportHubPage() {
   }, [apiSportKey]);
 
   // Keep hub schedule aligned to "today ET" and always include live games.
-  const todayEt = useMemo(() => getDateInEastern(new Date()), []);
+  const todayEt = getDateInEastern(new Date());
   const todayGames = useMemo(() => {
     return allGames.filter((g) => {
       const status = String(g?.status || '').toUpperCase();
@@ -239,7 +361,9 @@ export function SportHubPage() {
       >
         {/* League Pulse Strip - Quick insights (uses allGames, no fetch) */}
         <div className="mb-6 -mt-1 rounded-2xl border border-white/8 bg-[rgba(15,23,42,0.55)] p-2">
-          <LeaguePulseStrip sportKey={normalizedKey} games={todayGames} />
+          <SectionErrorBoundary sectionName="League Pulse Strip">
+            <LeaguePulseStrip sportKey={normalizedKey} games={todayGames} />
+          </SectionErrorBoundary>
         </div>
 
         {/* Coach G Quick Actions */}
@@ -249,7 +373,9 @@ export function SportHubPage() {
           subtitle="Quick insights with one tap"
           icon={<Sparkles className="h-5 w-5 text-[var(--sport-accent)]" />}
         >
-          <CoachCommandCard sportKey={normalizedKey} />
+          <SectionErrorBoundary sectionName="Coach Command Card">
+            <CoachCommandCard sportKey={normalizedKey} />
+          </SectionErrorBoundary>
         </HubSection>
 
         {/* Today's Games - (uses allGames, no fetch) */}
@@ -259,7 +385,9 @@ export function SportHubPage() {
           subtitle={`Full ${sportConfig.name} schedule`}
           icon={<Calendar className="h-5 w-5 text-[var(--sport-accent)]" />}
         >
-          <HubSchedule sportKey={normalizedKey} games={todayGames} loading={false} />
+          <SectionErrorBoundary sectionName="Hub Schedule">
+            <HubSchedule sportKey={normalizedKey} games={todayGames} loading={false} />
+          </SectionErrorBoundary>
         </HubSection>
 
         {/* Standings - only for team sports */}
@@ -270,11 +398,13 @@ export function SportHubPage() {
             subtitle={getStandingsSubtitle(normalizedKey)}
             icon={<Trophy className="h-5 w-5 text-[var(--sport-accent)]" />}
           >
-            {normalizedKey === 'soccer' ? (
-              <SoccerHubStandings />
-            ) : (
-              <HubStandings sportKey={normalizedKey} />
-            )}
+            <SectionErrorBoundary sectionName="Standings">
+              {normalizedKey === 'soccer' ? (
+                <SoccerHubStandings />
+              ) : (
+                <HubStandings sportKey={normalizedKey} />
+              )}
+            </SectionErrorBoundary>
           </HubSection>
         )}
 
@@ -286,11 +416,13 @@ export function SportHubPage() {
             subtitle={normalizedKey === 'soccer' ? "Top scorers and assist leaders" : "Top performers this season"}
             icon={<Users className="h-5 w-5 text-[var(--sport-accent)]" />}
           >
-            {normalizedKey === 'soccer' ? (
-              <SoccerHubLeaders />
-            ) : (
-              <HubLeaders sportKey={normalizedKey} />
-            )}
+            <SectionErrorBoundary sectionName="Leaders">
+              {normalizedKey === 'soccer' ? (
+                <SoccerHubLeaders />
+              ) : (
+                <HubLeaders sportKey={normalizedKey} />
+              )}
+            </SectionErrorBoundary>
           </HubSection>
         )}
 

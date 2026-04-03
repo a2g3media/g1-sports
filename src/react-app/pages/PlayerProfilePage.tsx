@@ -16,6 +16,8 @@ import { cn } from "@/react-app/lib/utils";
 import { useDemoAuth } from "@/react-app/contexts/DemoAuthContext";
 import { useWatchboards } from "@/react-app/hooks/useWatchboards";
 import FavoriteEntityButton from "@/react-app/components/FavoriteEntityButton";
+import { getRouteCache, setRouteCache } from "@/react-app/lib/routeDataCache";
+import { fetchJsonCached } from "@/react-app/lib/fetchCache";
 
 // ============================================
 // TYPES
@@ -60,6 +62,13 @@ interface MatchupData {
     abbr: string;
     logo?: string;
   };
+  upcomingOpponents?: Array<{
+    name: string;
+    abbr: string;
+    logo?: string;
+    gameTime?: string;
+    venue?: string;
+  }>;
   gameTime?: string;
   venue?: string;
   defensiveRankings?: {
@@ -83,13 +92,43 @@ interface HealthData {
   };
 }
 
+interface VsOpponentData {
+  opponent: { name: string; abbr: string };
+  sampleSize: number;
+  wins: number;
+  losses: number;
+  averages: Record<string, number>;
+  props: Array<{ propType: string; line: number; hits: number; total: number; rate: number }>;
+  recent: Array<{ date: string; opponent: string; result: string; stats: Record<string, number> }>;
+}
+
+interface RecentPerformanceEntry {
+  date: string;
+  opponent: string;
+  result: 'W' | 'L' | 'T';
+  stats: {
+    PTS: number | null;
+    REB: number | null;
+    AST: number | null;
+    MIN: number | null;
+  };
+  propLines?: {
+    points: number | null;
+    rebounds: number | null;
+    assists: number | null;
+  };
+  lineSource?: 'historical' | 'latest_fallback' | 'event_fallback' | 'unavailable';
+}
+
 interface PlayerProfileData {
   player: PlayerInfo;
   gameLog: GameLogEntry[];
   seasonAverages: Record<string, number>;
   currentProps: any[];
   propHitRates: Record<string, PropHitRate>;
+  recentPerformance?: RecentPerformanceEntry[];
   matchup: MatchupData | null;
+  vsOpponent?: VsOpponentData | null;
   health?: HealthData;
   lastUpdated: string;
 }
@@ -638,16 +677,109 @@ function GameLogTable({ games, sport, seasonAverages }: { games: GameLogEntry[];
 // MATCHUP SECTION
 // ============================================
 
-function MatchupSection({ matchup }: { matchup: MatchupData }) {
-  const gameTime = matchup.gameTime ? new Date(matchup.gameTime) : null;
+function MatchupSection({
+  matchup,
+  gameLog,
+  vsOpponent,
+}: {
+  matchup: MatchupData;
+  gameLog: GameLogEntry[];
+  vsOpponent?: VsOpponentData | null;
+}) {
+  const normalizeToken = (value: string) =>
+    String(value || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  const normalizeWords = (value: string) =>
+    String(value || '')
+      .toLowerCase()
+      .replace(/[^a-z0-9\s]/g, ' ')
+      .split(/\s+/)
+      .map((w) => w.trim())
+      .filter(Boolean);
+  const upcoming = (Array.isArray(matchup.upcomingOpponents) && matchup.upcomingOpponents.length > 0)
+    ? matchup.upcomingOpponents
+    : [{
+        name: matchup.opponent.name,
+        abbr: matchup.opponent.abbr,
+        logo: matchup.opponent.logo,
+        gameTime: matchup.gameTime,
+        venue: matchup.venue,
+      }];
+  const [selectedOpponentIdx, setSelectedOpponentIdx] = useState(0);
+  const safeIdx = Math.min(selectedOpponentIdx, Math.max(0, upcoming.length - 1));
+  const selectedOpponent = upcoming[safeIdx];
+  const [logoBroken, setLogoBroken] = useState(false);
+  const gameTime = selectedOpponent?.gameTime ? new Date(selectedOpponent.gameTime) : null;
   const isToday = gameTime && gameTime.toDateString() === new Date().toDateString();
+  useEffect(() => {
+    setSelectedOpponentIdx(0);
+  }, [matchup.opponent.name, matchup.gameTime]);
+  useEffect(() => {
+    setLogoBroken(false);
+  }, [selectedOpponent?.abbr, selectedOpponent?.name, selectedOpponent?.logo]);
+
+  const oppName = String(selectedOpponent?.name || '');
+  const oppNorm = normalizeToken(oppName);
+  const oppTailNorm = normalizeToken(oppName.split(' ').slice(-1).join(' '));
+  const oppWordTokens = normalizeWords(oppName).filter((w) => w.length >= 4);
+  const h2hRecent = [...(gameLog || [])]
+    .filter((g) => {
+      const gameOppRaw = String(g.opponent || '');
+      const gameOpp = normalizeToken(gameOppRaw);
+      if (!gameOpp) return false;
+      if (oppNorm && (gameOpp === oppNorm || gameOpp.includes(oppNorm) || oppNorm.includes(gameOpp))) {
+        return true;
+      }
+      if (oppTailNorm && oppTailNorm.length >= 4 && gameOpp.includes(oppTailNorm)) {
+        return true;
+      }
+      const gameWords = normalizeWords(gameOppRaw);
+      return oppWordTokens.some((t) => gameWords.includes(t));
+    })
+    .sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime())
+    .slice(0, 5)
+    .map((g) => ({
+      date: g.date,
+      result: g.result,
+      stats: {
+        PTS: Number(g.stats.PTS ?? g.stats.Points),
+        REB: Number(g.stats.REB ?? g.stats.Rebounds ?? g.stats.TRB),
+        AST: Number(g.stats.AST ?? g.stats.Assists),
+      },
+    }));
+  const avg = (key: 'PTS' | 'REB' | 'AST'): number | null => {
+    const values = h2hRecent
+      .map((g) => Number(g?.stats?.[key]))
+      .filter((n) => Number.isFinite(n));
+    if (values.length === 0) return null;
+    return Number((values.reduce((sum, n) => sum + n, 0) / values.length).toFixed(1));
+  };
+  const h2hPts = avg('PTS');
+  const h2hReb = avg('REB');
+  const h2hAst = avg('AST');
+  const h2hWins = h2hRecent.filter((g) => g.result === 'W').length;
+  const h2hLosses = h2hRecent.filter((g) => g.result === 'L').length;
+  const h2hSample = h2hRecent.length;
+  const confidence =
+    h2hSample >= 5 ? 'High' :
+    h2hSample >= 3 ? 'Medium' :
+    h2hSample >= 1 ? 'Low' :
+    'N/A';
+  const selectedMatchesVsOpponent =
+    Boolean(vsOpponent?.opponent) &&
+    (
+      normalizeToken(String(vsOpponent?.opponent?.name || '')) === normalizeToken(String(selectedOpponent?.name || ''))
+      || normalizeToken(String(vsOpponent?.opponent?.abbr || '')) === normalizeToken(String(selectedOpponent?.abbr || ''))
+    );
+  const bestPropHit = selectedMatchesVsOpponent && Array.isArray(vsOpponent?.props)
+    ? [...vsOpponent.props].sort((a, b) => b.rate - a.rate)[0]
+    : null;
   
   return (
-    <div className="bg-white/[0.02] rounded-xl border border-white/[0.04] overflow-hidden">
-      <div className="px-4 py-3 border-b border-white/[0.04] flex items-center justify-between">
+    <div className="rounded-xl border border-cyan-400/15 bg-gradient-to-br from-[#0d1628]/90 via-[#0b1323]/90 to-[#111827]/90 overflow-hidden shadow-[0_0_30px_rgba(34,211,238,0.08)]">
+      <div className="px-4 py-3 border-b border-white/[0.06] flex items-center justify-between bg-white/[0.02]">
         <div className="flex items-center gap-2">
-          <Shield className="w-4 h-4 text-purple-400" />
-          <h3 className="font-semibold text-white">Next Matchup</h3>
+          <Shield className="w-4 h-4 text-cyan-300" />
+          <h3 className="font-semibold text-white">Matchup Edge</h3>
         </div>
         {isToday && (
           <span className="px-2 py-0.5 bg-amber-500/20 text-amber-400 text-xs font-bold rounded-full">
@@ -657,24 +789,30 @@ function MatchupSection({ matchup }: { matchup: MatchupData }) {
       </div>
       
       <div className="p-4">
+        <div className="mb-3 rounded-md border border-white/[0.08] bg-white/[0.02] px-3 py-2 text-[11px] text-white/70">
+          <span className="font-semibold text-white/85">Clarity:</span> `Last 5 Form` above = overall last five games.
+          This panel = last five meetings against the selected opponent only.
+        </div>
+
         {/* Opponent Card */}
         <div className="flex items-center gap-4 mb-4">
-          {matchup.opponent.logo ? (
+          {selectedOpponent?.logo && !logoBroken ? (
             <img 
-              src={matchup.opponent.logo} 
-              alt={matchup.opponent.name}
+              src={selectedOpponent.logo} 
+              alt={selectedOpponent.name}
               className="w-14 h-14 object-contain"
+              onError={() => setLogoBroken(true)}
             />
           ) : (
-            <div className="w-14 h-14 rounded-lg bg-white/[0.05] flex items-center justify-center">
-              <span className="text-xl font-bold text-white/40">
-                {matchup.opponent.abbr.slice(0, 2)}
+            <div className="w-14 h-14 rounded-lg bg-gradient-to-br from-cyan-500/15 to-blue-500/10 border border-white/10 flex items-center justify-center">
+              <span className="text-lg font-bold text-white/65 tracking-wide">
+                {(selectedOpponent?.abbr || '--').slice(0, 3)}
               </span>
             </div>
           )}
           <div className="flex-1">
             <div className="text-lg font-semibold text-white">
-              vs {matchup.opponent.name}
+              vs {selectedOpponent?.name}
             </div>
             {gameTime && (
               <div className="flex items-center gap-3 text-sm text-white/50 mt-1">
@@ -688,12 +826,82 @@ function MatchupSection({ matchup }: { matchup: MatchupData }) {
                 </span>
               </div>
             )}
-            {matchup.venue && (
-              <div className="text-xs text-white/30 mt-1">{matchup.venue}</div>
+            {selectedOpponent?.venue && (
+              <div className="text-xs text-white/30 mt-1">{selectedOpponent.venue}</div>
             )}
           </div>
         </div>
+
+        {upcoming.length > 1 && (
+          <div className="mb-4 flex items-center justify-between rounded-xl border border-cyan-400/20 bg-gradient-to-r from-cyan-500/10 to-blue-500/10 px-2.5 py-2.5">
+            <button
+              type="button"
+              onClick={() => setSelectedOpponentIdx((prev) => Math.max(0, prev - 1))}
+              disabled={safeIdx === 0}
+              className={cn(
+                "min-w-[112px] px-4 py-2.5 rounded-full text-xs font-semibold transition-all border",
+                safeIdx === 0
+                  ? "text-white/30 bg-white/[0.03] border-white/[0.08] shadow-none"
+                  : "text-cyan-100 bg-cyan-500/22 border-cyan-300/40 shadow-[0_0_14px_rgba(34,211,238,0.25)] hover:bg-cyan-500/34 hover:shadow-[0_0_20px_rgba(34,211,238,0.38)] hover:-translate-y-[1px] hover:animate-[pulse_520ms_ease-out_1] active:translate-y-0"
+              )}
+            >
+              <span className="inline-flex items-center gap-1">
+                <span aria-hidden>◀</span>
+                Prev Team
+              </span>
+            </button>
+            <div className="text-xs font-medium text-white/75">
+              Opponent {safeIdx + 1} of {upcoming.length}
+            </div>
+            <button
+              type="button"
+              onClick={() => setSelectedOpponentIdx((prev) => Math.min(upcoming.length - 1, prev + 1))}
+              disabled={safeIdx >= upcoming.length - 1}
+              className={cn(
+                "min-w-[112px] px-4 py-2.5 rounded-full text-xs font-semibold transition-all border",
+                safeIdx >= upcoming.length - 1
+                  ? "text-white/30 bg-white/[0.03] border-white/[0.08] shadow-none"
+                  : "text-cyan-100 bg-cyan-500/22 border-cyan-300/40 shadow-[0_0_14px_rgba(34,211,238,0.25)] hover:bg-cyan-500/34 hover:shadow-[0_0_20px_rgba(34,211,238,0.38)] hover:-translate-y-[1px] hover:animate-[pulse_520ms_ease-out_1] active:translate-y-0"
+              )}
+            >
+              <span className="inline-flex items-center gap-1">
+                Next Team
+                <span aria-hidden>▶</span>
+              </span>
+            </button>
+          </div>
+        )}
         
+        {h2hSample > 0 && (
+          <div className="mb-4 grid grid-cols-2 sm:grid-cols-4 gap-2.5">
+            <div className="rounded-lg bg-white/[0.04] border border-white/[0.07] p-2.5 text-center">
+              <div className="text-[10px] text-white/40">H2H Record</div>
+              <div className="text-sm font-bold text-white">{h2hWins}-{h2hLosses}</div>
+            </div>
+            <div className="rounded-lg bg-white/[0.04] border border-white/[0.07] p-2.5 text-center">
+              <div className="text-[10px] text-white/40">Games vs Team</div>
+              <div className="text-sm font-bold text-white">{h2hSample}</div>
+            </div>
+            <div className="rounded-lg bg-white/[0.04] border border-white/[0.07] p-2.5 text-center">
+              <div className="text-[10px] text-white/40">Confidence</div>
+              <div className={cn(
+                "text-sm font-bold",
+                confidence === 'High' ? 'text-emerald-300' :
+                confidence === 'Medium' ? 'text-amber-300' :
+                'text-orange-300'
+              )}>
+                {confidence}
+              </div>
+            </div>
+            <div className="rounded-lg bg-white/[0.04] border border-white/[0.07] p-2.5 text-center">
+              <div className="text-[10px] text-white/40">Best Prop Hit</div>
+              <div className="text-sm font-bold text-white">
+                {bestPropHit ? `${Math.round(bestPropHit.rate * 100)}%` : '-'}
+              </div>
+            </div>
+          </div>
+        )}
+
         {/* Defensive Rankings */}
         {matchup.defensiveRankings && (
           <div className="grid grid-cols-2 gap-3">
@@ -727,6 +935,40 @@ function MatchupSection({ matchup }: { matchup: MatchupData }) {
             )}
           </div>
         )}
+
+        {h2hRecent.length > 0 && (
+          <div className="mt-4 space-y-2.5">
+            <div className="flex items-center justify-between">
+              <div className="text-[11px] uppercase tracking-wider text-white/40">
+                Last 5 meetings vs {selectedOpponent?.abbr || selectedOpponent?.name}
+              </div>
+              <div className="text-[11px] text-white/45">
+                {`AVG: ${h2hPts ?? '-'} PTS • ${h2hReb ?? '-'} REB • ${h2hAst ?? '-'} AST`}
+              </div>
+            </div>
+            <div className="space-y-1.5">
+              {h2hRecent.map((game, idx) => (
+                <div
+                  key={`${game.date}-${idx}`}
+                  className="rounded-md bg-white/[0.02] border border-white/[0.05] px-2.5 py-2 text-xs flex items-center justify-between"
+                >
+                  <span className="text-white/65">
+                    {new Date(game.date).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })} • {game.result}
+                  </span>
+                  <span className="text-white/85 font-medium">
+                    {`PTS ${game.stats.PTS ?? '-'} | REB ${game.stats.REB ?? '-'} | AST ${game.stats.AST ?? '-'}`}
+                  </span>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {h2hRecent.length === 0 && (
+          <div className="mt-2 rounded-md border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-xs text-white/55">
+            No recent meetings found against this opponent yet.
+          </div>
+        )}
         
         {/* Favorable/Tough indicator */}
         {matchup.defensiveRankings?.overall !== undefined && (
@@ -756,6 +998,180 @@ function MatchupSection({ matchup }: { matchup: MatchupData }) {
             )}
           </div>
         )}
+      </div>
+    </div>
+  );
+}
+
+function LastFiveFormSection({
+  gameLog,
+  recentPerformance,
+}: {
+  gameLog: GameLogEntry[];
+  recentPerformance?: RecentPerformanceEntry[];
+}) {
+  const sample = (Array.isArray(recentPerformance) && recentPerformance.length > 0)
+    ? recentPerformance.slice(0, 5)
+    : gameLog.slice(0, 5).map((g) => ({
+        date: g.date,
+        opponent: g.opponent,
+        result: g.result,
+        stats: {
+          PTS: Number(g.stats.PTS ?? g.stats.Points),
+          REB: Number(g.stats.REB ?? g.stats.Rebounds ?? g.stats.TRB),
+          AST: Number(g.stats.AST ?? g.stats.Assists),
+          MIN: Number(g.stats.MIN ?? g.stats.Minutes),
+        },
+        propLines: undefined,
+        lineSource: 'unavailable' as const,
+      }));
+  if (sample.length === 0) return null;
+
+  const avgFor = (keys: Array<'PTS' | 'REB' | 'AST' | 'MIN'>): number | null => {
+    const values: number[] = [];
+    for (const game of sample) {
+      for (const key of keys) {
+        const n = Number(game.stats[key]);
+        if (Number.isFinite(n)) {
+          values.push(n);
+          break;
+        }
+      }
+    }
+    if (values.length === 0) return null;
+    return Number((values.reduce((sum, n) => sum + n, 0) / values.length).toFixed(1));
+  };
+
+  const pts = avgFor(['PTS']);
+  const reb = avgFor(['REB']);
+  const ast = avgFor(['AST']);
+  const min = avgFor(['MIN']);
+
+  const cards = [
+    { label: 'L5 PTS', value: pts },
+    { label: 'L5 REB', value: reb },
+    { label: 'L5 AST', value: ast },
+    { label: 'L5 MIN', value: min },
+  ].filter((row) => row.value !== null);
+
+  if (cards.length === 0) return null;
+
+  return (
+    <div className="rounded-xl border border-cyan-400/15 bg-gradient-to-br from-[#0d1628]/90 via-[#0b1323]/90 to-[#111827]/90 overflow-hidden shadow-[0_0_30px_rgba(34,211,238,0.08)]">
+      <div className="px-4 py-3 border-b border-white/[0.06] flex items-center gap-2 bg-white/[0.02]">
+        <BarChart3 className="w-4 h-4 text-cyan-400" />
+        <h3 className="font-semibold text-white">Recent 5 Games (All Opponents)</h3>
+      </div>
+      <div className="p-4 space-y-3">
+        <div className="flex items-center gap-2 text-[11px]">
+          <span className="inline-flex items-center rounded-full border border-cyan-300/30 bg-cyan-500/10 px-2 py-0.5 font-medium text-cyan-100">
+            All Opponents
+          </span>
+          <span className="inline-flex items-center rounded-full border border-white/15 bg-white/[0.03] px-2 py-0.5 font-medium text-white/65">
+            Game-by-Game + Cover Checks
+          </span>
+        </div>
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+          {cards.map((card) => (
+            <div key={card.label} className="rounded-lg bg-white/[0.04] border border-white/[0.07] p-3 text-center">
+              <div className="text-xs text-white/40 mb-1">{card.label}</div>
+              <div className="text-xl font-bold text-white">{card.value}</div>
+            </div>
+          ))}
+        </div>
+        <div className="space-y-2">
+          {sample.map((game, idx) => (
+            (() => {
+              const outcome = (actual: number | null, line: number | null): 'Over' | 'Under' | 'Push' | 'No Line' => {
+                if (actual === null || line === null) return 'No Line';
+                if (Math.abs(actual - line) < 0.0001) return 'Push';
+                return actual > line ? 'Over' : 'Under';
+              };
+              const ptsOutcome = outcome(game.stats.PTS, game.propLines?.points ?? null);
+              const rebOutcome = outcome(game.stats.REB, game.propLines?.rebounds ?? null);
+              const astOutcome = outcome(game.stats.AST, game.propLines?.assists ?? null);
+              const outcomeTone = (label: 'Over' | 'Under' | 'Push' | 'No Line') =>
+                label === 'Over'
+                  ? 'text-emerald-100'
+                  : label === 'Under'
+                    ? 'text-rose-100'
+                    : label === 'Push'
+                      ? 'text-slate-100'
+                      : 'text-amber-100';
+              const outcomeBlockTone = (label: 'Over' | 'Under' | 'Push' | 'No Line') =>
+                label === 'Over'
+                  ? 'bg-emerald-500/16 border-emerald-300/30'
+                  : label === 'Under'
+                    ? 'bg-rose-500/16 border-rose-300/30'
+                    : label === 'Push'
+                      ? 'bg-slate-400/16 border-slate-300/25'
+                      : 'bg-amber-500/16 border-amber-300/30';
+              const outcomeBadgeTone = (label: 'Over' | 'Under' | 'Push' | 'No Line') =>
+                label === 'Over'
+                  ? 'bg-emerald-500 text-white'
+                  : label === 'Under'
+                    ? 'bg-rose-500 text-white'
+                    : label === 'Push'
+                      ? 'bg-slate-500 text-white'
+                      : 'bg-amber-500 text-black';
+              const outcomeIcon = (label: 'Over' | 'Under' | 'Push' | 'No Line') =>
+                label === 'Over'
+                  ? '▲'
+                  : label === 'Under'
+                    ? '▼'
+                    : label === 'Push'
+                      ? '•'
+                      : '○';
+              return (
+            <div
+              key={`${game.date}-${idx}`}
+              className="group rounded-md bg-white/[0.02] border border-white/[0.05] px-3 py-3 text-xs transition-all duration-200 hover:border-cyan-300/25 hover:bg-white/[0.04] hover:shadow-[0_0_16px_rgba(34,211,238,0.08)] hover:-translate-y-[1px]"
+            >
+              <div className="md:grid md:grid-cols-[1.6fr_1fr] md:items-center md:gap-4">
+                <div className="min-w-0">
+                  <div className="text-white/70">
+                    {new Date(game.date).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })} • vs {game.opponent} • {game.result}
+                  </div>
+                  <div className="mt-1 text-[11px] text-white/85 font-semibold">
+                    {`Actual stat line: PTS ${game.stats.PTS ?? '-'} | REB ${game.stats.REB ?? '-'} | AST ${game.stats.AST ?? '-'} | MIN ${game.stats.MIN ?? '-'}`}
+                  </div>
+                  <div className="mt-1 text-[11px] font-semibold text-cyan-200/85">
+                    {game.propLines
+                      ? `Line: PTS ${game.propLines.points ?? '-'} | REB ${game.propLines.rebounds ?? '-'} | AST ${game.propLines.assists ?? '-'}`
+                      : 'No confirmed line available for this game.'}
+                  </div>
+                </div>
+
+                <div className="relative mt-2 md:mt-0 grid grid-cols-3 divide-x divide-white/[0.08] rounded-md border border-white/[0.05] bg-white/[0.02] overflow-hidden">
+                  <div className="pointer-events-none absolute inset-0 opacity-0 transition-opacity duration-200 group-hover:opacity-100 bg-gradient-to-r from-transparent via-cyan-400/[0.06] to-transparent" />
+                  {([
+                    { key: 'PTS', outcome: ptsOutcome, actual: game.stats.PTS, line: game.propLines?.points ?? null },
+                    { key: 'REB', outcome: rebOutcome, actual: game.stats.REB, line: game.propLines?.rebounds ?? null },
+                    { key: 'AST', outcome: astOutcome, actual: game.stats.AST, line: game.propLines?.assists ?? null },
+                  ] as const).map((row) => (
+                    <div key={row.key} className={cn("px-2 py-1.5 text-center border transition-colors", outcomeBlockTone(row.outcome))}>
+                      <div className="text-[9px] uppercase tracking-wide text-white/65">
+                        {row.key}
+                      </div>
+                      <div className={cn("mt-0.5 text-[11px] font-semibold tracking-wide", outcomeTone(row.outcome))}>
+                        <span className={cn("inline-flex items-center gap-1 rounded-full px-2 py-0.5", outcomeBadgeTone(row.outcome))}>
+                          <span aria-hidden className="text-[11px] opacity-95">{outcomeIcon(row.outcome)}</span>
+                          <span>{row.outcome}</span>
+                        </span>
+                      </div>
+                      <div className="mt-0.5 text-[10px] text-white/62">
+                        <span className="text-white/85 font-semibold">{`${row.actual ?? '-'}`}</span>
+                        <span className="text-white/30">{` / ${row.line ?? '-'}`}</span>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+              );
+            })()
+          ))}
+        </div>
       </div>
     </div>
   );
@@ -1290,46 +1706,86 @@ export default function PlayerProfilePage() {
   
   useEffect(() => {
     if (!sport || !playerName) return;
+    const cacheKey = `player-profile:${sport.toUpperCase()}:${decodeURIComponent(playerName)}`;
+    const cached = getRouteCache<PlayerProfileData>(cacheKey, 120_000);
+    if (cached) {
+      setData(cached);
+      setLoading(false);
+    }
     
     const fetchProfile = async () => {
-      setLoading(true);
+      if (!cached) {
+        setLoading(true);
+      }
       setError(null);
       
       try {
-        const res = await fetch(`/api/player/${sport}/${encodeURIComponent(playerName)}`, {
-          credentials: 'include',
-        });
-        
-        if (!res.ok) {
-          if (res.status === 404) {
-            const errData = await res.json();
-            // Use fallback data if provided
-            if (errData.fallback) {
-              setData({
-                player: {
-                  ...errData.fallback,
-                  espnId: '',
-                  position: '',
-                  jersey: '',
-                  teamAbbr: '',
-                  teamColor: '3B82F6',
-                },
-                gameLog: [],
-                seasonAverages: {},
-                currentProps: [],
-                propHitRates: {},
-                matchup: null,
-                lastUpdated: new Date().toISOString(),
-              });
-              return;
+        const apiUrl = `/api/player/${sport}/${encodeURIComponent(playerName)}`;
+        let profileData: any;
+        try {
+          profileData = await fetchJsonCached<any>(apiUrl, {
+            cacheKey: `player-api:${sport.toUpperCase()}:${decodeURIComponent(playerName)}`,
+            ttlMs: 45_000,
+            timeoutMs: 8_000,
+            init: { credentials: 'include' },
+          });
+        } catch (err: any) {
+          const message = String(err?.message || '');
+          // Only do an explicit fallback request for 404, and keep it tightly timed.
+          if (message.includes('HTTP 404')) {
+            const controller = new AbortController();
+            const timer = setTimeout(() => controller.abort(), 2500);
+            try {
+              const fallbackRes = await fetch(apiUrl, { credentials: 'include', signal: controller.signal });
+              if (fallbackRes.ok) {
+                profileData = await fallbackRes.json();
+              } else if (fallbackRes.status === 404) {
+                const errData = await fallbackRes.json();
+                profileData = { __fallback404: true, errData };
+              } else {
+                throw err;
+              }
+            } finally {
+              clearTimeout(timer);
             }
-            throw new Error('Player not found');
+          } else {
+            throw err;
           }
+        }
+
+        if (!profileData) {
           throw new Error('Failed to load player data');
         }
-        
-        const profileData = await res.json();
+        if (profileData?.__fallback404) {
+          const errData = profileData.errData;
+          // Use fallback data if provided
+          if (errData.fallback) {
+            const fallbackData: PlayerProfileData = {
+              player: {
+                ...errData.fallback,
+                espnId: '',
+                position: '',
+                jersey: '',
+                teamAbbr: '',
+                teamColor: '3B82F6',
+              },
+              gameLog: [],
+              seasonAverages: {},
+              currentProps: [],
+              propHitRates: {},
+              matchup: null,
+              vsOpponent: null,
+              lastUpdated: new Date().toISOString(),
+            };
+            setData(fallbackData);
+            setRouteCache(cacheKey, fallbackData, 120_000);
+            return;
+          }
+          throw new Error('Player not found');
+        }
+
         setData(profileData);
+        setRouteCache(cacheKey, profileData, 180_000);
       } catch (err: any) {
         console.error('Failed to fetch player profile:', err);
         setError(err.message || 'Failed to load player profile');
@@ -1402,6 +1858,7 @@ export default function PlayerProfilePage() {
     
     return avgEntries.slice(0, 6);
   }, [data?.seasonAverages, sport]);
+  const extendedAverages = useMemo(() => displayAverages.slice(3), [displayAverages]);
   
   return (
     <div className="relative min-h-screen">
@@ -1471,15 +1928,15 @@ export default function PlayerProfilePage() {
               </div>
             )}
             
-            {/* Season Averages Grid */}
-            {displayAverages.length > 0 && (
+            {/* Season Averages Grid (exclude top 3 hero stats to avoid duplicate display) */}
+            {extendedAverages.length > 0 && (
               <div>
                 <div className="flex items-center gap-2 mb-3">
                   <BarChart3 className="w-4 h-4 text-emerald-400" />
-                  <h2 className="font-semibold text-white">Season Averages</h2>
+                  <h2 className="font-semibold text-white">More Season Averages</h2>
                 </div>
                 <div className="grid grid-cols-3 sm:grid-cols-6 gap-3">
-                  {displayAverages.map(({ key, value }) => (
+                  {extendedAverages.map(({ key, value }) => (
                     <StatCard 
                       key={key}
                       label={STAT_LABELS[key] || key}
@@ -1497,12 +1954,14 @@ export default function PlayerProfilePage() {
               seasonAverages={data.seasonAverages}
               props={data.currentProps}
             />
+
+            <LastFiveFormSection gameLog={data.gameLog} recentPerformance={data.recentPerformance} />
             
             {/* Matchup & Health Row */}
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
               {/* Next Matchup */}
               {data.matchup && (
-                <MatchupSection matchup={data.matchup} />
+                <MatchupSection matchup={data.matchup} gameLog={data.gameLog} vsOpponent={data.vsOpponent} />
               )}
               
               {/* Health & Minutes */}
@@ -1510,7 +1969,7 @@ export default function PlayerProfilePage() {
                 <HealthSection health={data.health} />
               )}
             </div>
-            
+
             {/* Props & Hit Rates */}
             <PropHitRatesPanel 
               hitRates={data.propHitRates}

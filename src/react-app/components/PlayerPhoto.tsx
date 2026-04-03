@@ -159,6 +159,9 @@ const ESPN_PLAYER_IDS: Record<string, string> = {
   'walker kessler': '4432743',
   'khris middleton': '6609',
   'brook lopez': '3448',
+  'kadary richmond': '4701845',
+  'k richmond': '4701845',
+  'richmond': '4701845',
   
   // ===== MLB =====
   'luis arraez': '39836',
@@ -234,6 +237,12 @@ const ESPN_PLAYER_IDS: Record<string, string> = {
   'jordan spieth': '5467',
   'dustin johnson': '3448',
   'tiger woods': '462',
+  'tony finau': '2230',
+  'davis thompson': '4602218',
+  'd thompson': '4602218',
+  'd. thompson': '4602218',
+  't. finau': '2230',
+  't finau': '2230',
   
   // ===== MMA =====
   'islam makhachev': '3087623',
@@ -246,8 +255,33 @@ const ESPN_PLAYER_IDS: Record<string, string> = {
   'tom aspinall': '4351875',
 };
 
+const GOLF_LAST_NAME_IDS: Record<string, string> = {
+  scheffler: '9478',
+  mcilroy: '3470',
+  rahm: '9780',
+  koepka: '6798',
+  thomas: '9256',
+  hovland: '10592',
+  morikawa: '10592',
+  schauffele: '9521',
+  spieth: '5467',
+  johnson: '3448',
+  woods: '462',
+  finau: '2230',
+  thompson: '4602218',
+};
+
+function stripNameDecorators(input: string): string {
+  return String(input || '')
+    .replace(/\([^)]*\)/g, ' ')
+    .replace(/\[[^\]]*]/g, ' ')
+    .replace(/\s[+-]\d+(\.\d+)?\s*$/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 function normalizePlayerKey(name: string): string {
-  const trimmed = name.trim();
+  const trimmed = stripNameDecorators(name);
   const reordered = trimmed.includes(',')
     ? (() => {
         const [last, first] = trimmed.split(',', 2).map((part) => part.trim());
@@ -274,7 +308,7 @@ const NORMALIZED_ESPN_PLAYER_IDS: Record<string, string> = Object.entries(ESPN_P
 );
 
 function buildPlayerLookupKeys(playerName: string): string[] {
-  const trimmed = playerName.trim();
+  const trimmed = stripNameDecorators(playerName);
   const reordered = trimmed.includes(',')
     ? (() => {
         const [last, first] = trimmed.split(',', 2).map((part) => part.trim());
@@ -287,6 +321,15 @@ function buildPlayerLookupKeys(playerName: string): string[] {
   const noSuffixDots = raw.replace(/[.,]/g, '');
 
   return Array.from(new Set([raw, noSuffixDots, normalized, noMiddleInitial])).filter(Boolean);
+}
+
+function resolveGolfFallbackId(playerName: string): string | undefined {
+  const normalized = normalizePlayerKey(playerName);
+  if (!normalized) return undefined;
+  const parts = normalized.split(' ').filter(Boolean);
+  const lastName = parts[parts.length - 1];
+  if (!lastName) return undefined;
+  return GOLF_LAST_NAME_IDS[lastName];
 }
 
 function buildInitialsAvatarDataUri(name: string): string {
@@ -315,6 +358,9 @@ export function getPlayerPhotoUrls(
     espnId = ESPN_PLAYER_IDS[key] || NORMALIZED_ESPN_PLAYER_IDS[key];
     if (espnId) break;
   }
+  if (!espnId && sport.toLowerCase() === 'golf') {
+    espnId = resolveGolfFallbackId(playerName);
+  }
   
   if (!espnId) return [];
   
@@ -322,8 +368,10 @@ export function getPlayerPhotoUrls(
   const dimensions = size === 'small' ? 'w=48&h=35' : size === 'large' ? 'w=160&h=120' : 'w=96&h=70';
   const combinerUrl = `${ESPN_HEADSHOT_BASE}/${sportPath}/players/full/${espnId}.png&${dimensions}&cb=1`;
   const directUrl = `https://a.espncdn.com/i/headshots/${sportPath}/players/full/${espnId}.png`;
+  const proxiedCombinerUrl = `/api/media/player-photo?url=${encodeURIComponent(combinerUrl)}`;
+  const proxiedDirectUrl = `/api/media/player-photo?url=${encodeURIComponent(directUrl)}`;
 
-  return [combinerUrl, directUrl];
+  return [proxiedCombinerUrl, proxiedDirectUrl, combinerUrl, directUrl];
 }
 
 // Fallback silhouette component
@@ -367,6 +415,8 @@ export interface PlayerPhotoProps {
   showRing?: boolean;
   /** Custom ring color */
   ringColor?: string;
+  /** Image shape style */
+  shape?: 'circle' | 'rounded';
 }
 
 export function PlayerPhoto({
@@ -377,6 +427,7 @@ export function PlayerPhoto({
   highlight = false,
   showRing = false,
   ringColor = 'ring-white/20',
+  shape = 'circle',
 }: PlayerPhotoProps) {
   const [attemptIndex, setAttemptIndex] = useState(0);
   const [allFailed, setAllFailed] = useState(false);
@@ -421,7 +472,8 @@ export function PlayerPhoto({
       src={candidateUrls[Math.min(attemptIndex, candidateUrls.length - 1)]}
       alt={playerName}
       className={cn(
-        "object-cover object-top rounded-full",
+        "object-cover object-center",
+        shape === 'rounded' ? "rounded-xl" : "rounded-full",
         showRing && `ring-2 ${ringColor}`,
         highlight && "ring-2 ring-amber-500/30",
         className

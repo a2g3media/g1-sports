@@ -168,8 +168,8 @@ function isRelevantHomepageGame(game: DbGame, todayEt: string): boolean {
   // Keep upcoming games for today, but avoid far-future bleed.
   if (scheduledStatuses.has(status)) {
     return gameEt === todayEt
-      && startMs >= now - 60 * 60 * 1000
-      && startMs <= now + 12 * 60 * 60 * 1000;
+      && startMs >= now - 2 * 60 * 60 * 1000
+      && startMs <= now + 24 * 60 * 60 * 1000;
   }
 
   // Keep finals only from today ET to avoid yesterday bleed-through.
@@ -221,6 +221,171 @@ interface DbGame {
   overUnder?: number | null;
   moneylineHome?: number | null;
   moneylineAway?: number | null;
+}
+
+const DATAHUB_ODDS_HYDRATION_TTL_MS = 30000;
+const dataHubOddsHydrationCache = new Map<string, { expiresAt: number; byId: Record<string, any> }>();
+
+function normalizeOddsGameId(value: unknown): string {
+  return String(value || '').trim().toLowerCase();
+}
+
+function buildOddsLookupCandidates(value: unknown): string[] {
+  const raw = String(value || '').trim();
+  if (!raw) return [];
+  const out = new Set<string>();
+  const add = (v: string) => {
+    const n = normalizeOddsGameId(v);
+    if (n) out.add(n);
+  };
+  add(raw);
+  if (raw.startsWith('sr_')) {
+    const parts = raw.split('_');
+    const tail = parts.slice(2).join('_');
+    if (tail) {
+      add(`sr:sport_event:${tail}`);
+      add(`sr:sport_event:${tail.replace(/_/g, '-')}`);
+      add(`sr:match:${tail}`);
+      add(tail);
+      add(tail.replace(/_/g, '-'));
+    }
+  }
+  if (raw.startsWith('sr:sport_event:')) {
+    const tail = raw.replace('sr:sport_event:', '');
+    add(tail);
+    add(`sr_${tail.replace(/-/g, '_')}`);
+    add(tail.replace(/-/g, '_'));
+  }
+  if (raw.startsWith('sr:match:')) {
+    const tail = raw.replace('sr:match:', '');
+    add(tail);
+    add(`sr_${tail.replace(/-/g, '_')}`);
+  }
+  return Array.from(out);
+}
+
+function normalizeTeamToken(value: unknown): string {
+  return String(value || '').trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
+}
+
+function ymdPart(value: unknown): string {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  const direct = raw.slice(0, 10);
+  if (/^\d{4}-\d{2}-\d{2}$/.test(direct)) return direct;
+  const dt = new Date(raw);
+  if (Number.isNaN(dt.getTime())) return '';
+  return dt.toISOString().slice(0, 10);
+}
+
+function buildOddsMatchKey(sport: unknown, home: unknown, away: unknown, startTime: unknown): string | null {
+  const s = String(sport || '').trim().toUpperCase();
+  const h = normalizeTeamToken(home);
+  const a = normalizeTeamToken(away);
+  const d = ymdPart(startTime);
+  if (!s || !h || !a) return null;
+  return `match::${s}|${h}|${a}|${d || 'nodate'}`;
+}
+
+function summaryStrength(summary: any): number {
+  if (!summary || typeof summary !== 'object') return 0;
+  const n = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) ? 1 : 0);
+  let score = 0;
+  score += n(summary?.spread?.home_line);
+  score += n(summary?.total?.line);
+  score += n(summary?.moneyline?.home_price) + n(summary?.moneyline?.away_price);
+  score += n(summary?.first_half?.spread?.home_line) + n(summary?.first_half?.spread?.away_line);
+  score += n(summary?.first_half?.total?.line);
+  score += n(summary?.first_half?.moneyline?.home_price) + n(summary?.first_half?.moneyline?.away_price);
+  return score;
+}
+
+function hasNativeOdds(game: DbGame): boolean {
+  return (
+    game.spread !== null && game.spread !== undefined ||
+    game.overUnder !== null && game.overUnder !== undefined ||
+    game.moneylineHome !== null && game.moneylineHome !== undefined ||
+    game.moneylineAway !== null && game.moneylineAway !== undefined
+  );
+}
+
+async function hydrateGamesWithOddsSummaries(games: DbGame[], dateStr: string): Promise<DbGame[]> {
+  if (!Array.isArray(games) || games.length === 0) return games;
+  const nativeCount = games.reduce((acc, g) => acc + (hasNativeOdds(g) ? 1 : 0), 0);
+  const nativeCoverage = nativeCount / games.length;
+  if (nativeCoverage >= 0.6) return games;
+
+  const ids = games.map((g) => String(g?.game_id || '').trim()).filter(Boolean).slice(0, 60);
+  if (ids.length === 0) return games;
+  const cacheKey = `${dateStr}|${ids.join('|')}`;
+  const cached = dataHubOddsHydrationCache.get(cacheKey);
+  const now = Date.now();
+  let byId: Record<string, any> = {};
+  if (cached && cached.expiresAt > now) {
+    byId = cached.byId;
+  } else {
+    const addSummary = (summary: any) => {
+      const strength = summaryStrength(summary);
+      if (strength <= 0) return;
+      const gameId = String(summary?.game?.game_id || summary?.game_id || '').trim();
+      for (const candidate of buildOddsLookupCandidates(gameId)) {
+        const prev = byId[candidate];
+        if (!prev || strength >= summaryStrength(prev)) byId[candidate] = summary;
+      }
+      const sportKey = String(summary?.game?.sport || '').toUpperCase();
+      const keys = [
+        buildOddsMatchKey(sportKey, summary?.game?.home_team_code, summary?.game?.away_team_code, summary?.game?.start_time),
+        buildOddsMatchKey(sportKey, summary?.game?.home_team_name, summary?.game?.away_team_name, summary?.game?.start_time),
+        buildOddsMatchKey(sportKey, summary?.game?.home_team_code || summary?.game?.home_team_name, summary?.game?.away_team_code || summary?.game?.away_team_name, summary?.game?.start_time),
+      ].filter((k): k is string => Boolean(k));
+      for (const key of keys) {
+        const prev = byId[key];
+        if (!prev || strength >= summaryStrength(prev)) byId[key] = summary;
+      }
+    };
+
+    const chunks: string[][] = [];
+    for (let i = 0; i < ids.length; i += 30) chunks.push(ids.slice(i, i + 30));
+    const chunkResponses = await Promise.allSettled(
+      chunks.map(async (chunk) => {
+        const qs = new URLSearchParams({ game_ids: chunk.join(','), scope: 'PROD', date: dateStr });
+        const res = await fetchWithTimeout(`/api/odds/slate?${qs.toString()}`, undefined, 10000);
+        if (!res.ok) return [];
+        const payload = await res.json();
+        return Array.isArray(payload?.summaries) ? payload.summaries : [];
+      })
+    );
+    for (const response of chunkResponses) {
+      if (response.status !== 'fulfilled') continue;
+      for (const summary of response.value) addSummary(summary);
+    }
+    dataHubOddsHydrationCache.set(cacheKey, {
+      expiresAt: now + DATAHUB_ODDS_HYDRATION_TTL_MS,
+      byId,
+    });
+  }
+
+  if (Object.keys(byId).length === 0) return games;
+
+  return games.map((game) => {
+    const gameId = String(game?.game_id || '').trim();
+    const idSummary = buildOddsLookupCandidates(gameId).map((candidate) => byId[candidate]).find(Boolean);
+    const matchupCandidates = [
+      buildOddsMatchKey(game.sport, game.home_team_code, game.away_team_code, game.start_time),
+      buildOddsMatchKey(game.sport, game.home_team_name, game.away_team_name, game.start_time),
+      buildOddsMatchKey(game.sport, game.home_team_code || game.home_team_name, game.away_team_code || game.away_team_name, game.start_time),
+    ].filter((k): k is string => Boolean(k));
+    const matchupSummary = matchupCandidates.map((candidate) => byId[candidate]).find(Boolean);
+    const summary = idSummary || matchupSummary;
+    if (!summary) return game;
+    return {
+      ...game,
+      spread: game.spread ?? summary?.spread?.home_line ?? null,
+      overUnder: game.overUnder ?? summary?.total?.line ?? null,
+      moneylineHome: game.moneylineHome ?? summary?.moneyline?.home_price ?? null,
+      moneylineAway: game.moneylineAway ?? summary?.moneyline?.away_price ?? null,
+    };
+  });
 }
 
 function mergeDbGames(base: DbGame, incoming: DbGame): DbGame {
@@ -447,11 +612,11 @@ async function fetchGamesData(): Promise<LiveGame[]> {
   // then include today's upcoming schedule.
   const todayEt = getDateInEastern(new Date());
   const tomorrowEt = getDateInEastern(new Date(Date.now() + 24 * 60 * 60 * 1000));
-  const [liveRes, scheduledRes, dayRes, dayNextRes] = await Promise.allSettled([
-    fetchWithTimeout('/api/games/live'),
-    fetchWithTimeout('/api/games/scheduled?hours=24'),
-    fetchWithTimeout(`/api/games?date=${todayEt}`),
-    fetchWithTimeout(`/api/games?date=${tomorrowEt}`),
+  // Bundled home-path fetch first, then lightweight live overlay.
+  // This reduces home route request fanout from 4 blocking calls to 2.
+  const [baseRes, liveRes] = await Promise.allSettled([
+    fetchWithTimeout('/api/games?includeOdds=0', undefined, 5000),
+    fetchWithTimeout('/api/games/live', undefined, 1500),
   ]);
 
   const safeJsonGames = async (res: PromiseSettledResult<Response>): Promise<DbGame[]> => {
@@ -464,23 +629,14 @@ async function fetchGamesData(): Promise<LiveGame[]> {
     }
   };
 
-  const [liveGamesRaw, scheduledGamesRaw, dayGamesA, dayGamesB] = await Promise.all([
+  const [baseGamesRaw, liveGamesRaw] = await Promise.all([
+    safeJsonGames(baseRes),
     safeJsonGames(liveRes),
-    safeJsonGames(scheduledRes),
-    safeJsonGames(dayRes),
-    safeJsonGames(dayNextRes),
   ]);
-  // Provider day endpoint can be UTC-boundary based; combine adjacent day keys
-  // and rely on strict ET filtering below to avoid stale-day drift.
-  const dayMap = new Map<string, DbGame>();
-  for (const game of [...dayGamesA, ...dayGamesB]) {
-    const key = String(game?.game_id || '').trim();
-    if (!key) continue;
-    const existing = dayMap.get(key);
-    dayMap.set(key, existing ? mergeDbGames(existing, game) : game);
-  }
-  const dayGamesRaw = Array.from(dayMap.values());
-  const merged = [...liveGamesRaw, ...scheduledGamesRaw, ...dayGamesRaw];
+
+  // Keep this alias for downstream schedule-driven soccer fallback logic.
+  const dayGamesRaw = baseGamesRaw;
+  const merged = [...baseGamesRaw, ...liveGamesRaw];
   const deduped = new Map<string, DbGame>();
   for (const game of merged) {
     const key = String(game?.game_id || '').trim();
@@ -489,8 +645,53 @@ async function fetchGamesData(): Promise<LiveGame[]> {
     deduped.set(key, existing ? mergeDbGames(existing, game) : game);
   }
 
-  const allDedupedGames = Array.from(deduped.values());
-  const currentGames = allDedupedGames.filter((g) => isRelevantHomepageGame(g, todayEt));
+  let allDedupedGames = Array.from(deduped.values());
+  if (allDedupedGames.length === 0) {
+    // Defensive fallback: if concurrent endpoint calls timeout or fail together,
+    // use the base games feed so homepage never renders a false-empty slate.
+    try {
+      const fallbackRes = await fetchWithTimeout('/api/games?includeOdds=0', undefined, 5000);
+      if (fallbackRes.ok) {
+        const fallbackPayload = await fallbackRes.json();
+        const fallbackGames = Array.isArray(fallbackPayload?.games) ? fallbackPayload.games as DbGame[] : [];
+        if (fallbackGames.length > 0) {
+          allDedupedGames = fallbackGames;
+        }
+      }
+    } catch {
+      // Keep the original empty set when fallback feed is also unavailable.
+    }
+  }
+  let currentGames = allDedupedGames.filter((g) => isRelevantHomepageGame(g, todayEt));
+
+  // Guardrail: never return a false-empty homepage slate when valid games exist.
+  // If strict relevance filtering yields nothing, use a bounded near-term fallback set.
+  if (currentGames.length === 0 && allDedupedGames.length > 0) {
+    const now = Date.now();
+    const fallbackCandidates = allDedupedGames
+      .filter((g) => {
+        const status = String(g.status || '').toUpperCase();
+        if (status === 'IN_PROGRESS' || status === 'LIVE' || status === 'INPROGRESS') return true;
+        if (!g.start_time) return false;
+        const dt = new Date(g.start_time);
+        if (Number.isNaN(dt.getTime())) return false;
+        const gameEt = getDateInEastern(dt);
+        const ts = dt.getTime();
+        // Keep today/tomorrow ET rows in a practical visibility window.
+        const isNearDay = gameEt === todayEt || gameEt === tomorrowEt;
+        if (!isNearDay) return false;
+        if (status === 'FINAL' || status === 'COMPLETED' || status === 'CLOSED') {
+          return gameEt === todayEt;
+        }
+        return ts >= now - 3 * 60 * 60 * 1000 && ts <= now + 36 * 60 * 60 * 1000;
+      })
+      .sort((a, b) => {
+        const ta = a.start_time ? new Date(a.start_time).getTime() : Number.POSITIVE_INFINITY;
+        const tb = b.start_time ? new Date(b.start_time).getTime() : Number.POSITIVE_INFINITY;
+        return ta - tb;
+      });
+    currentGames = fallbackCandidates.slice(0, 40);
+  }
 
   // Ensure key sports appear in rotation when they have games today, even if
   // strict relevance filtering excludes them (common with delayed statuses).
@@ -643,7 +844,8 @@ async function fetchGamesData(): Promise<LiveGame[]> {
   // Soccer homepage cards should always reflect real schedule data from top leagues.
   // Strictly keep today's ET slate (live, upcoming, final).
   // Replace stale aggregate soccer rows with a schedule-driven top 3 selection.
-  {
+  const allowSoccerDeepHydration = false;
+  if (allowSoccerDeepHydration) {
     const soccerLeagueKeys = [
       'la-liga',
       'premier-league',
@@ -781,9 +983,17 @@ async function fetchGamesData(): Promise<LiveGame[]> {
   console.log('[DataHub] First 3 games from API:', currentGames.slice(0, 3).map(g => ({ 
     game_id: g.game_id, sport: g.sport, status: g.status 
   })));
+
+  // Guardrail: when base feeds lack odds fields, hydrate from odds summaries so cards don't go blank.
+  let gamesWithOdds = currentGames;
+  try {
+    gamesWithOdds = await hydrateGamesWithOddsSummaries(currentGames, todayEt);
+  } catch {
+    // Keep original games when odds hydration fails.
+  }
   
   // Transform all games
-  const transformed = currentGames.map(transformDbGameToLiveGame);
+  const transformed = gamesWithOdds.map(transformDbGameToLiveGame);
 
   // MLB live feed frequently lacks inning fields in base game payload.
   // Enrich a small capped subset from play-by-play so cards can show inning.
@@ -1042,74 +1252,128 @@ export function DataHubProvider({
   // Refs for avoiding stale closure issues
   const userIdRef = useRef(userId);
   const isDemoModeRef = useRef(isDemoMode);
+  const gamesRef = useRef<LiveGame[]>(cachedGames);
+  const fetchInFlightRef = useRef<Promise<void> | null>(null);
   
   useEffect(() => {
     userIdRef.current = userId;
     isDemoModeRef.current = isDemoMode;
   }, [userId, isDemoMode]);
+
+  useEffect(() => {
+    gamesRef.current = games;
+  }, [games]);
   
   // Consolidated fetch function with error backoff
   const fetchAllData = useCallback(async (isManualRefresh = false) => {
-    if (isManualRefresh) setIsRefreshing(true);
-    
-    let hasAnyError = false;
-    
-    // Fetch all data types in parallel
-    const results = await Promise.allSettled([
-      fetchGamesData(),
-      fetchWatchboardsData(userIdRef.current),
-      fetchAlertsData(isDemoModeRef.current),
-    ]);
-    
-    // Process games result
-    if (results[0].status === 'fulfilled') {
-      setGames(results[0].value);
-      saveCachedGames(results[0].value); // Cache for instant navigation
-      setGamesError(null);
-    } else {
-      setGamesError(results[0].reason?.message || 'Failed to fetch games');
-      hasAnyError = true;
+    if (fetchInFlightRef.current) {
+      await fetchInFlightRef.current;
+      return;
     }
-    setGamesLoading(false);
-    
-    // Process watchboards result
-    if (results[1].status === 'fulfilled') {
-      setWatchboards(results[1].value);
-    } else {
-      hasAnyError = true;
-    }
-    setWatchboardsLoading(false);
-    
-    // Process alerts result
-    if (results[2].status === 'fulfilled') {
-      setAlerts(results[2].value);
-    } else {
-      hasAnyError = true;
-    }
-    setAlertsLoading(false);
-    
-    // Track consecutive errors for backoff
-    if (hasAnyError) {
-      consecutiveErrorsRef.current += 1;
-      // Exponential backoff: 1x, 2x, 4x, 8x (max)
-      backoffMultiplierRef.current = Math.min(
-        Math.pow(2, consecutiveErrorsRef.current - 1),
-        MAX_BACKOFF_MULTIPLIER
-      );
-      console.warn(`[DataHub] Error detected, backoff multiplier: ${backoffMultiplierRef.current}x`);
-    } else {
-      // Reset backoff on success
-      if (consecutiveErrorsRef.current > 0) {
-        console.log('[DataHub] Success, resetting backoff');
+
+    const run = async () => {
+      if (isManualRefresh) setIsRefreshing(true);
+
+      let hasAnyError = false;
+      const startedAt = Date.now();
+      const timings: Record<string, number> = {};
+
+      const timed = async <T,>(key: string, fn: () => Promise<T>): Promise<T> => {
+        const t0 = Date.now();
+        try {
+          return await fn();
+        } finally {
+          timings[key] = Date.now() - t0;
+        }
+      };
+
+      // Start secondary feeds, but resolve games first so homepage paints fast.
+      const watchboardsPromise = timed('watchboards', () => fetchWatchboardsData(userIdRef.current));
+      const alertsPromise = timed('alerts', () => fetchAlertsData(isDemoModeRef.current));
+      const gamesResult = await Promise.allSettled([timed('games', () => fetchGamesData())]);
+
+      // Process games result first with stale-protection (never overwrite valid with empty/transient failures)
+      if (gamesResult[0].status === 'fulfilled') {
+        const nextGames = Array.isArray(gamesResult[0].value) ? gamesResult[0].value : [];
+        if (nextGames.length > 0) {
+          setGames(nextGames);
+          gamesRef.current = nextGames;
+          saveCachedGames(nextGames); // Cache for instant navigation
+          setGamesError(null);
+        } else if (gamesRef.current.length > 0) {
+          console.warn('[DataHub] Empty games refresh ignored; preserving last-known-valid slate.');
+          setGamesError(null);
+        } else {
+          setGames(nextGames);
+          setGamesError(null);
+        }
+      } else {
+        const message = (gamesResult[0].reason as Error)?.message || 'Failed to fetch games';
+        if (gamesRef.current.length === 0) {
+          setGamesError(message);
+        } else {
+          console.warn('[DataHub] Games refresh failed; preserving last-known-valid slate:', message);
+          setGamesError(null);
+        }
+        hasAnyError = true;
       }
-      consecutiveErrorsRef.current = 0;
-      backoffMultiplierRef.current = 1;
+      setGamesLoading(false);
+
+      // Secondary feeds can finish after games are already rendered.
+      const [watchboardsResult, alertsResult] = await Promise.allSettled([watchboardsPromise, alertsPromise]);
+
+      if (watchboardsResult.status === 'fulfilled') {
+        setWatchboards(watchboardsResult.value);
+      } else {
+        hasAnyError = true;
+      }
+      setWatchboardsLoading(false);
+
+      if (alertsResult.status === 'fulfilled') {
+        setAlerts(alertsResult.value);
+      } else {
+        hasAnyError = true;
+      }
+      setAlertsLoading(false);
+
+      // Track consecutive errors for backoff
+      if (hasAnyError) {
+        consecutiveErrorsRef.current += 1;
+        // Exponential backoff: 1x, 2x, 4x, 8x (max)
+        backoffMultiplierRef.current = Math.min(
+          Math.pow(2, consecutiveErrorsRef.current - 1),
+          MAX_BACKOFF_MULTIPLIER
+        );
+        console.warn(`[DataHub] Error detected, backoff multiplier: ${backoffMultiplierRef.current}x`);
+      } else {
+        // Reset backoff on success
+        if (consecutiveErrorsRef.current > 0) {
+          console.log('[DataHub] Success, resetting backoff');
+        }
+        consecutiveErrorsRef.current = 0;
+        backoffMultiplierRef.current = 1;
+      }
+
+      const totalMs = Date.now() - startedAt;
+      console.debug('[DataHub][perf]', {
+        total_ms: totalMs,
+        timings,
+        games_count: gamesResult[0].status === 'fulfilled' && Array.isArray(gamesResult[0].value) ? gamesResult[0].value.length : gamesRef.current.length,
+        backoff_multiplier: backoffMultiplierRef.current,
+      });
+
+      setLastFetchAt(new Date());
+      setIsRefreshing(false);
+    };
+
+    fetchInFlightRef.current = run();
+    try {
+      await fetchInFlightRef.current;
+    } finally {
+      fetchInFlightRef.current = null;
     }
-    
-    setLastFetchAt(new Date());
-    setIsRefreshing(false);
   }, []);
-  
+
   // Initial fetch
   useEffect(() => {
     if (enabled) {

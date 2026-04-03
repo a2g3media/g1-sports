@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { motion } from "framer-motion";
 import { TrendingUp, Award, Flame, Sparkles } from "lucide-react";
+import { Link } from "react-router-dom";
 import { PlayerPhoto } from "@/react-app/components/PlayerPhoto";
 
 // Use centralized PlayerPhoto component instead of inline implementation
@@ -16,6 +17,9 @@ interface PlayerStat {
   rank: number;
   trend?: "up" | "down" | "same";
   imageUrl?: string;
+  league?: string | null;
+  sampleValue?: number | string | null;
+  sampleLabel?: string | null;
 }
 
 interface StatCategory {
@@ -23,6 +27,8 @@ interface StatCategory {
   label: string;
   shortLabel: string;
   unit: string;
+  statGroup?: "hitting" | "pitching";
+  qualifierLabel?: string;
   players: PlayerStat[];
 }
 
@@ -191,6 +197,45 @@ const MOCK_LEADERS: Record<string, StatCategory[]> = {
         { playerId: "lebron", name: "LeBron James", teamCode: "LAL", teamName: "Lakers", value: 8.1, gamesPlayed: 68, rank: 5, trend: "same" },
       ],
     },
+    {
+      key: "spg",
+      label: "Steals Per Game",
+      shortLabel: "STL",
+      unit: "spg",
+      players: [
+        { playerId: "shai", name: "Shai Gilgeous-Alexander", teamCode: "OKC", teamName: "Thunder", value: 2.1, gamesPlayed: 72, rank: 1, trend: "up" },
+        { playerId: "fox", name: "De'Aaron Fox", teamCode: "SAC", teamName: "Kings", value: 1.9, gamesPlayed: 74, rank: 2, trend: "same" },
+        { playerId: "caruso", name: "Alex Caruso", teamCode: "CHI", teamName: "Bulls", value: 1.8, gamesPlayed: 70, rank: 3, trend: "up" },
+        { playerId: "butler", name: "Jimmy Butler", teamCode: "MIA", teamName: "Heat", value: 1.7, gamesPlayed: 64, rank: 4, trend: "same" },
+        { playerId: "herb", name: "Herb Jones", teamCode: "NOP", teamName: "Pelicans", value: 1.6, gamesPlayed: 71, rank: 5, trend: "same" },
+      ],
+    },
+    {
+      key: "bpg",
+      label: "Blocks Per Game",
+      shortLabel: "BLK",
+      unit: "bpg",
+      players: [
+        { playerId: "wemby", name: "Victor Wembanyama", teamCode: "SAS", teamName: "Spurs", value: 3.6, gamesPlayed: 71, rank: 1, trend: "up" },
+        { playerId: "turner", name: "Myles Turner", teamCode: "IND", teamName: "Pacers", value: 2.3, gamesPlayed: 73, rank: 2, trend: "same" },
+        { playerId: "lopez", name: "Brook Lopez", teamCode: "MIL", teamName: "Bucks", value: 2.2, gamesPlayed: 74, rank: 3, trend: "same" },
+        { playerId: "davis", name: "Anthony Davis", teamCode: "LAL", teamName: "Lakers", value: 2.1, gamesPlayed: 65, rank: 4, trend: "up" },
+        { playerId: "chet", name: "Chet Holmgren", teamCode: "OKC", teamName: "Thunder", value: 2.0, gamesPlayed: 76, rank: 5, trend: "up" },
+      ],
+    },
+    {
+      key: "tpg",
+      label: "Three-Pointers Made",
+      shortLabel: "3PM",
+      unit: "tpg",
+      players: [
+        { playerId: "curry", name: "Stephen Curry", teamCode: "GSW", teamName: "Warriors", value: 4.8, gamesPlayed: 70, rank: 1, trend: "up" },
+        { playerId: "lillard", name: "Damian Lillard", teamCode: "MIL", teamName: "Bucks", value: 3.7, gamesPlayed: 73, rank: 2, trend: "same" },
+        { playerId: "donovan", name: "Donovan Mitchell", teamCode: "CLE", teamName: "Cavaliers", value: 3.5, gamesPlayed: 62, rank: 3, trend: "up" },
+        { playerId: "thompson", name: "Klay Thompson", teamCode: "GSW", teamName: "Warriors", value: 3.4, gamesPlayed: 75, rank: 4, trend: "down" },
+        { playerId: "luka", name: "Luka Dončić", teamCode: "DAL", teamName: "Mavericks", value: 3.3, gamesPlayed: 70, rank: 5, trend: "same" },
+      ],
+    },
   ],
   golf: [
     {
@@ -282,6 +327,9 @@ function formatStatValue(value: number, unit: string): string {
     case 'avg':
       // Golf scoring average or batting average
       return value >= 50 ? value.toFixed(2) : value.toFixed(3).slice(1);
+    case 'era':
+    case 'whip':
+      return value.toFixed(2);
     case 'earnings':
       // Format as currency (millions)
       if (value >= 1000000) {
@@ -292,9 +340,13 @@ function formatStatValue(value: number, unit: string): string {
       // P4P ranking - show as #1, #2, etc.
       return `#${Math.round(value)}`;
     case 'wins':
+    case 'w':
     case 'finishes':
     case 'hr':
     case 'rbi':
+    case 'hits':
+    case 'so':
+    case 'saves':
     case 'goals':
     case 'assists':
     case 'pts':
@@ -311,180 +363,376 @@ function formatUnitLabel(unit: string): string {
     case 'earnings': return 'earned';
     case 'rank': return 'P4P';
     case 'wins': return 'win streak';
+    case 'w': return 'W';
+    case 'so': return 'K';
+    case 'saves': return 'SV';
     case 'finishes': return 'KO/TKO';
+    case 'spg': return 'STL';
+    case 'bpg': return 'BLK';
+    case 'tpg': return '3PM';
     default: return unit;
   }
+}
+
+function getDisplayLastName(name: string): string {
+  const safe = String(name || '').trim();
+  if (!safe) return 'Player';
+  const stripSuffix = (value: string) =>
+    value.replace(/\b(JR|SR|II|III|IV|V)\b\.?/gi, '').replace(/\s+/g, ' ').trim();
+
+  if (safe.includes(',')) {
+    const [lastPart] = safe.split(',', 1);
+    const normalizedLast = stripSuffix(lastPart || '');
+    return normalizedLast || 'Player';
+  }
+
+  const tokens = stripSuffix(safe).split(' ').filter(Boolean);
+  return tokens[tokens.length - 1] || safe;
 }
 
 interface HubLeadersProps {
   sportKey: string;
 }
 
-interface LivePropRow {
-  player_id?: string;
-  player_name?: string;
-  team?: string;
-  sport?: string;
-  prop_type?: string;
-  line_value?: number | string;
+interface LeadersApiCategory {
+  key?: string;
+  label?: string;
+  shortLabel?: string;
+  unit?: string;
+  statGroup?: "hitting" | "pitching";
+  qualifierLabel?: string;
+  players?: Array<{
+    playerId?: string;
+    name?: string;
+    teamCode?: string;
+    teamName?: string;
+    value?: number;
+    gamesPlayed?: number;
+    rank?: number;
+    imageUrl?: string | null;
+    league?: string | null;
+    sampleValue?: number | string | null;
+    sampleLabel?: string | null;
+  }>;
 }
 
-function normalizePropType(value: string): string {
-  return value.trim().toUpperCase().replace(/\s+/g, "_");
-}
+const NBA_LIVE_FETCH_TIMEOUT_MS = 4200;
 
-function buildNbaLeadersFromProps(props: LivePropRow[]): StatCategory[] {
-  const categories = [
-    {
-      key: "ppg",
-      label: "Points Lines",
-      shortLabel: "PTS",
-      unit: "ppg",
-      matches: (type: string) => type.includes("POINTS") && !type.includes("ASSISTS") && !type.includes("REBOUNDS"),
-    },
-    {
-      key: "rpg",
-      label: "Rebounds Lines",
-      shortLabel: "REB",
-      unit: "rpg",
-      matches: (type: string) => type.includes("REBOUNDS") && !type.includes("ASSISTS"),
-    },
-    {
-      key: "apg",
-      label: "Assists Lines",
-      shortLabel: "AST",
-      unit: "apg",
-      matches: (type: string) => type.includes("ASSISTS") && !type.includes("REBOUNDS"),
-    },
-  ];
-
-  return categories.map((category) => {
-    const byPlayer = new Map<string, { playerId: string; name: string; team: string; total: number; count: number }>();
-
-    for (const prop of props) {
-      const type = normalizePropType(String(prop.prop_type || ""));
-      if (!category.matches(type)) continue;
-      const rawLine = Number(prop.line_value);
-      if (!Number.isFinite(rawLine)) continue;
-
-      const playerName = String(prop.player_name || "").trim();
-      if (!playerName) continue;
-      const playerId = String(prop.player_id || `${playerName}-${prop.team || "TEAM"}`);
-      const team = String(prop.team || "NBA");
-      const key = `${playerId}::${team}`;
-      const prev = byPlayer.get(key);
-
-      if (prev) {
-        prev.total += rawLine;
-        prev.count += 1;
-      } else {
-        byPlayer.set(key, { playerId, name: playerName, team, total: rawLine, count: 1 });
-      }
-    }
-
-    const players = Array.from(byPlayer.values())
-      .map((entry) => ({
-        playerId: entry.playerId,
-        name: entry.name,
-        teamCode: entry.team,
-        teamName: entry.team,
-        value: entry.total / Math.max(1, entry.count),
-        gamesPlayed: 0,
-        sampleSize: entry.count,
-        rank: 0,
-      }))
-      .sort((a, b) => b.value - a.value)
-      .slice(0, 5)
-      .map((player, idx) => ({ ...player, rank: idx + 1 }));
-
-    return {
-      key: category.key,
-      label: category.label,
-      shortLabel: category.shortLabel,
-      unit: category.unit,
-      players,
-    };
-  });
+function parseLeadersApiCategories(categoriesRaw: LeadersApiCategory[]): StatCategory[] {
+  return categoriesRaw.map((cat) => ({
+    key: String(cat.key || "leader"),
+    label: String(cat.label || "Leader"),
+    shortLabel: String(cat.shortLabel || cat.key || "LDR"),
+    unit: String(cat.unit || "stat"),
+    players: Array.isArray(cat.players)
+      ? cat.players
+        .map((player, idx) => ({
+          playerId: String(player.playerId || `${cat.key || "leader"}-${idx}`),
+          name: String(player.name || "Unknown Player"),
+          teamCode: String(player.teamCode || ""),
+          teamName: String(player.teamName || ""),
+          value: Number(player.value ?? 0),
+          gamesPlayed: Number(player.gamesPlayed ?? 0),
+          rank: Number(player.rank ?? idx + 1),
+          imageUrl: typeof player.imageUrl === "string" ? player.imageUrl : undefined,
+          league: typeof player.league === "string" ? player.league : null,
+          sampleValue: player.sampleValue ?? null,
+          sampleLabel: typeof player.sampleLabel === "string" ? player.sampleLabel : null,
+        }))
+        .filter((player) => Number.isFinite(player.value))
+      : [],
+    statGroup: (cat.statGroup === "pitching" ? "pitching" : cat.statGroup === "hitting" ? "hitting" : undefined) as "hitting" | "pitching" | undefined,
+    qualifierLabel: typeof cat.qualifierLabel === "string" ? cat.qualifierLabel : undefined,
+  })).filter((cat) => cat.players.length > 0);
 }
 
 export function HubLeaders({ sportKey }: HubLeadersProps) {
+  const sportKeyLower = String(sportKey || "").toLowerCase();
   const [activeCategory, setActiveCategory] = useState(0);
-  const [liveNbaCategories, setLiveNbaCategories] = useState<StatCategory[] | null>(null);
-  const [liveNbaLoading, setLiveNbaLoading] = useState(false);
-  const [liveNbaError, setLiveNbaError] = useState<string | null>(null);
+  const [activeMlbGroup, setActiveMlbGroup] = useState<"hitting" | "pitching">("hitting");
+  const [activeMlbLeague, setActiveMlbLeague] = useState<"all" | "AL" | "NL">("all");
+  const [liveSportCategories, setLiveSportCategories] = useState<StatCategory[] | null>(null);
+  const [liveSportLoading, setLiveSportLoading] = useState(false);
+  const [nbaMode, setNbaMode] = useState<"season" | "live">("season");
+  const [nbaLeadersSource, setNbaLeadersSource] = useState<"live" | "cached" | "fallback">("fallback");
+  const isLivePropsSport = sportKeyLower === "nba";
+  const nbaCacheKey = `hub:nba:leaders:${nbaMode}:v2`;
+  const nbaLiveCacheKey = "hub:nba:leaders:live:v2";
 
   useEffect(() => {
-    if (sportKey !== "nba") {
-      setLiveNbaCategories(null);
-      setLiveNbaError(null);
-      setLiveNbaLoading(false);
+    if (!isLivePropsSport) {
       return;
     }
 
     let mounted = true;
-    setLiveNbaLoading(true);
-    setLiveNbaError(null);
+    let hasWarmCache = false;
+    try {
+      const cachedRaw = sessionStorage.getItem(nbaCacheKey);
+      const cached = cachedRaw ? JSON.parse(cachedRaw) as StatCategory[] : [];
+      const cacheRows = Array.isArray(cached) ? cached : [];
+      if (cacheRows.length > 0) {
+        hasWarmCache = true;
+        setLiveSportCategories(cacheRows);
+        setNbaLeadersSource("cached");
+      }
+    } catch {
+      // ignore cache parse failures
+    }
+    setLiveSportLoading(!hasWarmCache);
 
-    fetch("/api/sports-data/props/today", { credentials: "include" })
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), NBA_LIVE_FETCH_TIMEOUT_MS);
+
+    fetch(`/api/teams/NBA/leaders?limit=5&mode=${nbaMode}`, {
+      credentials: "include",
+      signal: controller.signal,
+    })
       .then(async (res) => {
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.json();
-        const nbaProps = Array.isArray(data?.props)
-          ? data.props.filter((row: LivePropRow) => String(row.sport || "").toUpperCase() === "NBA")
-          : [];
-        const built = buildNbaLeadersFromProps(nbaProps);
-        if (mounted) setLiveNbaCategories(built);
+        const categoriesRaw = Array.isArray(data?.categories) ? data.categories as LeadersApiCategory[] : [];
+        const parsed = parseLeadersApiCategories(categoriesRaw);
+        if (parsed.length > 0) {
+          try {
+            sessionStorage.setItem(nbaCacheKey, JSON.stringify(parsed));
+          } catch {
+            // ignore storage failures
+          }
+        }
+        if (mounted) {
+          if (parsed.length > 0) {
+            setLiveSportCategories(parsed);
+            setNbaLeadersSource("live");
+          } else if (!hasWarmCache) {
+            try {
+              const cachedRaw = sessionStorage.getItem(nbaCacheKey);
+              const cached = cachedRaw ? JSON.parse(cachedRaw) as StatCategory[] : [];
+              const cacheRows = Array.isArray(cached) ? cached : [];
+              setLiveSportCategories(cacheRows);
+              setNbaLeadersSource(cacheRows.length > 0 ? "cached" : "fallback");
+            } catch {
+              setLiveSportCategories([]);
+              setNbaLeadersSource("fallback");
+            }
+          }
+        }
       })
       .catch((err) => {
         if (mounted) {
-          console.error("[HubLeaders] Failed to fetch NBA live leaders:", err);
-          setLiveNbaError("Live NBA leader lines are currently unavailable.");
-          setLiveNbaCategories([]);
+          console.error(`[HubLeaders] Failed to fetch ${sportKeyLower.toUpperCase()} live leaders:`, err);
+          if (!hasWarmCache) {
+            try {
+              const cachedRaw = sessionStorage.getItem(nbaCacheKey);
+              const cached = cachedRaw ? JSON.parse(cachedRaw) as StatCategory[] : [];
+              const cacheRows = Array.isArray(cached) ? cached : [];
+              setLiveSportCategories(cacheRows);
+              setNbaLeadersSource(cacheRows.length > 0 ? "cached" : "fallback");
+            } catch {
+              setLiveSportCategories([]);
+              setNbaLeadersSource("fallback");
+            }
+          } else {
+            setNbaLeadersSource("cached");
+          }
         }
       })
       .finally(() => {
-        if (mounted) setLiveNbaLoading(false);
+        clearTimeout(timeout);
+        if (mounted) setLiveSportLoading(false);
+      });
+
+    return () => {
+      mounted = false;
+      clearTimeout(timeout);
+      controller.abort();
+    };
+  }, [isLivePropsSport, nbaCacheKey, nbaMode, sportKeyLower]);
+
+  // Warm live cache in the background while season mode is visible.
+  useEffect(() => {
+    if (!isLivePropsSport || nbaMode !== "season") return;
+    try {
+      const existing = sessionStorage.getItem(nbaLiveCacheKey);
+      if (existing) return;
+    } catch {
+      // ignore storage read failures
+    }
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), NBA_LIVE_FETCH_TIMEOUT_MS);
+    fetch("/api/teams/NBA/leaders?limit=5&mode=live", {
+      credentials: "include",
+      signal: controller.signal,
+    })
+      .then(async (res) => {
+        if (!res.ok) return;
+        const data = await res.json();
+        const categoriesRaw = Array.isArray(data?.categories) ? data.categories as LeadersApiCategory[] : [];
+        const parsed = parseLeadersApiCategories(categoriesRaw);
+        if (parsed.length > 0) {
+          try {
+            sessionStorage.setItem(nbaLiveCacheKey, JSON.stringify(parsed));
+          } catch {
+            // ignore storage failures
+          }
+        }
+      })
+      .catch(() => {
+        // silent prefetch failure
+      })
+      .finally(() => clearTimeout(timeout));
+    return () => {
+      clearTimeout(timeout);
+      controller.abort();
+    };
+  }, [isLivePropsSport, nbaLiveCacheKey, nbaMode]);
+
+  useEffect(() => {
+    if (sportKeyLower !== "mlb") {
+      if (!isLivePropsSport) {
+        setLiveSportCategories(null);
+        setLiveSportLoading(false);
+      }
+      return;
+    }
+
+    let mounted = true;
+    setLiveSportLoading(true);
+
+    fetch("/api/teams/MLB/leaders?limit=5", { credentials: "include" })
+      .then(async (res) => {
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        const categoriesRaw = Array.isArray(data?.categories) ? data.categories as LeadersApiCategory[] : [];
+        const parsed: StatCategory[] = categoriesRaw.map((cat) => ({
+          key: String(cat.key || "leader"),
+          label: String(cat.label || "Leader"),
+          shortLabel: String(cat.shortLabel || cat.key || "LDR"),
+          unit: String(cat.unit || "stat"),
+          players: Array.isArray(cat.players)
+            ? cat.players
+              .map((player, idx) => ({
+                playerId: String(player.playerId || `${cat.key || "leader"}-${idx}`),
+                name: String(player.name || "Unknown Player"),
+                teamCode: String(player.teamCode || ""),
+                teamName: String(player.teamName || ""),
+                value: Number(player.value ?? 0),
+                gamesPlayed: Number(player.gamesPlayed ?? 0),
+                rank: Number(player.rank ?? idx + 1),
+                imageUrl: typeof player.imageUrl === "string" ? player.imageUrl : undefined,
+                league: typeof player.league === "string" ? player.league : null,
+                sampleValue: player.sampleValue ?? null,
+                sampleLabel: typeof player.sampleLabel === "string" ? player.sampleLabel : null,
+              }))
+              .filter((player) => Number.isFinite(player.value))
+            : [],
+          statGroup: cat.statGroup === "pitching" ? "pitching" : "hitting",
+          qualifierLabel: typeof cat.qualifierLabel === "string" ? cat.qualifierLabel : undefined,
+        }));
+        if (mounted) setLiveSportCategories(parsed);
+      })
+      .catch((err) => {
+        if (mounted) {
+          console.error("[HubLeaders] Failed to fetch MLB leaders:", err);
+          setLiveSportCategories([]);
+        }
+      })
+      .finally(() => {
+        if (mounted) setLiveSportLoading(false);
       });
 
     return () => {
       mounted = false;
     };
-  }, [sportKey]);
+  }, [isLivePropsSport, sportKeyLower]);
 
   const categories = useMemo(() => {
-    if (sportKey === "nba") {
-      return liveNbaCategories || [];
+    const hasRenderableLive = Boolean(
+      liveSportCategories?.some((cat) => Array.isArray(cat.players) && cat.players.length > 0),
+    );
+    if (sportKeyLower === "nba") {
+      const liveOrCache = hasRenderableLive ? (liveSportCategories || []) : [];
+      return liveOrCache.filter((cat) => Array.isArray(cat.players) && cat.players.length > 0);
     }
-    return MOCK_LEADERS[sportKey] || [];
-  }, [liveNbaCategories, sportKey]);
+    const source =
+      sportKeyLower === "mlb"
+        ? (hasRenderableLive ? liveSportCategories || [] : (MOCK_LEADERS[sportKeyLower] || []))
+        : (isLivePropsSport ? (liveSportCategories || []) : (MOCK_LEADERS[sportKeyLower] || []));
+    // Guardrail: avoid rendering empty category shells that can crash quick cards.
+    return source.filter((cat) => Array.isArray(cat.players) && cat.players.length > 0);
+  }, [isLivePropsSport, liveSportCategories, nbaMode, sportKeyLower]);
+  const visibleCategories = useMemo(() => {
+    if (sportKeyLower !== "mlb") return categories;
+    const grouped = categories.filter((cat) => (cat.statGroup || "hitting") === activeMlbGroup);
+    const leagueFiltered = grouped
+      .map((cat) => ({
+        ...cat,
+        players: activeMlbLeague === "all"
+          ? cat.players
+          : cat.players.filter((player) => String(player.league || "").toUpperCase() === activeMlbLeague),
+      }))
+      .filter((cat) => cat.players.length > 0);
+    return leagueFiltered.length > 0 ? leagueFiltered : grouped;
+  }, [activeMlbGroup, activeMlbLeague, categories, sportKeyLower]);
+  const leadersSource: "season" | "live" | "cached" | "fallback" | "static" = useMemo(() => {
+    const hasRenderableLive = Boolean(
+      liveSportCategories?.some((cat) => Array.isArray(cat.players) && cat.players.length > 0),
+    );
+    if (sportKeyLower === "mlb") {
+      return hasRenderableLive ? "live" : "fallback";
+    }
+    if (sportKeyLower === "nba") {
+      if (nbaMode === "season") return "season";
+      if (!hasRenderableLive) return "fallback";
+      return nbaLeadersSource;
+    }
+    return "static";
+  }, [liveSportCategories, nbaLeadersSource, nbaMode, sportKeyLower]);
+  const leadersSourceLabel = useMemo(() => {
+    if (sportKeyLower === "nba") {
+      if (leadersSource === "season") return nbaLeadersSource === "cached" ? "season cache" : "season live";
+      if (leadersSource === "live") return "live";
+      if (leadersSource === "cached") return "live cache";
+      if (leadersSource === "fallback") return "unavailable";
+    }
+    return leadersSource;
+  }, [leadersSource, nbaLeadersSource, sportKeyLower]);
 
   useEffect(() => {
-    if (activeCategory >= categories.length) {
+    if (activeCategory >= visibleCategories.length) {
       setActiveCategory(0);
     }
-  }, [activeCategory, categories.length]);
+  }, [activeCategory, visibleCategories.length]);
 
-  if (sportKey === "nba" && liveNbaLoading) {
+  if (isLivePropsSport && liveSportLoading && categories.length === 0) {
     return (
       <div className="rounded-2xl border border-white/10 bg-gradient-to-br from-white/[0.03] to-transparent p-8 text-center">
-        <p className="text-sm text-white/60">Loading live NBA leader lines...</p>
+        <p className="text-sm text-white/60">
+          Loading {nbaMode === "season" ? "season" : "live"} {sportKey.toUpperCase()} leader lines...
+        </p>
       </div>
     );
   }
 
-  if (sportKey === "nba" && (liveNbaError || categories.length === 0)) {
+  if (sportKeyLower === "mlb" && liveSportLoading) {
     return (
       <div className="rounded-2xl border border-white/10 bg-gradient-to-br from-white/[0.03] to-transparent p-8 text-center">
-        <h3 className="text-lg font-semibold text-white/90 mb-2">Live NBA Leaders Unavailable</h3>
-        <p className="text-white/50 text-sm max-w-xs mx-auto">
-          {liveNbaError || "No live NBA props were returned for the current slate."}
-        </p>
+        <p className="text-sm text-white/60">Loading live MLB leaders...</p>
       </div>
     );
   }
 
   // Show coming soon message for sports without data
   if (categories.length === 0) {
+    if (sportKeyLower === "nba") {
+      return (
+        <div className="rounded-2xl border border-white/10 bg-gradient-to-br from-white/[0.03] to-transparent p-8 text-center">
+          <h3 className="text-lg font-semibold text-white/90 mb-2">NBA leaders temporarily unavailable</h3>
+          <p className="text-white/50 text-sm max-w-xs mx-auto">
+            We could not load current {nbaMode} leaders right now. Try refreshing shortly.
+          </p>
+        </div>
+      );
+    }
     return (
       <div className="rounded-2xl border border-white/10 bg-gradient-to-br from-[var(--sport-accent)]/5 via-transparent to-transparent p-8 text-center">
         <div className="inline-flex items-center justify-center w-14 h-14 rounded-2xl bg-white/5 border border-white/10 mb-4">
@@ -500,11 +748,39 @@ export function HubLeaders({ sportKey }: HubLeadersProps) {
     );
   }
 
+  const activeCategoryData = visibleCategories[activeCategory] || visibleCategories[0];
+  if (!activeCategoryData) {
+    return (
+      <div className="rounded-2xl border border-white/10 bg-gradient-to-br from-white/[0.03] to-transparent p-8 text-center">
+        <p className="text-white/50 text-sm">Leaderboard data is temporarily unavailable.</p>
+      </div>
+    );
+  }
+
   return (
     <div className="space-y-4">
-      {/* Category Tabs */}
-      <div className="flex items-center gap-2">
-        {categories.map((cat, idx) => (
+      {/* Category Controls */}
+      <div className="space-y-3">
+      <div className="flex items-center justify-between gap-3">
+        <div className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/[0.03] px-2.5 py-1 text-[10px] uppercase tracking-wider text-white/55">
+          <span>Leaders</span>
+          <span className={
+            leadersSource === "season"
+              ? "text-violet-300"
+              :
+            leadersSource === "live"
+              ? "text-emerald-400"
+              : leadersSource === "cached"
+                ? "text-sky-300"
+              : leadersSource === "fallback"
+                ? "text-amber-300"
+                : "text-cyan-300"
+          }>
+            {leadersSourceLabel}
+          </span>
+        </div>
+        <div className="flex items-center gap-2">
+        {visibleCategories.map((cat, idx) => (
           <button
             key={cat.key}
             onClick={() => setActiveCategory(idx)}
@@ -517,6 +793,88 @@ export function HubLeaders({ sportKey }: HubLeadersProps) {
             {cat.shortLabel}
           </button>
         ))}
+        </div>
+      </div>
+      {sportKeyLower === "nba" && (
+        <div className="inline-flex rounded-full border border-white/10 bg-white/[0.03] p-1">
+          <button
+            onClick={() => {
+              setNbaMode("season");
+              setActiveCategory(0);
+            }}
+            className={`px-3 py-1.5 rounded-full text-xs font-semibold transition ${
+              nbaMode === "season"
+                ? "bg-violet-500/20 text-violet-300 border border-violet-400/30"
+                : "text-white/60 hover:text-white/80"
+            }`}
+          >
+            Season
+          </button>
+          <button
+            onClick={() => {
+              setNbaMode("live");
+              setActiveCategory(0);
+            }}
+            className={`px-3 py-1.5 rounded-full text-xs font-semibold transition ${
+              nbaMode === "live"
+                ? "bg-emerald-500/20 text-emerald-300 border border-emerald-400/30"
+                : "text-white/60 hover:text-white/80"
+            }`}
+          >
+            Live
+          </button>
+        </div>
+      )}
+      {sportKeyLower === "mlb" && (
+        <div className="flex flex-wrap items-center gap-2">
+        <div className="inline-flex rounded-full border border-white/10 bg-white/[0.03] p-1">
+          <button
+            onClick={() => {
+              setActiveMlbGroup("hitting");
+              setActiveCategory(0);
+            }}
+            className={`px-3 py-1.5 rounded-full text-xs font-semibold transition ${
+              activeMlbGroup === "hitting"
+                ? "bg-emerald-500/20 text-emerald-300 border border-emerald-400/30"
+                : "text-white/60 hover:text-white/80"
+            }`}
+          >
+            Hitting
+          </button>
+          <button
+            onClick={() => {
+              setActiveMlbGroup("pitching");
+              setActiveCategory(0);
+            }}
+            className={`px-3 py-1.5 rounded-full text-xs font-semibold transition ${
+              activeMlbGroup === "pitching"
+                ? "bg-cyan-500/20 text-cyan-300 border border-cyan-400/30"
+                : "text-white/60 hover:text-white/80"
+            }`}
+          >
+            Pitching
+          </button>
+        </div>
+        <div className="inline-flex rounded-full border border-white/10 bg-white/[0.03] p-1">
+          {(["all", "AL", "NL"] as const).map((league) => (
+            <button
+              key={league}
+              onClick={() => {
+                setActiveMlbLeague(league);
+                setActiveCategory(0);
+              }}
+              className={`px-3 py-1.5 rounded-full text-xs font-semibold transition ${
+                activeMlbLeague === league
+                  ? "bg-violet-500/20 text-violet-300 border border-violet-400/30"
+                  : "text-white/60 hover:text-white/80"
+              }`}
+            >
+              {league === "all" ? "All Leagues" : league}
+            </button>
+          ))}
+        </div>
+        </div>
+      )}
       </div>
 
       {/* Leaders Display */}
@@ -526,7 +884,12 @@ export function HubLeaders({ sportKey }: HubLeadersProps) {
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-2">
               <Award className="h-4 w-4 text-amber-400" />
-              <span className="font-bold text-white text-sm">{categories[activeCategory].label}</span>
+              <span className="font-bold text-white text-sm">{activeCategoryData.label}</span>
+              {activeCategoryData.qualifierLabel ? (
+                <span className="rounded-full border border-emerald-400/30 bg-emerald-500/10 px-2 py-0.5 text-[10px] font-semibold text-emerald-300">
+                  {activeCategoryData.qualifierLabel}
+                </span>
+              ) : null}
             </div>
           </div>
         </div>
@@ -534,13 +897,13 @@ export function HubLeaders({ sportKey }: HubLeadersProps) {
         {/* Player Cards - Horizontal Scroll */}
         <div className="p-4">
           <div className="flex gap-3 overflow-x-auto pb-2 scrollbar-hide snap-x">
-            {categories[activeCategory].players.map((player, index) => (
+            {activeCategoryData.players.map((player, index) => (
               <PlayerCard 
                 key={player.playerId}
                 player={player}
                 index={index}
                 sportKey={sportKey}
-                unit={categories[activeCategory].unit}
+                unit={activeCategoryData.unit}
               />
             ))}
           </div>
@@ -549,13 +912,14 @@ export function HubLeaders({ sportKey }: HubLeadersProps) {
 
       {/* Quick Stats Grid - Top 3 across categories */}
       <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-        {categories.map((cat, catIdx) => {
+        {visibleCategories.map((cat, catIdx) => {
           const leader = cat.players[0];
           return (
             <QuickStatCard 
               key={cat.key}
               category={cat}
               leader={leader}
+              sportKey={sportKey}
               isActive={catIdx === activeCategory}
               onClick={() => setActiveCategory(catIdx)}
             />
@@ -575,6 +939,8 @@ interface PlayerCardProps {
 
 function PlayerCard({ player, index, sportKey, unit }: PlayerCardProps) {
   const isFirst = player.rank === 1;
+  const [headshotFailed, setHeadshotFailed] = useState(false);
+  const playerPath = `/props/player/${String(sportKey || "").toUpperCase()}/${encodeURIComponent(player.name)}`;
   
   return (
     <motion.div
@@ -583,11 +949,12 @@ function PlayerCard({ player, index, sportKey, unit }: PlayerCardProps) {
       transition={{ delay: index * 0.05 }}
       className="snap-start"
     >
-      <div
+      <Link
+        to={playerPath}
         className={`block w-[160px] sm:w-[200px] rounded-xl border transition-all group ${
           isFirst 
             ? 'border-amber-500/30 bg-gradient-to-br from-amber-500/10 to-transparent' 
-            : 'border-white/10 bg-white/[0.02]'
+            : 'border-white/10 bg-white/[0.02] hover:border-white/25'
         }`}
       >
         {/* Rank Badge */}
@@ -610,28 +977,44 @@ function PlayerCard({ player, index, sportKey, unit }: PlayerCardProps) {
         {/* Player Info */}
         <div className="p-3 pt-2 text-center">
           {/* Player Photo or Silhouette Fallback */}
-          <div className={`w-12 h-12 sm:w-16 sm:h-16 mx-auto rounded-full flex items-center justify-center text-lg font-bold mb-2 overflow-hidden ${
+          <div className={`w-[72px] h-[80px] sm:w-[88px] sm:h-[96px] mx-auto rounded-2xl flex items-center justify-center text-lg font-bold mb-2 overflow-hidden bg-gradient-to-b from-white/[0.06] to-white/[0.02] border border-white/10 ${
             isFirst 
               ? 'ring-2 ring-amber-500/30' 
               : ''
           }`}>
-            <PlayerPhoto
-              playerName={player.name}
-              sport={sportKey}
-              size={64}
-              highlight={isFirst}
-            />
+            {!headshotFailed && player.imageUrl ? (
+              <img
+                src={player.imageUrl}
+                alt={player.name}
+                className="object-contain object-center rounded-2xl p-1"
+                style={{ width: "100%", height: "100%" }}
+                onError={() => setHeadshotFailed(true)}
+                loading="lazy"
+              />
+            ) : (
+              <PlayerPhoto
+                playerName={player.name}
+                sport={sportKey}
+                size={92}
+                highlight={isFirst}
+                shape="rounded"
+                className="object-contain object-center p-1"
+              />
+            )}
           </div>
 
           {/* Name */}
           <div className="font-semibold text-white text-sm truncate group-hover:text-[var(--sport-accent)] transition-colors">
-            {player.name.split(' ').slice(-1)[0]}
+            {getDisplayLastName(player.name)}
           </div>
           
           {/* Team */}
           <div className="text-[10px] text-white/40 mt-0.5">
             {player.teamName}
           </div>
+          {player.league ? (
+            <div className="text-[10px] text-white/30 mt-0.5">{player.league}</div>
+          ) : null}
 
           {/* Stat Value */}
           <div className={`mt-2 text-xl sm:text-2xl font-bold tabular-nums ${
@@ -647,10 +1030,14 @@ function PlayerCard({ player, index, sportKey, unit }: PlayerCardProps) {
         {/* Footer */}
         <div className="px-3 py-2 border-t border-white/5 flex justify-center">
           <span className="text-[10px] text-white/30">
-            {player.sampleSize ? `${player.sampleSize} markets` : `${player.gamesPlayed} GP`}
+            {player.sampleValue != null && player.sampleLabel
+              ? `${player.sampleValue} ${player.sampleLabel}`
+              : player.sampleSize
+                ? `${player.sampleSize} markets`
+                : `${player.gamesPlayed} GP`}
           </span>
         </div>
-      </div>
+      </Link>
     </motion.div>
   );
 }
@@ -676,12 +1063,15 @@ function TrendIndicator({ trend }: { trend: "up" | "down" | "same" }) {
 
 interface QuickStatCardProps {
   category: StatCategory;
-  leader: PlayerStat;
+  leader?: PlayerStat;
+  sportKey: string;
   isActive: boolean;
   onClick: () => void;
 }
 
-function QuickStatCard({ category, leader, isActive, onClick }: QuickStatCardProps) {
+function QuickStatCard({ category, leader, sportKey, isActive, onClick }: QuickStatCardProps) {
+  if (!leader) return null;
+  const playerPath = `/props/player/${String(sportKey || "").toUpperCase()}/${encodeURIComponent(leader.name)}`;
   return (
     <button
       onClick={onClick}
@@ -694,9 +1084,13 @@ function QuickStatCard({ category, leader, isActive, onClick }: QuickStatCardPro
       <div className="text-[10px] text-white/40 uppercase tracking-wider mb-1">
         {category.shortLabel} Leader
       </div>
-      <div className="font-semibold text-white text-sm truncate">
-        {leader.name.split(' ').slice(-1)[0]}
-      </div>
+      <Link
+        to={playerPath}
+        onClick={(event) => event.stopPropagation()}
+        className="font-semibold text-white text-sm truncate hover:text-[var(--sport-accent)] transition-colors"
+      >
+        {getDisplayLastName(leader.name)}
+      </Link>
       <div className="flex items-baseline gap-1 mt-1">
         <span className={`text-lg font-bold ${isActive ? 'text-[var(--sport-accent)]' : 'text-white'}`}>
           {formatStatValue(leader.value, category.unit)}

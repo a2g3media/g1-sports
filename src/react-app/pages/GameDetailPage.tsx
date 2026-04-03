@@ -48,6 +48,9 @@ import {
 import { getMarketPeriodLabels } from "@/react-app/lib/marketPeriodLabels";
 import { getAllSoccerLeagues, getSoccerLeagueMeta } from "@/react-app/lib/soccerLeagueMeta";
 import { toGameDetailPath } from "@/react-app/lib/gameRoutes";
+import { fetchJsonCached, getFetchCacheStats } from "@/react-app/lib/fetchCache";
+import { getRouteCache, setRouteCache, getRouteCacheStats } from "@/react-app/lib/routeDataCache";
+import { logPerfSnapshot, startPerfTimer } from "@/react-app/lib/perfTelemetry";
 
 // ====================
 // TYPES
@@ -700,9 +703,13 @@ const SectionHeader = memo(function SectionHeader({
 const GameHeroPanel = memo(function GameHeroPanel({
   game,
   getTeamName,
+  onTeamNavigate,
+  onTeamPrefetch,
 }: {
   game: GameData;
   getTeamName: (isHome: boolean) => string;
+  onTeamNavigate?: (teamCode: string, teamName: string) => void;
+  onTeamPrefetch?: (teamCode: string, teamName: string) => void;
 }) {
   const { formatMoneylineValue } = useOddsFormat();
   const awayName = getTeamName(false);
@@ -756,7 +763,15 @@ const GameHeroPanel = memo(function GameHeroPanel({
               : "linear-gradient(120deg, rgba(17,24,39,0.7) 0%, rgba(15,23,42,0.4) 100%)",
           }}
         >
-          <div className="flex items-center gap-3">
+          <button
+            type="button"
+            onClick={() => onTeamNavigate?.(game.awayTeam || "", awayName)}
+            onMouseEnter={() => onTeamPrefetch?.(game.awayTeam || "", awayName)}
+            onFocus={() => onTeamPrefetch?.(game.awayTeam || "", awayName)}
+            onTouchStart={() => onTeamPrefetch?.(game.awayTeam || "", awayName)}
+            className="group flex items-center gap-3 rounded-lg -m-1 p-1 text-left transition-colors hover:bg-white/[0.05] cursor-pointer"
+            aria-label={`Open ${awayName} team page`}
+          >
             <TeamLogo
               teamCode={game.awayTeam || "AWY"}
               teamName={awayName}
@@ -768,8 +783,11 @@ const GameHeroPanel = memo(function GameHeroPanel({
             <div className="min-w-0">
               <p className="truncate text-xs uppercase tracking-wide text-[#9CA3AF]">Away</p>
               <p className="truncate text-base font-semibold text-[#E5E7EB] md:text-xl">{awayName}</p>
+              <p className="text-[10px] text-cyan-300/80 opacity-0 -translate-y-0.5 transition-all duration-150 group-hover:opacity-100 group-hover:translate-y-0">
+                View Team &rarr;
+              </p>
             </div>
-          </div>
+          </button>
         </div>
         <div className="col-span-4 border-x border-white/[0.05] bg-[#16202B] p-4 text-center md:p-6">
           <p className="text-xs uppercase tracking-wider text-[#9CA3AF]">{game.sport}</p>
@@ -790,10 +808,21 @@ const GameHeroPanel = memo(function GameHeroPanel({
               : "linear-gradient(240deg, rgba(17,24,39,0.7) 0%, rgba(15,23,42,0.4) 100%)",
           }}
         >
-          <div className="flex items-center justify-end gap-3">
+          <button
+            type="button"
+            onClick={() => onTeamNavigate?.(game.homeTeam || "", homeName)}
+            onMouseEnter={() => onTeamPrefetch?.(game.homeTeam || "", homeName)}
+            onFocus={() => onTeamPrefetch?.(game.homeTeam || "", homeName)}
+            onTouchStart={() => onTeamPrefetch?.(game.homeTeam || "", homeName)}
+            className="group flex items-center justify-end gap-3 rounded-lg -m-1 p-1 w-full text-right transition-colors hover:bg-white/[0.05] cursor-pointer"
+            aria-label={`Open ${homeName} team page`}
+          >
             <div className="min-w-0 text-right">
               <p className="truncate text-xs uppercase tracking-wide text-[#9CA3AF]">Home</p>
               <p className="truncate text-base font-semibold text-[#E5E7EB] md:text-xl">{homeName}</p>
+              <p className="text-[10px] text-cyan-300/80 opacity-0 -translate-y-0.5 transition-all duration-150 group-hover:opacity-100 group-hover:translate-y-0">
+                View Team &rarr;
+              </p>
             </div>
             <TeamLogo
               teamCode={game.homeTeam || "HOM"}
@@ -803,7 +832,7 @@ const GameHeroPanel = memo(function GameHeroPanel({
               winnerGlow={homeWon}
               className="drop-shadow-[0_0_22px_rgba(255,255,255,0.35)]"
             />
-          </div>
+          </button>
         </div>
       </div>
       <div className="grid grid-cols-3 border-t border-white/[0.05] bg-[#0F141B]">
@@ -2353,6 +2382,49 @@ const PlayerPropsTab = memo(function PlayerPropsTab({
   const [marketFilter, setMarketFilter] = useState<string>('ALL');
   const [teamFilter, setTeamFilter] = useState<'ALL' | 'HOME' | 'AWAY'>('ALL');
   const [sortBy, setSortBy] = useState<'edge' | 'line' | 'name'>('edge');
+  const [teamH2H, setTeamH2H] = useState<{ sampleSize: number; series: { teamAWins: number; teamBWins: number } } | null>(null);
+  const [playerGameLogs, setPlayerGameLogs] = useState<Record<string, Array<{ stats: Record<string, string | number> }>>>({});
+
+  useEffect(() => {
+    let cancelled = false;
+    const fetchTeamH2H = async () => {
+      const sportKey = String(sport || '').toUpperCase();
+      const teamA = String(homeTeamCode || homeTeamName || '').trim();
+      const teamB = String(awayTeamCode || awayTeamName || '').trim();
+      if (!sportKey || !teamA || !teamB) {
+        if (!cancelled) setTeamH2H(null);
+        return;
+      }
+      try {
+        const res = await fetch(
+          `/api/teams/${encodeURIComponent(sportKey)}/h2h?teamA=${encodeURIComponent(teamA)}&teamB=${encodeURIComponent(teamB)}&window=10`,
+          { credentials: 'include', cache: 'no-store' }
+        );
+        if (!res.ok) {
+          if (!cancelled) setTeamH2H(null);
+          return;
+        }
+        const json = await res.json();
+        if (!cancelled && Number(json?.sampleSize) > 0) {
+          setTeamH2H({
+            sampleSize: Number(json.sampleSize),
+            series: {
+              teamAWins: Number(json?.series?.teamAWins || 0),
+              teamBWins: Number(json?.series?.teamBWins || 0),
+            },
+          });
+        } else if (!cancelled) {
+          setTeamH2H(null);
+        }
+      } catch {
+        if (!cancelled) setTeamH2H(null);
+      }
+    };
+    fetchTeamH2H();
+    return () => {
+      cancelled = true;
+    };
+  }, [sport, homeTeamCode, awayTeamCode, homeTeamName, awayTeamName]);
 
   // Format prop type display
   const formatPropType = (type: string) => {
@@ -2378,6 +2450,21 @@ const PlayerPropsTab = memo(function PlayerPropsTab({
     };
     return typeMap[type.toLowerCase()] || type.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
   };
+
+  const getStatKeysForPropType = useCallback((propType: string): string[] => {
+    const t = String(propType || '').toLowerCase();
+    if (t.includes('point') && !t.includes('three')) return ['PTS', 'Points'];
+    if (t.includes('rebound') || t === 'reb') return ['REB', 'Rebounds', 'TRB'];
+    if (t.includes('assist') || t === 'ast') return ['AST', 'Assists'];
+    if (t.includes('steal')) return ['STL', 'Steals'];
+    if (t.includes('block')) return ['BLK', 'Blocks'];
+    if (t.includes('three') || t.includes('3pt') || t.includes('3pm')) return ['3PM', '3PT', 'FG3M'];
+    if (t.includes('pts_reb_ast') || t.includes('pra')) return ['PTS_REB_AST', 'PRA'];
+    if (t.includes('pts_reb')) return ['PTS_REB', 'PR'];
+    if (t.includes('pts_ast')) return ['PTS_AST', 'PA'];
+    if (t.includes('reb_ast')) return ['REB_AST', 'RA'];
+    return [];
+  }, []);
 
   const hashCode = (value: string) => {
     return value.split('').reduce((acc, ch) => ((acc << 5) - acc + ch.charCodeAt(0)) | 0, 0);
@@ -2485,6 +2572,125 @@ const PlayerPropsTab = memo(function PlayerPropsTab({
     return 'OTHER';
   }, [awayTeamTokens, homeTeamTokens]);
 
+  const resolvePropTeamSide = useCallback((prop: PlayerProp): 'HOME' | 'AWAY' | 'OTHER' => {
+    let side = inferPropTeamSide(prop.team);
+    if (side === 'OTHER') {
+      const playerToken = normalizePlayerToken(prop.player_name);
+      if (playerToken) {
+        if (homeRosterPlayerTokens.has(playerToken)) side = 'HOME';
+        else if (awayRosterPlayerTokens.has(playerToken)) side = 'AWAY';
+      }
+    }
+    return side;
+  }, [awayRosterPlayerTokens, homeRosterPlayerTokens, inferPropTeamSide]);
+
+  const deriveTeamH2HRecord = useCallback((prop: PlayerProp, fallbackPct: number): { pct: number; wins: number | null; total: number | null } => {
+    if (!teamH2H || teamH2H.sampleSize <= 0) {
+      return { pct: fallbackPct, wins: null, total: null };
+    }
+    const side = resolvePropTeamSide(prop);
+    if (side === 'HOME') {
+      return {
+        pct: Math.round((teamH2H.series.teamAWins / teamH2H.sampleSize) * 100),
+        wins: teamH2H.series.teamAWins,
+        total: teamH2H.sampleSize,
+      };
+    }
+    if (side === 'AWAY') {
+      return {
+        pct: Math.round((teamH2H.series.teamBWins / teamH2H.sampleSize) * 100),
+        wins: teamH2H.series.teamBWins,
+        total: teamH2H.sampleSize,
+      };
+    }
+    return { pct: fallbackPct, wins: null, total: null };
+  }, [resolvePropTeamSide, teamH2H]);
+
+  const statFromGame = useCallback((game: { stats?: Record<string, string | number> }, keys: string[]): number | null => {
+    const hasCombo = keys.includes('PTS_REB_AST') || keys.includes('PTS_REB') || keys.includes('PTS_AST') || keys.includes('REB_AST');
+    const numFor = (candidate: string): number | null => {
+      const raw = game?.stats?.[candidate];
+      const n = Number(raw);
+      return Number.isFinite(n) ? n : null;
+    };
+    if (hasCombo) {
+      const pts = numFor('PTS') ?? numFor('Points') ?? 0;
+      const reb = numFor('REB') ?? numFor('Rebounds') ?? numFor('TRB') ?? 0;
+      const ast = numFor('AST') ?? numFor('Assists') ?? 0;
+      if (keys.includes('PTS_REB_AST') || keys.includes('PRA')) return pts + reb + ast;
+      if (keys.includes('PTS_REB') || keys.includes('PR')) return pts + reb;
+      if (keys.includes('PTS_AST') || keys.includes('PA')) return pts + ast;
+      if (keys.includes('REB_AST') || keys.includes('RA')) return reb + ast;
+    }
+    for (const key of keys) {
+      const n = numFor(key);
+      if (n !== null) return n;
+    }
+    return null;
+  }, []);
+
+  const derivePlayerRateStats = useCallback((prop: PlayerProp, scope: 'l5' | 'season'): { pct: number | null; hits: number; total: number } => {
+    const playerToken = normalizePlayerToken(prop.player_name);
+    const logs = playerGameLogs[playerToken];
+    if (!Array.isArray(logs) || logs.length === 0) return { pct: null, hits: 0, total: 0 };
+    const keys = getStatKeysForPropType(prop.prop_type);
+    if (keys.length === 0 || !Number.isFinite(Number(prop.line_value))) return { pct: null, hits: 0, total: 0 };
+    const sample = (scope === 'l5' ? logs.slice(0, 5) : logs).slice(0, 12);
+    if (sample.length === 0) return { pct: null, hits: 0, total: 0 };
+    let hits = 0;
+    let total = 0;
+    for (const g of sample) {
+      const value = statFromGame(g, keys);
+      if (value === null) continue;
+      total += 1;
+      if (value > Number(prop.line_value)) hits += 1;
+    }
+    if (total === 0) return { pct: null, hits, total };
+    return { pct: Math.round((hits / total) * 100), hits, total };
+  }, [getStatKeysForPropType, normalizePlayerToken, playerGameLogs, statFromGame]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const uniquePlayers = Array.from(new Set((props || []).map((p) => String(p.player_name || '').trim()).filter(Boolean))).slice(0, 12);
+    const missing = uniquePlayers.filter((name) => !playerGameLogs[normalizePlayerToken(name)]);
+    if (missing.length === 0 || !sport) return;
+
+    const fetchLogs = async () => {
+      const entries = await Promise.allSettled(
+        missing.map(async (name) => {
+          const teamHint = (props || []).find((p) => String(p.player_name || '').trim() === name)?.team || '';
+          const res = await fetch(
+            `/api/player/${encodeURIComponent(String(sport).toUpperCase())}/${encodeURIComponent(name)}?team=${encodeURIComponent(String(teamHint || ''))}`,
+            { credentials: 'include', cache: 'no-store' }
+          );
+          if (!res.ok) return { token: normalizePlayerToken(name), logs: [] as Array<{ stats: Record<string, string | number> }> };
+          const json = await res.json();
+          return {
+            token: normalizePlayerToken(name),
+            logs: Array.isArray(json?.gameLog) ? json.gameLog : [],
+          };
+        })
+      );
+      if (cancelled) return;
+      setPlayerGameLogs((prev) => {
+        const next = { ...prev };
+        for (const result of entries) {
+          if (result.status !== 'fulfilled') continue;
+          if (!result.value.token) continue;
+          if (!next[result.value.token]) {
+            next[result.value.token] = result.value.logs;
+          }
+        }
+        return next;
+      });
+    };
+
+    fetchLogs();
+    return () => {
+      cancelled = true;
+    };
+  }, [normalizePlayerToken, playerGameLogs, props, sport]);
+
   const teamPills = useMemo(() => {
     const homeLabel = homeTeamName || homeTeamCode || 'Home';
     const awayLabel = awayTeamName || awayTeamCode || 'Away';
@@ -2543,14 +2749,7 @@ const PlayerPropsTab = memo(function PlayerPropsTab({
   });
   const sideFilteredProps = baseFilteredProps.filter((prop) => {
     if (teamFilter !== 'ALL') {
-      let side = inferPropTeamSide(prop.team);
-      if (side === 'OTHER') {
-        const playerToken = normalizePlayerToken(prop.player_name);
-        if (playerToken) {
-          if (homeRosterPlayerTokens.has(playerToken)) side = 'HOME';
-          else if (awayRosterPlayerTokens.has(playerToken)) side = 'AWAY';
-        }
-      }
+      const side = resolvePropTeamSide(prop);
       if (side !== teamFilter) return false;
     }
     return true;
@@ -2799,7 +2998,16 @@ const PlayerPropsTab = memo(function PlayerPropsTab({
               const overAdded = addedProps.has(overKey) || isPropInWatchboard(gameId, prop.player_name, prop.prop_type, 'Over');
               const underAdded = addedProps.has(underKey) || isPropInWatchboard(gameId, prop.player_name, prop.prop_type, 'Under');
               const trackedInWatchboard = addedProps.has(watchKey) || isPropInWatchboard(gameId, prop.player_name, prop.prop_type);
-              const insight = buildInsight(prop);
+              const baseInsight = buildInsight(prop);
+              const l5Stats = derivePlayerRateStats(prop, 'l5');
+              const seasonStats = derivePlayerRateStats(prop, 'season');
+              const h2hStats = deriveTeamH2HRecord(prop, baseInsight.h2hPct);
+              const insight = {
+                ...baseInsight,
+                l5Pct: l5Stats.pct ?? baseInsight.l5Pct,
+                seasonPct: seasonStats.pct ?? baseInsight.seasonPct,
+                h2hPct: h2hStats.pct,
+              };
               const edgeColor = insight.edge >= 0 ? "text-emerald-300" : "text-rose-300";
               const confidenceStars = Array.from({ length: 5 }, (_, i) => i < insight.confidence);
               const overAction = Math.max(50, Math.min(88, insight.l5Pct));
@@ -2936,17 +3144,29 @@ const PlayerPropsTab = memo(function PlayerPropsTab({
                       <div className="text-[10px] text-[#6B7280]">OPP</div>
                       <div className="text-xs font-semibold text-[#E5E7EB]">{insight.oppRank}th</div>
                     </div>
-                    <div className={cn("rounded-md border p-2 text-center", metricBandClass('pct', insight.l5Pct))}>
-                      <div className="text-[10px] text-[#6B7280]">O-L5</div>
+                    <div
+                      title={l5Stats.total > 0 ? `Over L5: ${l5Stats.hits}/${l5Stats.total}` : 'Over L5 sample unavailable'}
+                      className={cn("rounded-md border p-2 text-center", metricBandClass('pct', insight.l5Pct))}
+                    >
+                      <div className="text-[10px] text-[#6B7280]">L5</div>
                       <div className="text-xs font-semibold text-[#E5E7EB]">{insight.l5Pct}%</div>
+                      <div className="text-[9px] text-[#6B7280]">{l5Stats.total > 0 ? `${l5Stats.hits}/${l5Stats.total}` : '-'}</div>
                     </div>
-                    <div className={cn("rounded-md border p-2 text-center", metricBandClass('pct', insight.seasonPct))}>
+                    <div
+                      title={seasonStats.total > 0 ? `Over season sample: ${seasonStats.hits}/${seasonStats.total}` : 'Season sample unavailable'}
+                      className={cn("rounded-md border p-2 text-center", metricBandClass('pct', insight.seasonPct))}
+                    >
                       <div className="text-[10px] text-[#6B7280]">SZN</div>
                       <div className="text-xs font-semibold text-[#E5E7EB]">{insight.seasonPct}%</div>
+                      <div className="text-[9px] text-[#6B7280]">{seasonStats.total > 0 ? `${seasonStats.hits}/${seasonStats.total}` : '-'}</div>
                     </div>
-                    <div className={cn("rounded-md border p-2 text-center", metricBandClass('pct', insight.h2hPct))}>
+                    <div
+                      title={h2hStats.total ? `Team H2H wins: ${h2hStats.wins}/${h2hStats.total}` : 'Team H2H sample unavailable'}
+                      className={cn("rounded-md border p-2 text-center", metricBandClass('pct', insight.h2hPct))}
+                    >
                       <div className="text-[10px] text-[#6B7280]">H2H</div>
                       <div className="text-xs font-semibold text-[#E5E7EB]">{insight.h2hPct}%</div>
+                      <div className="text-[9px] text-[#6B7280]">{h2hStats.total ? `${h2hStats.wins}/${h2hStats.total}` : '-'}</div>
                     </div>
                   </div>
 
@@ -3799,10 +4019,14 @@ const LiveHeroScoreboard = memo(function LiveHeroScoreboard({
   game,
   getTeamName,
   lastPlay,
+  onTeamNavigate,
+  onTeamPrefetch,
 }: {
   game: GameData;
   getTeamName: (isHome: boolean) => string;
   lastPlay: PlayByPlayEvent | null;
+  onTeamNavigate?: (teamCode: string, teamName: string) => void;
+  onTeamPrefetch?: (teamCode: string, teamName: string) => void;
 }) {
   const { formatMoneylineValue } = useOddsFormat();
   const homeDisplay = getTeamName(true);
@@ -3819,7 +4043,15 @@ const LiveHeroScoreboard = memo(function LiveHeroScoreboard({
       <SectionHeader icon={Zap} title="Live Hero Scoreboard" subtitle="Real-time scoring, market state, and flow context." accent="green" />
       <div className="grid grid-cols-12 items-center gap-3">
         <div className="col-span-5 rounded-[14px] border border-white/[0.05] bg-[#121821] p-3">
-          <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={() => onTeamNavigate?.(game.awayTeam || "", awayDisplay)}
+            onMouseEnter={() => onTeamPrefetch?.(game.awayTeam || "", awayDisplay)}
+            onFocus={() => onTeamPrefetch?.(game.awayTeam || "", awayDisplay)}
+            onTouchStart={() => onTeamPrefetch?.(game.awayTeam || "", awayDisplay)}
+            className="group flex items-center gap-2 rounded-md -m-1 p-1 transition-colors hover:bg-white/[0.05] cursor-pointer"
+            aria-label={`Open ${awayDisplay} team page`}
+          >
             <TeamLogo
               teamCode={game.awayTeam || "AWY"}
               teamName={awayDisplay}
@@ -3827,8 +4059,13 @@ const LiveHeroScoreboard = memo(function LiveHeroScoreboard({
               size={52}
               className="drop-shadow-[0_10px_14px_rgba(0,0,0,0.45)]"
             />
-            <p className="truncate text-sm font-semibold tracking-wide text-[#E5E7EB]">{awayDisplay}</p>
-          </div>
+            <div className="min-w-0">
+              <p className="truncate text-sm font-semibold tracking-wide text-[#E5E7EB]">{awayDisplay}</p>
+              <p className="text-[10px] text-cyan-300/80 opacity-0 -translate-y-0.5 transition-all duration-150 group-hover:opacity-100 group-hover:translate-y-0">
+                View Team &rarr;
+              </p>
+            </div>
+          </button>
           <p className="mt-1 text-3xl font-black text-[#E5E7EB] md:text-4xl">{game.awayScore ?? "-"}</p>
           {possession === "away" && <Badge className="mt-2 border border-cyan-400/30 bg-cyan-500/15 text-[10px] text-cyan-100">POSSESSION</Badge>}
         </div>
@@ -3838,8 +4075,21 @@ const LiveHeroScoreboard = memo(function LiveHeroScoreboard({
           <p className="text-sm font-semibold text-[#E5E7EB]">{game.clock || "--:--"}</p>
         </div>
         <div className="col-span-5 rounded-[14px] border border-white/[0.05] bg-[#121821] p-3 text-right">
-          <div className="flex items-center justify-end gap-2">
-            <p className="truncate text-sm font-semibold tracking-wide text-[#E5E7EB]">{homeDisplay}</p>
+          <button
+            type="button"
+            onClick={() => onTeamNavigate?.(game.homeTeam || "", homeDisplay)}
+            onMouseEnter={() => onTeamPrefetch?.(game.homeTeam || "", homeDisplay)}
+            onFocus={() => onTeamPrefetch?.(game.homeTeam || "", homeDisplay)}
+            onTouchStart={() => onTeamPrefetch?.(game.homeTeam || "", homeDisplay)}
+            className="group flex w-full items-center justify-end gap-2 rounded-md -m-1 p-1 transition-colors hover:bg-white/[0.05] cursor-pointer"
+            aria-label={`Open ${homeDisplay} team page`}
+          >
+            <div className="min-w-0 text-right">
+              <p className="truncate text-sm font-semibold tracking-wide text-[#E5E7EB]">{homeDisplay}</p>
+              <p className="text-[10px] text-cyan-300/80 opacity-0 -translate-y-0.5 transition-all duration-150 group-hover:opacity-100 group-hover:translate-y-0">
+                View Team &rarr;
+              </p>
+            </div>
             <TeamLogo
               teamCode={game.homeTeam || "HOM"}
               teamName={homeDisplay}
@@ -3847,7 +4097,7 @@ const LiveHeroScoreboard = memo(function LiveHeroScoreboard({
               size={52}
               className="drop-shadow-[0_10px_14px_rgba(0,0,0,0.45)]"
             />
-          </div>
+          </button>
           <p className="mt-1 text-3xl font-black text-[#E5E7EB] md:text-4xl">{game.homeScore ?? "-"}</p>
           {possession === "home" && <Badge className="mt-2 border border-cyan-400/30 bg-cyan-500/15 text-[10px] text-cyan-100">POSSESSION</Badge>}
         </div>
@@ -4152,9 +4402,13 @@ const LiveBettingCards = memo(function LiveBettingCards({ game }: { game: GameDa
 const FinalHeroPanel = memo(function FinalHeroPanel({
   game,
   getTeamName,
+  onTeamNavigate,
+  onTeamPrefetch,
 }: {
   game: GameData;
   getTeamName: (isHome: boolean) => string;
+  onTeamNavigate?: (teamCode: string, teamName: string) => void;
+  onTeamPrefetch?: (teamCode: string, teamName: string) => void;
 }) {
   const outcomes = deriveFinalOutcomes(game);
   const awayWon = game.awayScore !== null && game.homeScore !== null && game.awayScore > game.homeScore;
@@ -4165,7 +4419,13 @@ const FinalHeroPanel = memo(function FinalHeroPanel({
       <div className="grid grid-cols-3 items-center gap-3">
         <div className="rounded-xl border border-white/[0.05] bg-[#121821] p-3 text-center">
           <div className="mb-2 flex justify-center">
-            <div
+            <button
+              type="button"
+              onClick={() => onTeamNavigate?.(game.awayTeam || "", getTeamName(false))}
+              onMouseEnter={() => onTeamPrefetch?.(game.awayTeam || "", getTeamName(false))}
+              onFocus={() => onTeamPrefetch?.(game.awayTeam || "", getTeamName(false))}
+              onTouchStart={() => onTeamPrefetch?.(game.awayTeam || "", getTeamName(false))}
+              aria-label={`Open ${getTeamName(false)} team page`}
               className="relative rounded-full p-1.5 md:scale-[1.18]"
               style={{ transform: "perspective(700px) rotateX(8deg)" }}
             >
@@ -4179,7 +4439,7 @@ const FinalHeroPanel = memo(function FinalHeroPanel({
                 winnerGlow={awayWon}
                 className="relative z-10 drop-shadow-[0_12px_18px_rgba(0,0,0,0.55)]"
               />
-            </div>
+            </button>
           </div>
           <p className="text-xs text-[#9CA3AF]">{getTeamName(false)}</p>
           <p className="text-3xl font-black text-[#E5E7EB]">{game.awayScore ?? "-"}</p>
@@ -4190,7 +4450,13 @@ const FinalHeroPanel = memo(function FinalHeroPanel({
         </div>
         <div className="rounded-xl border border-white/[0.05] bg-[#121821] p-3 text-center">
           <div className="mb-2 flex justify-center">
-            <div
+            <button
+              type="button"
+              onClick={() => onTeamNavigate?.(game.homeTeam || "", getTeamName(true))}
+              onMouseEnter={() => onTeamPrefetch?.(game.homeTeam || "", getTeamName(true))}
+              onFocus={() => onTeamPrefetch?.(game.homeTeam || "", getTeamName(true))}
+              onTouchStart={() => onTeamPrefetch?.(game.homeTeam || "", getTeamName(true))}
+              aria-label={`Open ${getTeamName(true)} team page`}
               className="relative rounded-full p-1.5 md:scale-[1.18]"
               style={{ transform: "perspective(700px) rotateX(8deg)" }}
             >
@@ -4204,7 +4470,7 @@ const FinalHeroPanel = memo(function FinalHeroPanel({
                 winnerGlow={homeWon}
                 className="relative z-10 drop-shadow-[0_12px_18px_rgba(0,0,0,0.55)]"
               />
-            </div>
+            </button>
           </div>
           <p className="text-xs text-[#9CA3AF]">{getTeamName(true)}</p>
           <p className="text-3xl font-black text-[#E5E7EB]">{game.homeScore ?? "-"}</p>
@@ -4323,6 +4589,24 @@ export function GameDetailPage() {
   const [playByPlay, setPlayByPlay] = useState<PlayByPlayData | null>(null);
   const [lastPlay, setLastPlay] = useState<PlayByPlayEvent | null>(null);
   const [lastPlayUpdated, setLastPlayUpdated] = useState<Date | null>(null);
+  const activeGameRequestRef = useRef(0);
+
+  useEffect(() => {
+    if (!fullGameId) return;
+    const cached = getRouteCache<GameData>(`route:game-detail:${fullGameId}`, 45000);
+    if (!cached) return;
+    setGame((prev) => prev || cached);
+    setIsLoading(false);
+  }, [fullGameId]);
+
+  useEffect(() => {
+    if (!fullGameId || !game) return;
+    setRouteCache(`route:game-detail:${fullGameId}`, game, 90000);
+  }, [fullGameId, game]);
+  const propsFreshAttemptedRef = useRef<Set<string>>(new Set());
+  const playByPlayInFlightRef = useRef(false);
+  const gameRefreshInFlightRef = useRef(false);
+  const liveOddsRefreshInFlightRef = useRef(false);
   const [soccerAdjacentGames, setSoccerAdjacentGames] = useState<{
     loading: boolean;
     prevId: string | null;
@@ -4354,6 +4638,11 @@ export function GameDetailPage() {
   useEffect(() => {
     setSportsbooksLoaded(false);
     setLineHistoryLoaded(false);
+    // Keep current valid game visible during transitions; only show full-screen loading when empty.
+    if (!game) {
+      setIsLoading(true);
+    }
+    setError(null);
   }, [fullGameId]);
 
   const mergeHeroOddsFromOddsApi = useCallback((prevOdds: OddsData | undefined, oddsData: any): OddsData => {
@@ -4438,6 +4727,8 @@ export function GameDetailPage() {
   const uiStyleParam = String(searchParams.get("uiStyle") || "").toLowerCase();
   const isLuxuryLivePreset = uiStyleParam === "luxury_live" || uiStyleParam === "live";
   const soccerLeagueOptions = useMemo(() => getAllSoccerLeagues(), []);
+  const prefetchedTeamKeysRef = useRef<Set<string>>(new Set());
+  const resolvedTeamIdsRef = useRef<Map<string, string>>(new Map());
   const currentSoccerScopeLabel = useMemo(() => {
     if (!isSoccerContext) return "";
     if (isAllSoccerTodayMode) return "All Soccer Today";
@@ -4458,6 +4749,139 @@ export function GameDetailPage() {
     const normalizedSport = rawSport === "CBB" ? "NCAAB" : rawSport === "CFB" ? "NCAAF" : rawSport;
     return new Set(["NBA", "NHL", "MLB", "NFL", "NCAAB", "NCAAF"]).has(normalizedSport);
   }, [game?.sport, srSport, params.sportKey, league]);
+  const normalizedSportKey = useMemo(() => {
+    const rawSport = String(game?.sport || srSport || params.sportKey || league || "").toUpperCase();
+    if (rawSport === "CBB") return "NCAAB";
+    if (rawSport === "CFB") return "NCAAF";
+    return rawSport;
+  }, [game?.sport, srSport, params.sportKey, league]);
+  const resolveTeamIdFromStandings = useCallback(async (teamCode: string, teamName: string): Promise<string | null> => {
+    const sport = String(normalizedSportKey || "").toUpperCase();
+    if (!sport) return null;
+    const normalize = (value: unknown) =>
+      String(value || "")
+        .toLowerCase()
+        .replace(/[^a-z0-9]/g, "");
+    const codeToken = normalize(teamCode);
+    const nameToken = normalize(teamName);
+    if (!codeToken && !nameToken) return null;
+    const memoKey = `${sport}:${codeToken || nameToken}`;
+    const memoizedId = resolvedTeamIdsRef.current.get(memoKey);
+    if (memoizedId) return memoizedId;
+    try {
+      const json = await fetchJsonCached<any>(`/api/teams/${encodeURIComponent(sport)}/standings`, {
+        cacheKey: `team-standings:${sport}`,
+        ttlMs: 90_000,
+        timeoutMs: 4_500,
+        init: { credentials: "include" },
+      });
+      const teams = Array.isArray(json?.teams) ? json.teams : [];
+      const hit = teams.find((row: any) => {
+        const rowAlias = normalize(row?.alias || row?.abbreviation || row?.teamCode || row?.code);
+        const rowName = normalize(row?.name);
+        const rowMarket = normalize(row?.market);
+        const rowFull = normalize(
+          row?.fullName || row?.displayName || [row?.market, row?.name].filter(Boolean).join(" ")
+        );
+        if (codeToken && (rowAlias === codeToken || rowAlias.includes(codeToken) || codeToken.includes(rowAlias))) {
+          return true;
+        }
+        if (!nameToken) return false;
+        return (
+          rowName === nameToken ||
+          rowFull === nameToken ||
+          `${rowMarket}${rowName}` === nameToken ||
+          rowFull.includes(nameToken) ||
+          nameToken.includes(rowFull)
+        );
+      });
+      const teamId = String(hit?.id || "").trim();
+      if (teamId) {
+        resolvedTeamIdsRef.current.set(memoKey, teamId);
+      }
+      return teamId || null;
+    } catch {
+      return null;
+    }
+  }, [normalizedSportKey]);
+  const prefetchTeamData = useCallback(async (teamCode: string, teamName: string) => {
+    const code = String(teamCode || "").trim();
+    const name = String(teamName || "").trim();
+    const sport = String(normalizedSportKey || "").toUpperCase();
+    if (!sport || (!code && !name)) return;
+    const key = `${sport}:${code || name}`;
+    if (prefetchedTeamKeysRef.current.has(key)) return;
+    prefetchedTeamKeysRef.current.add(key);
+
+    const teamId = await resolveTeamIdFromStandings(code, name);
+    if (!teamId) return;
+
+    const profile = await fetchJsonCached<any>(`/api/teams/${sport}/${teamId}`, {
+      cacheKey: `team-profile:${sport}:${teamId}`,
+      ttlMs: 60_000,
+      timeoutMs: 4_500,
+      init: { credentials: "include" },
+    }).catch(() => null);
+
+    await Promise.all([
+      fetchJsonCached(`/api/teams/${sport}/${teamId}/schedule`, {
+        cacheKey: `team-schedule:${sport}:${teamId}`,
+        ttlMs: 45_000,
+        timeoutMs: 4_500,
+        init: { credentials: "include" },
+      }).catch(() => null),
+      fetchJsonCached(`/api/teams/${sport}/${teamId}/stats`, {
+        cacheKey: `team-stats:${sport}:${teamId}`,
+        ttlMs: 120_000,
+        timeoutMs: 4_000,
+        init: { credentials: "include" },
+      }).catch(() => null),
+      fetchJsonCached(`/api/teams/${sport}/${teamId}/injuries`, {
+        cacheKey: `team-injuries:${sport}:${teamId}`,
+        ttlMs: 45_000,
+        timeoutMs: 4_000,
+        init: { credentials: "include" },
+      }).catch(() => null),
+      fetchJsonCached(`/api/teams/${sport}/${teamId}/splits`, {
+        cacheKey: `team-splits:${sport}:${teamId}`,
+        ttlMs: 90_000,
+        timeoutMs: 4_000,
+        init: { credentials: "include" },
+      }).catch(() => null),
+      fetchJsonCached(`/api/games?sport=${sport}&includeOdds=0`, {
+        cacheKey: `games-lite:${sport}`,
+        ttlMs: 20_000,
+        timeoutMs: 3_500,
+        init: { credentials: "include" },
+      }).catch(() => null),
+    ]);
+
+    const roster = Array.isArray(profile?.roster) ? profile.roster : [];
+    const topNames = roster
+      .map((p: any) => String(p?.name || "").trim())
+      .filter(Boolean)
+      .slice(0, 8);
+    await Promise.all(
+      topNames.map((playerName: string) =>
+        fetchJsonCached(`/api/player/${sport}/${encodeURIComponent(playerName)}`, {
+          cacheKey: `player-api:${sport}:${playerName}`,
+          ttlMs: 45_000,
+          timeoutMs: 4_000,
+          init: { credentials: "include" },
+        }).catch(() => null)
+      )
+    );
+  }, [normalizedSportKey, resolveTeamIdFromStandings]);
+  const handleTeamNavigate = useCallback(async (teamCode: string, teamName: string) => {
+    void prefetchTeamData(teamCode, teamName);
+    const teamId = await resolveTeamIdFromStandings(teamCode, teamName);
+    if (!teamId) return;
+    if (normalizedSportKey === "SOCCER") {
+      navigate(`/sports/soccer/team/${encodeURIComponent(teamId)}`);
+      return;
+    }
+    navigate(`/sports/${String(normalizedSportKey || "").toLowerCase()}/team/${encodeURIComponent(teamId)}`);
+  }, [navigate, normalizedSportKey, prefetchTeamData, resolveTeamIdFromStandings]);
   const activeAdjacentGames = isSoccerContext ? soccerAdjacentGames : sportAdjacentGames;
 
   const handleBackToList = useCallback(() => {
@@ -4542,35 +4966,38 @@ export function GameDetailPage() {
   // Fetch play-by-play data
   const fetchPlayByPlay = useCallback(async () => {
     if (!fullGameId) return;
+    if (playByPlayInFlightRef.current) return;
+    playByPlayInFlightRef.current = true;
     
     try {
-      const res = await fetch(`/api/games/${fullGameId}/playbyplay`, {
-        credentials: 'include',
+      const data = await fetchJsonCached<PlayByPlayData>(`/api/games/${fullGameId}/playbyplay`, {
+        cacheKey: `game-detail:pbp:${fullGameId}`,
+        ttlMs: 5000,
+        timeoutMs: 12000,
+        init: { credentials: 'include' },
       });
-      
-      if (res.ok) {
-        const data: PlayByPlayData = await res.json();
-        setPlayByPlay(data);
-        if (data.lastPlay) {
-          setLastPlay(data.lastPlay);
-          setLastPlayUpdated(new Date());
-        }
+      setPlayByPlay(data);
+      if (data?.lastPlay) {
+        setLastPlay(data.lastPlay);
+        setLastPlayUpdated(new Date());
       }
     } catch (err) {
       console.error('[GameDetailPage] Failed to fetch play-by-play:', err);
+    } finally {
+      playByPlayInFlightRef.current = false;
     }
-  }, [gameId, league]);
+  }, [fullGameId]);
 
   const fetchBoxScore = useCallback(async ({ silent = false }: { silent?: boolean } = {}) => {
     if (!fullGameId) return;
     if (!silent) setBoxScoreLoading(true);
     try {
-      const res = await fetch(`/api/game-detail/${fullGameId}/box-score`, {
-        credentials: "include",
-        cache: "no-store",
+      const data = await fetchJsonCached<BoxScoreData>(`/api/game-detail/${fullGameId}/box-score`, {
+        cacheKey: `game-detail:box:${fullGameId}`,
+        ttlMs: 8000,
+        timeoutMs: 12000,
+        init: { credentials: 'include', cache: 'no-store' },
       });
-      if (!res.ok) return;
-      const data = await res.json() as BoxScoreData;
       if (data) setBoxScore(data);
     } catch (err) {
       console.error("[GameDetailPage] Failed to fetch box score:", err);
@@ -4579,35 +5006,55 @@ export function GameDetailPage() {
     }
   }, [fullGameId]);
 
-  const fetchGameProps = useCallback(async (targetGameId: string, targetSport?: string) => {
+  const fetchGameProps = useCallback(async (targetGameId: string, targetSport?: string, allowFreshFallback = false) => {
     const gameIdForProps = String(targetGameId || '').trim();
     if (!gameIdForProps) return;
     const sportForProps = String(targetSport || league || '').toUpperCase();
 
     try {
-      const qs = new URLSearchParams({
-        sport: sportForProps || 'ALL',
-        game_id: gameIdForProps,
-        limit: '500',
-        fresh: '1',
-      });
-      const res = await fetch(`/api/sports-data/props/today?${qs.toString()}`, {
-        credentials: 'include',
-        cache: 'no-store',
-      });
-      if (!res.ok) return;
+      const fetchPropsVariant = async (fresh: boolean): Promise<{ normalized: PlayerProp[]; fallbackReason: string | null } | null> => {
+        const qs = new URLSearchParams({
+          sport: sportForProps || 'ALL',
+          game_id: gameIdForProps,
+          limit: fresh ? '500' : '200',
+          ...(fresh ? { fresh: '1' } : {}),
+        });
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), fresh ? 12000 : 9000);
+        try {
+          const res = await fetch(`/api/sports-data/props/today?${qs.toString()}`, {
+            credentials: 'include',
+            cache: 'no-store',
+            signal: controller.signal,
+          });
+          if (!res.ok) return null;
+          const data = await res.json();
+          return {
+            normalized: normalizeGameProps(Array.isArray(data?.props) ? data.props : []),
+            fallbackReason: data?.fallback_reason || null,
+          };
+        } finally {
+          clearTimeout(timer);
+        }
+      };
 
-      const data = await res.json();
-      const normalized = normalizeGameProps(
-        Array.isArray(data?.props) ? data.props : []
-      );
+      // Fast cached pass first. Optional fresh refresh is for explicit props-tab fallback.
+      let result = await fetchPropsVariant(false);
+      if (allowFreshFallback && (!result || result.normalized.length === 0)) {
+        const freshResult = await fetchPropsVariant(true);
+        if (freshResult) result = freshResult;
+      }
+      if (!result) return;
 
+      const { normalized, fallbackReason } = result;
       setGame((prev) => {
         if (!prev) return prev;
+        const prevId = String(prev.id || "").trim();
+        if (prevId && prevId !== gameIdForProps) return prev;
         if (normalized.length === 0 && Array.isArray(prev.props) && prev.props.length > 0) {
           return {
             ...prev,
-            propsFallbackReason: prev.propsFallbackReason || data?.fallback_reason || null,
+            propsFallbackReason: prev.propsFallbackReason || fallbackReason || null,
           };
         }
         return {
@@ -4617,7 +5064,7 @@ export function GameDetailPage() {
           propsFallbackReason:
             normalized.length > 0
               ? null
-              : (data?.fallback_reason || 'No player props available for this game yet'),
+              : (fallbackReason || 'No player props available for this game yet'),
         };
       });
     } catch (err) {
@@ -4626,20 +5073,25 @@ export function GameDetailPage() {
   }, [league]);
 
   // Fetch game data
-  const fetchGame = useCallback(async () => {
+  const fetchGame = useCallback(async (options?: { refreshOnly?: boolean }) => {
     if (!gameId) return;
+    const refreshOnly = options?.refreshOnly === true;
+    const requestId = ++activeGameRequestRef.current;
+    const stopPerf = startPerfTimer('gameDetail.fetch');
     
     console.log('[GameDetailPage] Fetching game:', { league, gameId, fullGameId, isSportsRadarGame });
     
     try {
       // Try to fetch from our games API
-      const res = await fetch(`/api/games/${fullGameId}?lite=1`, {
-        credentials: 'include',
-        cache: 'no-store',
+      const data = await fetchJsonCached<any>(`/api/games/${fullGameId}?lite=1`, {
+        cacheKey: `game-detail:lite:${fullGameId}`,
+        ttlMs: 8000,
+        timeoutMs: 15000,
+        init: { credentials: 'include', cache: 'no-store' },
       });
       
-      if (res.ok) {
-        const data = await res.json();
+      if (data) {
+        if (requestId !== activeGameRequestRef.current) return;
         
         // Extract odds from root-level odds payload (array or object)
         const rootOddsArray = Array.isArray(data.odds) ? data.odds : [];
@@ -4747,20 +5199,33 @@ export function GameDetailPage() {
         }));
         setError(null);
 
-        // Lite game payload can omit props; fetch strict game-scoped props explicitly.
+        // Avoid preloading heavy props for every game switch; load fresh when props tab is active.
         const resolvedGameId = String(data.game?.id || data.game?.game_id || fullGameId || '');
         const resolvedSport = String(data.game?.sport || league || '');
-        if (resolvedGameId) {
-          void fetchGameProps(resolvedGameId, resolvedSport);
+        if (resolvedGameId && activeTab === 'props') {
+          void fetchGameProps(resolvedGameId, resolvedSport, true);
         }
         
-        // Fetch opening odds in background so initial page render is not blocked.
-        fetch(`/api/games/${fullGameId}/odds`, { credentials: 'include', cache: 'no-store' })
-          .then((oddsRes) => (oddsRes.ok ? oddsRes.json() : null))
+        if (!refreshOnly) {
+        // Hydrate hero odds right away from the game odds endpoint.
+        // Keep this on game entry so lines/books appear immediately.
+        fetchJsonCached<any>(`/api/games/${encodeURIComponent(fullGameId)}/odds`, {
+          cacheKey: `game-detail:odds:${fullGameId}`,
+          ttlMs: 6000,
+          timeoutMs: 15000,
+          init: {
+            credentials: 'include',
+            cache: 'no-store',
+          },
+        })
+          .then((oddsData) => oddsData || null)
           .then((oddsData) => {
+            if (requestId !== activeGameRequestRef.current) return;
             if (!oddsData) return;
             setGame((prev) => {
               if (!prev) return prev;
+              const prevId = String(prev.id || "").trim();
+              if (prevId && resolvedGameId && prevId !== resolvedGameId) return prev;
               const mergedOdds = mergeHeroOddsFromOddsApi(prev.odds, oddsData);
               return {
                 ...prev,
@@ -4768,50 +5233,171 @@ export function GameDetailPage() {
                 lineHistory: reconcileLineHistoryWithOdds(prev.lineHistory, mergedOdds),
               };
             });
-            // Force line-history refresh against latest odds baseline.
             setLineHistoryLoaded(false);
+
+            const hasConsensus =
+              Boolean(oddsData?.consensus) ||
+              (Array.isArray(oddsData?.sportsbooks) && oddsData.sportsbooks.length > 0);
+            if (hasConsensus) return;
+
+            // Recovery path: use sport slate odds when per-game odds endpoint is empty.
+            const fallbackSport = String(resolvedSport || '').toLowerCase();
+            const fallbackDate = String(data.game?.start_time || '').slice(0, 10);
+            if (!fallbackSport) return;
+            const dateCandidates = (() => {
+              if (!fallbackDate) return [undefined];
+              const parsed = new Date(`${fallbackDate}T00:00:00.000Z`);
+              if (Number.isNaN(parsed.getTime())) return [fallbackDate, undefined];
+              const minus = new Date(parsed.getTime() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+              const plus = new Date(parsed.getTime() + 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+              return [fallbackDate, minus, plus, undefined];
+            })();
+            const normalizeName = (value: unknown) =>
+              String(value || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+            const targetHome = normalizeName(data.game?.home_team_name);
+            const targetAway = normalizeName(data.game?.away_team_name);
+            const hasAnyOdds = (row: any) =>
+              typeof row?.spread === "number" ||
+              typeof row?.overUnder === "number" ||
+              typeof row?.moneylineHome === "number" ||
+              typeof row?.moneylineAway === "number";
+
+            (async () => {
+              for (const dateCandidate of dateCandidates) {
+                if (requestId !== activeGameRequestRef.current) return;
+                const qs = new URLSearchParams({
+                  sport: fallbackSport,
+                  includeOdds: '1',
+                  ...(dateCandidate ? { date: dateCandidate } : {}),
+                });
+                try {
+                  const slateRes = await fetch(`/api/games?${qs.toString()}`, {
+                    credentials: 'include',
+                    cache: 'no-store',
+                  });
+                  if (!slateRes.ok) continue;
+                  const slateData = await slateRes.json();
+                  if (requestId !== activeGameRequestRef.current) return;
+                  const slateGames = Array.isArray(slateData?.games) ? slateData.games : [];
+                  const resolvedId = String(resolvedGameId || '');
+                  const idMatch = slateGames.find((g: any) =>
+                    String(g?.id || g?.game_id || '') === resolvedId
+                  );
+                  const teamMatch = slateGames.find((g: any) =>
+                    normalizeName(g?.home_team_name || g?.homeTeam) === targetHome &&
+                    normalizeName(g?.away_team_name || g?.awayTeam) === targetAway
+                  );
+                  const match = (idMatch && hasAnyOdds(idMatch)) ? idMatch : ((teamMatch && hasAnyOdds(teamMatch)) ? teamMatch : null);
+                  if (!match) continue;
+
+                  const syntheticOddsData = {
+                    consensus: {
+                      spreadHome: match?.spread ?? null,
+                      total: match?.overUnder ?? null,
+                      moneylineHome: match?.moneylineHome ?? null,
+                      moneylineAway: match?.moneylineAway ?? null,
+                    },
+                    sportsbooks: [],
+                    openSpread: match?.openSpread ?? null,
+                    openTotal: match?.openTotal ?? null,
+                    openMoneylineHome: match?.openMoneylineHome ?? null,
+                  };
+
+                  setGame((curr) => {
+                    if (!curr) return curr;
+                    const currId = String(curr.id || "").trim();
+                    if (currId && resolvedId && currId !== resolvedId) return curr;
+                    const mergedOdds = mergeHeroOddsFromOddsApi(curr.odds, syntheticOddsData);
+                    return {
+                      ...curr,
+                      odds: mergedOdds,
+                      lineHistory: reconcileLineHistoryWithOdds(curr.lineHistory, mergedOdds),
+                    };
+                  });
+                  setLineHistoryLoaded(false);
+                  return;
+                } catch {
+                  // Continue through candidate windows.
+                }
+              }
+            })();
           })
-          .catch(() => {
-            // Ignore opening odds fetch errors
+          .catch((err) => {
+            console.error('[GameDetailPage] Initial odds hydrate failed:', err);
+          })
+          .finally(() => {
+            // Safety fallback: if /games/:id/odds misses, try summary endpoint.
+            setTimeout(() => {
+              setGame((prev) => {
+                const hasHeroOdds =
+                  typeof prev?.odds?.spread === 'number' ||
+                  typeof prev?.odds?.total === 'number' ||
+                  typeof prev?.odds?.mlHome === 'number' ||
+                  typeof prev?.odds?.mlAway === 'number';
+                if (hasHeroOdds) return prev;
+                fetchJsonCached<any>(`/api/odds/summary/${encodeURIComponent(fullGameId)}?scope=PROD`, {
+                  cacheKey: `game-detail:summary:${fullGameId}`,
+                  ttlMs: 6000,
+                  timeoutMs: 12000,
+                  init: { credentials: 'include', cache: 'no-store' },
+                })
+                  .then((summaryData) => summaryData || null)
+                  .then((summaryData) => {
+                    if (requestId !== activeGameRequestRef.current) return;
+                    if (!summaryData) return;
+                    setGame((curr) => {
+                      if (!curr) return curr;
+                      const currId = String(curr.id || "").trim();
+                      if (currId && resolvedGameId && currId !== resolvedGameId) return curr;
+                      const mergedOdds = {
+                        ...(curr.odds || {}),
+                        spread: summaryData?.spread?.line ?? summaryData?.spread ?? curr.odds?.spread,
+                        total: summaryData?.total?.line ?? summaryData?.total ?? curr.odds?.total,
+                        mlHome: summaryData?.moneyline?.home_price ?? summaryData?.moneylineHome ?? curr.odds?.mlHome,
+                        mlAway: summaryData?.moneyline?.away_price ?? summaryData?.moneylineAway ?? curr.odds?.mlAway,
+                        openSpread: summaryData?.opening_spread ?? curr.odds?.openSpread,
+                        openTotal: summaryData?.opening_total ?? curr.odds?.openTotal,
+                        openMoneylineHome: summaryData?.opening_home_ml ?? curr.odds?.openMoneylineHome,
+                        spread1HHome: summaryData?.first_half?.spread?.home_line ?? curr.odds?.spread1HHome,
+                        spread1HAway: summaryData?.first_half?.spread?.away_line ?? curr.odds?.spread1HAway,
+                        total1H: summaryData?.first_half?.total?.line ?? curr.odds?.total1H,
+                        ml1HHome: summaryData?.first_half?.moneyline?.home_price ?? curr.odds?.ml1HHome,
+                        ml1HAway: summaryData?.first_half?.moneyline?.away_price ?? curr.odds?.ml1HAway,
+                      };
+                      return {
+                        ...curr,
+                        odds: mergedOdds,
+                        lineHistory: reconcileLineHistoryWithOdds(curr.lineHistory, mergedOdds),
+                      };
+                    });
+                  })
+                  .catch(() => {
+                    // Non-fatal.
+                  });
+                return prev;
+              });
+            }, 1200);
           });
 
-        // Fetch 1H summary in background to ensure first-half lines are always available.
-        fetch(`/api/odds/summary/${encodeURIComponent(fullGameId)}?scope=PROD`, {
-          credentials: 'include',
-          cache: 'no-store',
-        })
-          .then((summaryRes) => (summaryRes.ok ? summaryRes.json() : null))
-          .then((summaryData) => {
-            const firstHalf = summaryData?.first_half;
-            if (!firstHalf) return;
-            setGame((prev) => {
-              if (!prev) return prev;
-              return {
-                ...prev,
-                odds: {
-                  ...(prev.odds || {}),
-                  spread1HHome: firstHalf?.spread?.home_line ?? prev.odds?.spread1HHome,
-                  spread1HAway: firstHalf?.spread?.away_line ?? prev.odds?.spread1HAway,
-                  total1H: firstHalf?.total?.line ?? prev.odds?.total1H,
-                  ml1HHome: firstHalf?.moneyline?.home_price ?? prev.odds?.ml1HHome,
-                  ml1HAway: firstHalf?.moneyline?.away_price ?? prev.odds?.ml1HAway,
-                },
-              };
-            });
-          })
-          .catch(() => {
-            // Ignore summary fetch errors
-          });
+        }
       } else {
-        setError('Game not found');
+        if (requestId !== activeGameRequestRef.current) return;
+        if (!game) setError('Game not found');
       }
+
     } catch (err) {
+      if (requestId !== activeGameRequestRef.current) return;
       console.error('Failed to fetch game:', err);
-      setError('Failed to load game data');
+      if (!game) setError('Failed to load game data');
     } finally {
+      if (requestId !== activeGameRequestRef.current) return;
+      stopPerf();
+      console.debug('[GameDetail][fetch-cache]', getFetchCacheStats());
+      console.debug('[GameDetail][route-cache]', getRouteCacheStats());
+      logPerfSnapshot('GameDetailPage');
       setIsLoading(false);
     }
-  }, [fetchGameProps, fullGameId, gameId, isSportsRadarGame, league]);
+  }, [activeTab, fetchGameProps, fullGameId, gameId, isSportsRadarGame, league]);
 
   // Initial fetch
   useEffect(() => {
@@ -5011,11 +5597,25 @@ export function GameDetailPage() {
           cache: "no-store",
         });
         if (!res.ok) {
-          if (!cancelled) setSportAdjacentGames({ loading: false, prevId: null, nextId: null, prevLabel: null, nextLabel: null });
+          if (!cancelled) setSportAdjacentGames((prev) => ({ ...prev, loading: false }));
           return;
         }
         const data = await res.json();
-        const games = Array.isArray(data?.games) ? data.games : [];
+        let games = Array.isArray(data?.games) ? data.games : [];
+        if (games.length <= 1) {
+          // Date-scoped feeds can be sparse for some providers/time zones; broaden query.
+          const broadRes = await fetch(`/api/games?sport=${encodeURIComponent(sportKey)}&includeOdds=0`, {
+            credentials: "include",
+            cache: "no-store",
+          });
+          if (broadRes.ok) {
+            const broadData = await broadRes.json();
+            const broadGames = Array.isArray(broadData?.games) ? broadData.games : [];
+            if (broadGames.length > games.length) {
+              games = broadGames;
+            }
+          }
+        }
         const rows: Row[] = [];
         for (const g of games) {
           const id = normalizeId(String(g?.id || g?.game_id || ""));
@@ -5047,36 +5647,41 @@ export function GameDetailPage() {
         const prevRow = idx > 0 ? ordered[idx - 1] : null;
         const nextRow = idx >= 0 && idx < ordered.length - 1 ? ordered[idx + 1] : null;
         if (!cancelled) {
-          setSportAdjacentGames({
+          setSportAdjacentGames((prev) => ({
             loading: false,
-            prevId: prevRow?.id || null,
-            nextId: nextRow?.id || null,
-            prevLabel: prevRow?.preview || null,
-            nextLabel: nextRow?.preview || null,
-          });
+            prevId: prevRow?.id || prev.prevId || null,
+            nextId: nextRow?.id || prev.nextId || null,
+            prevLabel: prevRow?.preview || prev.prevLabel || null,
+            nextLabel: nextRow?.preview || prev.nextLabel || null,
+          }));
         }
       } catch {
-        if (!cancelled) setSportAdjacentGames({ loading: false, prevId: null, nextId: null, prevLabel: null, nextLabel: null });
+        if (!cancelled) setSportAdjacentGames((prev) => ({ ...prev, loading: false }));
       }
     };
 
     void loadAdjacent();
     return () => { cancelled = true; };
-  }, [isSoccerContext, game, fullGameId, gameId, srSport, params.sportKey, league]);
+  }, [isSoccerContext, fullGameId, gameId, srSport, params.sportKey, league, game?.id, game?.startTime, game?.sport]);
 
   // Fetch sportsbook odds when tab is selected
   useEffect(() => {
     if (activeTab !== 'sportsbooks' || !fullGameId || sportsbooksLoaded) return;
+    const controller = new AbortController();
+    let cancelled = false;
     
     const fetchSportsbooks = async () => {
       try {
         const res = await fetch(`/api/games/${fullGameId}/odds`, {
           credentials: 'include',
           cache: 'no-store',
+          signal: controller.signal,
         });
+        if (cancelled) return;
         
         if (res.ok) {
           const data = await res.json();
+          if (cancelled) return;
           
           // Track if we're getting live in-game odds
           setIsLiveOdds(data.isLiveOdds ?? false);
@@ -5108,6 +5713,8 @@ export function GameDetailPage() {
             setGame(prev => {
               console.log('[Books Tab] Updating game state with', lines.length, 'sportsbooks');
               if (!prev) return prev;
+              const prevId = String(prev.id || "").trim();
+              if (prevId && prevId !== fullGameId) return prev;
               const mergedOdds = mergeHeroOddsFromOddsApi(prev.odds, data);
               return {
                 ...prev,
@@ -5120,32 +5727,87 @@ export function GameDetailPage() {
             setLineHistoryLoaded(false);
           }
           setSportsbooksLoaded(true);
+
+          // If fast path only returned consensus, backfill full book grid in background.
+          if (lines.length <= 1) {
+            fetch(`/api/games/${fullGameId}/odds?full=1`, {
+              credentials: 'include',
+              cache: 'no-store',
+            })
+              .then((fullRes) => (fullRes.ok ? fullRes.json() : null))
+              .then((fullData) => {
+                if (cancelled) return;
+                if (!fullData) return;
+                const fullLines: SportsbookLine[] = [];
+                if (fullData.consensus) {
+                  fullLines.push({
+                    sportsbook: 'Consensus',
+                    spread: fullData.consensus.spreadHome,
+                    spreadOdds: null,
+                    total: fullData.consensus.total,
+                    totalOverOdds: null,
+                    totalUnderOdds: null,
+                    mlHome: fullData.consensus.moneylineHome,
+                    mlAway: fullData.consensus.moneylineAway,
+                    updated: fullData.lastUpdated || new Date().toISOString(),
+                  });
+                }
+                fullLines.push(...normalizeSportsbookLines(fullData.sportsbooks));
+                if (fullLines.length <= 1) return;
+                setGame((prev) => {
+                  if (!prev) return prev;
+                  const prevId = String(prev.id || "").trim();
+                  if (prevId && prevId !== fullGameId) return prev;
+                  const mergedOdds = mergeHeroOddsFromOddsApi(prev.odds, fullData);
+                  return {
+                    ...prev,
+                    sportsbooks: fullLines,
+                    odds: mergedOdds,
+                    lineHistory: reconcileLineHistoryWithOdds(prev.lineHistory, mergedOdds),
+                  };
+                });
+                setLineHistoryLoaded(false);
+              })
+              .catch(() => {
+                // Non-fatal.
+              });
+          }
         } else {
           // Mark as loaded even if no extra data, use what we have from game fetch
           setSportsbooksLoaded(true);
         }
       } catch (err) {
+        if ((err as Error)?.name === 'AbortError') return;
         console.error('Failed to fetch sportsbook odds:', err);
       }
     };
     
     fetchSportsbooks();
+    return () => {
+      cancelled = true;
+      controller.abort();
+    };
   }, [activeTab, fullGameId, sportsbooksLoaded]);
 
   // Fetch line history when tab is selected
   useEffect(() => {
     if (activeTab !== 'line-movement' || !fullGameId) return;
     if (lineHistoryLoaded && (game?.lineHistory?.length || 0) > 0) return;
+    const controller = new AbortController();
+    let isCancelled = false;
     
     const fetchLineHistory = async () => {
       try {
         const res = await fetch(`/api/games/${fullGameId}/line-history`, {
           credentials: 'include',
           cache: 'no-store',
+          signal: controller.signal,
         });
+        if (isCancelled) return;
         
         if (res.ok) {
           const data = await res.json();
+          if (isCancelled) return;
           
           // Transform history to LineHistoryPoint format
           const history: LineHistoryPoint[] = (data.history || []).map((h: {
@@ -5161,32 +5823,36 @@ export function GameDetailPage() {
             mlHome: h.moneylineHome,
             mlAway: h.moneylineAway,
           }));
-          
-          if (history.length > 0) {
-            setGame(prev => {
-              if (!prev) return prev;
-              const prevHistory = Array.isArray(prev.lineHistory) ? prev.lineHistory : [];
-              // Guard against transient backend regressions where a refresh briefly
-              // returns only a single-point history for the same game.
-              const shouldKeepPreviousHistory =
-                prevHistory.length >= 2 &&
-                history.length <= 1;
-              return {
-                ...prev,
-                lineHistory: shouldKeepPreviousHistory
+          setGame(prev => {
+            if (!prev) return prev;
+            const prevHistory = Array.isArray(prev.lineHistory) ? prev.lineHistory : [];
+            // Guard against transient backend regressions where a refresh briefly
+            // returns only a single-point history for the same game.
+            const shouldKeepPreviousHistory =
+              prevHistory.length >= 2 &&
+              history.length <= 1;
+            return {
+              ...prev,
+              lineHistory: history.length === 0
+                ? []
+                : shouldKeepPreviousHistory
                   ? prevHistory
                   : reconcileLineHistoryWithOdds(history, prev.odds),
-              };
-            });
-          }
+            };
+          });
           setLineHistoryLoaded(true);
         }
       } catch (err) {
+        if ((err as Error)?.name === 'AbortError') return;
         console.error('Failed to fetch line history:', err);
       }
     };
     
     fetchLineHistory();
+    return () => {
+      isCancelled = true;
+      controller.abort();
+    };
   }, [activeTab, fullGameId, lineHistoryLoaded, game?.lineHistory?.length, reconcileLineHistoryWithOdds]);
 
   // Fetch box score when tab is selected
@@ -5195,6 +5861,17 @@ export function GameDetailPage() {
     if (hasBoxScoreData(boxScore)) return;
     void fetchBoxScore();
   }, [activeTab, fetchBoxScore, fullGameId]);
+
+  // Escalate to fresh props fetch only when user is actively on the props tab.
+  useEffect(() => {
+    if (activeTab !== "props") return;
+    const targetGameId = String(game?.id || fullGameId || "").trim();
+    if (!targetGameId) return;
+    if ((game?.props || []).length > 0) return;
+    if (propsFreshAttemptedRef.current.has(targetGameId)) return;
+    propsFreshAttemptedRef.current.add(targetGameId);
+    void fetchGameProps(targetGameId, String(game?.sport || league || ""), true);
+  }, [activeTab, fetchGameProps, fullGameId, game?.id, game?.props, game?.sport, league]);
 
   // Fetch H2H when tab is selected
   useEffect(() => {
@@ -5251,8 +5928,19 @@ export function GameDetailPage() {
   // Auto-refresh for live games (20s)
   useEffect(() => {
     if (game?.status !== 'LIVE') return;
-    
-    const interval = setInterval(fetchGame, 20000);
+
+    const tick = async () => {
+      if (gameRefreshInFlightRef.current) return;
+      gameRefreshInFlightRef.current = true;
+      try {
+        await fetchGame({ refreshOnly: true });
+      } finally {
+        gameRefreshInFlightRef.current = false;
+      }
+    };
+    const interval = setInterval(() => {
+      void tick();
+    }, 20000);
     return () => clearInterval(interval);
   }, [game?.status, fetchGame]);
 
@@ -5261,6 +5949,8 @@ export function GameDetailPage() {
     if (game?.status !== 'LIVE' || !fullGameId) return;
     
     const refreshOdds = async () => {
+      if (liveOddsRefreshInFlightRef.current) return;
+      liveOddsRefreshInFlightRef.current = true;
       try {
         const res = await fetch(`/api/games/${fullGameId}/odds`, {
           credentials: 'include',
@@ -5303,11 +5993,23 @@ export function GameDetailPage() {
           }
           
           if (lines.length > 0) {
-            setGame(prev => prev ? { ...prev, sportsbooks: lines, odds: mergeHeroOddsFromOddsApi(prev.odds, data) } : null);
+            setGame((prev) => {
+              if (!prev) return prev;
+              const prevBooks = Array.isArray(prev.sportsbooks) ? prev.sportsbooks : [];
+              const incomingIsThin = lines.length <= 1;
+              const keepExistingBooks = prevBooks.length > lines.length && incomingIsThin;
+              return {
+                ...prev,
+                sportsbooks: keepExistingBooks ? prevBooks : lines,
+                odds: mergeHeroOddsFromOddsApi(prev.odds, data),
+              };
+            });
           }
         }
       } catch (err) {
         console.error('Failed to refresh live odds:', err);
+      } finally {
+        liveOddsRefreshInFlightRef.current = false;
       }
     };
     
@@ -5315,7 +6017,7 @@ export function GameDetailPage() {
     const refreshInterval = isLiveOdds ? 30000 : 120000;
     const interval = setInterval(refreshOdds, refreshInterval);
     return () => clearInterval(interval);
-  }, [game?.status, gameId, isLiveOdds, league, mergeHeroOddsFromOddsApi]);
+  }, [game?.status, fullGameId, isLiveOdds, mergeHeroOddsFromOddsApi]);
 
   // Build teamInfo lookup for display names
   const teamInfo = useMemo(() => {
@@ -5521,7 +6223,7 @@ export function GameDetailPage() {
     return <GolfTournamentDetail tournamentId={gameId || ''} />;
   }
 
-  if (isLoading) {
+  if (isLoading && !game) {
     return (
       <div className="min-h-screen flex items-center justify-center">
         <CinematicBackground />
@@ -5533,7 +6235,7 @@ export function GameDetailPage() {
     );
   }
 
-  if (error || !game) {
+  if (!game) {
     return (
       <div className="min-h-screen flex flex-col">
         <CinematicBackground />
@@ -5610,7 +6312,7 @@ export function GameDetailPage() {
             )}>
               <button
                 onClick={() => navigateToAdjacentGame(activeAdjacentGames.prevId)}
-                disabled={!activeAdjacentGames.prevId || activeAdjacentGames.loading}
+                disabled={!activeAdjacentGames.prevId}
                 className={cn(
                   "group relative flex h-10 items-center gap-2 rounded-xl border border-white/12 bg-gradient-to-b from-white/[0.07] to-white/[0.02] px-3 text-[#D1D5DB] transition-all duration-200 active:scale-[0.995] disabled:cursor-not-allowed disabled:opacity-45 disabled:hover:scale-100",
                   !isSoccerContext && "justify-start min-w-0 w-full overflow-hidden",
@@ -5683,7 +6385,7 @@ export function GameDetailPage() {
               )}
               <button
                 onClick={() => navigateToAdjacentGame(activeAdjacentGames.nextId)}
-                disabled={!activeAdjacentGames.nextId || activeAdjacentGames.loading}
+                disabled={!activeAdjacentGames.nextId}
                 className={cn(
                   "group relative flex h-10 items-center gap-2 rounded-xl border border-white/12 bg-gradient-to-b from-white/[0.07] to-white/[0.02] px-3 text-[#D1D5DB] transition-all duration-200 active:scale-[0.995] disabled:cursor-not-allowed disabled:opacity-45 disabled:hover:scale-100",
                   !isSoccerContext && "justify-end min-w-0 w-full overflow-hidden",
@@ -5837,7 +6539,12 @@ export function GameDetailPage() {
 
           {viewMode === "pregame" && (
             <>
-              <GameHeroPanel game={game} getTeamName={getTeamDisplayName} />
+              <GameHeroPanel
+                game={game}
+                getTeamName={getTeamDisplayName}
+                onTeamNavigate={(teamCode, teamName) => { void handleTeamNavigate(teamCode, teamName); }}
+                onTeamPrefetch={(teamCode, teamName) => { void prefetchTeamData(teamCode, teamName); }}
+              />
               <MarketIntelligenceStrip game={game} lastPlay={lastPlay} />
               <LiveSignalTicker game={game} lastPlay={lastPlay} />
               <CoachGSpotlightCard
@@ -5861,7 +6568,13 @@ export function GameDetailPage() {
 
           {viewMode === "live" && (
             <>
-              <LiveHeroScoreboard game={game} getTeamName={getTeamDisplayName} lastPlay={lastPlay} />
+              <LiveHeroScoreboard
+                game={game}
+                getTeamName={getTeamDisplayName}
+                lastPlay={lastPlay}
+                onTeamNavigate={(teamCode, teamName) => { void handleTeamNavigate(teamCode, teamName); }}
+                onTeamPrefetch={(teamCode, teamName) => { void prefetchTeamData(teamCode, teamName); }}
+              />
               <LiveBoxScoreSnapshot boxScore={boxScore} isLoading={boxScoreLoading} getTeamName={getTeamDisplayName} />
               <LiveSignalStrip game={game} lastPlay={lastPlay} />
               <LiveCoachGPanel pregameRead={pregameCoachRead} liveNotes={liveNotes} />
@@ -5874,7 +6587,12 @@ export function GameDetailPage() {
 
           {viewMode === "final" && (
             <>
-              <FinalHeroPanel game={game} getTeamName={getTeamDisplayName} />
+              <FinalHeroPanel
+                game={game}
+                getTeamName={getTeamDisplayName}
+                onTeamNavigate={(teamCode, teamName) => { void handleTeamNavigate(teamCode, teamName); }}
+                onTeamPrefetch={(teamCode, teamName) => { void prefetchTeamData(teamCode, teamName); }}
+              />
               <GlassCard className="border border-violet-400/20 bg-[#121821] p-4 md:p-5">
                 <SectionHeader icon={Sparkles} title="Coach G Postgame Take" subtitle="Calm recap of the leverage moments that decided this result." accent="violet" />
                 <p className="text-sm text-[#9CA3AF]">{postgameTake}</p>

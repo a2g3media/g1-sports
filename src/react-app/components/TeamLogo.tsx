@@ -4,7 +4,7 @@
  * Uses ESPN CDN with comprehensive team mappings.
  */
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { getTeamOrCountryLogoUrl } from '@/react-app/lib/teamLogos';
 import { getEspnTeamLogo } from '@/react-app/lib/espnSoccer';
 import { cn } from '@/react-app/lib/utils';
@@ -80,6 +80,14 @@ export function TeamLogo({
       })()
     : null;
   const logoUrl = primaryLogoUrl || soccerFallbackLogo;
+  const shouldEagerLoad = size <= 40;
+
+  useEffect(() => {
+    if (!logoUrl || failed || !shouldEagerLoad) return;
+    const warm = new Image();
+    warm.decoding = 'async';
+    warm.src = logoUrl;
+  }, [failed, logoUrl, shouldEagerLoad]);
   
   // Show fallback if no URL or load failed
   if (!logoUrl || failed) {
@@ -107,7 +115,9 @@ export function TeamLogo({
       )}
       style={{ width: size, height: size }}
       onError={() => setFailed(true)}
-      loading="lazy"
+      loading={shouldEagerLoad ? "eager" : "lazy"}
+      decoding="async"
+      fetchPriority={shouldEagerLoad ? "high" : "auto"}
     />
   );
 }

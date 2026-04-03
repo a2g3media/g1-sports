@@ -389,6 +389,10 @@ function AppRoutes() {
           </Layout>
         }
       />
+      <Route path="/sports/college-basketball" element={<Navigate to="/sports/ncaab" replace />} />
+      <Route path="/sports/collegebasketball" element={<Navigate to="/sports/ncaab" replace />} />
+      <Route path="/sports/ncaam" element={<Navigate to="/sports/ncaab" replace />} />
+      <Route path="/sports/cbb" element={<Navigate to="/sports/ncaab" replace />} />
       <Route
         path="/sports/ncaab"
         element={

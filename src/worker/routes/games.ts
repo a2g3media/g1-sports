@@ -34,8 +34,9 @@ import {
   finalGameHeaders,
   type GameStatus,
 } from "../services/responseCache";
+import { getCachedData, setCachedData } from "../services/apiCacheService";
 import type { Game } from "../../shared/types";
-import { fetchSportsRadarOdds, fetchSportsRadarOddsForGame, captureAllOddsSnapshots, fetchGamePlayerProps, fetchAllSportsbooksForGame, getLineMovement } from "../services/sportsRadarOddsService";
+import { fetchSportsRadarOdds, fetchSportsRadarOddsForGame, captureAllOddsSnapshots, fetchGamePlayerProps, fetchAllSportsbooksForGame, getLineMovement, storeOpeningLines, captureOddsSnapshot, type SportsRadarOdds } from "../services/sportsRadarOddsService";
 import {
   fetchStandingsCached,
   fetchTeamProfileCached,
@@ -58,6 +59,35 @@ function getRedisClient(env: Partial<Env> = {}): Redis | null {
   return redisClient;
 }
 const ODDS_DEBUG_LOGS = false;
+const scoreboardListCache = new Map<string, { expiresAt: number; payload: Record<string, unknown> }>();
+const SCOREBOARD_LIST_CACHE_TTL_MS = 20000;
+const liveResponseCache = new Map<string, { expiresAt: number; staleExpiresAt: number; payload: Record<string, unknown> }>();
+const LIVE_CACHE_TTL_MS = 12000;
+const LIVE_STALE_WINDOW_MS = 120000;
+
+function getLiveCacheKey(sports: SportKey[] | undefined): string {
+  if (!sports || sports.length === 0) return 'all';
+  return [...sports].sort().join(',');
+}
+
+function getLivePersistentCacheKeys(cacheKey: string): { primary: string; backup: string } {
+  return {
+    primary: `games_live_v1:${cacheKey}`,
+    backup: `games_live_v1_backup:${cacheKey}`,
+  };
+}
+
+function getGamesPersistentCacheKeys(cacheKey: string): { primary: string; backup: string } {
+  return {
+    primary: `games_list_v2:${cacheKey}`,
+    backup: `games_list_v2_backup:${cacheKey}`,
+  };
+}
+
+function hasGamesRows(payload: unknown): boolean {
+  const rows = Array.isArray((payload as any)?.games) ? (payload as any).games : [];
+  return rows.length > 0;
+}
 const nascarLiveSnapshotTelemetry = {
   requests: 0,
   failures: 0,
@@ -96,6 +126,18 @@ function getTodayEasternDateString(): string {
   }).format(new Date());
 }
 
+function getEasternDateString(value: string | Date | null | undefined): string {
+  if (!value) return "";
+  const parsed = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(parsed.getTime())) return "";
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/New_York",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(parsed);
+}
+
 async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, fallbackValue: T): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | null = null;
   const timeoutPromise = new Promise<T>((resolve) => {
@@ -104,6 +146,10 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, fallbackVa
   const result = await Promise.race([promise, timeoutPromise]);
   if (timer) clearTimeout(timer);
   return result;
+}
+
+function getScoreboardListCacheKey(sport: SportKey | undefined, status: Game["status"] | undefined, date: string, includeOdds: boolean): string {
+  return `${sport || "all"}|${status || "all"}|${date}|${includeOdds ? "1" : "0"}`;
 }
 
 function normalizeNascarNameToken(value: string): string {
@@ -176,18 +222,48 @@ function buildLineHistoryIdCandidates(gameId: string): string[] {
   const candidates = new Set<string>([raw]);
   const srEventId = toSportsRadarEventId(raw);
   if (srEventId) candidates.add(srEventId);
+  const srMatchId = toSportsRadarMatchId(raw);
+  if (srMatchId) candidates.add(srMatchId);
+  if (raw.startsWith("sr_")) {
+    const parts = raw.split("_");
+    const sport = parts[1] || "";
+    const tailUnderscore = parts.slice(2).join("_");
+    if (tailUnderscore) {
+      const tailHyphen = tailUnderscore.replace(/_/g, "-");
+      candidates.add(tailUnderscore);
+      candidates.add(tailHyphen);
+      if (sport) {
+        candidates.add(`sr_${sport}_${tailUnderscore}`);
+        candidates.add(`sr_${sport}_${tailHyphen}`);
+      }
+      candidates.add(`sr:sport_event:${tailHyphen}`);
+      candidates.add(`sr:sport_event:${tailUnderscore}`);
+      candidates.add(`sr:match:${tailUnderscore}`);
+      candidates.add(`sr:match:${tailHyphen}`);
+    }
+  }
   if (raw.startsWith("sr:sport_event:")) {
     const tail = raw.replace("sr:sport_event:", "");
+    candidates.add(tail);
+    candidates.add(tail.replace(/_/g, "-"));
+    candidates.add(tail.replace(/-/g, "_"));
     const maybeSportHint = ["nba", "nfl", "mlb", "nhl", "ncaab", "ncaaf", "soccer", "mma", "golf", "nascar"];
     for (const sport of maybeSportHint) {
       candidates.add(`sr_${sport}_${tail.replace(/-/g, "_")}`);
+      candidates.add(`sr_${sport}_${tail.replace(/_/g, "-")}`);
     }
+  }
+  if (raw.startsWith("sr:match:")) {
+    const tail = raw.replace("sr:match:", "");
+    candidates.add(tail);
+    candidates.add(tail.replace(/_/g, "-"));
+    candidates.add(tail.replace(/-/g, "_"));
   }
   const parts = raw.split("_").filter(Boolean);
   if (parts.length > 0) {
     candidates.add(parts[parts.length - 1]);
   }
-  return Array.from(candidates).slice(0, 6);
+  return Array.from(candidates).slice(0, 16);
 }
 
 function normalizePropGameId(value: string): string {
@@ -471,6 +547,202 @@ async function generatePlaceholderProps(sport: string, homeTeam: string, awayTea
 /**
  * Fetch odds from SportsRadar Odds Comparison API and merge into games
  */
+const ODDS_SPORTS = ['nba', 'nfl', 'mlb', 'nhl', 'ncaab', 'ncaaf', 'soccer', 'mma', 'golf', 'nascar'] as const;
+
+type MergedOdds = {
+  spread?: number;
+  total?: number;
+  moneylineHome?: number;
+  moneylineAway?: number;
+  sourceGameId?: string;
+};
+
+function getMatchedOddsForGame(game: Game, combinedOddsMap: Map<string, MergedOdds>): MergedOdds | null {
+  const sport = game.sport?.toLowerCase() || '';
+  const homeName = game.home_team_name?.split(' ').pop()?.toLowerCase() || '';
+  const awayName = game.away_team_name?.split(' ').pop()?.toLowerCase() || '';
+  const gameIdParts = game.game_id?.split('_') || [];
+  const srEventId = gameIdParts.length >= 3
+    ? `sr:sport_event:${gameIdParts.slice(2).join('-')}`
+    : null;
+
+  const keys = [
+    srEventId,
+    `${sport}|${awayName}|${homeName}`,
+    `${sport}|${game.away_team_name?.toLowerCase()}|${game.home_team_name?.toLowerCase()}`,
+    game.game_id,
+  ].filter(Boolean) as string[];
+
+  for (const key of keys) {
+    const odds = combinedOddsMap.get(key);
+    if (odds) return odds;
+  }
+  return null;
+}
+
+function toSnapshotOdds(game: Game, odds: MergedOdds): SportsRadarOdds {
+  const spreadHome = odds.spread ?? null;
+  return {
+    gameId: game.game_id,
+    sportEventId: toSportsRadarEventId(game.game_id) || game.game_id,
+    homeTeam: game.home_team_name || "",
+    awayTeam: game.away_team_name || "",
+    spread: spreadHome,
+    spreadHome,
+    spreadAway: spreadHome !== null ? -spreadHome : null,
+    total: odds.total ?? null,
+    moneylineHome: odds.moneylineHome ?? null,
+    moneylineAway: odds.moneylineAway ?? null,
+    spread1HHome: null,
+    spread1HAway: null,
+    total1H: null,
+    moneyline1HHome: null,
+    moneyline1HAway: null,
+  };
+}
+
+async function persistAliasSnapshotsForGames(
+  games: Game[],
+  combinedOddsMap: Map<string, MergedOdds>,
+  env: Env
+): Promise<void> {
+  if (!env.DB || games.length === 0 || combinedOddsMap.size === 0) return;
+
+  const cloneHistoryFromSource = async (sourceGameId: string, aliasGameId: string) => {
+    if (!env.DB || !sourceGameId || !aliasGameId || sourceGameId === aliasGameId) return;
+
+    try {
+      await env.DB.prepare(`
+        INSERT OR IGNORE INTO odds_opening
+        (data_scope, game_id, bookmaker_key, market_key, outcome_key, opening_line_value, opening_price_american, opening_price_decimal, opened_at, created_at, updated_at)
+        SELECT
+          'PROD',
+          ?,
+          COALESCE(o.bookmaker_key, 'consensus'),
+          o.market_key,
+          o.outcome_key,
+          o.opening_line_value,
+          o.opening_price_american,
+          o.opening_price_decimal,
+          o.opened_at,
+          CURRENT_TIMESTAMP,
+          CURRENT_TIMESTAMP
+        FROM odds_opening o
+        WHERE o.game_id = ? AND o.data_scope = 'PROD'
+      `).bind(aliasGameId, sourceGameId).run();
+
+      await env.DB.prepare(`
+        INSERT INTO odds_snapshots
+        (data_scope, game_id, bookmaker_key, market_key, outcome_key, line_value, price_american, price_decimal, captured_at, created_at, updated_at)
+        SELECT
+          'PROD',
+          ?,
+          COALESCE(s.bookmaker_key, 'consensus'),
+          s.market_key,
+          s.outcome_key,
+          s.line_value,
+          s.price_american,
+          s.price_decimal,
+          s.captured_at,
+          CURRENT_TIMESTAMP,
+          CURRENT_TIMESTAMP
+        FROM odds_snapshots s
+        WHERE s.game_id = ?
+          AND s.data_scope = 'PROD'
+          AND NOT EXISTS (
+            SELECT 1
+            FROM odds_snapshots t
+            WHERE t.game_id = ?
+              AND t.data_scope = 'PROD'
+              AND t.market_key = s.market_key
+              AND t.outcome_key = s.outcome_key
+              AND t.captured_at = s.captured_at
+          )
+        ORDER BY s.captured_at DESC
+        LIMIT 200
+      `).bind(aliasGameId, sourceGameId, aliasGameId).run();
+    } catch (err) {
+      console.log(`[Games API] Alias history clone failed ${sourceGameId} -> ${aliasGameId}:`, err);
+    }
+  };
+
+  await Promise.allSettled(
+    games.map(async (game) => {
+      if (!game?.game_id) return;
+      const matched = getMatchedOddsForGame(game, combinedOddsMap);
+      if (!matched) return;
+      if (matched.sourceGameId && matched.sourceGameId !== game.game_id) {
+        await cloneHistoryFromSource(matched.sourceGameId, game.game_id);
+      }
+      const snapshotOdds = toSnapshotOdds(game, matched);
+      await storeOpeningLines(env.DB, game.game_id, snapshotOdds);
+      await captureOddsSnapshot(env.DB, game.game_id, game.sport || "", snapshotOdds);
+    })
+  );
+}
+
+async function fetchCombinedOddsForGames(
+  games: Game[],
+  env: Env,
+  captureSnapshots: boolean
+): Promise<Map<string, MergedOdds>> {
+  const combinedOddsMap = new Map<string, MergedOdds>();
+  if (games.length === 0) return combinedOddsMap;
+
+  const apiKey = env.SPORTSRADAR_API_KEY;
+  if (!apiKey) return combinedOddsMap;
+
+  const sportGames = new Map<string, Game[]>();
+  for (const game of games) {
+    const sport = game.sport?.toLowerCase() || '';
+    if (!sportGames.has(sport)) sportGames.set(sport, []);
+    sportGames.get(sport)!.push(game);
+  }
+
+  const sportsToFetch = ODDS_SPORTS.filter((sport) => sportGames.has(sport));
+  if (sportsToFetch.length === 0) return combinedOddsMap;
+
+  const oddsApiKey = env.SPORTSRADAR_ODDS_KEY || apiKey;
+  const settled = await Promise.allSettled(
+    sportsToFetch.map(async (sportKey) => {
+      const oddsMap = await fetchSportsRadarOdds(sportKey, apiKey, env.DB, undefined, oddsApiKey);
+      if (captureSnapshots && oddsMap.size > 0 && env.DB) {
+        await captureAllOddsSnapshots(env.DB, oddsMap, sportKey);
+      }
+      return { sportKey, oddsMap };
+    })
+  );
+
+  for (const result of settled) {
+    if (result.status !== "fulfilled") continue;
+    const { sportKey, oddsMap } = result.value;
+    for (const [key, odds] of oddsMap) {
+      combinedOddsMap.set(key, {
+        spread: odds.spread ?? odds.spreadHome ?? undefined,
+        total: odds.total ?? undefined,
+        moneylineHome: odds.moneylineHome ?? undefined,
+        moneylineAway: odds.moneylineAway ?? undefined,
+        sourceGameId: odds.gameId || undefined,
+      });
+    }
+    if (captureSnapshots && oddsMap.size > 0) {
+      console.log(`[Games API] Snapshot capture queued for ${sportKey}: ${oddsMap.size} odds rows`);
+    }
+  }
+
+  return combinedOddsMap;
+}
+
+async function captureLineMovementSnapshotsForGames(games: Game[], env: Env): Promise<void> {
+  if (!env.DB || games.length === 0) return;
+  try {
+    const combinedOddsMap = await fetchCombinedOddsForGames(games, env, true);
+    await persistAliasSnapshotsForGames(games, combinedOddsMap, env);
+  } catch (err) {
+    console.log("[Games API] Background snapshot capture failed:", err);
+  }
+}
+
 async function enrichGamesWithOdds(games: Game[], env: Env): Promise<Game[]> {
   if (games.length === 0) return games;
   
@@ -482,48 +754,8 @@ async function enrichGamesWithOdds(games: Game[], env: Env): Promise<Game[]> {
       return games;
     }
     
-    // Group games by sport to minimize API calls
-    const sportGames = new Map<string, Game[]>();
-    for (const game of games) {
-      const sport = game.sport?.toLowerCase() || '';
-      if (!sportGames.has(sport)) sportGames.set(sport, []);
-      sportGames.get(sport)!.push(game);
-    }
-    
-    // Supported sports for SportsRadar odds - all sports with competition IDs
-    const ODDS_SPORTS = ['nba', 'nfl', 'mlb', 'nhl', 'ncaab', 'ncaaf', 'soccer', 'mma', 'golf', 'nascar'];
-    
-    // Fetch odds SEQUENTIALLY with caching (service handles rate limiting)
-    const combinedOddsMap = new Map<string, { spread?: number; total?: number; moneylineHome?: number; moneylineAway?: number }>();
-    
-    for (const sportKey of ODDS_SPORTS) {
-      if (!sportGames.has(sportKey)) continue;
-      
-      try {
-        // Pass database for persistent D1 caching (reduces rate limiting)
-        // Use dedicated SPORTSRADAR_ODDS_KEY if set, otherwise fall back to main API key
-        const oddsApiKey = env.SPORTSRADAR_ODDS_KEY || apiKey;
-        const oddsMap = await fetchSportsRadarOdds(sportKey, apiKey, env.DB, undefined, oddsApiKey);
-        
-        // Capture snapshots for line movement tracking (async, don't block)
-        if (oddsMap.size > 0 && env.DB) {
-          captureAllOddsSnapshots(env.DB, oddsMap, sportKey).catch(err => {
-            console.log(`[Games API] Snapshot capture failed for ${sportKey}:`, err);
-          });
-        }
-        
-        for (const [key, odds] of oddsMap) {
-          combinedOddsMap.set(key, {
-            spread: odds.spread ?? odds.spreadHome ?? undefined,
-            total: odds.total ?? undefined,
-            moneylineHome: odds.moneylineHome ?? undefined,
-            moneylineAway: odds.moneylineAway ?? undefined,
-          });
-        }
-      } catch (err) {
-        console.log(`[SportsRadar Odds] Error for ${sportKey}:`, err);
-      }
-    }
+    // Fetch per-sport odds in parallel so one sport cannot starve others.
+    const combinedOddsMap = await fetchCombinedOddsForGames(games, env, true);
     
     console.log(`[Games API] SportsRadar odds: ${combinedOddsMap.size} games with odds data`);
     
@@ -544,38 +776,22 @@ async function enrichGamesWithOdds(games: Game[], env: Env): Promise<Game[]> {
       const homeName = game.home_team_name?.split(' ').pop()?.toLowerCase() || '';
       const awayName = game.away_team_name?.split(' ').pop()?.toLowerCase() || '';
       
-      // Extract SportsRadar event ID from game_id (e.g., sr_nba_653e460f-1e7e-... -> sr:sport_event:653e460f-1e7e-...)
-      const gameIdParts = game.game_id?.split('_') || [];
-      const srEventId = gameIdParts.length >= 3 
-        ? `sr:sport_event:${gameIdParts.slice(2).join('-')}`
-        : null;
-      
-      // Try several key patterns to match
-      const keys = [
-        srEventId, // SportsRadar sport event ID
-        `${sport}|${awayName}|${homeName}`,
-        `${sport}|${game.away_team_name?.toLowerCase()}|${game.home_team_name?.toLowerCase()}`,
-        game.game_id, // Our game ID format
-      ].filter(Boolean) as string[];
-      
-      for (const key of keys) {
-        const odds = combinedOddsMap.get(key);
-        if (odds) {
-          if (ODDS_DEBUG_LOGS) {
-            console.log(`[Games API] Matched odds for ${game.home_team_name} - key: ${key}, spread: ${odds.spread}, ml: ${odds.moneylineHome}`);
-          }
-          return {
-            ...game,
-            spread: odds.spread,
-            overUnder: odds.total,
-            moneylineHome: odds.moneylineHome,
-            moneylineAway: odds.moneylineAway,
-          };
+      const odds = getMatchedOddsForGame(game, combinedOddsMap);
+      if (odds) {
+        if (ODDS_DEBUG_LOGS) {
+          console.log(`[Games API] Matched odds for ${game.home_team_name} (${sport}|${awayName}|${homeName}) spread=${odds.spread}, ml=${odds.moneylineHome}`);
         }
+        return {
+          ...game,
+          spread: odds.spread,
+          overUnder: odds.total,
+          moneylineHome: odds.moneylineHome,
+          moneylineAway: odds.moneylineAway,
+        };
       }
       
       if (ODDS_DEBUG_LOGS && sport === 'nba' && game.home_team_name) {
-        console.log(`[Games API] No odds match for ${game.away_team_name} @ ${game.home_team_name}, tried keys:`, keys.slice(0, 2));
+        console.log(`[Games API] No odds match for ${game.away_team_name} @ ${game.home_team_name} (${sport}|${awayName}|${homeName})`);
       }
       
       return game;
@@ -688,6 +904,10 @@ gamesRouter.get("/", async (c) => {
   const status = rawStatus === "LIVE" ? "IN_PROGRESS" : rawStatus as Game["status"] | undefined;
   const date = c.req.query("date") || getTodayEasternDateString();
   const includeOdds = !["0", "false", "no"].includes(String(c.req.query("includeOdds") || "").toLowerCase());
+  const forceFresh = ["1", "true", "yes"].includes(String(c.req.query("fresh") || "").toLowerCase());
+  const listTimeoutMs = includeOdds ? 12000 : 4500;
+  const cacheKey = getScoreboardListCacheKey(sport, status, date, includeOdds);
+  const persistentKeys = getGamesPersistentCacheKeys(cacheKey);
   
   console.log("[Games API] GET / called", { sport, status, date });
   
@@ -697,6 +917,126 @@ gamesRouter.get("/", async (c) => {
       error: `Invalid sport. Supported: ${SUPPORTED_SPORTS.join(", ")}` 
     }, 400);
   }
+
+  if (!includeOdds && !forceFresh) {
+    const cached = scoreboardListCache.get(cacheKey);
+    if (cached && cached.expiresAt > Date.now()) {
+      return c.json(cached.payload);
+    }
+  }
+
+  if (!includeOdds && !forceFresh) {
+    try {
+      const persistent = await getCachedData<Record<string, unknown>>(c.env.DB, persistentKeys.primary);
+      if (persistent && hasGamesRows(persistent)) {
+        scoreboardListCache.set(cacheKey, { expiresAt: Date.now() + SCOREBOARD_LIST_CACHE_TTL_MS, payload: persistent });
+        return c.json({ ...persistent, cached: true, persistent_cached: true });
+      }
+    } catch {
+      // Non-fatal.
+    }
+
+    try {
+      const backup = await getCachedData<Record<string, unknown>>(c.env.DB, persistentKeys.backup);
+      if (backup && hasGamesRows(backup)) {
+        scoreboardListCache.set(cacheKey, { expiresAt: Date.now() + SCOREBOARD_LIST_CACHE_TTL_MS, payload: backup });
+        return c.json({
+          ...backup,
+          cached: true,
+          source_stale: true,
+          persistent_cached: true,
+          fallback_reason: 'Served last known games slate while provider refresh catches up',
+        });
+      }
+    } catch {
+      // Non-fatal.
+    }
+  }
+
+  // Fast scoreboard path: use cached live/scheduled feeds for today's slate.
+  // This avoids slow provider fan-out for /games list views that do not need odds.
+  if (!includeOdds && !status && date === getTodayEasternDateString()) {
+    const scopedSports = sport ? [sport] : undefined;
+    const [liveResult, scheduledResult] = await Promise.all([
+      withTimeout(
+        fetchLiveGamesWithFallback({ sports: scopedSports }),
+        3000,
+        { data: [], fromCache: false, provider: "none", error: "live_timeout" } as any
+      ),
+      withTimeout(
+        fetchScheduledGamesWithFallback({ sports: scopedSports, hours: 36 }),
+        3500,
+        { data: [], fromCache: false, provider: "none", error: "scheduled_timeout" } as any
+      ),
+    ]);
+
+    const byId = new Map<string, Game>();
+    for (const game of [...(liveResult.data || []), ...(scheduledResult.data || [])]) {
+      const gameId = String((game as any)?.game_id || "").trim();
+      if (!gameId) continue;
+      const startDate = getEasternDateString((game as any)?.start_time);
+      const isLive = String((game as any)?.status || "").toUpperCase() === "IN_PROGRESS";
+      if (!isLive && startDate && startDate !== date) continue;
+      byId.set(gameId, game);
+    }
+
+    const fastGames = Array.from(byId.values());
+
+    // Guardrail: if fast feeds return only live games (scheduled feed timeout/empty),
+    // run a bounded provider fallback for single-sport views so hubs don't show partial slates.
+    if (sport && scheduledResult.data.length === 0 && fastGames.length > 0) {
+      const fallbackFull = await withTimeout(
+        fetchGamesWithFallback(sport, { status, date }),
+        6500,
+        { data: [], fromCache: false, provider: "none", error: `${sport}_fallback_timeout` } as any
+      );
+      if (Array.isArray(fallbackFull.data) && fallbackFull.data.length > 0) {
+        for (const game of fallbackFull.data) {
+          const gameId = String((game as any)?.game_id || "").trim();
+          if (!gameId) continue;
+          const startDate = getEasternDateString((game as any)?.start_time);
+          const isLive = String((game as any)?.status || "").toUpperCase() === "IN_PROGRESS";
+          if (!isLive && startDate && startDate !== date) continue;
+          if (!byId.has(gameId)) byId.set(gameId, game);
+        }
+      }
+    }
+
+    const healedFastGames = Array.from(byId.values());
+    if (healedFastGames.length > 0) {
+      healedFastGames.sort((a, b) => {
+        if (a.sport !== b.sport) return a.sport.localeCompare(b.sport);
+        return new Date(a.start_time).getTime() - new Date(b.start_time).getTime();
+      });
+
+      if (c.env.DB) {
+        c.executionCtx.waitUntil(captureLineMovementSnapshotsForGames(healedFastGames, c.env));
+      }
+
+      const statuses = healedFastGames.map(g => g.status as GameStatus);
+      const ttl = getTTLForGamesList(statuses);
+      const headers = cacheHeaders(ttl, { isPublic: true, staleWhileRevalidate: 30 });
+
+      const payload = {
+        games: healedFastGames.map(withClientGameId),
+        fromCache: Boolean(liveResult.fromCache && scheduledResult.fromCache),
+        provider: liveResult.provider || scheduledResult.provider || "fast_feed",
+        timestamp: new Date().toISOString(),
+      };
+      scoreboardListCache.set(cacheKey, { expiresAt: Date.now() + SCOREBOARD_LIST_CACHE_TTL_MS, payload });
+      c.executionCtx.waitUntil((async () => {
+        try {
+          await setCachedData(c.env.DB, persistentKeys.primary, 'sportsradar', 'games/list', payload, 60);
+          if (hasGamesRows(payload)) {
+            await setCachedData(c.env.DB, persistentKeys.backup, 'sportsradar', 'games/list', payload, 60 * 60);
+          }
+        } catch {
+          // Non-fatal persistent cache write failure.
+        }
+      })());
+      return c.json(payload, { headers });
+    }
+  }
   
   // If no sport specified, get all sports IN PARALLEL for faster response
   if (!sport) {
@@ -705,7 +1045,7 @@ gamesRouter.get("/", async (c) => {
       SUPPORTED_SPORTS.map((s) =>
         withTimeout(
           fetchGamesWithFallback(s, { status, date }),
-          12000,
+          listTimeoutMs,
           { data: [], fromCache: false, provider: "none", error: `${s}_timeout` } as any
         )
       )
@@ -730,6 +1070,8 @@ gamesRouter.get("/", async (c) => {
         9000,
         allGames
       );
+    } else if (allGames.length > 0 && c.env.DB) {
+      c.executionCtx.waitUntil(captureLineMovementSnapshotsForGames(allGames, c.env));
     }
     
     // Sort by sport then start time
@@ -739,16 +1081,29 @@ gamesRouter.get("/", async (c) => {
     });
     
     // Log response summary
-    const sportsCounts = SUPPORTED_SPORTS.map(s => `${s}:${allGames.filter(g => g.sport === s).length}`).join(", ");
-    console.log("[Games API] Response:", { totalGames: allGames.length, provider: primaryProvider, sportsCounts });
+    console.log("[Games API] Response:", { totalGames: allGames.length, provider: primaryProvider });
     
-    return c.json({ 
+    const payload = { 
       games: allGames.map(withClientGameId),
       fromCache: anyFromCache,
       provider: primaryProvider,
       error: hasError && allGames.length === 0 ? "Live data unavailable" : undefined,
       timestamp: new Date().toISOString(),
-    });
+    };
+    if (!includeOdds) {
+      scoreboardListCache.set(cacheKey, { expiresAt: Date.now() + SCOREBOARD_LIST_CACHE_TTL_MS, payload });
+      c.executionCtx.waitUntil((async () => {
+        try {
+          await setCachedData(c.env.DB, persistentKeys.primary, 'sportsradar', 'games/list', payload, 60);
+          if (hasGamesRows(payload)) {
+            await setCachedData(c.env.DB, persistentKeys.backup, 'sportsradar', 'games/list', payload, 60 * 60);
+          }
+        } catch {
+          // Non-fatal persistent cache write failure.
+        }
+      })());
+    }
+    return c.json(payload);
   }
 
   if (sport === "soccer") {
@@ -759,6 +1114,14 @@ gamesRouter.get("/", async (c) => {
       if (redis) {
         const cachedPayload = await redis.get<Record<string, unknown>>(soccerCacheKey);
         if (cachedPayload && typeof cachedPayload === "object") {
+          if (!includeOdds && c.env.DB) {
+            const cachedGames = Array.isArray((cachedPayload as { games?: unknown[] }).games)
+              ? ((cachedPayload as { games?: Game[] }).games || [])
+              : [];
+            if (cachedGames.length > 0) {
+              c.executionCtx.waitUntil(captureLineMovementSnapshotsForGames(cachedGames, c.env));
+            }
+          }
           return c.json(cachedPayload, { headers: soccerHeaders });
         }
       }
@@ -768,7 +1131,7 @@ gamesRouter.get("/", async (c) => {
 
     const soccerResult = await withTimeout(
       fetchGamesWithFallback(sport, { status, date }),
-      12000,
+      listTimeoutMs,
       { data: [], fromCache: false, provider: "none", error: `${sport}_timeout` } as any
     );
 
@@ -779,6 +1142,9 @@ gamesRouter.get("/", async (c) => {
           soccerResult.data
         )
       : soccerResult.data;
+    if (!includeOdds && soccerResult.data.length > 0 && c.env.DB) {
+      c.executionCtx.waitUntil(captureLineMovementSnapshotsForGames(soccerResult.data, c.env));
+    }
 
     const soccerPayload = {
       games: soccerEnrichedGames.map(withClientGameId),
@@ -796,12 +1162,25 @@ gamesRouter.get("/", async (c) => {
       console.log("[Games API] Soccer cache write failed:", err);
     }
 
+    if (!includeOdds) {
+      scoreboardListCache.set(cacheKey, { expiresAt: Date.now() + SCOREBOARD_LIST_CACHE_TTL_MS, payload: soccerPayload });
+      c.executionCtx.waitUntil((async () => {
+        try {
+          await setCachedData(c.env.DB, persistentKeys.primary, 'sportsradar', 'games/list', soccerPayload, 60);
+          if (hasGamesRows(soccerPayload)) {
+            await setCachedData(c.env.DB, persistentKeys.backup, 'sportsradar', 'games/list', soccerPayload, 60 * 60);
+          }
+        } catch {
+          // Non-fatal persistent cache write failure.
+        }
+      })());
+    }
     return c.json(soccerPayload, { headers: soccerHeaders });
   }
   
   const result = await withTimeout(
     fetchGamesWithFallback(sport, { status, date }),
-    12000,
+    listTimeoutMs,
     { data: [], fromCache: false, provider: "none", error: `${sport}_timeout` } as any
   );
   
@@ -813,19 +1192,36 @@ gamesRouter.get("/", async (c) => {
         result.data
       )
     : result.data;
+  if (!includeOdds && result.data.length > 0 && c.env.DB) {
+    c.executionCtx.waitUntil(captureLineMovementSnapshotsForGames(result.data, c.env));
+  }
   
   // Determine cache headers based on game statuses
   const statuses = enrichedGames.map(g => g.status as GameStatus);
   const ttl = getTTLForGamesList(statuses);
   const headers = cacheHeaders(ttl, { isPublic: true, staleWhileRevalidate: 30 });
   
-  return c.json({
+  const payload = {
     games: enrichedGames.map(withClientGameId),
     fromCache: result.fromCache,
     cachedAt: result.cachedAt ? new Date(result.cachedAt).toISOString() : undefined,
     provider: result.provider,
     timestamp: new Date().toISOString(),
-  }, { headers });
+  };
+  if (!includeOdds) {
+    scoreboardListCache.set(cacheKey, { expiresAt: Date.now() + SCOREBOARD_LIST_CACHE_TTL_MS, payload });
+      c.executionCtx.waitUntil((async () => {
+        try {
+          await setCachedData(c.env.DB, persistentKeys.primary, 'sportsradar', 'games/list', payload, 60);
+          if (hasGamesRows(payload)) {
+            await setCachedData(c.env.DB, persistentKeys.backup, 'sportsradar', 'games/list', payload, 60 * 60);
+          }
+        } catch {
+          // Non-fatal persistent cache write failure.
+        }
+      })());
+  }
+  return c.json(payload, { headers });
 });
 
 /**
@@ -838,7 +1234,8 @@ gamesRouter.get("/", async (c) => {
 gamesRouter.get("/live", async (c) => {
   const sportsParam = c.req.query("sports");
   const singleSportParam = c.req.query("sport");
-  
+  const forceFresh = ["1", "true", "yes"].includes(String(c.req.query("fresh") || "").toLowerCase());
+
   let sports: SportKey[] | undefined;
   if (sportsParam || singleSportParam) {
     const raw = sportsParam
@@ -846,15 +1243,59 @@ gamesRouter.get("/live", async (c) => {
       : [singleSportParam as string];
     const normalized = raw.map((s) => String(s || "").trim().toLowerCase());
     sports = normalized.filter((s) => SUPPORTED_SPORTS.includes(s as SportKey)) as SportKey[];
-    
+
     if (sports.length === 0) {
       return c.json({ error: "No valid sports specified" }, 400);
     }
   }
-  
+
+  const liveCacheKey = getLiveCacheKey(sports);
+  const persistentKeys = getLivePersistentCacheKeys(liveCacheKey);
+
+  if (!forceFresh) {
+    const memoryHit = liveResponseCache.get(liveCacheKey);
+    if (memoryHit && memoryHit.expiresAt > Date.now()) {
+      return c.json(memoryHit.payload, { headers: liveGameHeaders() });
+    }
+
+    try {
+      const primary = await getCachedData<Record<string, unknown>>(c.env.DB, persistentKeys.primary);
+      if (primary && hasGamesRows(primary)) {
+        liveResponseCache.set(liveCacheKey, {
+          expiresAt: Date.now() + LIVE_CACHE_TTL_MS,
+          staleExpiresAt: Date.now() + LIVE_STALE_WINDOW_MS,
+          payload: primary,
+        });
+        return c.json({ ...primary, cached: true, persistent_cached: true }, { headers: liveGameHeaders() });
+      }
+    } catch {
+      // Non-fatal cache read failure.
+    }
+
+    try {
+      const backup = await getCachedData<Record<string, unknown>>(c.env.DB, persistentKeys.backup);
+      if (backup && hasGamesRows(backup)) {
+        liveResponseCache.set(liveCacheKey, {
+          expiresAt: Date.now() + LIVE_CACHE_TTL_MS,
+          staleExpiresAt: Date.now() + LIVE_STALE_WINDOW_MS,
+          payload: backup,
+        });
+        return c.json({
+          ...backup,
+          cached: true,
+          persistent_cached: true,
+          source_stale: true,
+          fallback_reason: "Serving last known live slate while provider refresh catches up",
+        }, { headers: liveGameHeaders() });
+      }
+    } catch {
+      // Non-fatal cache read failure.
+    }
+  }
+
   const result = await withTimeout(
     fetchLiveGamesWithFallback({ sports }),
-    7000,
+    900,
     {
       data: [],
       fromCache: false,
@@ -862,22 +1303,56 @@ gamesRouter.get("/live", async (c) => {
       error: "Provider request timed out",
     }
   );
-  
+
   // Group by sport for easier consumption
   const bySport: Record<string, Game[]> = {};
   for (const game of result.data) {
     if (!bySport[game.sport]) bySport[game.sport] = [];
     bySport[game.sport].push(game);
   }
-  
-  return c.json({
+
+  const payload = {
     games: result.data.map(withClientGameId),
     bySport,
     count: result.data.length,
     fromCache: result.fromCache,
     provider: result.provider,
+    error: result.error,
     timestamp: new Date().toISOString(),
-  }, { headers: liveGameHeaders() });
+  };
+
+  const hasRows = hasGamesRows(payload);
+  if (hasRows || !result.error) {
+    liveResponseCache.set(liveCacheKey, {
+      expiresAt: Date.now() + LIVE_CACHE_TTL_MS,
+      staleExpiresAt: Date.now() + LIVE_STALE_WINDOW_MS,
+      payload,
+    });
+  }
+
+  if (hasRows) {
+    c.executionCtx.waitUntil((async () => {
+      try {
+        await setCachedData(c.env.DB, persistentKeys.primary, 'sportsradar', 'games/live', payload, 30);
+        await setCachedData(c.env.DB, persistentKeys.backup, 'sportsradar', 'games/live', payload, 10 * 60);
+      } catch {
+        // Non-fatal persistent cache write failure.
+      }
+    })());
+  }
+
+  if (!hasRows && !forceFresh) {
+    const staleHit = liveResponseCache.get(liveCacheKey);
+    if (staleHit && staleHit.staleExpiresAt > Date.now()) {
+      return c.json({
+        ...staleHit.payload,
+        source_stale: true,
+        fallback_reason: result.error || 'Live feed returned empty response',
+      }, { headers: liveGameHeaders() });
+    }
+  }
+
+  return c.json(payload, { headers: liveGameHeaders() });
 });
 
 /**
@@ -1600,6 +2075,266 @@ gamesRouter.get("/:gameId", async (c) => {
  */
 gamesRouter.get("/:gameId/odds", async (c) => {
   const gameId = c.req.param("gameId");
+  const includeFullBooks = c.req.query("full") === "1";
+  const startedAt = Date.now();
+  const withinBudget = () => Date.now() - startedAt < 3500;
+  const toNum = (value: unknown): number | null => {
+    if (typeof value === "number" && Number.isFinite(value)) return value;
+    if (typeof value === "string" && value.trim()) {
+      const parsed = Number(value);
+      if (Number.isFinite(parsed)) return parsed;
+    }
+    return null;
+  };
+  const buildFallbackIds = (seedIds: string[]): string[] => {
+    const idSet = new Set<string>();
+    for (const seed of seedIds.map((v) => String(v || "").trim()).filter(Boolean)) {
+      idSet.add(seed);
+      for (const candidate of buildLineHistoryIdCandidates(seed)) idSet.add(candidate);
+      const srEvent = toSportsRadarEventId(seed);
+      const srMatch = toSportsRadarMatchId(seed);
+      if (srEvent) idSet.add(srEvent);
+      if (srMatch) idSet.add(srMatch);
+    }
+    return Array.from(idSet).filter(Boolean).slice(0, 8);
+  };
+  const loadDbOddsFallback = async (seedIds: string[]) => {
+    const candidateIds = buildFallbackIds(seedIds);
+    if (!c.env.DB || candidateIds.length === 0) {
+      return {
+        consensus: null as any,
+        sportsbooks: [] as any[],
+        opening: {
+          openSpread: null as number | null,
+          openTotal: null as number | null,
+          openMoneylineHome: null as number | null,
+          openMoneylineAway: null as number | null,
+        },
+      };
+    }
+
+    const placeholders = candidateIds.map(() => "?").join(",");
+    type SnapshotRow = {
+      market_key: string;
+      outcome_key: string;
+      line_value: number | null;
+      price_american: number | null;
+      captured_at: string;
+    };
+    type OpeningRow = {
+      market_key: string;
+      outcome_key: string;
+      opening_line_value: number | null;
+      opening_price_american: number | null;
+      opened_at: string;
+    };
+
+    const latestByPair = new Map<string, SnapshotRow>();
+    try {
+      const snapshotRows = await c.env.DB.prepare(`
+        SELECT market_key, outcome_key, line_value, price_american, captured_at
+        FROM odds_snapshots
+        WHERE data_scope = 'PROD'
+          AND game_id IN (${placeholders})
+        ORDER BY datetime(captured_at) DESC
+        LIMIT 200
+      `).bind(...candidateIds).all<SnapshotRow>();
+      for (const row of snapshotRows.results || []) {
+        const pair = `${String(row.market_key || "").toUpperCase()}:${String(row.outcome_key || "").toUpperCase()}`;
+        if (!latestByPair.has(pair)) latestByPair.set(pair, row);
+      }
+      if (latestByPair.size === 0) {
+        const likeNeedles = Array.from(new Set(
+          normalizedSeeds.flatMap((seed) => {
+            const trimmed = String(seed || "").trim();
+            if (!trimmed) return [];
+            const parts = trimmed.split("_").filter(Boolean);
+            const tail = parts.length >= 3 ? parts.slice(2).join("_") : trimmed;
+            const hyphenTail = tail.replace(/_/g, "-");
+            const underscoreTail = tail.replace(/-/g, "_");
+            return [hyphenTail, underscoreTail]
+              .map((v) => v.trim())
+              .filter((v) => v.length >= 12);
+          })
+        )).slice(0, 4);
+        if (likeNeedles.length > 0) {
+          const likeClause = likeNeedles.map(() => `game_id LIKE ?`).join(" OR ");
+          const likeRows = await c.env.DB.prepare(`
+            SELECT market_key, outcome_key, line_value, price_american, captured_at
+            FROM odds_snapshots
+            WHERE data_scope = 'PROD'
+              AND (${likeClause})
+            ORDER BY datetime(captured_at) DESC
+            LIMIT 200
+          `).bind(...likeNeedles.map((needle) => `%${needle}%`)).all<SnapshotRow>();
+          for (const row of likeRows.results || []) {
+            const pair = `${String(row.market_key || "").toUpperCase()}:${String(row.outcome_key || "").toUpperCase()}`;
+            if (!latestByPair.has(pair)) latestByPair.set(pair, row);
+          }
+        }
+      }
+    } catch {
+      // Non-fatal; keep empty fallback.
+    }
+
+    const spreadHome = latestByPair.get("SPREAD:HOME")?.line_value ?? null;
+    const spreadAway = latestByPair.get("SPREAD:AWAY")?.line_value ?? (spreadHome !== null ? -spreadHome : null);
+    const total = latestByPair.get("TOTAL:OVER")?.line_value ?? latestByPair.get("TOTAL:UNDER")?.line_value ?? null;
+    const moneylineHome = latestByPair.get("MONEYLINE:HOME")?.price_american ?? null;
+    const moneylineAway = latestByPair.get("MONEYLINE:AWAY")?.price_american ?? null;
+    const hasDbConsensus =
+      spreadHome !== null ||
+      spreadAway !== null ||
+      total !== null ||
+      moneylineHome !== null ||
+      moneylineAway !== null;
+
+    const earliestOpeningByPair = new Map<string, OpeningRow>();
+    try {
+      const openingRows = await c.env.DB.prepare(`
+        SELECT market_key, outcome_key, opening_line_value, opening_price_american, opened_at
+        FROM odds_opening
+        WHERE data_scope = 'PROD'
+          AND game_id IN (${placeholders})
+        ORDER BY datetime(opened_at) ASC
+        LIMIT 200
+      `).bind(...candidateIds).all<OpeningRow>();
+      for (const row of openingRows.results || []) {
+        const pair = `${String(row.market_key || "").toUpperCase()}:${String(row.outcome_key || "").toUpperCase()}`;
+        if (!earliestOpeningByPair.has(pair)) earliestOpeningByPair.set(pair, row);
+      }
+      if (earliestOpeningByPair.size === 0) {
+        const likeNeedles = Array.from(new Set(
+          normalizedSeeds.flatMap((seed) => {
+            const trimmed = String(seed || "").trim();
+            if (!trimmed) return [];
+            const parts = trimmed.split("_").filter(Boolean);
+            const tail = parts.length >= 3 ? parts.slice(2).join("_") : trimmed;
+            const hyphenTail = tail.replace(/_/g, "-");
+            const underscoreTail = tail.replace(/-/g, "_");
+            return [hyphenTail, underscoreTail]
+              .map((v) => v.trim())
+              .filter((v) => v.length >= 12);
+          })
+        )).slice(0, 4);
+        if (likeNeedles.length > 0) {
+          const likeClause = likeNeedles.map(() => `game_id LIKE ?`).join(" OR ");
+          const likeOpenRows = await c.env.DB.prepare(`
+            SELECT market_key, outcome_key, opening_line_value, opening_price_american, opened_at
+            FROM odds_opening
+            WHERE data_scope = 'PROD'
+              AND (${likeClause})
+            ORDER BY datetime(opened_at) ASC
+            LIMIT 200
+          `).bind(...likeNeedles.map((needle) => `%${needle}%`)).all<OpeningRow>();
+          for (const row of likeOpenRows.results || []) {
+            const pair = `${String(row.market_key || "").toUpperCase()}:${String(row.outcome_key || "").toUpperCase()}`;
+            if (!earliestOpeningByPair.has(pair)) earliestOpeningByPair.set(pair, row);
+          }
+        }
+      }
+    } catch {
+      // Non-fatal; keep null openings.
+    }
+
+    const openSpread = earliestOpeningByPair.get("SPREAD:HOME")?.opening_line_value ?? null;
+    const openTotal = earliestOpeningByPair.get("TOTAL:OVER")?.opening_line_value ?? earliestOpeningByPair.get("TOTAL:UNDER")?.opening_line_value ?? null;
+    const openMoneylineHome = earliestOpeningByPair.get("MONEYLINE:HOME")?.opening_price_american ?? null;
+    const openMoneylineAway = earliestOpeningByPair.get("MONEYLINE:AWAY")?.opening_price_american ?? null;
+
+    const consensus = hasDbConsensus
+      ? {
+        sportsbook: "Consensus",
+        spreadHome,
+        spreadAway,
+        total,
+        moneylineHome,
+        moneylineAway,
+        spread1HHome: null,
+        spread1HAway: null,
+        total1H: null,
+        moneyline1HHome: null,
+        moneyline1HAway: null,
+      }
+      : null;
+
+    return {
+      consensus,
+      sportsbooks: hasDbConsensus
+        ? [{
+          sportsbook: "D1 Snapshot Consensus",
+          spreadHome,
+          spreadAway,
+          total,
+          moneylineHome,
+          moneylineAway,
+          updatedAt: new Date().toISOString(),
+        }]
+        : [],
+      opening: { openSpread, openTotal, openMoneylineHome, openMoneylineAway },
+    };
+  };
+  const loadMovementFallback = async (seedIds: string[]) => {
+    const candidateIds = buildFallbackIds(seedIds);
+    for (const candidateId of candidateIds.slice(0, 3)) {
+      const [spread, total, mlHome, mlAway] = await Promise.all([
+        withTimeout(getLineMovement(c.env.DB, candidateId, "SPREAD", "HOME"), 700, null as any),
+        withTimeout(getLineMovement(c.env.DB, candidateId, "TOTAL", "OVER"), 700, null as any),
+        withTimeout(getLineMovement(c.env.DB, candidateId, "MONEYLINE", "HOME"), 700, null as any),
+        withTimeout(getLineMovement(c.env.DB, candidateId, "MONEYLINE", "AWAY"), 700, null as any),
+      ]);
+      const spreadCurrent = toNum(spread?.currentLine);
+      const spreadOpening = toNum(spread?.openingLine);
+      const totalCurrent = toNum(total?.currentLine);
+      const totalOpening = toNum(total?.openingLine);
+      const mlHomeCurrent = toNum(mlHome?.currentPrice);
+      const mlHomeOpening = toNum(mlHome?.openingPrice);
+      const mlAwayCurrent = toNum(mlAway?.currentPrice);
+      const mlAwayOpening = toNum(mlAway?.openingPrice);
+      const hasAny =
+        spreadCurrent !== null ||
+        spreadOpening !== null ||
+        totalCurrent !== null ||
+        totalOpening !== null ||
+        mlHomeCurrent !== null ||
+        mlHomeOpening !== null ||
+        mlAwayCurrent !== null ||
+        mlAwayOpening !== null;
+      if (!hasAny) continue;
+      const consensus = {
+        sportsbook: "Consensus",
+        spreadHome: spreadCurrent ?? spreadOpening,
+        spreadAway: spreadCurrent !== null ? -spreadCurrent : (spreadOpening !== null ? -spreadOpening : null),
+        total: totalCurrent ?? totalOpening,
+        moneylineHome: mlHomeCurrent ?? mlHomeOpening,
+        moneylineAway: mlAwayCurrent ?? mlAwayOpening,
+        spread1HHome: null,
+        spread1HAway: null,
+        total1H: null,
+        moneyline1HHome: null,
+        moneyline1HAway: null,
+      };
+      return {
+        consensus,
+        sportsbooks: [{
+          sportsbook: "LineHistory Fallback",
+          spreadHome: consensus.spreadHome,
+          spreadAway: consensus.spreadAway,
+          total: consensus.total,
+          moneylineHome: consensus.moneylineHome,
+          moneylineAway: consensus.moneylineAway,
+          updatedAt: new Date().toISOString(),
+        }],
+        opening: {
+          openSpread: spreadOpening,
+          openTotal: totalOpening,
+          openMoneylineHome: mlHomeOpening,
+          openMoneylineAway: mlAwayOpening,
+        },
+      };
+    }
+    return null;
+  };
   
   // Parse game ID to extract sport (format: sr_nba_xxx or sr:sport_event:xxx)
   let sport = '';
@@ -1613,14 +2348,241 @@ gamesRouter.get("/:gameId/odds", async (c) => {
   }
   
   // First, get the game details
-  const result = await fetchGameWithFallback(gameId);
+  let result = await withTimeout(
+    fetchGameWithFallback(gameId),
+    2500,
+    { data: null } as any
+  );
   
   if (!result.data?.game) {
-    return c.json({ error: "Game not found" }, 404);
+    // Retry via sport slate as a recovery path when per-game lookup misses.
+    if (sport && SUPPORTED_SPORTS.includes(sport as SportKey)) {
+      try {
+        const [liveSlateResult, scheduledSlateResult] = await Promise.all([
+          withTimeout(
+            fetchLiveGamesWithFallback({ sports: [sport as SportKey] }),
+            1200,
+            { data: [] } as any
+          ),
+          withTimeout(
+            fetchScheduledGamesWithFallback({ sports: [sport as SportKey], hours: 120 }),
+            1800,
+            { data: [] } as any
+          ),
+        ]);
+        const combinedSlate = [
+          ...(liveSlateResult.data || []),
+          ...(scheduledSlateResult.data || []),
+        ];
+        const recoveredGame = combinedSlate.find((g: any) =>
+          String(g?.game_id || "") === gameId || String(g?.id || "") === gameId
+        );
+        if (recoveredGame) {
+          result = {
+            data: {
+              game: recoveredGame,
+              stats: [],
+              playByPlay: [],
+              injuries: [],
+              weather: null,
+              odds: [],
+            },
+          } as any;
+        }
+      } catch {
+        // Continue to direct odds fallback.
+      }
+    }
+  }
+  if (!result.data?.game && c.env.DB) {
+    try {
+      const eventRow = await withTimeout(
+        c.env.DB.prepare(`
+          SELECT *
+          FROM events
+          WHERE id = ? OR external_id = ?
+          LIMIT 1
+        `).bind(gameId, gameId).first<Record<string, unknown>>(),
+        1200,
+        null
+      );
+      if (eventRow) {
+        const row = eventRow as Record<string, unknown>;
+        const recoveredGameId = String(row.id || gameId).trim() || gameId;
+        const recoveredExternalId = String(row.external_id || row.provider_game_id || recoveredGameId).trim() || recoveredGameId;
+        result = {
+          data: {
+            game: {
+              game_id: recoveredGameId,
+              external_id: recoveredExternalId,
+              sport: String(row.sport || sport || "").toLowerCase(),
+              home_team_name: String(row.home_team || row.home_team_name || "").trim(),
+              away_team_name: String(row.away_team || row.away_team_name || "").trim(),
+              start_time: String(row.start_time || row.commence_time || row.scheduled || "").trim() || null,
+              status: String(row.status || row.game_status || "SCHEDULED").trim(),
+            },
+            stats: [],
+            playByPlay: [],
+            injuries: [],
+            weather: null,
+            odds: [],
+          },
+        } as any;
+      }
+    } catch {
+      // Continue with direct odds fallback paths.
+    }
+  }
+  
+  if (!result.data?.game) {
+    const dbFallbackNoGame = await loadDbOddsFallback([gameId]);
+    if (dbFallbackNoGame.consensus) {
+      return c.json({
+        gameId,
+        sport: sport || null,
+        homeTeam: null,
+        awayTeam: null,
+        startTime: null,
+        consensus: dbFallbackNoGame.consensus,
+        first_half: null,
+        sportsbooks: dbFallbackNoGame.sportsbooks,
+        isLiveOdds: false,
+        ...dbFallbackNoGame.opening,
+        lastUpdated: new Date().toISOString(),
+        source: "db_snapshot_fallback_no_game",
+      }, {
+        headers: cacheHeaders(120, { isPublic: true })
+      });
+    }
+    const apiKey = c.env.SPORTSRADAR_API_KEY;
+    const oddsKey = c.env.SPORTSRADAR_ODDS_KEY || apiKey;
+    const oddsKeyCandidates = Array.from(new Set([oddsKey, apiKey].filter(Boolean))) as string[];
+    const srIdCandidates = Array.from(
+      new Set(
+        [
+          toSportsRadarEventId(String(gameId || "")),
+          toSportsRadarMatchId(String(gameId || "")),
+        ].filter(Boolean) as string[]
+      )
+    );
+    if (oddsKeyCandidates.length > 0 && srIdCandidates.length > 0) {
+      try {
+        let directOdds: any = null;
+        for (const srEventId of srIdCandidates.slice(0, 2)) {
+          for (const keyCandidate of oddsKeyCandidates.slice(0, 2)) {
+            directOdds = await withTimeout(
+              fetchSportsRadarOddsForGame(srEventId, keyCandidate),
+              900,
+              null
+            );
+            if (directOdds) break;
+          }
+          if (directOdds) break;
+        }
+        if (directOdds) {
+          const spreadHome = Number.isFinite(Number(directOdds.spreadHome ?? directOdds.spread))
+            ? Number(directOdds.spreadHome ?? directOdds.spread)
+            : null;
+          const spreadAway = spreadHome !== null ? -spreadHome : null;
+          const total = Number.isFinite(Number(directOdds.total)) ? Number(directOdds.total) : null;
+          const moneylineHome = Number.isFinite(Number(directOdds.moneylineHome)) ? Number(directOdds.moneylineHome) : null;
+          const moneylineAway = Number.isFinite(Number(directOdds.moneylineAway)) ? Number(directOdds.moneylineAway) : null;
+          return c.json({
+            gameId,
+            sport: sport || null,
+            homeTeam: null,
+            awayTeam: null,
+            startTime: null,
+            consensus: {
+              sportsbook: "Consensus",
+              spreadHome,
+              spreadAway,
+              total,
+              moneylineHome,
+              moneylineAway,
+              spread1HHome: null,
+              spread1HAway: null,
+              total1H: null,
+              moneyline1HHome: null,
+              moneyline1HAway: null,
+            },
+            first_half: null,
+            sportsbooks: [
+              {
+                sportsbook: "SportsRadar Consensus",
+                spreadHome,
+                spreadAway,
+                total,
+                moneylineHome,
+                moneylineAway,
+                updatedAt: new Date().toISOString(),
+              },
+            ],
+            isLiveOdds: false,
+            openSpread: null,
+            openTotal: null,
+            openMoneylineHome: null,
+            openMoneylineAway: null,
+            lastUpdated: new Date().toISOString(),
+            source: "sportsradar_direct_fallback",
+          }, {
+            headers: cacheHeaders(90, { isPublic: true })
+          });
+        }
+      } catch {
+        // Continue with not-found response below.
+      }
+    }
+    // Synthesize a minimal game shell so we can still run DB/snapshot fallbacks.
+    const fallbackSport = sport || "";
+    const fallbackExternalId = (() => {
+      const raw = String(gameId || "").trim();
+      if (!raw.startsWith("sr_")) return raw;
+      const parts = raw.split("_");
+      return parts.slice(2).join("_");
+    })();
+    result = {
+      data: {
+        game: {
+          game_id: gameId,
+          external_id: fallbackExternalId || gameId,
+          sport: fallbackSport,
+          status: "SCHEDULED",
+          home_team_name: "",
+          away_team_name: "",
+          start_time: null,
+        },
+        stats: [],
+        playByPlay: [],
+        injuries: [],
+        weather: null,
+        odds: [],
+      },
+    } as any;
   }
   
   const game = result.data.game;
   sport = (game.sport || sport).toLowerCase();
+  const status = String(game.status || "").toUpperCase();
+  const isLiveOdds = status === 'IN_PROGRESS' || status === 'LIVE';
+  const fallbackSeedIds = [
+    gameId,
+    String(game.game_id || ""),
+    String(game.external_id || ""),
+    toSportsRadarEventId(String(game.game_id || "")) || "",
+    toSportsRadarEventId(String(game.external_id || "")) || "",
+  ];
+  const dbFallback = await loadDbOddsFallback(fallbackSeedIds);
+  const movementFallback = !dbFallback.consensus
+    ? await loadMovementFallback(fallbackSeedIds)
+    : null;
+  const gameDate = (() => {
+    const raw = String(game.start_time || "");
+    if (!raw) return undefined;
+    const parsed = new Date(raw);
+    if (Number.isNaN(parsed.getTime())) return undefined;
+    return parsed.toISOString().slice(0, 10);
+  })();
   
   const sportsbooks: Array<{
     sportsbook: string;
@@ -1644,29 +2606,291 @@ gamesRouter.get("/:gameId/odds", async (c) => {
   
   if (apiKey && sport) {
     try {
-      // Fetch ALL sportsbooks for this game (not just consensus)
+      const srIdCandidates = Array.from(
+        new Set(
+          [
+            toSportsRadarEventId(String(game.game_id || "")),
+            toSportsRadarEventId(String(game.external_id || "")),
+            toSportsRadarMatchId(String(game.game_id || "")),
+            toSportsRadarMatchId(String(game.external_id || "")),
+            String(game.external_id || "").includes("-") ? `sr:sport_event:${String(game.external_id || "").trim()}` : null,
+            String(game.external_id || "").includes("-") ? `sr:match:${String(game.external_id || "").trim()}` : null,
+          ].filter(Boolean) as string[]
+        )
+      );
+
+      // Fast path first: direct event odds is usually much cheaper than full book scans.
+      let fastDirectOdds: any = null;
+      if (withinBudget() && srIdCandidates.length > 0) {
+        const fastSrIds = srIdCandidates.slice(0, 2);
+        const fastKeys = (!includeFullBooks && !isLiveOdds)
+          ? oddsKeyCandidates.slice(0, 2)
+          : oddsKeyCandidates;
+        const fastTimeoutMs = (!includeFullBooks && !isLiveOdds) ? 700 : 1500;
+        for (const srEventId of fastSrIds) {
+          for (const keyCandidate of fastKeys) {
+            fastDirectOdds = await withTimeout(
+              fetchSportsRadarOddsForGame(srEventId, keyCandidate),
+              fastTimeoutMs,
+              null
+            );
+            if (fastDirectOdds) break;
+          }
+          if (fastDirectOdds) break;
+          if (!withinBudget()) break;
+        }
+      }
+      if (fastDirectOdds) {
+        sportsbooks.push({
+          sportsbook: "SportsRadar Consensus",
+          spreadHome: fastDirectOdds.spreadHome ?? fastDirectOdds.spread ?? null,
+          spreadAway: fastDirectOdds.spreadAway ?? (fastDirectOdds.spread ? -fastDirectOdds.spread : null),
+          total: fastDirectOdds.total ?? null,
+          moneylineHome: fastDirectOdds.moneylineHome ?? null,
+          moneylineAway: fastDirectOdds.moneylineAway ?? null,
+          spread1HHome: fastDirectOdds.spread1HHome ?? null,
+          spread1HAway: fastDirectOdds.spread1HAway ?? null,
+          total1H: fastDirectOdds.total1H ?? null,
+          moneyline1HHome: fastDirectOdds.moneyline1HHome ?? null,
+          moneyline1HAway: fastDirectOdds.moneyline1HAway ?? null,
+          updatedAt: new Date().toISOString(),
+        });
+        if (!includeFullBooks) {
+          const consensus = {
+            sportsbook: "Consensus",
+            spreadHome: fastDirectOdds.spreadHome ?? fastDirectOdds.spread ?? null,
+            spreadAway: fastDirectOdds.spreadAway ?? (fastDirectOdds.spread ? -fastDirectOdds.spread : null),
+            total: fastDirectOdds.total ?? null,
+            moneylineHome: fastDirectOdds.moneylineHome ?? null,
+            moneylineAway: fastDirectOdds.moneylineAway ?? null,
+            spread1HHome: fastDirectOdds.spread1HHome ?? null,
+            spread1HAway: fastDirectOdds.spread1HAway ?? null,
+            total1H: fastDirectOdds.total1H ?? null,
+            moneyline1HHome: fastDirectOdds.moneyline1HHome ?? null,
+            moneyline1HAway: fastDirectOdds.moneyline1HAway ?? null,
+          };
+          return c.json({
+            gameId,
+            sport: game.sport,
+            homeTeam: game.home_team_name,
+            awayTeam: game.away_team_name,
+            startTime: game.start_time,
+            consensus,
+            first_half: {
+              spread: {
+                home_line: consensus.spread1HHome ?? null,
+                away_line: consensus.spread1HAway ?? null,
+              },
+              total: {
+                line: consensus.total1H ?? null,
+              },
+              moneyline: {
+                home_price: consensus.moneyline1HHome ?? null,
+                away_price: consensus.moneyline1HAway ?? null,
+              },
+            },
+            sportsbooks,
+            isLiveOdds,
+            ...dbFallback.opening,
+            lastUpdated: new Date().toISOString(),
+            source: "sportsradar_fast",
+          }, {
+            headers: cacheHeaders(isLiveOdds ? 30 : 120, { isPublic: true })
+          });
+        }
+      }
+      if (!includeFullBooks && !isLiveOdds && sportsbooks.length === 0 && withinBudget()) {
+        try {
+          const keyCandidate = oddsKeyCandidates[0];
+          if (keyCandidate) {
+            const dateCandidates = Array.from(new Set([
+              gameDate,
+              gameDate
+                ? new Date(new Date(`${gameDate}T00:00:00.000Z`).getTime() - 86400000).toISOString().slice(0, 10)
+                : undefined,
+              gameDate
+                ? new Date(new Date(`${gameDate}T00:00:00.000Z`).getTime() + 86400000).toISOString().slice(0, 10)
+                : undefined,
+            ]));
+            for (const dateCandidate of dateCandidates) {
+              if (!withinBudget()) break;
+              const cachedMap = await withTimeout(
+                fetchSportsRadarOdds(sport, apiKey, c.env.DB, dateCandidate, keyCandidate),
+                500,
+                new Map<string, any>()
+              );
+              if (cachedMap.size === 0) continue;
+              const homeTeamName = String(game.home_team_name || "");
+              const awayTeamName = String(game.away_team_name || "");
+              const candidateIds = new Set<string>(
+                [
+                  String(game.game_id || "").trim(),
+                  String(game.external_id || "").trim(),
+                  toSportsRadarEventId(String(game.game_id || "")) || "",
+                  toSportsRadarEventId(String(game.external_id || "")) || "",
+                  toSportsRadarMatchId(String(game.game_id || "")) || "",
+                  toSportsRadarMatchId(String(game.external_id || "")) || "",
+                ].filter(Boolean)
+              );
+              let cachedOdds: any = null;
+              for (const [key, odds] of cachedMap) {
+                if (candidateIds.has(String(key || "")) || candidateIds.has(String(odds?.gameId || ""))) {
+                  cachedOdds = odds;
+                  break;
+                }
+              }
+              if (!cachedOdds) {
+                for (const odds of cachedMap.values()) {
+                  if (
+                    teamsRoughlyMatch(String(odds?.homeTeam || ""), homeTeamName)
+                    && teamsRoughlyMatch(String(odds?.awayTeam || ""), awayTeamName)
+                  ) {
+                    cachedOdds = odds;
+                    break;
+                  }
+                }
+              }
+              if (cachedOdds) {
+                sportsbooks.push({
+                  sportsbook: "SportsRadar Cached Consensus",
+                  spreadHome: cachedOdds.spreadHome ?? cachedOdds.spread ?? null,
+                  spreadAway: cachedOdds.spreadAway ?? (cachedOdds.spread ? -cachedOdds.spread : null),
+                  total: cachedOdds.total ?? null,
+                  moneylineHome: cachedOdds.moneylineHome ?? null,
+                  moneylineAway: cachedOdds.moneylineAway ?? null,
+                  updatedAt: new Date().toISOString(),
+                });
+                break;
+              }
+            }
+          }
+        } catch {
+          // Non-fatal; keep fast scheduled fallback.
+        }
+      }
+      if (!includeFullBooks && !isLiveOdds && sportsbooks.length === 0) {
+        const fallbackPack = dbFallback.consensus ? dbFallback : movementFallback;
+        if (fallbackPack?.consensus) {
+          return c.json({
+            gameId,
+            sport: game.sport,
+            homeTeam: game.home_team_name,
+            awayTeam: game.away_team_name,
+            startTime: game.start_time,
+            consensus: fallbackPack.consensus,
+            first_half: null,
+            sportsbooks: fallbackPack.sportsbooks,
+            isLiveOdds,
+            ...fallbackPack.opening,
+            lastUpdated: new Date().toISOString(),
+            source: dbFallback.consensus ? "db_snapshot_fallback" : "line_history_fallback",
+          }, {
+            headers: cacheHeaders(120, { isPublic: true })
+          });
+        }
+        // Self-heal missing pregame odds: backfill snapshots asynchronously so
+        // subsequent requests have DB history even when provider calls miss now.
+        if (apiKey && sport) {
+          const backfillSport = sport;
+          const backfillDate = gameDate;
+          const backfillHome = String(game.home_team_name || "");
+          const backfillAway = String(game.away_team_name || "");
+          const backfillGameIds = Array.from(new Set([
+            gameId,
+            String(game.game_id || ""),
+            String(game.external_id || ""),
+          ].filter(Boolean)));
+          c.executionCtx.waitUntil((async () => {
+            try {
+              for (const keyCandidate of oddsKeyCandidates.slice(0, 1)) {
+                const map = await fetchSportsRadarOdds(backfillSport, apiKey, c.env.DB, backfillDate, keyCandidate);
+                if (!map || map.size === 0) continue;
+                let matched: SportsRadarOdds | null = null;
+                for (const odds of map.values()) {
+                  if (
+                    teamsRoughlyMatch(String(odds?.homeTeam || ""), backfillHome)
+                    && teamsRoughlyMatch(String(odds?.awayTeam || ""), backfillAway)
+                  ) {
+                    matched = odds;
+                    break;
+                  }
+                }
+                if (!matched) continue;
+                for (const id of backfillGameIds) {
+                  const snapshotOdds: SportsRadarOdds = {
+                    ...matched,
+                    gameId: id,
+                  };
+                  await storeOpeningLines(c.env.DB, id, snapshotOdds);
+                  await captureOddsSnapshot(c.env.DB, id, backfillSport, snapshotOdds);
+                }
+                break;
+              }
+            } catch {
+              // Non-fatal asynchronous backfill.
+            }
+          })());
+        }
+        return c.json({
+          gameId,
+          sport: game.sport,
+          homeTeam: game.home_team_name,
+          awayTeam: game.away_team_name,
+          startTime: game.start_time,
+          consensus: null,
+          first_half: null,
+          sportsbooks: [],
+          isLiveOdds,
+          ...(movementFallback?.opening || dbFallback.opening),
+          lastUpdated: new Date().toISOString(),
+          source: "sportsradar_scheduled_fast_skip_scan",
+        }, {
+          headers: cacheHeaders(120, { isPublic: true })
+        });
+      }
+
+      // Fetch full sportsbook grid only when explicitly requested.
       let allBooks: any[] = [];
-      for (const keyCandidate of oddsKeyCandidates) {
-        allBooks = await fetchAllSportsbooksForGame(
-          sport,
-          apiKey,
-          c.env.DB,
-          game.home_team_name || '',
-          game.away_team_name || '',
-          keyCandidate
-        );
-        if (allBooks.length > 0) break;
+      if (includeFullBooks) {
+        for (const keyCandidate of oddsKeyCandidates) {
+          if (!withinBudget()) break;
+          allBooks = await withTimeout(
+            fetchAllSportsbooksForGame(
+              sport,
+              apiKey,
+              c.env.DB,
+              game.home_team_name || '',
+              game.away_team_name || '',
+              keyCandidate
+            ),
+            3500,
+            []
+          );
+          if (allBooks.length > 0) break;
+        }
       }
       
       if (allBooks.length > 0) {
+        sportsbooks.length = 0;
         sportsbooks.push(...allBooks);
       } else {
         // Fallback to consensus if no individual books returned
         let oddsMap = new Map<string, any>();
+        const dateCandidates = Array.from(new Set([gameDate, undefined]));
         for (const keyCandidate of oddsKeyCandidates) {
-          const candidateMap = await fetchSportsRadarOdds(sport, apiKey, c.env.DB, undefined, keyCandidate);
-          if (candidateMap.size > 0) {
-            oddsMap = candidateMap;
+          if (!withinBudget()) break;
+          for (const dateCandidate of dateCandidates) {
+            const candidateMap = await withTimeout(
+              fetchSportsRadarOdds(sport, apiKey, c.env.DB, dateCandidate, keyCandidate),
+              3500,
+              new Map<string, any>()
+            );
+            if (candidateMap.size > 0) {
+              oddsMap = candidateMap;
+              break;
+            }
+          }
+          if (oddsMap.size > 0) {
             break;
           }
         }
@@ -1706,27 +2930,20 @@ gamesRouter.get("/:gameId/odds", async (c) => {
         }
         // Pass 3: direct event odds endpoint by SportsRadar event ID.
         if (!gameOdds) {
-          const srIdCandidates = Array.from(
-            new Set(
-              [
-                toSportsRadarEventId(String(game.game_id || "")),
-                toSportsRadarEventId(String(game.external_id || "")),
-                toSportsRadarMatchId(String(game.game_id || "")),
-                toSportsRadarMatchId(String(game.external_id || "")),
-                String(game.external_id || "").includes("-") ? `sr:sport_event:${String(game.external_id || "").trim()}` : null,
-                String(game.external_id || "").includes("-") ? `sr:match:${String(game.external_id || "").trim()}` : null,
-              ].filter(Boolean) as string[]
-            )
-          );
           if (srIdCandidates.length > 0) {
             try {
               let directOdds: any = null;
               for (const srEventId of srIdCandidates) {
                 for (const keyCandidate of oddsKeyCandidates) {
-                  directOdds = await fetchSportsRadarOddsForGame(srEventId, keyCandidate);
+                  directOdds = await withTimeout(
+                    fetchSportsRadarOddsForGame(srEventId, keyCandidate),
+                    1500,
+                    null
+                  );
                   if (directOdds) break;
                 }
                 if (directOdds) break;
+                if (!withinBudget()) break;
               }
               if (directOdds) gameOdds = directOdds;
             } catch {
@@ -1752,9 +2969,7 @@ gamesRouter.get("/:gameId/odds", async (c) => {
     }
   }
   
-  // Track if odds are live in-game odds
-  const status = String(game.status || "").toUpperCase();
-  const isLiveOdds = status === 'IN_PROGRESS' || status === 'LIVE';
+  // Track if odds are live in-game odds (precomputed above)
   
   // Calculate consensus (average of all sportsbooks)
   let consensus = undefined;
@@ -1780,6 +2995,14 @@ gamesRouter.get("/:gameId/odds", async (c) => {
       moneyline1HAway: snapInt(avg(sportsbooks.map(s => s.moneyline1HAway ?? null))),
     };
   }
+  if (!consensus && dbFallback.consensus) {
+    consensus = dbFallback.consensus;
+    if (sportsbooks.length === 0) sportsbooks.push(...dbFallback.sportsbooks);
+  }
+  if (!consensus && movementFallback?.consensus) {
+    consensus = movementFallback.consensus;
+    if (sportsbooks.length === 0) sportsbooks.push(...movementFallback.sportsbooks);
+  }
   
   // Sort sportsbooks by priority
   const priority = ["DraftKings", "FanDuel", "BetMGM", "Caesars", "ESPN BET", "PointsBet", "Bet365", "SportsRadar"];
@@ -1798,7 +3021,7 @@ gamesRouter.get("/:gameId/odds", async (c) => {
     openTotal?: number | null;
     openMoneylineHome?: number | null;
     openMoneylineAway?: number | null;
-  } = {};
+  } = { ...(movementFallback?.opening || dbFallback.opening) };
   
   try {
     // Try line_history with the game ID
@@ -2457,6 +3680,11 @@ gamesRouter.get("/:gameId/playbyplay", async (c) => {
  */
 gamesRouter.get("/:gameId/line-history", async (c) => {
   const gameId = c.req.param("gameId");
+  const routeStartedAt = Date.now();
+  const phaseMs: Record<string, number> = {};
+  const markPhase = (phase: string, startedAt: number) => {
+    phaseMs[phase] = Date.now() - startedAt;
+  };
   let detailGame: Record<string, unknown> | null = null;
   const pickNumber = (...values: unknown[]): number | null => {
     for (const value of values) {
@@ -2477,10 +3705,11 @@ gamesRouter.get("/:gameId/line-history", async (c) => {
   // Align candidate IDs with whichever provider ID resolved this game detail.
   // This prevents summary/line-history mismatches when a route is called with
   // sr_* but snapshots were stored under provider_game_id (or vice-versa).
+  const detailLookupStartedAt = Date.now();
   try {
     const detailResult = await withTimeout(
       fetchGameWithFallback(gameId),
-      3500,
+      1500,
       { data: null } as any
     );
     detailGame = (detailResult.data?.game as Record<string, unknown> | null) || null;
@@ -2493,13 +3722,20 @@ gamesRouter.get("/:gameId/line-history", async (c) => {
   } catch {
     // non-fatal: keep existing candidates
   }
+  markPhase("detail_lookup", detailLookupStartedAt);
+  const gameStatus = String(detailGame?.status || "").toUpperCase();
+  const isLiveGame = gameStatus === "IN_PROGRESS" || gameStatus === "LIVE" || gameStatus === "HALFTIME";
   // Keep this lookup bounded; full odds-map scans can be expensive and should
   // never block line-history rendering.
-  const resolvedOddsEventId = await withTimeout(
-    resolveOddsEventIdForGame(c.env, gameId).catch(() => null),
-    2500,
-    null
-  );
+  const resolveOddsEventStartedAt = Date.now();
+  const resolvedOddsEventId = isLiveGame
+    ? await withTimeout(
+      resolveOddsEventIdForGame(c.env, gameId).catch(() => null),
+      1500,
+      null
+    )
+    : null;
+  markPhase("resolve_odds_event_id", resolveOddsEventStartedAt);
   if (resolvedOddsEventId && !candidates.includes(resolvedOddsEventId)) {
     candidates.unshift(resolvedOddsEventId);
   }
@@ -2519,6 +3755,7 @@ gamesRouter.get("/:gameId/line-history", async (c) => {
   
   try {
     // Build history from modern odds tables.
+    const historyBuildStartedAt = Date.now();
     if (lineHistory.length === 0) {
       let bestHistory: Array<{
         timestamp: string;
@@ -2530,12 +3767,15 @@ gamesRouter.get("/:gameId/line-history", async (c) => {
       }> = [];
       let bestLatestTs = 0;
 
-      for (const candidateId of candidates.slice(0, 2)) {
+      // Historical games often need multiple ID formats (sr_nba_*, sr:sport_event:*, raw uuid).
+      // Checking only the first candidate misses valid odds rows in many environments.
+      const historyCandidates = isLiveGame ? candidates.slice(0, 3) : candidates.slice(0, 5);
+      for (const candidateId of historyCandidates) {
         const [spreadHome, totalOver, moneylineHome, moneylineAway] = await Promise.all([
-          withTimeout(getLineMovement(c.env.DB, candidateId, "SPREAD", "HOME"), 1800, null),
-          withTimeout(getLineMovement(c.env.DB, candidateId, "TOTAL", "OVER"), 1800, null),
-          withTimeout(getLineMovement(c.env.DB, candidateId, "MONEYLINE", "HOME"), 1800, null),
-          withTimeout(getLineMovement(c.env.DB, candidateId, "MONEYLINE", "AWAY"), 1800, null),
+          withTimeout(getLineMovement(c.env.DB, candidateId, "SPREAD", "HOME"), isLiveGame ? 1800 : 900, null),
+          withTimeout(getLineMovement(c.env.DB, candidateId, "TOTAL", "OVER"), isLiveGame ? 1800 : 900, null),
+          withTimeout(getLineMovement(c.env.DB, candidateId, "MONEYLINE", "HOME"), isLiveGame ? 1800 : 900, null),
+          withTimeout(getLineMovement(c.env.DB, candidateId, "MONEYLINE", "AWAY"), isLiveGame ? 1800 : 900, null),
         ]);
 
         const byTimestamp = new Map<string, {
@@ -2703,6 +3943,7 @@ gamesRouter.get("/:gameId/line-history", async (c) => {
         lineHistory.push(...bestHistory);
       }
     }
+    markPhase("history_build", historyBuildStartedAt);
 
     // Fast fallback: fetch direct event odds only (bounded), avoiding full odds-map scans.
     if (lineHistory.length === 0 && detailGame) {
@@ -2790,6 +4031,7 @@ gamesRouter.get("/:gameId/line-history", async (c) => {
 
     // Reconcile with current odds even when history exists:
     // if current values differ from latest history point, append a fresh "now" point.
+    const currentReconcileStartedAt = Date.now();
     if (detailGame) {
       let currentSpread = pickNumber(
         detailGame.spread,
@@ -2815,7 +4057,9 @@ gamesRouter.get("/:gameId/line-history", async (c) => {
       );
 
       // Some game-detail payloads omit live odds fields. Pull direct current odds by event id.
+      // Restrict this expensive fallback to live/in-progress contexts.
       if (
+        isLiveGame &&
         currentSpread === null &&
         currentTotal === null &&
         currentMoneylineHome === null &&
@@ -2871,6 +4115,7 @@ gamesRouter.get("/:gameId/line-history", async (c) => {
       }
       // Final current-odds fallback: use /odds consensus if available.
       if (
+        isLiveGame &&
         currentSpread === null &&
         currentTotal === null &&
         currentMoneylineHome === null &&
@@ -2900,7 +4145,7 @@ gamesRouter.get("/:gameId/line-history", async (c) => {
         }
       }
       // Prefer sportsbook consensus for sparse histories so "current" matches books tab.
-      if (lineHistory.length <= 1) {
+      if (isLiveGame && lineHistory.length <= 1) {
       try {
         const sport = String(detailGame.sport || "").toLowerCase();
         const homeTeam = String(
@@ -3053,6 +4298,7 @@ gamesRouter.get("/:gameId/line-history", async (c) => {
         }
       }
     }
+    markPhase("current_reconcile", currentReconcileStartedAt);
 
     // Final parity step: align with /odds consensus when available.
     // Trigger for sparse or flat histories where movement can appear stuck at 0.
@@ -3070,8 +4316,10 @@ gamesRouter.get("/:gameId/line-history", async (c) => {
       lastHistoryPoint?.total !== null &&
       lastHistoryPoint?.total !== undefined &&
       firstHistoryPoint.total === lastHistoryPoint.total;
-    const needsOddsParity = lineHistory.length <= 1 || spreadLooksFlat || totalLooksFlat;
+    const needsOddsParity =
+      isLiveGame && (lineHistory.length <= 1 || spreadLooksFlat || totalLooksFlat);
 
+    const oddsParityStartedAt = Date.now();
     if (needsOddsParity) {
     if (lineHistory.length <= 1 && candidates.length > 0) {
     try {
@@ -3141,6 +4389,7 @@ gamesRouter.get("/:gameId/line-history", async (c) => {
     } catch {
       // Non-fatal recovery attempt.
     }
+    markPhase("odds_parity", oddsParityStartedAt);
     }
     try {
       const baseUrl = new URL(c.req.url).origin;
@@ -3290,6 +4539,19 @@ gamesRouter.get("/:gameId/line-history", async (c) => {
         : null,
     };
     
+    const totalMs = Date.now() - routeStartedAt;
+    if (totalMs >= 1200) {
+      console.log("[Line History] slow request", {
+        gameId,
+        totalMs,
+        phaseMs,
+        candidateCount: candidates.length,
+        historyCount: swingHistory.length,
+        rawHistoryCount: lineHistory.length,
+        isLiveGame,
+      });
+    }
+
     return c.json({
       gameId,
       historyCount: swingHistory.length,

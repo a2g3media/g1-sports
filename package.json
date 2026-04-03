@@ -81,6 +81,7 @@
     "migrate:local": "wrangler d1 execute 019ce56b-b0ff-7056-a2d5-613f9cde7650 --local --file=migrations/91.sql",
     "migrate:remote": "wrangler d1 execute 019ce56b-b0ff-7056-a2d5-613f9cde7650 --remote --file=migrations/91.sql --config=wrangler.d1.migrations.json",
     "migrate:local:92": "wrangler d1 execute 019ce56b-b0ff-7056-a2d5-613f9cde7650 --local --file=migrations/92.sql",
-    "migrate:remote:92": "wrangler d1 execute 019ce56b-b0ff-7056-a2d5-613f9cde7650 --remote --file=migrations/92.sql --config=wrangler.d1.migrations.json"
+    "migrate:remote:92": "wrangler d1 execute 019ce56b-b0ff-7056-a2d5-613f9cde7650 --remote --file=migrations/92.sql --config=wrangler.d1.migrations.json",
+    "qa:warroom:perf": "npx tsx scripts/qa-warroom-perf.ts"
   }
 }

@@ -4,6 +4,7 @@ import { Radio, ChevronRight, ChevronLeft } from "lucide-react";
 import { getTeamColors } from "@/react-app/lib/teamColors";
 import { toGameDetailPath } from "@/react-app/lib/gameRoutes";
 import { cn } from "@/react-app/lib/utils";
+import { TeamLogo } from "@/react-app/components/TeamLogo";
 
 interface HeroGame {
   id: string;
@@ -96,15 +97,18 @@ export function StickyMiniScorebar({
                 >
                   {/* Away team */}
                   <div className="flex items-center gap-2 sm:gap-3">
-                    <div 
-                      className="w-8 h-8 sm:w-9 sm:h-9 rounded-lg flex items-center justify-center text-xs sm:text-sm font-bold"
-                      style={{ 
-                        background: `${awayColors.primary}30`,
-                        borderColor: `${awayColors.primary}40`,
-                        borderWidth: '1px'
-                      }}
-                    >
-                      <span className="text-white">{game.awayTeam.code}</span>
+                    <div className="relative w-8 h-8 sm:w-9 sm:h-9 rounded-full flex items-center justify-center">
+                      <div
+                        className="pointer-events-none absolute inset-0 rounded-full opacity-55 blur-[9px]"
+                        style={{ background: `radial-gradient(circle at 50% 50%, ${awayColors.primary}52 0%, transparent 72%)` }}
+                      />
+                      <TeamLogo
+                        teamCode={game.awayTeam.code}
+                        teamName={game.awayTeam.name}
+                        sport={sportKey.toUpperCase()}
+                        size={26}
+                        className="relative z-10 [filter:drop-shadow(0_10px_16px_rgba(0,0,0,0.68))_drop-shadow(0_0_1px_rgba(255,255,255,0.72))]"
+                      />
                     </div>
                     <span className={cn(
                       "text-xl sm:text-2xl font-bold tabular-nums",
@@ -149,15 +153,18 @@ export function StickyMiniScorebar({
                     )}>
                       {isLive || isFinal ? game.homeTeam.score : '-'}
                     </span>
-                    <div 
-                      className="w-8 h-8 sm:w-9 sm:h-9 rounded-lg flex items-center justify-center text-xs sm:text-sm font-bold"
-                      style={{ 
-                        background: `${homeColors.primary}30`,
-                        borderColor: `${homeColors.primary}40`,
-                        borderWidth: '1px'
-                      }}
-                    >
-                      <span className="text-white">{game.homeTeam.code}</span>
+                    <div className="relative w-8 h-8 sm:w-9 sm:h-9 rounded-full flex items-center justify-center">
+                      <div
+                        className="pointer-events-none absolute inset-0 rounded-full opacity-55 blur-[9px]"
+                        style={{ background: `radial-gradient(circle at 50% 50%, ${homeColors.primary}52 0%, transparent 72%)` }}
+                      />
+                      <TeamLogo
+                        teamCode={game.homeTeam.code}
+                        teamName={game.homeTeam.name}
+                        sport={sportKey.toUpperCase()}
+                        size={26}
+                        className="relative z-10 [filter:drop-shadow(0_10px_16px_rgba(0,0,0,0.68))_drop-shadow(0_0_1px_rgba(255,255,255,0.72))]"
+                      />
                     </div>
                   </div>
                 </Link>

@@ -6,7 +6,7 @@
  * Bettor-first, market-first experience.
  */
 
-import { useState, useEffect, useCallback, useMemo } from "react";
+import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { useParams, useNavigate } from "react-router-dom";
 import { 
   ArrowLeft, Loader2, Bell, Star, Share2,
@@ -23,6 +23,7 @@ import { useOddsFormat } from "@/react-app/hooks/useOddsFormat";
 import { generateCoachWhisper, getWhisperColors } from "@/react-app/lib/coachWhisper";
 import { toGameDetailPath } from "@/react-app/lib/gameRoutes";
 import { getMarketPeriodLabels } from "@/react-app/lib/marketPeriodLabels";
+import { fetchJsonCached } from "@/react-app/lib/fetchCache";
 import { useParlayBuilder } from "@/react-app/context/ParlayBuilderContext";
 import { GameContextCard } from "@/react-app/components/GameContextCard";
 import {
@@ -1100,12 +1101,47 @@ interface TrendStat {
   homeValue: string | number;
   awayValue: string | number;
   winner: 'home' | 'away' | 'tie';
+  tooltip?: string;
+}
+
+interface TeamH2HPayload {
+  sampleSize: number;
+  series: { teamAWins: number; teamBWins: number };
+  ats: { sampleWithLine: number; teamACovers: number; teamBCovers: number };
+  totals: { sampleWithLine: number; overs: number; unders: number };
+  meetings: Array<{ winner: string; awayScore: number; homeScore: number; date: string }>;
 }
 
 function MatchupTrendsSection({ game }: { game: GameData }) {
-  // Generate mock H2H and trends (would come from API)
-  const h2hRecord = useMemo(() => {
-    // Random but consistent based on team names
+  const [remoteH2H, setRemoteH2H] = useState<TeamH2HPayload | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    const fetchH2H = async () => {
+      try {
+        const teamA = encodeURIComponent(game.homeTeamCode || game.homeTeam);
+        const teamB = encodeURIComponent(game.awayTeamCode || game.awayTeam);
+        const sportKey = String(game.sport || '').toUpperCase();
+        const res = await fetch(`/api/teams/${sportKey}/h2h?teamA=${teamA}&teamB=${teamB}&window=10`, {
+          credentials: 'include',
+          cache: 'no-store',
+        });
+        if (!res.ok) return;
+        const json = await res.json();
+        if (!cancelled && Number(json?.sampleSize) > 0) {
+          setRemoteH2H(json as TeamH2HPayload);
+        }
+      } catch {
+        // Non-fatal; fallback trends stay visible.
+      }
+    };
+    fetchH2H();
+    return () => {
+      cancelled = true;
+    };
+  }, [game.homeTeam, game.awayTeam, game.homeTeamCode, game.awayTeamCode, game.sport]);
+
+  const fallbackH2H = useMemo(() => {
     const seed = (game.homeTeam.length + game.awayTeam.length) % 10;
     return {
       homeWins: 3 + (seed % 4),
@@ -1117,15 +1153,75 @@ function MatchupTrendsSection({ game }: { game: GameData }) {
       ]
     };
   }, [game.homeTeam, game.awayTeam]);
-  
+
+  const h2hRecord = useMemo(() => {
+    if (!remoteH2H) return fallbackH2H;
+    const mappedMeetings = (remoteH2H.meetings || []).slice(0, 3).map((meeting) => {
+      const winnerIsHome = String(meeting.winner || '').toLowerCase().includes('team a')
+        || String(meeting.winner || '').toLowerCase().includes(game.homeTeam.toLowerCase())
+        || String(meeting.winner || '').toUpperCase() === String(game.homeTeamCode || '').toUpperCase();
+      return {
+        winner: winnerIsHome ? 'home' : 'away',
+        score: `${meeting.awayScore}-${meeting.homeScore}`,
+        date: meeting.date ? new Date(meeting.date).toLocaleDateString('en-US', { month: 'short', day: 'numeric' }) : '-',
+      };
+    });
+    return {
+      homeWins: remoteH2H.series.teamAWins,
+      awayWins: remoteH2H.series.teamBWins,
+      lastMeetings: mappedMeetings.length > 0 ? mappedMeetings : fallbackH2H.lastMeetings,
+    };
+  }, [remoteH2H, fallbackH2H, game.homeTeam, game.homeTeamCode]);
+
   const trendStats: TrendStat[] = useMemo(() => {
+    if (!remoteH2H) {
+      return [
+        { label: 'ATS L10', homeValue: '6-4', awayValue: '5-5', winner: 'home', tooltip: 'Fallback trend sample' },
+        { label: 'O/U L10', homeValue: '7-3 O', awayValue: '4-6 U', winner: 'home', tooltip: 'Fallback trend sample' },
+        { label: 'Home/Away', homeValue: '8-2', awayValue: '5-5', winner: 'home', tooltip: 'Fallback trend sample' },
+        {
+          label: 'H2H L5',
+          homeValue: h2hRecord.homeWins,
+          awayValue: h2hRecord.awayWins,
+          winner: h2hRecord.homeWins > h2hRecord.awayWins ? 'home' : 'away',
+          tooltip: 'Fallback H2H sample',
+        },
+      ];
+    }
+    const atsWinner: 'home' | 'away' | 'tie' =
+      remoteH2H.ats.teamACovers > remoteH2H.ats.teamBCovers ? 'home' :
+      remoteH2H.ats.teamACovers < remoteH2H.ats.teamBCovers ? 'away' : 'tie';
+    const totalsWinner: 'home' | 'away' | 'tie' =
+      remoteH2H.totals.overs > remoteH2H.totals.unders ? 'home' :
+      remoteH2H.totals.overs < remoteH2H.totals.unders ? 'away' : 'tie';
     return [
-      { label: 'ATS Last 10', homeValue: '6-4', awayValue: '5-5', winner: 'home' },
-      { label: 'O/U Last 10', homeValue: '7-3 O', awayValue: '4-6 U', winner: 'home' },
-      { label: 'Home/Away', homeValue: '8-2', awayValue: '5-5', winner: 'home' },
-      { label: 'Last 5 H2H', homeValue: h2hRecord.homeWins, awayValue: h2hRecord.awayWins, winner: h2hRecord.homeWins > h2hRecord.awayWins ? 'home' : 'away' },
+      {
+        label: 'ATS H2H',
+        homeValue: remoteH2H.ats.sampleWithLine > 0 ? `${remoteH2H.ats.teamACovers}` : '-',
+        awayValue: remoteH2H.ats.sampleWithLine > 0 ? `${remoteH2H.ats.teamBCovers}` : '-',
+        winner: remoteH2H.ats.sampleWithLine > 0 ? atsWinner : 'tie',
+        tooltip: remoteH2H.ats.sampleWithLine > 0
+          ? `ATS sample with lines: ${remoteH2H.ats.sampleWithLine}`
+          : 'No ATS line sample',
+      },
+      {
+        label: 'O/U H2H',
+        homeValue: remoteH2H.totals.sampleWithLine > 0 ? `${remoteH2H.totals.overs} O` : '-',
+        awayValue: remoteH2H.totals.sampleWithLine > 0 ? `${remoteH2H.totals.unders} U` : '-',
+        winner: remoteH2H.totals.sampleWithLine > 0 ? totalsWinner : 'tie',
+        tooltip: remoteH2H.totals.sampleWithLine > 0
+          ? `Totals sample with lines: ${remoteH2H.totals.sampleWithLine}`
+          : 'No totals line sample',
+      },
+      {
+        label: `H2H L10${remoteH2H.sampleSize > 0 ? ` (${remoteH2H.sampleSize})` : ''}`,
+        homeValue: h2hRecord.homeWins,
+        awayValue: h2hRecord.awayWins,
+        winner: h2hRecord.homeWins > h2hRecord.awayWins ? 'home' : 'away',
+        tooltip: `H2H sample: ${remoteH2H.sampleSize}`,
+      },
     ];
-  }, [game.odds?.spread, h2hRecord]);
+  }, [remoteH2H, h2hRecord]);
   
   return (
     <div className="space-y-4">
@@ -1136,7 +1232,9 @@ function MatchupTrendsSection({ game }: { game: GameData }) {
           <div className="text-[10px] text-white/40 uppercase">Wins</div>
         </div>
         <div className="text-center px-4">
-          <div className="text-xs text-white/30 uppercase tracking-wider">Last 5 H2H</div>
+          <div className="text-xs text-white/30 uppercase tracking-wider">
+            {remoteH2H?.sampleSize ? `H2H Sample ${remoteH2H.sampleSize}` : 'H2H'}
+          </div>
           <Trophy className="w-5 h-5 text-amber-400 mx-auto mt-1" />
         </div>
         <div className="text-center flex-1">
@@ -1150,6 +1248,7 @@ function MatchupTrendsSection({ game }: { game: GameData }) {
         {trendStats.map((stat, i) => (
           <div 
             key={i}
+            title={stat.tooltip || ''}
             className="grid grid-cols-3 gap-2 items-center py-2 px-3 rounded-lg bg-white/[0.02]"
           >
             <div className={cn(
@@ -1304,6 +1403,12 @@ export default function OddsGamePage() {
   const [game, setGame] = useState<GameData | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const gameRef = useRef<GameData | null>(null);
+  const activeFetchRequestRef = useRef(0);
+
+  useEffect(() => {
+    gameRef.current = game;
+  }, [game]);
   const [showWatchboardModal, setShowWatchboardModal] = useState(false);
   const [showAlertModal, setShowAlertModal] = useState(false);
   const [lineHistory, setLineHistory] = useState<{
@@ -1316,48 +1421,237 @@ export default function OddsGamePage() {
     synced: boolean;
     message: string | null;
   }>({ synced: false, message: null });
+  const prefetchedTeamKeysRef = useRef<Set<string>>(new Set());
+  const resolvedTeamIdsRef = useRef<Map<string, string>>(new Map());
   const periodLabels = getMarketPeriodLabels(game?.sport || sportKey || "");
   const canonicalGameId = useMemo(() => game?.id || normalizedMatchId || "", [game?.id, normalizedMatchId]);
+  const normalizedSportKey = useMemo(() => {
+    const raw = String(game?.sport || sportKey || "").toUpperCase();
+    if (raw === "CBB") return "NCAAB";
+    if (raw === "CFB") return "NCAAF";
+    return raw;
+  }, [game?.sport, sportKey]);
+
+  const fetchJsonWithTimeout = useCallback(async (url: string, timeoutMs = 10000) => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const response = await fetch(url, {
+        credentials: "include",
+        cache: "no-store",
+        signal: controller.signal,
+      });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      return await response.json();
+    } finally {
+      clearTimeout(timer);
+    }
+  }, []);
+
+  const resolveTeamId = useCallback(async (teamCode: string, teamName: string): Promise<string | null> => {
+    const sport = String(normalizedSportKey || "").toUpperCase();
+    if (!sport) return null;
+    const normalize = (value: unknown) =>
+      String(value || "")
+        .toLowerCase()
+        .replace(/[^a-z0-9]/g, "");
+    const codeToken = normalize(teamCode);
+    const nameToken = normalize(teamName);
+    if (!codeToken && !nameToken) return null;
+    const memoKey = `${sport}:${codeToken || nameToken}`;
+    const memoizedId = resolvedTeamIdsRef.current.get(memoKey);
+    if (memoizedId) return memoizedId;
+    try {
+      const json = await fetchJsonCached<any>(`/api/teams/${encodeURIComponent(sport)}/standings`, {
+        cacheKey: `team-standings:${sport}`,
+        ttlMs: 90_000,
+        timeoutMs: 4_500,
+        init: { credentials: "include" },
+      });
+      const teams = Array.isArray(json?.teams) ? json.teams : [];
+      const hit = teams.find((row: any) => {
+        const rowAlias = normalize(row?.alias || row?.abbreviation || row?.teamCode || row?.code);
+        const rowName = normalize(row?.name);
+        const rowMarket = normalize(row?.market);
+        const rowFull = normalize(
+          row?.fullName || row?.displayName || [row?.market, row?.name].filter(Boolean).join(" ")
+        );
+        if (codeToken && (rowAlias === codeToken || rowAlias.includes(codeToken) || codeToken.includes(rowAlias))) {
+          return true;
+        }
+        if (!nameToken) return false;
+        return (
+          rowName === nameToken ||
+          rowFull === nameToken ||
+          `${rowMarket}${rowName}` === nameToken ||
+          rowFull.includes(nameToken) ||
+          nameToken.includes(rowFull)
+        );
+      });
+      const teamId = String(hit?.id || "").trim();
+      if (teamId) {
+        resolvedTeamIdsRef.current.set(memoKey, teamId);
+      }
+      return teamId || null;
+    } catch {
+      return null;
+    }
+  }, [normalizedSportKey]);
+
+  const prefetchTeamData = useCallback(async (teamCode?: string, teamName?: string) => {
+    const code = String(teamCode || "").trim();
+    const name = String(teamName || "").trim();
+    const sport = String(normalizedSportKey || "").toUpperCase();
+    if (!sport || (!code && !name)) return;
+    const key = `${sport}:${code || name}`;
+    if (prefetchedTeamKeysRef.current.has(key)) return;
+    prefetchedTeamKeysRef.current.add(key);
+
+    const teamId = await resolveTeamId(code, name);
+    if (!teamId) return;
+
+    const profile = await fetchJsonCached<any>(`/api/teams/${sport}/${teamId}`, {
+      cacheKey: `team-profile:${sport}:${teamId}`,
+      ttlMs: 60_000,
+      timeoutMs: 4_500,
+      init: { credentials: "include" },
+    }).catch(() => null);
+
+    const endpoints = [
+      { url: `/api/teams/${sport}/${teamId}/schedule`, cacheKey: `team-schedule:${sport}:${teamId}`, ttlMs: 45_000, timeoutMs: 4_500 },
+      { url: `/api/teams/${sport}/${teamId}/stats`, cacheKey: `team-stats:${sport}:${teamId}`, ttlMs: 120_000, timeoutMs: 4_000 },
+      { url: `/api/teams/${sport}/${teamId}/injuries`, cacheKey: `team-injuries:${sport}:${teamId}`, ttlMs: 45_000, timeoutMs: 4_000 },
+      { url: `/api/teams/${sport}/${teamId}/splits`, cacheKey: `team-splits:${sport}:${teamId}`, ttlMs: 90_000, timeoutMs: 4_000 },
+      { url: `/api/games?sport=${sport}&includeOdds=0`, cacheKey: `games-lite:${sport}`, ttlMs: 20_000, timeoutMs: 3_500 },
+    ] as const;
+
+    await Promise.all(
+      endpoints.map((entry) =>
+        fetchJsonCached(entry.url, {
+          cacheKey: entry.cacheKey,
+          ttlMs: entry.ttlMs,
+          timeoutMs: entry.timeoutMs,
+          init: { credentials: "include" },
+        }).catch(() => null)
+      )
+    );
+
+    const roster = Array.isArray(profile?.roster) ? profile.roster : [];
+    const topNames = roster
+      .map((p: any) => String(p?.name || "").trim())
+      .filter(Boolean)
+      .slice(0, 8);
+    await Promise.all(
+      topNames.map((playerName: string) =>
+        fetchJsonCached(`/api/player/${sport}/${encodeURIComponent(playerName)}`, {
+          cacheKey: `player-api:${sport}:${playerName}`,
+          ttlMs: 45_000,
+          timeoutMs: 4_000,
+          init: { credentials: "include" },
+        }).catch(() => null)
+      )
+    );
+  }, [normalizedSportKey, resolveTeamId]);
+
+  const handleTeamNavigate = useCallback(async (teamCode?: string, teamName?: string) => {
+    const code = String(teamCode || "").trim();
+    const name = String(teamName || "").trim();
+    if (!code && !name) return;
+    void prefetchTeamData(code, name);
+    const teamId = await resolveTeamId(code, name);
+    if (!teamId) return;
+    navigate(`/sports/${String(normalizedSportKey || "").toLowerCase()}/team/${encodeURIComponent(teamId)}`);
+  }, [navigate, normalizedSportKey, prefetchTeamData, resolveTeamId]);
   
   // Fetch game data
   useEffect(() => {
     if (!normalizedMatchId) return;
-    
+    let cancelled = false;
+
     const fetchGame = async () => {
-      setLoading(true);
-      setError(null);
-      
+      const requestId = ++activeFetchRequestRef.current;
+      if (!gameRef.current) {
+        setLoading(true);
+      }
+      if (!gameRef.current) {
+        setError(null);
+      }
+
       try {
-        const response = await fetch(`/api/games/${encodeURIComponent(normalizedMatchId)}`);
-        if (!response.ok) throw new Error('Failed to load game');
-        const data = await response.json();
-        
-        const gameData = data.game || data;
-        const oddsData = data.odds?.[0] || gameData.odds || null;
-        const resolvedGameId = gameData.game_id || gameData.id || normalizedMatchId;
-        let firstHalfSummary: any = null;
-        try {
-          const summaryRes = await fetch(`/api/odds/summary/${encodeURIComponent(resolvedGameId)}?scope=PROD`, {
-            credentials: "include",
-            cache: "no-store",
-          });
-          if (summaryRes.ok) {
-            const summaryJson = await summaryRes.json();
-            firstHalfSummary = summaryJson?.first_half || null;
+        const lookupIds: string[] = [normalizedMatchId];
+        if (normalizedMatchId.startsWith('sr:sport_event:') && String(sportKey || '').toLowerCase() !== 'soccer') {
+          try {
+            const sportParam = String(sportKey || '').toUpperCase();
+            const slate = await fetchJsonWithTimeout(`/api/games?sport=${encodeURIComponent(sportParam)}&includeOdds=1`, 8000);
+            const games = Array.isArray(slate?.games) ? slate.games : [];
+            const eventTail = normalizedMatchId.split(':').pop() || '';
+            const matched = games.find((g: any) => {
+              const gid = String(g?.game_id || '').trim();
+              const externalId = String(g?.external_id || '').trim();
+              return gid === normalizedMatchId || externalId === normalizedMatchId || externalId === eventTail;
+            });
+            const mappedGameId = String(matched?.game_id || '').trim();
+            if (mappedGameId && mappedGameId !== normalizedMatchId) {
+              lookupIds.unshift(mappedGameId);
+            }
+          } catch {
+            // Non-fatal: keep original lookup id.
           }
-        } catch {
-          // Non-blocking: page should still render if summary endpoint is unavailable/auth-blocked.
         }
-        
-        // Extract odds - backend puts them directly on gameData (spread, overUnder, moneylineHome, moneylineAway)
-        // Also check oddsData for array-style responses
-        const spreadValue = gameData.spread ?? oddsData?.spread ?? oddsData?.spreadHome ?? null;
-        const totalValue = gameData.overUnder ?? gameData.over_under ?? oddsData?.total ?? oddsData?.overUnder ?? null;
-        const mlHomeValue = gameData.moneylineHome ?? gameData.moneyline_home ?? oddsData?.moneylineHome ?? oddsData?.ml_home ?? null;
-        const mlAwayValue = gameData.moneylineAway ?? gameData.moneyline_away ?? oddsData?.moneylineAway ?? oddsData?.ml_away ?? null;
+
+        let summaryJson: any = null;
+        let liteJson: any = null;
+        let requestLookupId = normalizedMatchId;
+
+        for (const lookupId of lookupIds) {
+          const encodedLookupId = encodeURIComponent(lookupId);
+          const [summaryResult, liteResult] = await Promise.allSettled([
+            fetchJsonWithTimeout(`/api/odds/summary/${encodedLookupId}?scope=PROD`, 10000),
+            fetchJsonWithTimeout(`/api/games/${encodedLookupId}?lite=1`, 10000),
+          ]);
+
+          if (cancelled || requestId !== activeFetchRequestRef.current) return;
+
+          const candidateSummary = summaryResult.status === "fulfilled" ? summaryResult.value : null;
+          const candidateLite = liteResult.status === "fulfilled" ? liteResult.value : null;
+          const candidateGame = candidateLite?.game || candidateLite || null;
+          const candidateSummaryGame = candidateSummary?.game || null;
+          const candidateHasOdds = Boolean(
+            candidateSummary?.spread ||
+            candidateSummary?.total ||
+            candidateSummary?.moneyline ||
+            candidateSummary?.first_half?.spread?.home_line != null ||
+            candidateSummary?.first_half?.spread?.away_line != null ||
+            candidateSummary?.first_half?.total?.line != null ||
+            candidateSummary?.first_half?.moneyline?.home_price != null ||
+            candidateSummary?.first_half?.moneyline?.away_price != null
+          );
+
+          if (candidateGame || candidateSummaryGame || candidateHasOdds) {
+            summaryJson = candidateSummary;
+            liteJson = candidateLite;
+            requestLookupId = lookupId;
+            break;
+          }
+
+          if (!summaryJson) summaryJson = candidateSummary;
+          if (!liteJson) liteJson = candidateLite;
+        }
+
+        const encodedId = encodeURIComponent(requestLookupId);
+        const gameData = liteJson?.game || liteJson || null;
+        const oddsData = liteJson?.odds?.[0] || gameData?.odds || null;
+        const summaryGame = summaryJson?.game || null;
+        const firstHalfSummary = summaryJson?.first_half || null;
+        const resolvedGameId = gameData?.game_id || gameData?.id || summaryGame?.game_id || normalizedMatchId;
+
+        const spreadValue = summaryJson?.spread?.home_line ?? gameData?.spread ?? oddsData?.spread ?? oddsData?.spreadHome ?? null;
+        const totalValue = summaryJson?.total?.line ?? gameData?.overUnder ?? gameData?.over_under ?? oddsData?.total ?? oddsData?.overUnder ?? null;
+        const mlHomeValue = summaryJson?.moneyline?.home_price ?? gameData?.moneylineHome ?? gameData?.moneyline_home ?? oddsData?.moneylineHome ?? oddsData?.ml_home ?? null;
+        const mlAwayValue = summaryJson?.moneyline?.away_price ?? gameData?.moneylineAway ?? gameData?.moneyline_away ?? oddsData?.moneylineAway ?? oddsData?.ml_away ?? null;
         const spread1HHomeValue =
-          gameData.spread1HHome ??
-          gameData.spread_1h_home ??
+          gameData?.spread1HHome ??
+          gameData?.spread_1h_home ??
           oddsData?.spread1HHome ??
           oddsData?.spread_1h_home ??
           oddsData?.spread1H ??
@@ -1365,16 +1659,16 @@ export default function OddsGamePage() {
           firstHalfSummary?.spread?.home_line ??
           null;
         const spread1HAwayValue =
-          gameData.spread1HAway ??
-          gameData.spread_1h_away ??
+          gameData?.spread1HAway ??
+          gameData?.spread_1h_away ??
           oddsData?.spread1HAway ??
           oddsData?.spread_1h_away ??
           (spread1HHomeValue !== null ? -Number(spread1HHomeValue) : null);
         const total1HValue =
-          gameData.total1H ??
-          gameData.total_1h ??
-          gameData.overUnder1H ??
-          gameData.over_under_1h ??
+          gameData?.total1H ??
+          gameData?.total_1h ??
+          gameData?.overUnder1H ??
+          gameData?.over_under_1h ??
           oddsData?.total1H ??
           oddsData?.total_1h ??
           oddsData?.overUnder1H ??
@@ -1382,8 +1676,8 @@ export default function OddsGamePage() {
           firstHalfSummary?.total?.line ??
           null;
         const ml1HHomeValue =
-          gameData.moneyline1HHome ??
-          gameData.moneyline_1h_home ??
+          gameData?.moneyline1HHome ??
+          gameData?.moneyline_1h_home ??
           oddsData?.moneyline1HHome ??
           oddsData?.moneyline_1h_home ??
           oddsData?.ml1HHome ??
@@ -1391,66 +1685,134 @@ export default function OddsGamePage() {
           firstHalfSummary?.moneyline?.home_price ??
           null;
         const ml1HAwayValue =
-          gameData.moneyline1HAway ??
-          gameData.moneyline_1h_away ??
+          gameData?.moneyline1HAway ??
+          gameData?.moneyline_1h_away ??
           oddsData?.moneyline1HAway ??
           oddsData?.moneyline_1h_away ??
           oddsData?.ml1HAway ??
           oddsData?.ml_1h_away ??
           firstHalfSummary?.moneyline?.away_price ??
           null;
-        
-        const hasOdds = spreadValue !== null || totalValue !== null || mlHomeValue !== null;
-        
+
+        const hasOdds =
+          spreadValue !== null ||
+          totalValue !== null ||
+          mlHomeValue !== null ||
+          mlAwayValue !== null ||
+          spread1HHomeValue !== null ||
+          spread1HAwayValue !== null ||
+          total1HValue !== null ||
+          ml1HHomeValue !== null ||
+          ml1HAwayValue !== null;
+
+        if (!gameData && !summaryGame && !hasOdds) {
+          throw new Error("Failed to load game");
+        }
+
         setGame({
-          id: gameData.game_id || gameData.id || matchId,
-          homeTeam: gameData.home_team_name || gameData.home_team || gameData.homeTeam || 'Home',
-          awayTeam: gameData.away_team_name || gameData.away_team || gameData.awayTeam || 'Away',
-          homeTeamCode: gameData.home_team_code || gameData.homeTeamCode || gameData.home_team_abbr || '',
-          awayTeamCode: gameData.away_team_code || gameData.awayTeamCode || gameData.away_team_abbr || '',
-          homeScore: gameData.home_score ?? gameData.homeScore ?? null,
-          awayScore: gameData.away_score ?? gameData.awayScore ?? null,
-          status: gameData.status || 'SCHEDULED',
-          startTime: gameData.start_time || gameData.startTime || '',
-          league: gameData.league || sportKey?.toUpperCase() || '',
-          sport: gameData.sport || sportKey || 'nba',
-          odds: hasOdds ? {
-            spread: spreadValue,
-            spreadHome: spreadValue,
-            spreadAway: spreadValue !== null ? -spreadValue : undefined,
-            openSpread: oddsData?.open_spread ?? (spreadValue !== null ? spreadValue + (Math.random() > 0.5 ? 0.5 : -0.5) : undefined),
-            total: totalValue,
-            openTotal: oddsData?.open_total ?? (totalValue !== null ? totalValue + (Math.random() > 0.5 ? 1 : -1) : undefined),
-            mlHome: mlHomeValue,
-            mlAway: mlAwayValue,
-            openMlHome: oddsData?.open_ml_home,
-            openMlAway: oddsData?.open_ml_away,
-            spread1HHome: spread1HHomeValue ?? undefined,
-            spread1HAway: spread1HAwayValue ?? undefined,
-            total1H: total1HValue ?? undefined,
-            ml1HHome: ml1HHomeValue ?? undefined,
-            ml1HAway: ml1HAwayValue ?? undefined,
-          } : undefined,
-          lineHistory: data.lineHistory || [],
-          sportsbooks: data.sportsbooks || [],
-          props: (data.props || []).map((p: any) => ({
-            playerName: p.playerName || p.player_name || '',
-            propType: p.propType || p.prop_type || '',
-            line: p.line ?? 0,
-            overOdds: p.overOdds ?? p.over_odds ?? -110,
-            underOdds: p.underOdds ?? p.under_odds ?? -110,
-          })),
+          id: resolvedGameId,
+          homeTeam: gameData?.home_team_name || gameData?.home_team || gameData?.homeTeam || summaryGame?.home_team || "Home",
+          awayTeam: gameData?.away_team_name || gameData?.away_team || gameData?.awayTeam || summaryGame?.away_team || "Away",
+          homeTeamCode: gameData?.home_team_code || gameData?.homeTeamCode || gameData?.home_team_abbr || summaryGame?.home_team || "",
+          awayTeamCode: gameData?.away_team_code || gameData?.awayTeamCode || gameData?.away_team_abbr || summaryGame?.away_team || "",
+          homeScore: gameData?.home_score ?? gameData?.homeScore ?? null,
+          awayScore: gameData?.away_score ?? gameData?.awayScore ?? null,
+          status: gameData?.status || summaryGame?.status || "SCHEDULED",
+          startTime: gameData?.start_time || gameData?.startTime || summaryGame?.start_time || "",
+          league: gameData?.league || sportKey?.toUpperCase() || "",
+          sport: gameData?.sport || summaryGame?.sport || sportKey || "nba",
+          odds: hasOdds
+            ? {
+                spread: spreadValue,
+                spreadHome: spreadValue,
+                spreadAway: spreadValue !== null ? -spreadValue : undefined,
+                openSpread: summaryJson?.opening_spread ?? oddsData?.open_spread ?? undefined,
+                total: totalValue,
+                openTotal: summaryJson?.opening_total ?? oddsData?.open_total ?? undefined,
+                mlHome: mlHomeValue,
+                mlAway: mlAwayValue,
+                openMlHome: summaryJson?.opening_home_ml ?? oddsData?.open_ml_home ?? undefined,
+                openMlAway: summaryJson?.opening_away_ml ?? oddsData?.open_ml_away ?? undefined,
+                spread1HHome: spread1HHomeValue ?? undefined,
+                spread1HAway: spread1HAwayValue ?? undefined,
+                total1H: total1HValue ?? undefined,
+                ml1HHome: ml1HHomeValue ?? undefined,
+                ml1HAway: ml1HAwayValue ?? undefined,
+              }
+            : gameRef.current?.odds,
+          lineHistory:
+            Array.isArray(liteJson?.lineHistory) && liteJson.lineHistory.length > 0
+              ? liteJson.lineHistory
+              : (gameRef.current?.lineHistory || []),
+          sportsbooks:
+            Array.isArray(liteJson?.sportsbooks) && liteJson.sportsbooks.length > 0
+              ? liteJson.sportsbooks
+              : (gameRef.current?.sportsbooks || []),
+          props:
+            Array.isArray(liteJson?.props) && liteJson.props.length > 0
+              ? liteJson.props.map((p: any) => ({
+                  playerName: p.playerName || p.player_name || "",
+                  propType: p.propType || p.prop_type || "",
+                  line: p.line ?? 0,
+                  overOdds: p.overOdds ?? p.over_odds ?? -110,
+                  underOdds: p.underOdds ?? p.under_odds ?? -110,
+                }))
+              : (gameRef.current?.props || []),
         });
+
+        void (async () => {
+          try {
+            const fullJson = await fetchJsonWithTimeout(`/api/games/${encodedId}`, 15000);
+            if (cancelled) return;
+            const fullGame = fullJson?.game || fullJson || {};
+            const fullProps = Array.isArray(fullJson?.props) ? fullJson.props : [];
+            const fullBooks = Array.isArray(fullJson?.sportsbooks) ? fullJson.sportsbooks : [];
+            setGame((prev) => {
+              if (!prev) return prev;
+              return {
+                ...prev,
+                homeTeam: fullGame.home_team_name || fullGame.home_team || fullGame.homeTeam || prev.homeTeam,
+                awayTeam: fullGame.away_team_name || fullGame.away_team || fullGame.awayTeam || prev.awayTeam,
+                homeTeamCode: fullGame.home_team_code || fullGame.homeTeamCode || fullGame.home_team_abbr || prev.homeTeamCode,
+                awayTeamCode: fullGame.away_team_code || fullGame.awayTeamCode || fullGame.away_team_abbr || prev.awayTeamCode,
+                homeScore: fullGame.home_score ?? fullGame.homeScore ?? prev.homeScore,
+                awayScore: fullGame.away_score ?? fullGame.awayScore ?? prev.awayScore,
+                status: fullGame.status || prev.status,
+                startTime: fullGame.start_time || fullGame.startTime || prev.startTime,
+                league: fullGame.league || prev.league,
+                sport: fullGame.sport || prev.sport,
+                lineHistory: fullJson?.lineHistory || prev.lineHistory,
+                sportsbooks: fullBooks.length > 0 ? fullBooks : prev.sportsbooks,
+                props: fullProps.length > 0
+                  ? fullProps.map((p: any) => ({
+                      playerName: p.playerName || p.player_name || "",
+                      propType: p.propType || p.prop_type || "",
+                      line: p.line ?? 0,
+                      overOdds: p.overOdds ?? p.over_odds ?? -110,
+                      underOdds: p.underOdds ?? p.under_odds ?? -110,
+                    }))
+                  : prev.props,
+              };
+            });
+          } catch {
+            // Non-blocking: page already has core market data.
+          }
+        })();
       } catch (err) {
-        console.error('Error loading game:', err);
-        setError(err instanceof Error ? err.message : 'Failed to load game');
+        console.error("Error loading game:", err);
+        if (!cancelled && requestId === activeFetchRequestRef.current && !gameRef.current) {
+          setError(err instanceof Error ? err.message : "Failed to load game");
+        }
       } finally {
-        setLoading(false);
+        if (!cancelled && requestId === activeFetchRequestRef.current) setLoading(false);
       }
     };
-    
-    fetchGame();
-  }, [normalizedMatchId, sportKey]);
+
+    void fetchGame();
+    return () => {
+      cancelled = true;
+    };
+  }, [fetchJsonWithTimeout, normalizedMatchId, sportKey]);
   
   // Fetch line history data
   useEffect(() => {
@@ -1682,7 +2044,7 @@ export default function OddsGamePage() {
     spread: game.odds?.spread,
     total: game.odds?.total,
   });
-  const liveNotes = useMemo(() => {
+  const liveNotes: Array<{ time: string; note: string }> = (() => {
     const notes: Array<{ time: string; note: string }> = [];
     if (lineMovementData.movements?.spread !== null && lineMovementData.movements?.spread !== undefined) {
       notes.push({
@@ -1701,16 +2063,12 @@ export default function OddsGamePage() {
       note: `${marketSignals.publicBetPct}% public lean with ${marketSignals.sharpAction.toLowerCase()} sharp profile.`,
     });
     return notes.slice(0, 5);
-  }, [lineMovementData.movements?.spread, lineMovementData.movements?.total, marketSignals.publicBetPct, marketSignals.sharpAction]);
-  const liveFeedItems = useMemo(
-    () =>
-      liveNotes.map((n, idx) => ({
-        id: `odds-live-${idx}`,
-        time: n.time,
-        description: n.note,
-      })),
-    [liveNotes]
-  );
+  })();
+  const liveFeedItems = liveNotes.map((n, idx) => ({
+    id: `odds-live-${idx}`,
+    time: n.time,
+    description: n.note,
+  }));
   
   return (
     <div className="min-h-screen bg-[#050505]">
@@ -1757,7 +2115,15 @@ export default function OddsGamePage() {
             {/* Teams Row */}
             <div className="flex items-center justify-between gap-3">
               {/* Away Team */}
-              <div className="flex items-center gap-3 flex-1 min-w-0">
+              <button
+                type="button"
+                onClick={() => void handleTeamNavigate(game.awayTeamCode || game.awayTeam, game.awayTeam)}
+                onMouseEnter={() => void prefetchTeamData(game.awayTeamCode || game.awayTeam, game.awayTeam)}
+                onFocus={() => void prefetchTeamData(game.awayTeamCode || game.awayTeam, game.awayTeam)}
+                onTouchStart={() => void prefetchTeamData(game.awayTeamCode || game.awayTeam, game.awayTeam)}
+                className="group flex items-center gap-3 flex-1 min-w-0 text-left rounded-lg -m-1 p-1 transition-colors hover:bg-white/[0.05] cursor-pointer"
+                aria-label={`Open ${game.awayTeam} team page`}
+              >
                 <TeamLogo
                   teamCode={game.awayTeamCode || game.awayTeam}
                   teamName={game.awayTeam}
@@ -1772,11 +2138,14 @@ export default function OddsGamePage() {
                 />
                 <div className="min-w-0">
                   <div className="text-sm font-bold text-white truncate">{game.awayTeam}</div>
+                  <div className="text-[10px] text-cyan-300/80 opacity-0 -translate-y-0.5 transition-all duration-150 group-hover:opacity-100 group-hover:translate-y-0">
+                    View Team &rarr;
+                  </div>
                   {game.awayScore !== null && statusDisplay !== 'UPCOMING' && (
                     <div className="text-2xl font-black text-white/90">{game.awayScore}</div>
                   )}
                 </div>
-              </div>
+              </button>
               
               {/* Center - Status/Time */}
               <div className="flex flex-col items-center px-2">
@@ -1794,9 +2163,20 @@ export default function OddsGamePage() {
               </div>
               
               {/* Home Team */}
-              <div className="flex items-center gap-3 flex-1 min-w-0 justify-end">
+              <button
+                type="button"
+                onClick={() => void handleTeamNavigate(game.homeTeamCode || game.homeTeam, game.homeTeam)}
+                onMouseEnter={() => void prefetchTeamData(game.homeTeamCode || game.homeTeam, game.homeTeam)}
+                onFocus={() => void prefetchTeamData(game.homeTeamCode || game.homeTeam, game.homeTeam)}
+                onTouchStart={() => void prefetchTeamData(game.homeTeamCode || game.homeTeam, game.homeTeam)}
+                className="group flex items-center gap-3 flex-1 min-w-0 justify-end text-right rounded-lg -m-1 p-1 transition-colors hover:bg-white/[0.05] cursor-pointer"
+                aria-label={`Open ${game.homeTeam} team page`}
+              >
                 <div className="min-w-0 text-right">
                   <div className="text-sm font-bold text-white truncate">{game.homeTeam}</div>
+                  <div className="text-[10px] text-cyan-300/80 opacity-0 -translate-y-0.5 transition-all duration-150 group-hover:opacity-100 group-hover:translate-y-0">
+                    View Team &rarr;
+                  </div>
                   {game.homeScore !== null && statusDisplay !== 'UPCOMING' && (
                     <div className="text-2xl font-black text-white/90">{game.homeScore}</div>
                   )}
@@ -1813,7 +2193,7 @@ export default function OddsGamePage() {
                     && game.homeScore > game.awayScore
                   }
                 />
-              </div>
+              </button>
             </div>
             
             {/* League + Time */}

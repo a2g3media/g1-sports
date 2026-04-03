@@ -3,9 +3,9 @@ import { Link } from "react-router-dom";
 import { motion, AnimatePresence } from "framer-motion";
 import { Radio, Clock, ChevronRight, Eye, Flame, Tv } from "lucide-react";
 import { getTeamColors } from "@/react-app/lib/teamColors";
-import { getTeamLogoUrl } from "@/react-app/lib/teamLogos";
 import { toGameDetailPath } from "@/react-app/lib/gameRoutes";
 import { cn } from "@/react-app/lib/utils";
+import { TeamLogo } from "@/react-app/components/TeamLogo";
 
 interface HeroGame {
   id: string;
@@ -330,9 +330,6 @@ interface TeamDisplayProps {
 }
 
 function TeamDisplay({ team, teamColors, sportKey, isWinning, isLive }: TeamDisplayProps) {
-  const [logoFailed, setLogoFailed] = useState(false);
-  const logoUrl = getTeamLogoUrl(team.code, sportKey.toUpperCase());
-  const showLogo = logoUrl && !logoFailed;
   const primaryColor = teamColors?.primary || '#444';
 
   return (
@@ -347,27 +344,24 @@ function TeamDisplay({ team, teamColors, sportKey, isWinning, isLive }: TeamDisp
             style={{ backgroundColor: primaryColor }}
           />
         )}
-        <div 
-          className="relative w-16 h-16 sm:w-20 sm:h-20 md:w-24 md:h-24 rounded-2xl flex items-center justify-center overflow-hidden"
-          style={{ 
-            background: `linear-gradient(145deg, ${primaryColor}35, ${primaryColor}15)`,
-            borderColor: `${primaryColor}50`,
-            borderWidth: '1px',
-            boxShadow: isWinning && isLive ? `0 0 30px ${primaryColor}40` : 'none'
+        <div
+          className="relative w-[78px] h-[78px] sm:w-[92px] sm:h-[92px] md:w-[108px] md:h-[108px] rounded-full flex items-center justify-center"
+          style={{
+            boxShadow: isWinning && isLive ? `0 0 34px ${primaryColor}45` : 'none'
           }}
         >
-          {showLogo ? (
-            <img
-              src={logoUrl}
-              alt={team.name}
-              className="w-10 h-10 sm:w-14 sm:h-14 md:w-16 md:h-16 object-contain drop-shadow-lg"
-              onError={() => setLogoFailed(true)}
-            />
-          ) : (
-            <span className="text-xl sm:text-2xl md:text-3xl font-black text-white drop-shadow-lg">
-              {team.code}
-            </span>
-          )}
+          <div
+            className="pointer-events-none absolute inset-0 rounded-full opacity-55 blur-[14px]"
+            style={{ background: `radial-gradient(circle at 50% 50%, ${primaryColor}38 0%, transparent 72%)` }}
+          />
+          <TeamLogo
+            teamCode={team.code}
+            teamName={team.name}
+            sport={sportKey.toUpperCase()}
+            size={84}
+            className="relative z-10 [filter:drop-shadow(0_18px_26px_rgba(0,0,0,0.72))_drop-shadow(0_0_1px_rgba(255,255,255,0.82))]"
+            winnerGlow={isWinning && isLive}
+          />
         </div>
         
         {/* Winning flame indicator */}
@@ -385,7 +379,7 @@ function TeamDisplay({ team, teamColors, sportKey, isWinning, isLive }: TeamDisp
       
       {/* Team name */}
       <span className={cn(
-        "text-xs sm:text-sm md:text-base font-semibold text-center max-w-[80px] sm:max-w-[100px] truncate",
+        "text-xs sm:text-sm md:text-base font-semibold text-center max-w-[110px] sm:max-w-[130px] truncate",
         isWinning ? "text-white" : "text-slate-400"
       )}>
         {team.name}

@@ -71,6 +71,38 @@ export function Layout({ children, hideFooter: _hideFooter }: LayoutProps) {
     setMounted(true);
   }, []);
 
+  useEffect(() => {
+    // Warm core route chunks in idle time to reduce visible route-loading gaps.
+    const idle = (cb: () => void) => {
+      const ric = (window as any).requestIdleCallback as ((fn: () => void, opts?: { timeout: number }) => number) | undefined;
+      if (typeof ric === 'function') {
+        return ric(cb, { timeout: 2000 });
+      }
+      return window.setTimeout(cb, 400);
+    };
+
+    const cancelIdle = (id: number) => {
+      const cic = (window as any).cancelIdleCallback as ((x: number) => void) | undefined;
+      if (typeof cic === 'function') {
+        cic(id);
+      } else {
+        window.clearTimeout(id);
+      }
+    };
+
+    const handle = idle(() => {
+      void import('@/react-app/pages/GamesPage');
+      void import('@/react-app/pages/OddsPage');
+      void import('@/react-app/pages/PlayerPropsPage');
+      void import('@/react-app/pages/GameDetailPage');
+      void import('@/react-app/pages/OddsGamePage');
+    });
+
+    return () => {
+      cancelIdle(handle as number);
+    };
+  }, []);
+
   // Show onboarding modal for new users after loading
   useEffect(() => {
     if (!onboardingLoading && !hasCompletedOnboarding && user && !isDemoMode) {

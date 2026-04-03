@@ -235,6 +235,14 @@ function matchByTeams(
 
 export function buildMarchMadnessMatchupsFromGames(games: TournamentGame[]): BracketMatchup[] {
   const mmGames = games.filter((g) => g.tournament === "march_madness");
+  const r64Games = mmGames.filter((g) => normalizeRound(g.round) === "Round of 64");
+  const r64WithSeeds = r64Games.filter((g) => Number.isFinite(g.awaySeed) && Number.isFinite(g.homeSeed));
+  // Provider feeds sometimes omit seeds entirely; in that case we build a seedless bracket
+  // from round buckets so completed tournament games do not collapse into TBD chains.
+  if (r64Games.length >= 16 && r64WithSeeds.length < 8) {
+    return buildMarchMadnessMatchupsSeedless(mmGames);
+  }
+
   const used = new Set<string>();
   const result: BracketMatchup[] = [];
   const knownRegionTokens = new Set(MARCH_REGIONS.map((r) => normalizeToken(r)));
@@ -452,6 +460,186 @@ export function buildMarchMadnessMatchupsFromGames(games: TournamentGame[]): Bra
     topTeam: ff1.winner || "TBD",
     bottomTeam: ff2.winner || "TBD",
     winner: deriveWinnerTeam(champGame),
+  });
+
+  return result;
+}
+
+function buildMarchMadnessMatchupsSeedless(mmGames: TournamentGame[]): BracketMatchup[] {
+  const sortByStart = (rows: TournamentGame[]) =>
+    [...rows].sort((a, b) => {
+      const at = new Date(String(a.startTime || "")).getTime();
+      const bt = new Date(String(b.startTime || "")).getTime();
+      const av = Number.isNaN(at) ? Number.MAX_SAFE_INTEGER : at;
+      const bv = Number.isNaN(bt) ? Number.MAX_SAFE_INTEGER : bt;
+      if (av !== bv) return av - bv;
+      return String(a.id).localeCompare(String(b.id));
+    });
+
+  const byRound = (round: string) => sortByStart(mmGames.filter((g) => normalizeRound(g.round) === round));
+  const takeChunk = (rows: TournamentGame[], offset: number, size: number) => rows.slice(offset, offset + size);
+  const winnerName = (game: TournamentGame | undefined): string | undefined => deriveWinnerTeam(game);
+  const winnerSeed = (game: TournamentGame | undefined): number | undefined => deriveWinnerSeed(game);
+  const takeNextUnused = (rows: TournamentGame[], used: Set<string>): TournamentGame | undefined => {
+    const next = rows.find((g) => !used.has(g.id));
+    if (next) used.add(next.id);
+    return next;
+  };
+
+  const r64 = byRound("Round of 64");
+  const r32 = byRound("Round of 32");
+  const s16 = byRound("Sweet 16");
+  const e8 = byRound("Elite Eight");
+  const ff = byRound("Final Four");
+  const champ = byRound("Championship");
+
+  const regionCodes: Record<string, string> = { South: "so", East: "ea", Midwest: "mi", West: "we" };
+  const result: BracketMatchup[] = [];
+  const regionWinners: Array<{ region: string; team: string; seed?: number; gameId: string }> = [];
+  const used = new Set<string>();
+
+  for (let regionIndex = 0; regionIndex < MARCH_REGIONS.length; regionIndex++) {
+    const region = MARCH_REGIONS[regionIndex];
+    const regionCode = regionCodes[region] || region.toLowerCase().slice(0, 2);
+    const r64Chunk = takeChunk(r64, regionIndex * 8, 8);
+
+    const r64Nodes: BracketMatchup[] = [];
+    for (let i = 0; i < 8; i++) {
+      const game = r64Chunk[i];
+      if (game) used.add(game.id);
+      const topSeed = game?.awaySeed ?? R64_SEED_PAIRS[i]?.[0];
+      const bottomSeed = game?.homeSeed ?? R64_SEED_PAIRS[i]?.[1];
+      r64Nodes.push({
+        id: `${regionCode}-r64-${i + 1}`,
+        round: "Round of 64",
+        region,
+        gameId: game?.id || `${regionCode}-r64-game-${i + 1}`,
+        topTeam: game?.awayTeam || `#${topSeed ?? "?"} TBD`,
+        bottomTeam: game?.homeTeam || `#${bottomSeed ?? "?"} TBD`,
+        topSeed,
+        bottomSeed,
+        winner: winnerName(game),
+        nextMatchupId: `${regionCode}-r32-${Math.floor(i / 2) + 1}`,
+        nextSlot: i % 2 === 0 ? "top" : "bottom",
+      });
+    }
+    result.push(...r64Nodes);
+
+    const r32Nodes: BracketMatchup[] = [];
+    for (let i = 0; i < 4; i++) {
+      const topParent = r64Nodes[i * 2];
+      const bottomParent = r64Nodes[i * 2 + 1];
+      const topGuess = topParent?.winner || topParent?.topTeam || "TBD";
+      const bottomGuess = bottomParent?.winner || bottomParent?.bottomTeam || "TBD";
+      const game = matchByTeams(mmGames, used, "Round of 32", undefined, topGuess, bottomGuess)
+        || takeNextUnused(r32, used);
+      r32Nodes.push({
+        id: `${regionCode}-r32-${i + 1}`,
+        round: "Round of 32",
+        region,
+        gameId: game?.id || `${regionCode}-r32-game-${i + 1}`,
+        topTeam: game?.awayTeam || topGuess,
+        bottomTeam: game?.homeTeam || bottomGuess,
+        topSeed: game?.awaySeed ?? topParent?.topSeed,
+        bottomSeed: game?.homeSeed ?? bottomParent?.bottomSeed,
+        winner: winnerName(game),
+        nextMatchupId: `${regionCode}-s16-${Math.floor(i / 2) + 1}`,
+        nextSlot: i % 2 === 0 ? "top" : "bottom",
+      });
+    }
+    result.push(...r32Nodes);
+
+    const s16Nodes: BracketMatchup[] = [];
+    for (let i = 0; i < 2; i++) {
+      const topParent = r32Nodes[i * 2];
+      const bottomParent = r32Nodes[i * 2 + 1];
+      const topGuess = topParent?.winner || topParent?.topTeam || "TBD";
+      const bottomGuess = bottomParent?.winner || bottomParent?.bottomTeam || "TBD";
+      const game = matchByTeams(mmGames, used, "Sweet 16", undefined, topGuess, bottomGuess)
+        || takeNextUnused(s16, used);
+      s16Nodes.push({
+        id: `${regionCode}-s16-${i + 1}`,
+        round: "Sweet 16",
+        region,
+        gameId: game?.id || `${regionCode}-s16-game-${i + 1}`,
+        topTeam: game?.awayTeam || topGuess,
+        bottomTeam: game?.homeTeam || bottomGuess,
+        winner: winnerName(game),
+        nextMatchupId: `${regionCode}-e8-1`,
+        nextSlot: i % 2 === 0 ? "top" : "bottom",
+      });
+    }
+    result.push(...s16Nodes);
+
+    const e8TopGuess = s16Nodes[0]?.winner || s16Nodes[0]?.topTeam || "TBD";
+    const e8BottomGuess = s16Nodes[1]?.winner || s16Nodes[1]?.bottomTeam || "TBD";
+    const e8Game = matchByTeams(mmGames, used, "Elite Eight", undefined, e8TopGuess, e8BottomGuess)
+      || takeNextUnused(e8, used);
+    const elite: BracketMatchup = {
+      id: `${regionCode}-e8-1`,
+      round: "Elite Eight",
+      region,
+      gameId: e8Game?.id || `${regionCode}-e8-game-1`,
+      topTeam: e8Game?.awayTeam || e8TopGuess,
+      bottomTeam: e8Game?.homeTeam || e8BottomGuess,
+      winner: winnerName(e8Game),
+    };
+    result.push(elite);
+    regionWinners.push({
+      region,
+      team: elite.winner || "TBD",
+      seed: winnerSeed(e8Game),
+      gameId: elite.gameId,
+    });
+  }
+
+  const south = regionWinners.find((w) => w.region === "South");
+  const east = regionWinners.find((w) => w.region === "East");
+  const midwest = regionWinners.find((w) => w.region === "Midwest");
+  const west = regionWinners.find((w) => w.region === "West");
+  const ff1Game = matchByTeams(mmGames, used, "Final Four", undefined, south?.team, east?.team)
+    || takeNextUnused(ff, used);
+  const ff2Game = matchByTeams(mmGames, used, "Final Four", undefined, midwest?.team, west?.team)
+    || takeNextUnused(ff, used);
+
+  const ff1: BracketMatchup = {
+    id: "ff-1",
+    round: "Final Four",
+    region: "Final Four",
+    gameId: ff1Game?.id || "ff-1-game",
+    topTeam: ff1Game?.awayTeam || south?.team || "TBD",
+    bottomTeam: ff1Game?.homeTeam || east?.team || "TBD",
+    topSeed: ff1Game?.awaySeed ?? south?.seed,
+    bottomSeed: ff1Game?.homeSeed ?? east?.seed,
+    winner: winnerName(ff1Game),
+    nextMatchupId: "natty-1",
+    nextSlot: "top",
+  };
+  const ff2: BracketMatchup = {
+    id: "ff-2",
+    round: "Final Four",
+    region: "Final Four",
+    gameId: ff2Game?.id || "ff-2-game",
+    topTeam: ff2Game?.awayTeam || midwest?.team || "TBD",
+    bottomTeam: ff2Game?.homeTeam || west?.team || "TBD",
+    topSeed: ff2Game?.awaySeed ?? midwest?.seed,
+    bottomSeed: ff2Game?.homeSeed ?? west?.seed,
+    winner: winnerName(ff2Game),
+    nextMatchupId: "natty-1",
+    nextSlot: "bottom",
+  };
+  result.push(ff1, ff2);
+
+  const champGame = matchByTeams(mmGames, used, "Championship", undefined, ff1.winner, ff2.winner)
+    || takeNextUnused(champ, used);
+  result.push({
+    id: "natty-1",
+    round: "Championship",
+    region: "Championship",
+    gameId: champGame?.id || "natty-game-1",
+    topTeam: champGame?.awayTeam || ff1.winner || "TBD",
+    bottomTeam: champGame?.homeTeam || ff2.winner || "TBD",
+    winner: winnerName(champGame),
   });
 
   return result;
@@ -683,8 +871,10 @@ function parseRoundFromProvider(g: Record<string, unknown>, tournament: Tourname
   if (monthDay <= 318) return "First Four";
   if (monthDay <= 320) return "Round of 64";
   if (monthDay <= 322) return "Round of 32";
-  if (monthDay <= 329) return "Sweet 16";
-  if (monthDay <= 331) return "Elite Eight";
+  // Modern cadence: Sweet 16 is Thu/Fri, Elite Eight is Sat/Sun.
+  if (monthDay <= 327) return "Sweet 16";
+  if (monthDay <= 329) return "Elite Eight";
+  if (monthDay <= 331) return "Final Four";
   if (monthDay <= 406) return "Final Four";
   return "Championship";
 }
@@ -793,7 +983,7 @@ export function buildTournamentGamesFromProvider(
       const rawStatus = String(g.status || "").toUpperCase();
       const status: TournamentGame["status"] = rawStatus === "IN_PROGRESS" || rawStatus === "LIVE"
         ? "LIVE"
-        : rawStatus === "FINAL"
+        : rawStatus === "FINAL" || rawStatus === "COMPLETED" || rawStatus === "CLOSED"
           ? "FINAL"
           : "SCHEDULED";
       const dayNum = parseDateDayNumber(String(g.start_time || ""));

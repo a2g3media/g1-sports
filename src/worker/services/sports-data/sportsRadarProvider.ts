@@ -2476,6 +2476,13 @@ export class SportsRadarProvider implements OddsProviderInterface {
         try {
           const home = game.home || {};
           const away = game.away || {};
+          const parseScore = (...values: unknown[]): number | null => {
+            for (const value of values) {
+              const n = Number(value);
+              if (Number.isFinite(n)) return n;
+            }
+            return null;
+          };
           
           games.push({
             id: game.id,
@@ -2489,13 +2496,27 @@ export class SportsRadarProvider implements OddsProviderInterface {
             homeTeamName: home.name,
             homeTeamAlias: home.alias,
             homeTeamMarket: home.market,
-            homeScore: home.points ?? home.runs ?? null,
+            homeScore: parseScore(
+              home.points,
+              home.runs,
+              game.home_points,
+              game.home_score,
+              game.scoring?.home_points,
+              game.summary?.home?.points
+            ),
             
             awayTeamId: away.id,
             awayTeamName: away.name,
             awayTeamAlias: away.alias,
             awayTeamMarket: away.market,
-            awayScore: away.points ?? away.runs ?? null,
+            awayScore: parseScore(
+              away.points,
+              away.runs,
+              game.away_points,
+              game.away_score,
+              game.scoring?.away_points,
+              game.summary?.away?.points
+            ),
             
             // Is this team home or away?
             isHome: home.id === teamId

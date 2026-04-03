@@ -18,6 +18,9 @@ import { useWatchboards } from '@/react-app/hooks/useWatchboards';
 import AddToWatchboardModal from '@/react-app/components/AddToWatchboardModal';
 import { cn } from '@/react-app/lib/utils';
 import { toGameDetailPath, toOddsGamePath } from '@/react-app/lib/gameRoutes';
+import { fetchJsonCached, getFetchCacheStats } from '@/react-app/lib/fetchCache';
+import { incrementPerfCounter, logPerfSnapshot, startPerfTimer } from '@/react-app/lib/perfTelemetry';
+import { OddsTelemetryDebugPanel } from '@/react-app/components/debug/OddsTelemetryDebugPanel';
 import { generateCoachWhisper as _generateCoachWhisper } from '@/react-app/lib/coachWhisper';
 import { useFeatureFlags } from '@/react-app/hooks/useFeatureFlags';
 import FavoriteEntityButton from '@/react-app/components/FavoriteEntityButton';
@@ -39,17 +42,21 @@ interface DateCachedGames {
   timestamp: number;
 }
 
-function getDateCacheKey(dateStr: string, sport: string = 'ALL'): string {
-  return `gz_games_${GAMES_CACHE_VERSION}_${sport.toUpperCase()}_${dateStr}`;
+function getDateCacheKey(dateStr: string, sport: string = 'ALL', includeOdds: boolean = false): string {
+  return `gz_games_${GAMES_CACHE_VERSION}_${sport.toUpperCase()}_${includeOdds ? 'odds1' : 'odds0'}_${dateStr}`;
 }
 
-function loadCachedGamesForDate(dateStr: string, sport: string = 'ALL'): any[] | null {
+function loadCachedGamesForDate(
+  dateStr: string,
+  sport: string = 'ALL',
+  maxAgeMs: number = GAMES_CACHE_TTL,
+  includeOdds: boolean = false
+): any[] | null {
   try {
-    const cached = localStorage.getItem(getDateCacheKey(dateStr, sport));
+    const cached = localStorage.getItem(getDateCacheKey(dateStr, sport, includeOdds));
     if (!cached) return null;
     const data: DateCachedGames = JSON.parse(cached);
-    // Return cached data if it's less than 2 minutes old
-    if (Date.now() - data.timestamp < GAMES_CACHE_TTL) {
+    if (Date.now() - data.timestamp < maxAgeMs) {
       return data.games;
     }
     return null;
@@ -58,10 +65,10 @@ function loadCachedGamesForDate(dateStr: string, sport: string = 'ALL'): any[] |
   }
 }
 
-function saveCachedGamesForDate(dateStr: string, games: any[], sport: string = 'ALL'): void {
+function saveCachedGamesForDate(dateStr: string, games: any[], sport: string = 'ALL', includeOdds: boolean = false): void {
   try {
     const data: DateCachedGames = { games, timestamp: Date.now() };
-    localStorage.setItem(getDateCacheKey(dateStr, sport), JSON.stringify(data));
+    localStorage.setItem(getDateCacheKey(dateStr, sport, includeOdds), JSON.stringify(data));
     
     // Clean up old date caches (keep only last 20 entries across sports)
     const allKeys = Object.keys(localStorage).filter(k => k.startsWith('gz_games_'));
@@ -74,6 +81,33 @@ function saveCachedGamesForDate(dateStr: string, games: any[], sport: string = '
   } catch {
     // localStorage might be full or disabled
   }
+}
+
+type RouteSlateCacheEntry = {
+  games: any[];
+  updatedAt: number;
+};
+
+const routeSlateCache = new Map<string, RouteSlateCacheEntry>();
+const ROUTE_SLATE_CACHE_TTL_MS = 5 * 60 * 1000;
+
+function getRouteSlateCacheKey(dateStr: string, sport: string): string {
+  return `${String(sport || 'ALL').toUpperCase()}|${dateStr}`;
+}
+
+function readRouteSlateCache(key: string, maxAgeMs = ROUTE_SLATE_CACHE_TTL_MS): any[] | null {
+  const hit = routeSlateCache.get(key);
+  if (!hit) return null;
+  if (Date.now() - hit.updatedAt > maxAgeMs) {
+    routeSlateCache.delete(key);
+    return null;
+  }
+  return hit.games;
+}
+
+function writeRouteSlateCache(key: string, games: any[]): void {
+  if (!Array.isArray(games) || games.length === 0) return;
+  routeSlateCache.set(key, { games, updatedAt: Date.now() });
 }
 
 // Date utilities
@@ -113,8 +147,135 @@ const addDays = (date: Date, days: number): Date => {
   return result;
 };
 
-const getGamesApiPath = (dateStr: string, sport: string): string => {
-  const params = new URLSearchParams({ date: dateStr, includeOdds: "0" });
+const normalizeOddsGameId = (value: unknown): string => String(value || "").trim().toLowerCase();
+
+const buildOddsLookupCandidates = (value: unknown): string[] => {
+  const raw = String(value || "").trim();
+  if (!raw) return [];
+  const out = new Set<string>();
+  const add = (v: string) => {
+    const n = normalizeOddsGameId(v);
+    if (n) out.add(n);
+  };
+  add(raw);
+  if (raw.startsWith("sr_")) {
+    const parts = raw.split("_");
+    const tail = parts.slice(2).join("_");
+    if (tail) {
+      add(`sr:sport_event:${tail.replace(/_/g, "-")}`);
+      add(`sr:sport_event:${tail}`);
+      add(`sr:match:${tail}`);
+      add(tail);
+      add(tail.replace(/_/g, "-"));
+    }
+  }
+  if (raw.startsWith("sr:sport_event:")) {
+    const tail = raw.replace("sr:sport_event:", "");
+    add(tail);
+    add(`sr_${tail.replace(/-/g, "_")}`);
+    add(tail.replace(/-/g, "_"));
+  }
+  if (raw.startsWith("sr:match:")) {
+    const tail = raw.replace("sr:match:", "");
+    add(tail);
+    add(`sr_${tail.replace(/-/g, "_")}`);
+  }
+  return Array.from(out);
+};
+
+const toFiniteNumberOrNull = (value: unknown): number | null => {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+};
+
+const oddsSummaryStrength = (summary: any): number => {
+  if (!summary || typeof summary !== 'object') return 0;
+  let score = 0;
+  const n = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) ? 1 : 0);
+  score += n(summary?.spread?.home_line);
+  score += n(summary?.total?.line);
+  score += n(summary?.moneyline?.home_price) + n(summary?.moneyline?.away_price);
+  score += n(summary?.first_half?.spread?.home_line) + n(summary?.first_half?.spread?.away_line);
+  score += n(summary?.first_half?.total?.line);
+  score += n(summary?.first_half?.moneyline?.home_price) + n(summary?.first_half?.moneyline?.away_price);
+  score += n(summary?.opening_spread) + n(summary?.opening_total);
+  return score;
+};
+
+const mergeOddsSummaryRecord = (
+  prev: Record<string, any>,
+  incoming: Record<string, any>
+): Record<string, any> => {
+  const merged = { ...prev };
+  for (const [key, nextSummary] of Object.entries(incoming)) {
+    const nextStrength = oddsSummaryStrength(nextSummary);
+    if (nextStrength <= 0) continue;
+    const prevSummary = merged[key];
+    const prevStrength = oddsSummaryStrength(prevSummary);
+    if (!prevSummary || nextStrength >= prevStrength) {
+      merged[key] = nextSummary;
+    }
+  }
+  return merged;
+};
+
+const hasRenderableOddsSummary = (summary: any): boolean => oddsSummaryStrength(summary) > 0;
+
+function getOddsSummaryCacheKey(dateStr: string): string {
+  return `games:lastSummary:${dateStr}`;
+}
+
+function loadCachedOddsSummary(dateStr: string): Record<string, any> | null {
+  try {
+    const raw = sessionStorage.getItem(getOddsSummaryCacheKey(dateStr));
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function saveCachedOddsSummary(dateStr: string, summaries: Record<string, any>): void {
+  try {
+    const trimmed = Object.fromEntries(
+      Object.entries(summaries)
+        .filter(([, summary]) => hasRenderableOddsSummary(summary))
+        .slice(0, 800)
+    );
+    sessionStorage.setItem(getOddsSummaryCacheKey(dateStr), JSON.stringify(trimmed));
+  } catch {
+    // ignore cache write failures
+  }
+}
+
+const normalizeTeamToken = (value: unknown): string =>
+  String(value || "")
+    .trim()
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, "");
+
+const ymdPart = (value: unknown): string => {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  const direct = raw.slice(0, 10);
+  if (/^\d{4}-\d{2}-\d{2}$/.test(direct)) return direct;
+  const date = new Date(raw);
+  if (Number.isNaN(date.getTime())) return "";
+  return date.toISOString().slice(0, 10);
+};
+
+const buildOddsMatchKey = (sport: unknown, home: unknown, away: unknown, startTime: unknown): string | null => {
+  const s = String(sport || "").trim().toUpperCase();
+  const h = normalizeTeamToken(home);
+  const a = normalizeTeamToken(away);
+  const d = ymdPart(startTime);
+  if (!s || !h || !a) return null;
+  return `match::${s}|${h}|${a}|${d || "nodate"}`;
+};
+
+const getGamesApiPath = (dateStr: string, sport: string, includeOdds: boolean = false): string => {
+  const params = new URLSearchParams({ date: dateStr, includeOdds: includeOdds ? "1" : "0" });
   const normalizedSport = String(sport || "").trim().toUpperCase();
   if (normalizedSport && normalizedSport !== 'ALL') params.set('sport', normalizedSport);
   return `/api/games?${params.toString()}`;
@@ -138,21 +299,6 @@ const DROPDOWN_SPORTS = [
   { key: 'GOLF', label: 'Golf/PGA', emoji: '⛳' },
   { key: 'PROPS', label: 'Player Props', emoji: '🎯' },
 ] as const;
-
-// Sport-specific accent colors for league section headers
-const SPORT_COLORS: Record<string, { accent: string; bg: string; border: string; glow: string }> = {
-  NBA: { accent: 'text-orange-400', bg: 'bg-orange-500/10', border: 'border-orange-500/30', glow: 'from-orange-500/20' },
-  NFL: { accent: 'text-green-400', bg: 'bg-green-500/10', border: 'border-green-500/30', glow: 'from-green-500/20' },
-  MLB: { accent: 'text-blue-400', bg: 'bg-blue-500/10', border: 'border-blue-500/30', glow: 'from-blue-500/20' },
-  NHL: { accent: 'text-cyan-400', bg: 'bg-cyan-500/10', border: 'border-cyan-500/30', glow: 'from-cyan-500/20' },
-  NCAAB: { accent: 'text-amber-400', bg: 'bg-amber-500/10', border: 'border-amber-500/30', glow: 'from-amber-500/20' },
-  NCAAF: { accent: 'text-lime-400', bg: 'bg-lime-500/10', border: 'border-lime-500/30', glow: 'from-lime-500/20' },
-  SOCCER: { accent: 'text-emerald-400', bg: 'bg-emerald-500/10', border: 'border-emerald-500/30', glow: 'from-emerald-500/20' },
-  MMA: { accent: 'text-red-400', bg: 'bg-red-500/10', border: 'border-red-500/30', glow: 'from-red-500/20' },
-  GOLF: { accent: 'text-teal-400', bg: 'bg-teal-500/10', border: 'border-teal-500/30', glow: 'from-teal-500/20' },
-};
-
-const getDefaultSportColor = () => ({ accent: 'text-slate-400', bg: 'bg-slate-500/10', border: 'border-slate-500/30', glow: 'from-slate-500/20' });
 
 // National TV networks - games on these are considered Prime Time
 const NATIONAL_TV_NETWORKS = [
@@ -278,14 +424,14 @@ const _NCAAF_CONFERENCES = [
 
 // Sport Quick-Jump Chips (horizontal strip)
 const SPORT_CHIPS = [
-  { key: 'ALL', label: 'All', emoji: '🏆' },
-  { key: 'NBA', label: 'NBA', emoji: '🏀' },
-  { key: 'NHL', label: 'NHL', emoji: '🏒' },
-  { key: 'MLB', label: 'MLB', emoji: '⚾' },
-  { key: 'NCAAB', label: 'NCAAB', emoji: '🏀' },
-  { key: 'SOCCER', label: 'Soccer', emoji: '⚽' },
-  { key: 'MMA', label: 'MMA', emoji: '🥊' },
-  { key: 'GOLF', label: 'Golf', emoji: '⛳' },
+  { key: 'ALL', label: 'All' },
+  { key: 'NBA', label: 'NBA' },
+  { key: 'NHL', label: 'NHL' },
+  { key: 'MLB', label: 'MLB' },
+  { key: 'NCAAB', label: 'NCAAB' },
+  { key: 'SOCCER', label: 'Soccer' },
+  { key: 'MMA', label: 'MMA' },
+  { key: 'GOLF', label: 'Golf' },
 ] as const;
 
 function SportQuickJump({ 
@@ -317,19 +463,20 @@ function SportQuickJump({
               key={sport.key}
               onClick={() => onSelect(sport.key as ExtendedSportKey)}
               className={cn(
-                "flex items-center gap-1.5 px-3 py-2 rounded-full text-xs font-semibold whitespace-nowrap transition-all",
-                "active:scale-95 min-h-[36px]",
+                "group relative flex h-8 items-center gap-1 overflow-hidden rounded-full border px-2.5 text-[11px] font-medium whitespace-nowrap transition-all duration-200",
+                "border-white/12 bg-gradient-to-b from-white/[0.07] to-white/[0.02] text-[#D1D5DB] ring-1 ring-white/10 shadow-[inset_0_1px_0_rgba(255,255,255,0.08)] active:scale-[0.995]",
                 isSelected
-                  ? "bg-white text-slate-900 shadow-lg"
-                  : "bg-slate-800/60 text-slate-300 hover:bg-slate-700/70 border border-slate-700/50"
+                  ? "border-cyan-300/35 bg-cyan-500/14 text-cyan-100 shadow-[0_8px_18px_rgba(34,211,238,0.18)]"
+                  : "hover:border-white/20 hover:bg-[#16202B] hover:text-[#E5E7EB]"
               )}
             >
-              <span>{sport.emoji}</span>
               <span>{sport.label}</span>
               {count > 0 && (
                 <span className={cn(
-                  "text-[10px] px-1.5 py-0.5 rounded-full min-w-[18px] text-center",
-                  isSelected ? "bg-slate-900/20 text-slate-700" : "bg-slate-900/40 text-slate-500"
+                  "min-w-[18px] rounded-full border px-1.5 py-0.5 text-center text-[10px]",
+                  isSelected
+                    ? "border-cyan-300/35 bg-cyan-500/20 text-cyan-100"
+                    : "border-white/12 bg-white/[0.03] text-[#9CA3AF]"
                 )}>
                   {count}
                 </span>
@@ -692,10 +839,20 @@ export function GamesPage() {
   const [hubLoading, setHubLoading] = useState(true); // Only true on very first load
   // Removed isDateSwitching - now shows clear loading screen on date switch
   const [hubError, setHubError] = useState<string | null>(null);
+  const [staleNotice, setStaleNotice] = useState<string | null>(null);
   const hasFetchedRef = useRef(false);
   const isFetchingRef = useRef(false);
+  const pendingFetchRef = useRef<{
+    dateToFetch?: Date;
+    forceRefresh: boolean;
+    sportToFetch: ExtendedSportKey;
+    includeOdds: boolean;
+  } | null>(null);
   const currentDateRef = useRef<string>(''); // Track which date is currently displayed
+  const currentGamesRef = useRef<any[]>([]);
   const mountedRef = useRef(true);
+  const [oddsHydrating, setOddsHydrating] = useState(false);
+  const oddsAutoRecoveryAttemptRef = useRef<string>('');
   
   useEffect(() => {
     // React strict mode runs effect cleanup/re-run in development.
@@ -705,11 +862,20 @@ export function GamesPage() {
       mountedRef.current = false;
     };
   }, []);
+
+  useEffect(() => {
+    currentGamesRef.current = rawGames;
+  }, [rawGames]);
   
   // Fetch all games directly from API with date parameter
   // Uses cache for instant display, then fetches fresh data in background
-  const fetchGames = useCallback(async (dateToFetch?: Date, forceRefresh = false, sportToFetch: ExtendedSportKey = 'ALL') => {
-    const fetchWithTimeout = async (input: string, timeoutMs = 12000) => {
+  const fetchGames = useCallback(async (
+    dateToFetch?: Date,
+    forceRefresh = false,
+    sportToFetch: ExtendedSportKey = 'ALL',
+    includeOdds = false
+  ) => {
+    const fetchWithTimeout = async (input: string, timeoutMs = 8000) => {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), timeoutMs);
       try {
@@ -718,20 +884,151 @@ export function GamesPage() {
         clearTimeout(timer);
       }
     };
+    const sleep = async (ms: number) => {
+      if (ms <= 0) return;
+      await new Promise((resolve) => setTimeout(resolve, ms));
+    };
+    const readGamesWithRetry = async (
+      path: string,
+      timeoutMs = 8000,
+      attempts = 3,
+      retryDelaysMs: number[] = [1200, 2600],
+      retryOnEmpty = false
+    ): Promise<any[] | null> => {
+      let lastResult: any[] | null = null;
+      for (let attempt = 0; attempt < attempts; attempt += 1) {
+        try {
+          const res = await fetchWithTimeout(path, timeoutMs);
+          if (res.ok) {
+            const data = await res.json();
+            const games = Array.isArray(data?.games) ? data.games : [];
+            if (games.length > 0) return games;
+            if (!retryOnEmpty) return games;
+            lastResult = games;
+          }
+        } catch {
+          // Retry on transient failures.
+        }
+        if (attempt < attempts - 1) {
+          await sleep(retryDelaysMs[attempt] ?? retryDelaysMs[retryDelaysMs.length - 1] ?? 0);
+        }
+      }
+      return lastResult;
+    };
 
     const dateStr = dateToFetch ? formatDateYYYYMMDD(dateToFetch) : formatDateYYYYMMDD(new Date());
+    const todayStr = formatDateYYYYMMDD(new Date());
     const sportKey = (sportToFetch || 'ALL').toUpperCase();
-    const gamesPath = getGamesApiPath(dateStr, sportKey);
+    const isDateSwitch = Boolean(currentDateRef.current && currentDateRef.current !== dateStr);
+    const allowDateAgnosticRescue = !isDateSwitch && sportKey === 'ALL' && dateStr === todayStr;
+    const includeOddsForGames = false;
+    const routeCacheKey = getRouteSlateCacheKey(dateStr, sportKey);
+    const gamesPath = getGamesApiPath(dateStr, sportKey, includeOddsForGames);
+    const hasOdds = (game: any): boolean => (
+      game?.spread != null ||
+      game?.overUnder != null ||
+      game?.moneylineHome != null ||
+      game?.moneylineAway != null ||
+      game?.spread_home != null ||
+      game?.total != null ||
+      game?.moneyline_home != null ||
+      game?.moneyline_away != null
+    );
+    const mergeGamesById = (rows: any[]): any[] => {
+      const byId = new Map<string, any>();
+      for (const row of rows) {
+        const key = String(row?.game_id || row?.id || "").trim();
+        if (!key) continue;
+        const prev = byId.get(key);
+        if (!prev) {
+          byId.set(key, row);
+          continue;
+        }
+        if (!hasOdds(prev) && hasOdds(row)) {
+          byId.set(key, { ...prev, ...row });
+        } else {
+          byId.set(key, { ...row, ...prev });
+        }
+      }
+      return Array.from(byId.values());
+    };
+    const countSports = (rows: any[]): number =>
+      new Set(
+        (Array.isArray(rows) ? rows : [])
+          .map((g: any) => String(g?.sport || "").toUpperCase().trim())
+          .filter((s: string) => s.length > 0)
+      ).size;
+    const shouldRejectCollapsedAllSportsPayload = (rows: any[]): boolean => {
+      if (sportKey !== 'ALL') return false;
+      const nextSports = countSports(rows);
+      if (nextSports >= 2) return false;
+      const currentSports = countSports(currentGamesRef.current);
+      return currentSports >= 2;
+    };
+    const fetchGamesPayload = async (): Promise<any[] | null> => {
+      const primaryAttempts = sportKey === 'ALL' ? 3 : 1;
+      const primaryTimeoutMs = sportKey === 'ALL' ? 7000 : 3500;
+      const primary = await readGamesWithRetry(gamesPath, primaryTimeoutMs, primaryAttempts, [1200, 2600], sportKey === 'ALL');
+      if (Array.isArray(primary) && primary.length > 0) return primary;
+
+      if (sportKey !== 'ALL') {
+        return primary;
+      }
+
+      // Fallback to per-sport fanout only when all-sports feed is empty.
+      const scopedSports = ['NBA', 'NHL', 'MLB', 'NCAAB', 'SOCCER', 'MMA', 'GOLF'] as const;
+      const responses = await Promise.allSettled(
+        scopedSports.map((scopedSport) => readGamesWithRetry(getGamesApiPath(dateStr, scopedSport, false), 5000, 1, [0], false))
+      );
+      const merged = mergeGamesById(
+        responses
+          .filter((r): r is PromiseFulfilledResult<any[] | null> => r.status === 'fulfilled')
+          .flatMap((r) => (Array.isArray(r.value) ? r.value : []))
+      );
+      if (merged.length > 0) return merged;
+
+      const noDateFallback = await readGamesWithRetry('/api/games?includeOdds=0', 9000, 2, [1200], true);
+      return Array.isArray(noDateFallback) ? noDateFallback : [];
+    };
+    const rescueAllSportsGames = async (): Promise<any[] | null> =>
+      readGamesWithRetry('/api/games?includeOdds=0', 12000, 3, [1200, 2400], true);
+
+    // Never show a previous-date slate under the newly selected date.
+    // If no cache exists for the requested date, clear list and show loading immediately.
+    if (isDateSwitch) {
+      const hasRouteCacheForDate = Boolean(readRouteSlateCache(routeCacheKey, ROUTE_SLATE_CACHE_TTL_MS)?.length);
+      const hasLocalCacheForDate = Boolean(loadCachedGamesForDate(dateStr, sportKey, 15 * 60 * 1000, includeOddsForGames)?.length);
+      if (!hasRouteCacheForDate && !hasLocalCacheForDate) {
+        setRawGames([]);
+        setHubLoading(true);
+      }
+    }
     
-    // Check cache first for instant display (unless force refresh)
+    // Check in-memory route cache first for instant in-session revisits.
     if (!forceRefresh) {
-      const cachedGames = loadCachedGamesForDate(dateStr, sportKey);
-      if (cachedGames && cachedGames.length > 0) {
-        console.log('[GamesPage] Showing cached games for', dateStr, sportKey, ':', cachedGames.length);
-        setRawGames(cachedGames);
+      const routeCachedGames = readRouteSlateCache(routeCacheKey, ROUTE_SLATE_CACHE_TTL_MS);
+      if (routeCachedGames && routeCachedGames.length > 0) {
+        setRawGames(routeCachedGames);
         setHubLoading(false);
         currentDateRef.current = dateStr;
         hasFetchedRef.current = true;
+      }
+    }
+
+    // Check cache first for instant display (unless force refresh)
+    if (!forceRefresh) {
+      const cachedGames = loadCachedGamesForDate(dateStr, sportKey, GAMES_CACHE_TTL, includeOddsForGames);
+      if (cachedGames && cachedGames.length > 0) {
+        const shouldSkipCollapsedCache =
+          sportKey === 'ALL' &&
+          countSports(cachedGames) < 2 &&
+          countSports(currentGamesRef.current) >= 2;
+        if (!shouldSkipCollapsedCache) {
+          setRawGames(cachedGames);
+          setHubLoading(false);
+          currentDateRef.current = dateStr;
+          hasFetchedRef.current = true;
+        }
         
         // If cache is fresh enough, don't fetch again
         // (loadCachedGamesForDate already checks TTL)
@@ -739,122 +1036,189 @@ export function GamesPage() {
         if (!isFetchingRef.current) {
           isFetchingRef.current = true;
           // Background fetch - don't set loading state
-          fetchWithTimeout(gamesPath, 12000)
-            .then(res => res.ok ? res.json() : null)
-            .then(data => {
-              if (data?.games) {
-                setRawGames(data.games);
-                saveCachedGamesForDate(dateStr, data.games, sportKey);
+          fetchGamesPayload()
+            .then((gamesArray) => {
+              if (gamesArray && gamesArray.length > 0) {
+                if (shouldRejectCollapsedAllSportsPayload(gamesArray)) return;
+                setRawGames(gamesArray);
+                writeRouteSlateCache(routeCacheKey, gamesArray);
+                saveCachedGamesForDate(dateStr, gamesArray, sportKey, includeOddsForGames);
               }
             })
             .catch(() => {})
             .finally(() => { isFetchingRef.current = false; });
         }
-        return;
+        if (!(
+          sportKey === 'ALL' &&
+          countSports(cachedGames) < 2 &&
+          countSports(currentGamesRef.current) >= 2
+        )) {
+          return;
+        }
+      }
+    }
+
+    // Use stale cache to avoid blank/sluggish UX while network catches up.
+    const staleCachedGames = loadCachedGamesForDate(dateStr, sportKey, 15 * 60 * 1000, includeOddsForGames);
+    if (!forceRefresh && staleCachedGames && staleCachedGames.length > 0) {
+      const shouldSkipCollapsedStaleCache =
+        sportKey === 'ALL' &&
+        countSports(staleCachedGames) < 2 &&
+        countSports(currentGamesRef.current) >= 2;
+      if (!shouldSkipCollapsedStaleCache) {
+        setRawGames(staleCachedGames);
+        setHubLoading(false);
+        currentDateRef.current = dateStr;
+        hasFetchedRef.current = true;
       }
     }
     
     // No cache - fetch with clear loading state
     if (isFetchingRef.current) {
-      // Prevent indefinite loading when overlapping requests occur.
-      if (!hasFetchedRef.current) setHubLoading(false);
+      pendingFetchRef.current = { dateToFetch, forceRefresh, sportToFetch, includeOdds };
+      // On date switches, keep loading state so users don't see stale previous-date slate.
+      if (isDateSwitch) {
+        setRawGames([]);
+        setHubLoading(true);
+      } else if (!hasFetchedRef.current) {
+        // Prevent indefinite loading when overlapping requests occur.
+        setHubLoading(false);
+      }
       return;
     }
     isFetchingRef.current = true;
+    const stopPerf = startPerfTimer('games.fetch');
     
     try {
       setHubError(null);
-      // Always show clear loading screen when switching dates - no confusion
-      setHubLoading(true);
-      setRawGames([]); // Clear old games immediately
+      setStaleNotice(null);
+      // Keep current slate visible while refreshing unless nothing is loaded yet.
+      setHubLoading(currentGamesRef.current.length === 0);
       
-      const res = await fetchWithTimeout(gamesPath, 12000);
-      if (res.ok) {
-        const data = await res.json();
-        const gamesArray = data.games || [];
-        console.log('[GamesPage] Fetched games for', dateStr, ':', gamesArray.length, 
-          'by sport:', gamesArray.reduce((acc: Record<string, number>, g: any) => {
-            const s = (g.sport || 'unknown').toUpperCase();
-            acc[s] = (acc[s] || 0) + 1;
-            return acc;
-          }, {}));
-        setRawGames(gamesArray);
-        currentDateRef.current = dateStr;
-        // Enrich with odds summaries (including first-half lines) in background.
-        // Never block game tiles from rendering if enrichment is slow/hung.
-        void (async () => {
-          try {
-            const sports: string[] = Array.from(new Set(
-              gamesArray
-                .map((g: any) => String(g?.sport || "").toLowerCase().trim())
-                .filter((s: string) => s.length > 0)
-            ));
-            const byId: Record<string, {
-              spread?: { home_line?: number | null };
-              total?: { line?: number | null };
-              moneyline?: { home_price?: number | null; away_price?: number | null };
-              first_half?: {
-                spread?: { home_line?: number | null };
-                total?: { line?: number | null };
-                moneyline?: { home_price?: number | null; away_price?: number | null };
-              };
-            }> = {};
-
-            if (sports.length > 0) {
-              const responses = await Promise.allSettled(
-                sports.map(async (sport) => {
-                  const qs = new URLSearchParams({ sport, scope: "PROD" });
-                  const controller = new AbortController();
-                  const timeout = setTimeout(() => controller.abort(), 4500);
-                  try {
-                    const oddsRes = await fetch(`/api/odds/slate?${qs.toString()}`, {
-                      credentials: "include",
-                      signal: controller.signal,
-                    });
-                    if (!oddsRes.ok) return [];
-                    const payload = await oddsRes.json();
-                    return Array.isArray(payload?.summaries) ? payload.summaries : [];
-                  } finally {
-                    clearTimeout(timeout);
-                  }
-                })
-              );
-
-              for (const response of responses) {
-                if (response.status !== "fulfilled") continue;
-                for (const s of response.value) {
-                  const gameId = String(s?.game?.game_id || s?.game_id || "");
-                  if (!gameId) continue;
-                  byId[gameId] = s;
-                }
-              }
-            }
-
-            // Drop stale enrichment results if user already switched dates.
-            if (currentDateRef.current === dateStr) {
-              setOddsSummaryByGame(byId);
-            }
-          } catch {
-            // Keep existing odds summary on background failure.
+      const gamesArray = await fetchGamesPayload();
+      if (Array.isArray(gamesArray)) {
+        if (gamesArray.length > 0) {
+          if (!shouldRejectCollapsedAllSportsPayload(gamesArray)) {
+            setRawGames(gamesArray);
+            currentDateRef.current = dateStr;
+            writeRouteSlateCache(routeCacheKey, gamesArray);
+            saveCachedGamesForDate(dateStr, gamesArray, sportKey, includeOddsForGames);
+            hasFetchedRef.current = true;
+            setStaleNotice(null);
           }
-        })();
-        saveCachedGamesForDate(dateStr, gamesArray, sportKey);
-        hasFetchedRef.current = true;
+        } else if (isDateSwitch) {
+          setRawGames([]);
+          setHubError(null);
+          setStaleNotice(null);
+          hasFetchedRef.current = true;
+        } else if (currentGamesRef.current.length > 0) {
+          incrementPerfCounter('games.staleProtected');
+          setStaleNotice('Refreshing schedule feed - showing last known valid slate.');
+        } else {
+          const routeFallback = readRouteSlateCache(routeCacheKey, ROUTE_SLATE_CACHE_TTL_MS);
+          if (routeFallback && routeFallback.length > 0) {
+            setRawGames(routeFallback);
+            setStaleNotice('Refreshing schedule feed - showing last known valid slate.');
+            hasFetchedRef.current = true;
+          } else if (allowDateAgnosticRescue) {
+            const rescue = await rescueAllSportsGames();
+            if (Array.isArray(rescue) && rescue.length > 0) {
+              setRawGames(rescue);
+              writeRouteSlateCache(routeCacheKey, rescue);
+              saveCachedGamesForDate(dateStr, rescue, 'ALL', includeOddsForGames);
+              setStaleNotice('Using last available all-sports slate while the date feed refreshes.');
+              hasFetchedRef.current = true;
+            } else {
+              setHubError('No games available yet for this slate');
+            }
+          } else {
+            setRawGames([]);
+            setHubError('No games available for selected date');
+            setStaleNotice(null);
+          }
+        }
       } else {
-        setHubError('Failed to load games');
+        if (isDateSwitch) {
+          setRawGames([]);
+          setHubError('Failed to load selected date');
+          setStaleNotice(null);
+        } else if (currentGamesRef.current.length === 0) {
+          const routeFallback = readRouteSlateCache(routeCacheKey, ROUTE_SLATE_CACHE_TTL_MS);
+          if (routeFallback && routeFallback.length > 0) {
+            setRawGames(routeFallback);
+            setStaleNotice('Refreshing schedule feed - showing last known valid slate.');
+            hasFetchedRef.current = true;
+          } else if (allowDateAgnosticRescue) {
+            const rescue = await rescueAllSportsGames();
+            if (Array.isArray(rescue) && rescue.length > 0) {
+              setRawGames(rescue);
+              writeRouteSlateCache(routeCacheKey, rescue);
+              saveCachedGamesForDate(dateStr, rescue, 'ALL', includeOddsForGames);
+              setStaleNotice('Using last available all-sports slate while the date feed refreshes.');
+              hasFetchedRef.current = true;
+            } else {
+              setHubError('Failed to load games');
+            }
+          } else {
+            setRawGames([]);
+            setHubError('Failed to load selected date');
+            setStaleNotice(null);
+          }
+        } else {
+          incrementPerfCounter('games.staleProtected');
+          setStaleNotice('Refreshing schedule feed - showing last known valid slate.');
+        }
       }
     } catch (err) {
       if (!mountedRef.current) {
         return;
       }
       console.error('[GamesPage] Fetch error:', err);
-      setHubError('Network error loading games');
+      if (isDateSwitch) {
+        setRawGames([]);
+        setHubError('Network error loading selected date');
+        setStaleNotice(null);
+      } else if (currentGamesRef.current.length === 0) {
+        const routeFallback = readRouteSlateCache(routeCacheKey, ROUTE_SLATE_CACHE_TTL_MS);
+        if (routeFallback && routeFallback.length > 0) {
+          setRawGames(routeFallback);
+          setStaleNotice('Network issue - showing last known valid slate while we retry.');
+          hasFetchedRef.current = true;
+        } else if (allowDateAgnosticRescue) {
+          const rescue = await rescueAllSportsGames();
+          if (Array.isArray(rescue) && rescue.length > 0) {
+            setRawGames(rescue);
+            writeRouteSlateCache(routeCacheKey, rescue);
+            saveCachedGamesForDate(dateStr, rescue, 'ALL', includeOddsForGames);
+            setStaleNotice('Using last available all-sports slate while connectivity stabilizes.');
+            hasFetchedRef.current = true;
+          } else {
+            setHubError('Network error loading games');
+          }
+        } else {
+          setRawGames([]);
+          setHubError('Network error loading selected date');
+          setStaleNotice(null);
+        }
+      } else {
+        incrementPerfCounter('games.staleProtected');
+        setStaleNotice('Network issue - showing last known valid slate while we retry.');
+      }
     } finally {
+      stopPerf();
+      console.debug('[GamesPage][fetch-cache]', getFetchCacheStats());
+      logPerfSnapshot('GamesPage');
       // Always release fetch lock, even during strict-mode effect cleanup cycles.
       isFetchingRef.current = false;
       currentDateRef.current = dateStr;
       if (mountedRef.current) {
         setHubLoading(false);
+        setRefreshCycleCount((v) => v + 1);
+      }
+      const pending = pendingFetchRef.current;
+      if (pending) {
+        pendingFetchRef.current = null;
+        void fetchGames(pending.dateToFetch, pending.forceRefresh, pending.sportToFetch, pending.includeOdds);
       }
     }
   }, []);
@@ -873,17 +1237,19 @@ export function GamesPage() {
     datesToPrefetch.forEach((date, index) => {
       const dateStr = formatDateYYYYMMDD(date);
       // Skip if already cached
-      const cached = loadCachedGamesForDate(dateStr, sportKey);
+      const cached = loadCachedGamesForDate(dateStr, sportKey, GAMES_CACHE_TTL, false);
       if (cached && cached.length > 0) return;
       
       // Prefetch with delay to not compete with main request
       setTimeout(() => {
-        fetch(getGamesApiPath(dateStr, sportKey))
-          .then(res => res.ok ? res.json() : null)
-          .then(data => {
+        fetchJsonCached<any>(getGamesApiPath(dateStr, sportKey, false), {
+          cacheKey: `games:prefetch:${sportKey}:${dateStr}`,
+          ttlMs: 10000,
+          timeoutMs: 7000,
+        })
+          .then((data) => {
             if (data?.games) {
-              saveCachedGamesForDate(dateStr, data.games, sportKey);
-              console.log('[GamesPage] Pre-fetched games for', dateStr, sportKey, ':', data.games.length);
+              saveCachedGamesForDate(dateStr, data.games, sportKey, false);
             }
           })
           .catch(() => {});
@@ -893,27 +1259,244 @@ export function GamesPage() {
   
   // Initial fetch and refetch when date changes
   useEffect(() => {
-    fetchGames(selectedDate, false, selectedSport);
-  }, [fetchGames, selectedDate, selectedSport]);
+    fetchGames(selectedDate, false, selectedSport, activeTab === 'odds');
+  }, [activeTab, fetchGames, selectedDate, selectedSport]);
   
   // Pre-fetch adjacent dates after initial load completes
   useEffect(() => {
-    if (!hubLoading && rawGames.length > 0 && selectedDate) {
+    if (!hubLoading && rawGames.length > 0 && selectedDate && selectedSport !== 'ALL') {
       prefetchAdjacentDates(selectedDate, selectedSport);
     }
   }, [hubLoading, rawGames.length, selectedDate, selectedSport, prefetchAdjacentDates]);
+
+  const selectedDateStr = useMemo(() => formatDateYYYYMMDD(selectedDate), [selectedDate]);
+
+  useEffect(() => {
+    const cached = loadCachedOddsSummary(selectedDateStr);
+    if (!cached || Object.keys(cached).length === 0) return;
+    setOddsSummaryByGame((prev) => mergeOddsSummaryRecord(prev, cached));
+  }, [selectedDateStr]);
+
+  useEffect(() => {
+    if (rawGames.length === 0) return;
+
+    const hasRawOdds = (game: any): boolean =>
+      game?.spread != null ||
+      game?.spread_home != null ||
+      game?.overUnder != null ||
+      game?.total != null ||
+      game?.moneylineHome != null ||
+      game?.moneylineAway != null ||
+      game?.moneyline_home != null ||
+      game?.moneyline_away != null;
+
+    const hasSummaryOdds = (game: any): boolean => {
+      const gameId = String(game?.game_id || game?.id || '').trim();
+      const idSummary = buildOddsLookupCandidates(gameId)
+        .map((candidate) => oddsSummaryByGame[candidate])
+        .find((summary) => hasRenderableOddsSummary(summary));
+      if (idSummary) return true;
+      const sportKey = String(game?.sport || '').toUpperCase();
+      const matchupCandidates = [
+        buildOddsMatchKey(sportKey, game?.home_team_code, game?.away_team_code, game?.start_time),
+        buildOddsMatchKey(sportKey, game?.home_team_name, game?.away_team_name, game?.start_time),
+        buildOddsMatchKey(sportKey, game?.home_team_code || game?.home_team_name, game?.away_team_code || game?.away_team_name, game?.start_time),
+      ].filter((key): key is string => Boolean(key));
+      return matchupCandidates.some((candidate) => hasRenderableOddsSummary(oddsSummaryByGame[candidate]));
+    };
+
+    const coverageCount = rawGames.reduce((count, game) => count + ((hasRawOdds(game) || hasSummaryOdds(game)) ? 1 : 0), 0);
+    const coverageRatio = rawGames.length > 0 ? coverageCount / rawGames.length : 0;
+    const shouldHydrate =
+      activeTab === 'odds' ||
+      coverageRatio < 0.6;
+
+    if (!shouldHydrate) return;
+    incrementPerfCounter('games.guardrail.coverageHydration');
+
+    let cancelled = false;
+    setOddsHydrating(true);
+    void (async () => {
+      try {
+        const byId: Record<string, {
+          spread?: { home_line?: number | null };
+          total?: { line?: number | null };
+          moneyline?: { home_price?: number | null; away_price?: number | null };
+          first_half?: {
+            spread?: { home_line?: number | null };
+            total?: { line?: number | null };
+            moneyline?: { home_price?: number | null; away_price?: number | null };
+          };
+          game?: {
+            game_id?: string;
+            sport?: string;
+            home_team_code?: string;
+            away_team_code?: string;
+            home_team_name?: string;
+            away_team_name?: string;
+            start_time?: string;
+          };
+        }> = {};
+
+        const addSummary = (s: any) => {
+          const nextStrength = oddsSummaryStrength(s);
+          if (nextStrength <= 0) return;
+
+          const gameId = String(s?.game?.game_id || s?.game_id || s?.game?.id || '').trim();
+          if (gameId) {
+            for (const candidate of buildOddsLookupCandidates(gameId)) {
+              const prevSummary = byId[candidate];
+              if (!prevSummary || nextStrength >= oddsSummaryStrength(prevSummary)) {
+                byId[candidate] = s;
+              }
+            }
+          }
+          const summarySport = String(s?.game?.sport || '').trim().toUpperCase();
+          const summaryHomeCode = String(s?.game?.home_team_code || '').trim();
+          const summaryAwayCode = String(s?.game?.away_team_code || '').trim();
+          const summaryHomeName = String(s?.game?.home_team_name || '').trim();
+          const summaryAwayName = String(s?.game?.away_team_name || '').trim();
+          const summaryStart = String(s?.game?.start_time || '').trim();
+          const matchKeys = [
+            buildOddsMatchKey(summarySport, summaryHomeCode, summaryAwayCode, summaryStart),
+            buildOddsMatchKey(summarySport, summaryHomeName, summaryAwayName, summaryStart),
+            buildOddsMatchKey(summarySport, summaryHomeCode || summaryHomeName, summaryAwayCode || summaryAwayName, summaryStart),
+            buildOddsMatchKey(summarySport, summaryHomeCode, summaryAwayCode, ''),
+            buildOddsMatchKey(summarySport, summaryHomeName, summaryAwayName, ''),
+          ].filter((key): key is string => Boolean(key));
+          for (const key of matchKeys) {
+            const prevSummary = byId[key];
+            if (!prevSummary || nextStrength >= oddsSummaryStrength(prevSummary)) {
+              byId[key] = s;
+            }
+          }
+        };
+
+        const requestedIds = rawGames
+          .map((g: any) => String(g?.game_id || g?.id || '').trim())
+          .filter((id: string) => id.length > 0)
+          .slice(0, 80);
+
+        // Primary path: batch odds summaries by game ids (single bundled path, chunked).
+        const chunks: string[][] = [];
+        for (let i = 0; i < requestedIds.length; i += 30) {
+          chunks.push(requestedIds.slice(i, i + 30));
+        }
+
+        const chunkResponses = await Promise.allSettled(
+          chunks.map(async (chunkIds, idx) => {
+            const qs = new URLSearchParams({
+              game_ids: chunkIds.join(','),
+              scope: 'PROD',
+              date: selectedDateStr,
+            });
+            const payload = await fetchJsonCached<any>(`/api/odds/slate?${qs.toString()}`, {
+              cacheKey: `games:odds:slate:chunk:${selectedDateStr}:${idx}:${chunkIds.join('|')}`,
+              ttlMs: 6000,
+              timeoutMs: 12000,
+              init: { credentials: 'include' },
+            });
+            return Array.isArray(payload?.summaries) ? payload.summaries : [];
+          })
+        );
+
+        for (const response of chunkResponses) {
+          if (response.status !== 'fulfilled') continue;
+          for (const s of response.value) addSummary(s);
+        }
+
+        // Fallback path: if bundled coverage is weak, fan out by sport once.
+        const sports = Array.from(new Set(
+          rawGames
+            .map((g: any) => String(g?.sport || '').toUpperCase().trim())
+            .filter((s: string) => s.length > 0)
+        ));
+        const coveredRequested = requestedIds.filter((id) => Boolean(byId[id])).length;
+        const needsSportFallback = sports.length > 0 && coveredRequested < Math.min(requestedIds.length, 10) / 2;
+
+        if (needsSportFallback) {
+          incrementPerfCounter('games.guardrail.sportFallback');
+          const responses = await Promise.allSettled(
+            sports.map(async (sport) => {
+              const qs = new URLSearchParams({ sport, scope: 'PROD', date: selectedDateStr });
+              const payload = await fetchJsonCached<any>(`/api/odds/slate?${qs.toString()}`, {
+                cacheKey: `games:odds:slate:sport:${sport}:${selectedDateStr}`,
+                ttlMs: 6000,
+                timeoutMs: 12000,
+                init: { credentials: 'include' },
+              });
+              return Array.isArray(payload?.summaries) ? payload.summaries : [];
+            })
+          );
+          for (const response of responses) {
+            if (response.status !== 'fulfilled') continue;
+            for (const s of response.value) addSummary(s);
+          }
+        }
+
+        // Last-resort fallback: per-game summary when slate payloads are weak.
+        const coveredAfterSlate = requestedIds.filter((id) => Boolean(byId[id])).length;
+        if (coveredAfterSlate < Math.max(1, Math.floor(requestedIds.length * 0.6))) {
+          incrementPerfCounter('games.guardrail.perGameFallback');
+          const unresolvedIds = requestedIds.filter((id) => !byId[id]).slice(0, 24);
+          const summaryResponses = await Promise.allSettled(
+            unresolvedIds.map(async (id) => {
+              const payload = await fetchJsonCached<any>(`/api/odds/summary/${encodeURIComponent(id)}?scope=PROD`, {
+                cacheKey: `games:odds:summary:${id}`,
+                ttlMs: 6000,
+                timeoutMs: 5000,
+                init: { credentials: 'include' },
+              });
+              return payload || null;
+            })
+          );
+          for (const response of summaryResponses) {
+            if (response.status !== 'fulfilled' || !response.value) continue;
+            addSummary(response.value);
+          }
+        }
+
+        if (!cancelled && Object.keys(byId).length > 0) {
+          setOddsSummaryByGame((prev) => {
+            const merged = mergeOddsSummaryRecord(prev, byId);
+            saveCachedOddsSummary(selectedDateStr, merged);
+            return merged;
+          });
+        }
+      } catch {
+        // Keep existing odds summary on background failure.
+      } finally {
+        if (!cancelled) setOddsHydrating(false);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [activeTab, rawGames, selectedDateStr]);
   
   // Refresh function - force bypass cache
   const hubRefresh = useCallback(async () => {
-    await fetchGames(selectedDate, true, selectedSport); // forceRefresh = true
-  }, [fetchGames, selectedDate, selectedSport]);
+    await fetchGames(selectedDate, true, selectedSport, activeTab === 'odds'); // forceRefresh = true
+  }, [activeTab, fetchGames, selectedDate, selectedSport]);
   
   // Transform raw API games to LiveGame-like format
   const hubGames = useMemo(() => {
     return rawGames.map((game: any) => {
       const sportKey = (game.sport || 'NBA').toUpperCase();
         const gameId = game.game_id || game.id || `gen_${sportKey}_${game.home_team_code}_${game.away_team_code}_${game.start_time}`;
-        const summary = oddsSummaryByGame[gameId];
+        const idSummary = buildOddsLookupCandidates(gameId)
+          .map((candidate) => oddsSummaryByGame[candidate])
+          .find(Boolean);
+        const matchupCandidates = [
+          buildOddsMatchKey(sportKey, game.home_team_code, game.away_team_code, game.start_time),
+          buildOddsMatchKey(sportKey, game.home_team_name, game.away_team_name, game.start_time),
+          buildOddsMatchKey(sportKey, game.home_team_code || game.home_team_name, game.away_team_code || game.away_team_name, game.start_time),
+          buildOddsMatchKey(sportKey, game.home_team_code, game.away_team_code, ""),
+          buildOddsMatchKey(sportKey, game.home_team_name, game.away_team_name, ""),
+        ].filter((key): key is string => Boolean(key));
+        const matchupSummary = matchupCandidates.map((candidate) => oddsSummaryByGame[candidate]).find(Boolean);
+        const summary = idSummary || matchupSummary;
       return {
         id: gameId,
         sport: sportKey,
@@ -934,14 +1517,14 @@ export function GamesPage() {
         channel: game.channel || null,
         isOvertime: game.is_overtime || false,
         odds: {
-          spreadHome: summary?.spread?.home_line ?? game.spread_home ?? null,
-          total: summary?.total?.line ?? game.total ?? null,
-          moneylineHome: summary?.moneyline?.home_price ?? game.moneyline_home ?? null,
-          moneylineAway: summary?.moneyline?.away_price ?? game.moneyline_away ?? null,
-          spread1HHome: summary?.first_half?.spread?.home_line ?? game.spread_1h_home ?? null,
-          total1H: summary?.first_half?.total?.line ?? game.total_1h ?? null,
-          moneyline1HHome: summary?.first_half?.moneyline?.home_price ?? game.moneyline_1h_home ?? null,
-          moneyline1HAway: summary?.first_half?.moneyline?.away_price ?? game.moneyline_1h_away ?? null,
+          spreadHome: toFiniteNumberOrNull(summary?.spread?.home_line ?? game.spread_home ?? game.spread),
+          total: toFiniteNumberOrNull(summary?.total?.line ?? game.total ?? game.overUnder),
+          moneylineHome: toFiniteNumberOrNull(summary?.moneyline?.home_price ?? game.moneyline_home ?? game.moneylineHome),
+          moneylineAway: toFiniteNumberOrNull(summary?.moneyline?.away_price ?? game.moneyline_away ?? game.moneylineAway),
+          spread1HHome: toFiniteNumberOrNull(summary?.first_half?.spread?.home_line ?? game.spread_1h_home ?? game.spread1HHome),
+          total1H: toFiniteNumberOrNull(summary?.first_half?.total?.line ?? game.total_1h ?? game.total1H),
+          moneyline1HHome: toFiniteNumberOrNull(summary?.first_half?.moneyline?.home_price ?? game.moneyline_1h_home ?? game.moneyline1HHome),
+          moneyline1HAway: toFiniteNumberOrNull(summary?.first_half?.moneyline?.away_price ?? game.moneyline_1h_away ?? game.moneyline1HAway),
         },
       };
     });
@@ -950,7 +1533,19 @@ export function GamesPage() {
   // Data state
   const [refreshing, setRefreshing] = useState(false);
   const [lastFetchAt, setLastFetchAt] = useState<Date | null>(null);
-  
+  const [refreshCycleCount, setRefreshCycleCount] = useState(0);
+  const showDebugTelemetry = useMemo(() => {
+    if (typeof window === 'undefined') return false;
+    const debug = new URLSearchParams(window.location.search).get('debug');
+    return debug === 'true' || debug === 'telemetry';
+  }, []);
+  const debugCoverageThresholdPct = useMemo(() => {
+    if (typeof window === 'undefined') return 35;
+    const raw = Number(new URLSearchParams(window.location.search).get('cov'));
+    if (!Number.isFinite(raw)) return 35;
+    return Math.max(5, Math.min(95, Math.round(raw)));
+  }, []);
+
   // NCAAB/NCAAF team data for conference/ranking filtering
   type TeamLookup = Record<string, { conference?: string; apRank?: number | null }>;
   const [ncaabTeamLookup] = useState<TeamLookup>({});
@@ -989,7 +1584,7 @@ export function GamesPage() {
           const awayScore = typeof awayTeam === 'object' ? (awayTeam.score ?? null) : null;
           
           // Generate consistent public betting percentages based on game id
-          const gameIdHash = (g.id || '').split('').reduce((a: number, c: string) => a + c.charCodeAt(0), 0);
+          const gameIdHash = String(g.id || '').split('').reduce((a: number, c: string) => a + c.charCodeAt(0), 0);
           const homePercent = 45 + (gameIdHash % 20); // 45-64%
           const awayPercent = 100 - homePercent;
           
@@ -1023,12 +1618,20 @@ export function GamesPage() {
             awayScore,
             status: normalizedStatus,
             startTime: g.startTime || undefined,
-            periodLabel: g.period || undefined,
+            period: g.period || undefined,
             clock: g.clock || undefined,
+            spread: g.odds?.spreadHome ?? undefined,
+            overUnder: g.odds?.total ?? undefined,
+            moneylineHome: g.odds?.moneylineHome ?? undefined,
+            moneylineAway: g.odds?.moneylineAway ?? undefined,
             odds: {
               spread: g.odds?.spreadHome ?? undefined,
+              spreadHome: g.odds?.spreadHome ?? undefined,
+              total: g.odds?.total ?? undefined,
               overUnder: g.odds?.total ?? undefined,
+              mlHome: g.odds?.moneylineHome ?? undefined,
               homeML: g.odds?.moneylineHome ?? undefined,
+              mlAway: g.odds?.moneylineAway ?? undefined,
               awayML: g.odds?.moneylineAway ?? undefined,
               spread1HHome: g.odds?.spread1HHome ?? undefined,
               total1H: g.odds?.total1H ?? undefined,
@@ -1049,31 +1652,45 @@ export function GamesPage() {
     }
   }, [hubGames, ncaabTeamLookup, ncaafTeamLookup]);
 
-  // DEBUG: Trace the data flow
+  const realOddsGameCount = useMemo(() => {
+    return games.reduce((count, game) => {
+      const hasOdds =
+        game.spread != null ||
+        game.overUnder != null ||
+        game.moneylineHome != null ||
+        game.moneylineAway != null ||
+        game.odds?.spread != null ||
+        game.odds?.total != null ||
+        game.odds?.mlHome != null ||
+        game.odds?.mlAway != null;
+      return count + (hasOdds ? 1 : 0);
+    }, 0);
+  }, [games]);
+
   useEffect(() => {
-    // Count raw hubGames by sport
-    const hubSportCounts = hubGames.reduce((acc, g) => {
-      const sport = (g.sport || 'UNKNOWN').toUpperCase();
-      acc[sport] = (acc[sport] || 0) + 1;
-      return acc;
-    }, {} as Record<string, number>);
-    
-    // Check which games have valid IDs
-    const gamesWithId = hubGames.filter(g => g && g.id);
-    const gamesWithoutId = hubGames.filter(g => !g || !g.id);
-    
-    // NBA specific debug
-    const nbaGames = hubGames.filter(g => (g.sport || '').toUpperCase() === 'NBA');
-    const nbaWithId = nbaGames.filter(g => g.id);
-    
-    console.log('[GamesPage DEBUG] hubGames:', hubGames.length, 'sportCounts:', hubSportCounts);
-    console.log('[GamesPage DEBUG] withId:', gamesWithId.length, 'withoutId:', gamesWithoutId.length);
-    console.log('[GamesPage DEBUG] NBA games:', nbaGames.length, 'with id:', nbaWithId.length);
-    if (nbaGames.length > 0) {
-      console.log('[GamesPage DEBUG] First NBA game:', JSON.stringify(nbaGames[0], null, 2));
-    }
-  }, [hubGames]);
-  
+    if (hubLoading || refreshing || oddsHydrating) return;
+    if (games.length === 0) return;
+    if (realOddsGameCount > 0) return;
+    const recoveryKey = `${selectedDateStr}|${selectedSport}|${activeTab}`;
+    if (oddsAutoRecoveryAttemptRef.current === recoveryKey) return;
+    oddsAutoRecoveryAttemptRef.current = recoveryKey;
+    const timer = window.setTimeout(() => {
+      incrementPerfCounter('games.guardrail.autoRecovery');
+      void hubRefresh();
+    }, 1500);
+    return () => window.clearTimeout(timer);
+  }, [
+    activeTab,
+    games.length,
+    hubLoading,
+    hubRefresh,
+    oddsHydrating,
+    realOddsGameCount,
+    refreshing,
+    selectedDateStr,
+    selectedSport,
+  ]);
+
   const loading = hubLoading;
   const error = hubError;
 
@@ -1140,9 +1757,7 @@ export function GamesPage() {
     
     // Apply league filter for soccer
     if (selectedSport === 'SOCCER' && leagueFilter !== 'ALL') {
-      console.log('[GamesPage] Filtering soccer by league:', leagueFilter, 'games before:', filtered.length, 'leagues:', filtered.map(g => g.league));
       filtered = filtered.filter(g => g.league === leagueFilter);
-      console.log('[GamesPage] After filter:', filtered.length);
     }
     
     // Apply conference filter for NCAAB using team lookup
@@ -1213,7 +1828,7 @@ export function GamesPage() {
     
     // NCAAF conference filter removed - off season
     
-    if (statusFilter !== 'all') {
+    if (activeTab !== 'odds' && statusFilter !== 'all') {
       filtered = filtered.filter(g => {
         const status = (g.status || '').toString().toLowerCase();
         if (statusFilter === 'live') {
@@ -1243,7 +1858,7 @@ export function GamesPage() {
     });
     
     return { liveGames: live, scheduledGames: scheduled, finalGames: final, filteredCount: filtered.length };
-  }, [games, statusFilter, selectedSport, leagueFilter, conferenceFilter, ncaabTeamLookup, ncaafTeamLookup]);
+  }, [games, statusFilter, selectedSport, leagueFilter, conferenceFilter, ncaabTeamLookup, ncaafTeamLookup, activeTab]);
 
   // Status counts (same date filter as sections so tab counts match displayed games)
   const statusCounts = useMemo(() => {
@@ -1354,6 +1969,14 @@ export function GamesPage() {
 
   const sportConfig = AVAILABLE_SPORTS.find(s => s.key === selectedSport);
   const dateLabel = getDateLabel(selectedDate, today);
+  const navDateLabel = dateLabel === "Today"
+    ? selectedDate.toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric" })
+    : dateLabel;
+  const sectionShellClass = "rounded-[14px] border border-white/[0.05] bg-[#16202B] p-4 md:p-5 shadow-[0_10px_24px_rgba(0,0,0,0.30)]";
+  const sectionHeaderClass = "mb-4 inline-flex items-center gap-2 rounded-full border border-white/12 bg-gradient-to-b from-white/[0.07] to-white/[0.02] px-3 py-1.5 text-[#D1D5DB] ring-1 ring-white/10 shadow-[inset_0_1px_0_rgba(255,255,255,0.08)]";
+  const showMoreBtnClass = "mt-4 w-full rounded-xl border border-white/12 bg-gradient-to-b from-white/[0.07] to-white/[0.02] px-4 py-2.5 text-[12px] font-semibold text-[#D1D5DB] ring-1 ring-white/10 shadow-[inset_0_1px_0_rgba(255,255,255,0.08)] transition-all duration-200 hover:border-white/20 hover:bg-[#16202B] hover:text-[#E5E7EB]";
+  const sportGroupHeaderClass = "mb-4 flex items-center justify-between rounded-[12px] border border-white/[0.06] bg-[#121821]/95 px-4 py-3 backdrop-blur-xl shadow-[0_10px_22px_rgba(0,0,0,0.26)]";
+  const sportGroupHubBtnClass = "inline-flex items-center gap-1 rounded-md border border-white/[0.05] bg-white/5 px-2 py-1 text-xs text-[#9CA3AF] transition-colors hover:text-[#E5E7EB]";
 
   // Group games by sport for ALL view - memoized for performance
   const groupGamesBySport = useMemo(() => {
@@ -1411,8 +2034,10 @@ export function GamesPage() {
             clock: game.clock,
             startTime: game.startTime,
             channel: game.channel,
-            spread: game.spread,
-            overUnder: game.overUnder,
+            spread: game.spread ?? game.odds?.spread ?? null,
+            overUnder: game.overUnder ?? game.odds?.total ?? null,
+            mlHome: game.moneylineHome ?? game.odds?.mlHome ?? null,
+            mlAway: game.moneylineAway ?? game.odds?.mlAway ?? null,
             spread1H: game.odds?.spread1HHome ?? null,
             total1H: game.odds?.total1H ?? null,
             ml1HHome: game.odds?.moneyline1HHome ?? null,
@@ -1438,26 +2063,28 @@ export function GamesPage() {
     
     return (
       <div id="watchboard-section" className="mb-12 first:mt-0 mt-10">
-        <div className="flex items-center gap-3 mb-6 px-0.5">
-          <div className="flex items-center gap-2 text-cyan-400">
-            <Star className="w-4 h-4 fill-cyan-400" />
-            <span className="text-sm font-bold uppercase tracking-wider">Your Watchboard</span>
+        <div className={sectionShellClass}>
+          <div className={sectionHeaderClass}>
+            <div className="flex items-center gap-2 text-cyan-200">
+              <Star className="h-3.5 w-3.5" />
+              <span className="text-xs font-semibold uppercase tracking-wide">Your Watchboard</span>
+            </div>
+            <span className="rounded-full border border-cyan-300/30 bg-cyan-500/14 px-2 py-0.5 text-[10px] font-semibold text-cyan-100">
+              {watchboardGames.length}
+            </span>
           </div>
-          <span className="px-2 py-0.5 rounded-md bg-cyan-500/20 text-cyan-400 text-xs font-semibold">
-            {watchboardGames.length}
-          </span>
+          <div className="grid grid-cols-2 gap-3">
+            {displayGames.map((game) => renderCompactGameTile(game, true))}
+          </div>
+          {hasMore && (
+            <button
+              onClick={() => setShowMoreSections(prev => ({ ...prev, [sectionKey]: watchboardGames.length }))}
+              className={showMoreBtnClass}
+            >
+              Show {watchboardGames.length - showCount} More Watchboard Games
+            </button>
+          )}
         </div>
-        <div className="grid grid-cols-2 gap-3">
-          {displayGames.map((game) => renderCompactGameTile(game, true))}
-        </div>
-        {hasMore && (
-          <button
-            onClick={() => setShowMoreSections(prev => ({ ...prev, [sectionKey]: watchboardGames.length }))}
-            className="w-full mt-4 px-4 py-3 rounded-lg bg-slate-800/40 hover:bg-slate-700/50 text-slate-300 text-sm font-medium transition-colors border border-slate-700/30"
-          >
-            Show {watchboardGames.length - showCount} More Watchboard Games
-          </button>
-        )}
       </div>
     );
   };
@@ -1474,78 +2101,85 @@ export function GamesPage() {
       const groupedBySport = groupGamesBySport(sectionGames);
       return (
         <div className="mb-12 first:mt-0 mt-10" id="live-section">
-          <div className="flex items-center gap-3 mb-6 px-0.5">
-            <div className="flex items-center gap-2 text-red-400">
-              <div className="relative">
-                <div className="w-2 h-2 bg-red-500 rounded-full animate-pulse" />
-                <div className="absolute inset-0 w-2 h-2 bg-red-400 rounded-full animate-ping" />
+          <div className={sectionShellClass}>
+            <div className={sectionHeaderClass}>
+              <div className="flex items-center gap-2 text-red-300">
+                <div className="relative">
+                  <div className="w-2 h-2 bg-red-500 rounded-full animate-pulse" />
+                  <div className="absolute inset-0 w-2 h-2 bg-red-400 rounded-full animate-ping" />
+                </div>
+                <span className="text-xs font-semibold uppercase tracking-wide">Live Now</span>
               </div>
-              <span className="text-sm font-bold uppercase tracking-wider">Live Now</span>
+              <span className="rounded-full border border-red-300/30 bg-red-500/14 px-2 py-0.5 text-[10px] font-semibold text-red-100 animate-pulse">
+                {sectionGames.length}
+              </span>
             </div>
-            <span className="px-2 py-0.5 rounded-md bg-red-500/20 text-red-400 text-xs font-semibold animate-pulse">
-              {sectionGames.length}
-            </span>
-          </div>
-          {groupedBySport.map(([sport, sportGames]) => {
-            const sportInfo = DROPDOWN_SPORTS.find(s => s.key === sport);
-            const colors = SPORT_COLORS[sport] || getDefaultSportColor();
-            const sportSectionKey = `${sectionKey}-${sport}`;
-            const sportShowCount = showMoreSections[sportSectionKey] || INITIAL_SHOW;
-            const sportHasMore = sportGames.length > sportShowCount;
-            const displayGames = sportGames.slice(0, sportShowCount);
-            
-            return (
-              <div key={sport} id={`league-${sport.toLowerCase()}`} className="mb-10 last:mb-0">
-                {/* Enhanced League Section Header - Sticky */}
-                <div className={`sticky top-0 z-20 flex items-center justify-between mb-5 px-4 py-3 rounded-xl border ${colors.bg} ${colors.border} backdrop-blur-md shadow-lg`}>
-                  <div className="flex items-center gap-3">
-                    <span className="text-2xl">{sportInfo?.emoji || '🏆'}</span>
-                    <div className="flex flex-col">
-                      <span className={`font-bold ${colors.accent}`}>{sportInfo?.label || sport}</span>
-                      <span className="text-xs text-slate-500">{sportGames.length} game{sportGames.length !== 1 ? 's' : ''} live</span>
+            {groupedBySport.map(([sport, sportGames]) => {
+              const sportInfo = DROPDOWN_SPORTS.find(s => s.key === sport);
+              const sportSectionKey = `${sectionKey}-${sport}`;
+              const sportShowCount = showMoreSections[sportSectionKey] || INITIAL_SHOW;
+              const sportHasMore = sportGames.length > sportShowCount;
+              const displayGames = sportGames.slice(0, sportShowCount);
+
+              return (
+                <div key={sport} id={`league-${sport.toLowerCase()}`} className="mb-8 last:mb-0">
+                  <div className={sportGroupHeaderClass}>
+                    <div className="flex items-center gap-3">
+                      <div className="flex h-8 w-8 items-center justify-center rounded-lg border border-white/[0.08] bg-[#16202B] text-[11px] font-semibold text-slate-300">
+                        {String(sportInfo?.label || sport).slice(0, 2).toUpperCase()}
+                      </div>
+                      <div className="flex flex-col">
+                        <span className="text-sm font-semibold tracking-tight text-[#F3F4F6]">{sportInfo?.label || sport}</span>
+                        <span className="text-[11px] text-slate-400">Live</span>
+                      </div>
+                      <span className="inline-flex items-center rounded-full border border-white/[0.08] bg-white/[0.03] px-2 py-0.5 text-[10px] font-semibold text-slate-300">
+                        {sportGames.length} game{sportGames.length !== 1 ? 's' : ''}
+                      </span>
                     </div>
+                    <button
+                      onClick={() => navigate(`/sports/${sport.toLowerCase()}`)}
+                      className={sportGroupHubBtnClass}
+                    >
+                      View Hub <ChevronRight className="h-3.5 w-3.5" />
+                    </button>
                   </div>
-                  <button
-                    onClick={() => navigate(`/sports/${sport.toLowerCase()}`)}
-                    className={`text-xs font-medium px-3 py-1.5 rounded-lg ${colors.bg} ${colors.accent} hover:opacity-80 transition-opacity`}
-                  >
-                    View Hub →
-                  </button>
+                  <div className="grid grid-cols-2 gap-3">
+                    {displayGames.map((game) => renderCompactGameTile(game))}
+                  </div>
+                  {sportHasMore && (
+                    <button
+                      onClick={() => setShowMoreSections(prev => ({ ...prev, [sportSectionKey]: sportGames.length }))}
+                      className={showMoreBtnClass}
+                    >
+                      Show {sportGames.length - sportShowCount} More Live {sportInfo?.label || sport} Games
+                    </button>
+                  )}
                 </div>
-                <div className="grid grid-cols-2 gap-3">
-                  {displayGames.map((game) => renderCompactGameTile(game))}
-                </div>
-                {sportHasMore && (
-                  <button
-                    onClick={() => setShowMoreSections(prev => ({ ...prev, [sportSectionKey]: sportGames.length }))}
-                    className="w-full mt-4 px-4 py-3 rounded-lg bg-slate-800/40 hover:bg-slate-700/50 text-slate-300 text-sm font-medium transition-colors border border-slate-700/30"
-                  >
-                    Show {sportGames.length - sportShowCount} More Live {sportInfo?.label || sport} Games
-                  </button>
-                )}
-              </div>
-            );
-          })}
+              );
+            })}
+          </div>
         </div>
       );
     }
 
     return (
       <div className="mb-12 mt-10 first:mt-0" id="live-section">
-        <div className="mb-6 inline-flex items-center gap-3 rounded-xl border border-red-500/30 bg-red-500/10 px-3 py-2">
-          <div className="flex items-center gap-2 text-red-300">
-            <div className="relative">
-              <div className="w-2 h-2 bg-red-500 rounded-full animate-pulse" />
-              <div className="absolute inset-0 w-2 h-2 bg-red-400 rounded-full animate-ping" />
+        <div className={sectionShellClass}>
+          <div className={sectionHeaderClass}>
+            <div className="flex items-center gap-2 text-red-300">
+              <div className="relative">
+                <div className="w-2 h-2 bg-red-500 rounded-full animate-pulse" />
+                <div className="absolute inset-0 w-2 h-2 bg-red-400 rounded-full animate-ping" />
+              </div>
+              <span className="text-xs font-semibold uppercase tracking-wide">Live Now</span>
             </div>
-            <span className="text-sm font-bold uppercase tracking-wider">Live Now</span>
+            <span className="rounded-full border border-red-300/30 bg-red-500/14 px-2 py-0.5 text-[10px] font-semibold text-red-100 animate-pulse">
+              {sectionGames.length}
+            </span>
           </div>
-          <span className="rounded-md bg-red-500/20 px-2 py-0.5 text-xs font-semibold text-red-200 animate-pulse">
-            {sectionGames.length}
-          </span>
-        </div>
-        <div className="grid grid-cols-2 gap-3">
-          {sectionGames.map((game) => renderCompactGameTile(game))}
+          <div className="grid grid-cols-2 gap-3">
+            {sectionGames.map((game) => renderCompactGameTile(game))}
+          </div>
         </div>
       </div>
     );
@@ -1563,26 +2197,27 @@ export function GamesPage() {
     
     return (
       <div id="prime-section" className="mb-10">
-        <div className="mb-4 flex items-center gap-3">
-          <div className="flex items-center gap-2 rounded-xl border border-amber-500/30 bg-gradient-to-r from-amber-500/20 to-yellow-500/20 px-3 py-2">
-            <span className="text-amber-400 text-lg">📺</span>
-            <span className="text-sm font-bold uppercase tracking-wider text-amber-200">Prime Time</span>
+        <div className={sectionShellClass}>
+          <div className={sectionHeaderClass}>
+            <div className="flex items-center gap-2 text-amber-200">
+              <span className="text-xs font-semibold uppercase tracking-wide">Prime Time</span>
+            </div>
+            <span className="rounded-full border border-amber-300/30 bg-amber-500/14 px-2 py-0.5 text-[10px] font-semibold text-amber-100">
+              {primeTimeGames.length} on TV
+            </span>
           </div>
-          <span className="rounded-md bg-amber-500/20 px-2 py-0.5 text-xs font-semibold text-amber-200">
-            {primeTimeGames.length} on TV
-          </span>
+          <div className="grid grid-cols-2 gap-3">
+            {displayGames.map((game) => renderCompactGameTile(game))}
+          </div>
+          {hasMore && (
+            <button
+              onClick={() => setShowMoreSections(prev => ({ ...prev, [sectionKey]: primeTimeGames.length }))}
+              className={showMoreBtnClass}
+            >
+              Show {primeTimeGames.length - showCount} More Prime Time Games
+            </button>
+          )}
         </div>
-        <div className="grid grid-cols-2 gap-3">
-          {displayGames.map((game) => renderCompactGameTile(game))}
-        </div>
-        {hasMore && (
-          <button
-            onClick={() => setShowMoreSections(prev => ({ ...prev, [sectionKey]: primeTimeGames.length }))}
-            className="mt-4 w-full rounded-lg border border-slate-700/40 bg-slate-800/40 px-4 py-3 text-sm font-medium text-slate-200 transition-colors hover:bg-slate-700/55"
-          >
-            Show {primeTimeGames.length - showCount} More Prime Time Games
-          </button>
-        )}
       </div>
     );
   };
@@ -1598,26 +2233,28 @@ export function GamesPage() {
     
     return (
       <div id="coachg-section" className="mb-10">
-        <div className="mb-4 flex items-center gap-3">
-          <div className="flex items-center gap-2 rounded-xl border border-violet-500/40 bg-gradient-to-r from-violet-600/30 to-purple-500/30 px-3 py-2">
-            <Star className="w-4 h-4 text-violet-400 fill-violet-400" />
-            <span className="text-sm font-bold uppercase tracking-wider text-violet-200">Coach G Picks</span>
+        <div className={sectionShellClass}>
+          <div className={sectionHeaderClass}>
+            <div className="flex items-center gap-2 text-violet-200">
+              <Star className="h-3.5 w-3.5" />
+              <span className="text-xs font-semibold uppercase tracking-wide">Coach G Picks</span>
+            </div>
+            <span className="rounded-full border border-violet-300/30 bg-violet-500/14 px-2 py-0.5 text-[10px] font-semibold text-violet-100">
+              {coachGPicks.length} hot takes
+            </span>
           </div>
-          <span className="rounded-md bg-violet-500/20 px-2 py-0.5 text-xs font-semibold text-violet-200">
-            {coachGPicks.length} hot takes
-          </span>
+          <div className="grid grid-cols-2 gap-3">
+            {displayGames.map((game) => renderCompactGameTile(game))}
+          </div>
+          {hasMore && (
+            <button
+              onClick={() => setShowMoreSections(prev => ({ ...prev, [sectionKey]: coachGPicks.length }))}
+              className={showMoreBtnClass}
+            >
+              Show {coachGPicks.length - showCount} More Coach G Picks
+            </button>
+          )}
         </div>
-        <div className="grid grid-cols-2 gap-3">
-          {displayGames.map((game) => renderCompactGameTile(game))}
-        </div>
-        {hasMore && (
-          <button
-            onClick={() => setShowMoreSections(prev => ({ ...prev, [sectionKey]: coachGPicks.length }))}
-            className="mt-4 w-full rounded-lg border border-slate-700/40 bg-slate-800/40 px-4 py-3 text-sm font-medium text-slate-200 transition-colors hover:bg-slate-700/55"
-          >
-            Show {coachGPicks.length - showCount} More Coach G Picks
-          </button>
-        )}
       </div>
     );
   };
@@ -1635,36 +2272,41 @@ export function GamesPage() {
       const groupedBySport = groupGamesBySport(sectionGames);
       return (
         <div id={sectionId} className="mb-12 mt-10 first:mt-0">
-          <div className={cn("mb-6 inline-flex items-center gap-3 rounded-xl border border-slate-700/40 bg-slate-900/60 px-3 py-2", statusClass)}>
-            <span className="text-sm font-bold uppercase tracking-wider">{title}</span>
-            <span className="rounded-md bg-slate-800/80 px-2 py-0.5 text-xs font-semibold opacity-90">
-              {sectionGames.length}
-            </span>
-          </div>
-          {groupedBySport.map(([sport, sportGames]) => {
+          <div className={sectionShellClass}>
+            <div className={cn(sectionHeaderClass, statusClass)}>
+              <span className="text-xs font-semibold uppercase tracking-wide">{title}</span>
+              <span className="rounded-full border border-white/[0.08] bg-white/[0.03] px-2 py-0.5 text-[10px] font-semibold text-slate-300">
+                {sectionGames.length}
+              </span>
+            </div>
+            {groupedBySport.map(([sport, sportGames]) => {
             const sportInfo = DROPDOWN_SPORTS.find(s => s.key === sport);
-            const colors = SPORT_COLORS[sport] || getDefaultSportColor();
             const sportSectionKey = `${sectionKey}-${sport}`;
             const sportShowCount = showMoreSections[sportSectionKey] || INITIAL_SHOW;
             const sportHasMore = sportGames.length > sportShowCount;
             const displayGames = sportGames.slice(0, sportShowCount);
             
             return (
-              <div key={sport} id={`${sectionId}-${sport.toLowerCase()}`} className="mb-10 last:mb-0">
+              <div key={sport} id={`${sectionId}-${sport.toLowerCase()}`} className="mb-8 last:mb-0">
                 {/* Enhanced League Section Header - Sticky */}
-                <div className={`sticky top-0 z-20 flex items-center justify-between mb-5 px-4 py-3 rounded-xl border ${colors.bg} ${colors.border} backdrop-blur-md shadow-lg`}>
+                <div className={sportGroupHeaderClass}>
                   <div className="flex items-center gap-3">
-                    <span className="text-2xl">{sportInfo?.emoji || '🏆'}</span>
-                    <div className="flex flex-col">
-                      <span className={`font-bold ${colors.accent}`}>{sportInfo?.label || sport}</span>
-                      <span className="text-xs text-slate-500">{sportGames.length} game{sportGames.length !== 1 ? 's' : ''}</span>
+                    <div className="flex h-8 w-8 items-center justify-center rounded-lg border border-white/[0.08] bg-[#16202B] text-[11px] font-semibold text-slate-300">
+                      {String(sportInfo?.label || sport).slice(0, 2).toUpperCase()}
                     </div>
+                    <div className="flex flex-col">
+                      <span className="text-sm font-semibold tracking-tight text-[#F3F4F6]">{sportInfo?.label || sport}</span>
+                      <span className="text-[11px] text-slate-400">Slate</span>
+                    </div>
+                    <span className="inline-flex items-center rounded-full border border-white/[0.08] bg-white/[0.03] px-2 py-0.5 text-[10px] font-semibold text-slate-300">
+                      {sportGames.length} game{sportGames.length !== 1 ? 's' : ''}
+                    </span>
                   </div>
                   <button
                     onClick={() => navigate(`/sports/${sport.toLowerCase()}`)}
-                    className={`text-xs font-medium px-3 py-1.5 rounded-lg ${colors.bg} ${colors.accent} hover:opacity-80 transition-opacity`}
+                    className={sportGroupHubBtnClass}
                   >
-                    View Hub →
+                    View Hub <ChevronRight className="h-3.5 w-3.5" />
                   </button>
                 </div>
                 <div className="grid grid-cols-2 gap-3">
@@ -1673,14 +2315,15 @@ export function GamesPage() {
                 {sportHasMore && (
                   <button
                     onClick={() => setShowMoreSections(prev => ({ ...prev, [sportSectionKey]: sportGames.length }))}
-                    className="mt-4 w-full rounded-lg border border-slate-700/40 bg-slate-800/40 px-4 py-3 text-sm font-medium text-slate-200 transition-colors hover:bg-slate-700/55"
+                    className={showMoreBtnClass}
                   >
                     Show {sportGames.length - sportShowCount} More {sportInfo?.label || sport} Games
                   </button>
                 )}
               </div>
             );
-          })}
+            })}
+          </div>
         </div>
       );
     }
@@ -1689,29 +2332,35 @@ export function GamesPage() {
     
     return (
       <div id={sectionId} className="mb-12 mt-10 first:mt-0">
-        <div className={cn("mb-6 inline-flex items-center gap-3 rounded-xl border border-slate-700/40 bg-slate-900/60 px-3 py-2", statusClass)}>
-          <span className="text-sm font-bold uppercase tracking-wider">{title}</span>
-          <span className="rounded-md bg-slate-800/80 px-2 py-0.5 text-xs font-semibold opacity-90">
-            {sectionGames.length}
-          </span>
+        <div className={sectionShellClass}>
+          <div className={cn(sectionHeaderClass, statusClass)}>
+            <span className="text-xs font-semibold uppercase tracking-wide">{title}</span>
+            <span className="rounded-full border border-white/[0.08] bg-white/[0.03] px-2 py-0.5 text-[10px] font-semibold text-slate-300">
+              {sectionGames.length}
+            </span>
+          </div>
+          <div className="grid grid-cols-2 gap-3">
+            {displayGames.map((game) => renderCompactGameTile(game))}
+          </div>
+          {hasMore && (
+            <button
+              onClick={() => setShowMoreSections(prev => ({ ...prev, [sectionKey]: sectionGames.length }))}
+              className={showMoreBtnClass}
+            >
+              Show {sectionGames.length - showCount} More Games
+            </button>
+          )}
         </div>
-        <div className="grid grid-cols-2 gap-3">
-          {displayGames.map((game) => renderCompactGameTile(game))}
-        </div>
-        {hasMore && (
-          <button
-            onClick={() => setShowMoreSections(prev => ({ ...prev, [sectionKey]: sectionGames.length }))}
-            className="mt-4 w-full rounded-lg border border-slate-700/40 bg-slate-800/40 px-4 py-3 text-sm font-medium text-slate-200 transition-colors hover:bg-slate-700/55"
-          >
-            Show {sectionGames.length - showCount} More Games
-          </button>
-        )}
       </div>
     );
   };
 
   return (
-    <div className="min-h-screen bg-gradient-to-b from-slate-900 via-slate-850 to-slate-900">
+    <div className="relative min-h-screen overflow-hidden bg-[#080B10]">
+      <div className="pointer-events-none absolute inset-0 bg-gradient-to-b from-[#080B10] via-[#0C1118] to-[#080B10]" />
+      <div className="pointer-events-none absolute left-1/4 top-0 h-[30rem] w-[30rem] rounded-full bg-cyan-500/[0.03] blur-[120px]" />
+      <div className="pointer-events-none absolute right-1/4 top-6 h-[26rem] w-[26rem] rounded-full bg-violet-500/[0.03] blur-[120px]" />
+      <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(ellipse_at_center,rgba(12,17,24,0)_0%,#080B10_78%)]" />
       {/* Live Pulse Ticker - shows live scores scrolling */}
       <LivePulseTicker 
         games={games} 
@@ -1721,17 +2370,17 @@ export function GamesPage() {
       />
       
       {/* COMPACT COMMAND CENTER HEADER */}
-      <div className="sticky top-0 z-40 border-b border-cyan-500/20 bg-slate-950/90 backdrop-blur-xl">
+      <div className="sticky top-0 z-40 border-b border-white/[0.08] bg-[#121821]/92 backdrop-blur-xl">
         <div className="mx-auto max-w-5xl px-4">
           {/* Top Row: Title + Date + Actions */}
           <div className="flex items-center justify-between gap-3 py-3">
             {/* Title */}
             <div className="flex items-center gap-2 min-w-0">
-              <div className="flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-lg bg-gradient-to-br from-cyan-500 to-blue-600 shadow-[0_0_22px_rgba(34,211,238,0.35)]">
-                <Zap className="w-4 h-4 text-white" />
+              <div className="flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-lg border border-white/12 bg-gradient-to-b from-white/[0.07] to-white/[0.02] ring-1 ring-white/10 shadow-[inset_0_1px_0_rgba(255,255,255,0.08)]">
+                <Zap className="w-4 h-4 text-[#D1D5DB]" />
               </div>
               <div className="min-w-0">
-                <h1 className="truncate text-sm font-bold text-white">Command Center</h1>
+                <h1 className="truncate text-[15px] font-bold tracking-tight text-white">Command Center</h1>
                 <button 
                   onClick={() => setDateModalOpen(true)}
                   className="flex items-center gap-1 text-xs text-slate-400 transition-colors hover:text-cyan-300"
@@ -1749,32 +2398,32 @@ export function GamesPage() {
                 onClick={handleRefresh}
                 disabled={refreshing}
                 className={cn(
-                  "rounded-lg border border-transparent p-2 transition-all hover:border-cyan-500/25 hover:bg-slate-800/60",
+                  "h-8 w-8 rounded-full border border-white/12 bg-gradient-to-b from-white/[0.07] to-white/[0.02] p-0 text-[#D1D5DB] ring-1 ring-white/10 shadow-[inset_0_1px_0_rgba(255,255,255,0.08)] transition-all duration-200 hover:border-cyan-300/30 hover:bg-cyan-500/10 hover:text-cyan-100",
                   refreshing && "opacity-50"
                 )}
               >
-                <RefreshCw className={cn("w-4 h-4 text-slate-400", refreshing && "animate-spin")} />
+                <RefreshCw className={cn("mx-auto h-4 w-4", refreshing && "animate-spin")} />
               </button>
               
               {/* Settings */}
               <button
                 onClick={() => navigate('/settings')}
-                className="rounded-lg border border-transparent p-2 transition-all hover:border-cyan-500/25 hover:bg-slate-800/60"
+                className="h-8 w-8 rounded-full border border-white/12 bg-gradient-to-b from-white/[0.07] to-white/[0.02] p-0 text-[#D1D5DB] ring-1 ring-white/10 shadow-[inset_0_1px_0_rgba(255,255,255,0.08)] transition-all duration-200 hover:border-white/20 hover:bg-[#16202B] hover:text-[#E5E7EB]"
               >
-                <Settings className="w-4 h-4 text-slate-400" />
+                <Settings className="mx-auto h-4 w-4" />
               </button>
 
               {/* Coach G quick entry */}
               <button
                 onClick={() => navigate('/coach')}
-                className="flex items-center gap-1.5 rounded-lg border border-violet-500/25 bg-violet-500/10 px-2 py-1.5 transition-all hover:border-violet-400/40 hover:bg-violet-500/15"
+                className="flex h-8 items-center gap-1.5 rounded-full border border-white/12 bg-gradient-to-b from-white/[0.07] to-white/[0.02] px-2 text-[#D1D5DB] ring-1 ring-white/10 shadow-[inset_0_1px_0_rgba(255,255,255,0.08)] transition-all duration-200 hover:border-violet-300/30 hover:bg-violet-500/10 hover:text-violet-100"
               >
                 <img
                   src="/assets/coachg/coach-g-avatar.png?v=2"
                   alt="Coach G"
-                  className="h-5 w-5 rounded-full border border-violet-300/40 object-cover"
+                  className="h-5 w-5 rounded-full border border-violet-300/35 object-cover"
                 />
-                <span className="hidden text-[11px] font-semibold text-violet-200 sm:inline">Coach G</span>
+                <span className="hidden text-[10px] font-semibold tracking-wide sm:inline">Coach G</span>
               </button>
             </div>
           </div>
@@ -1821,8 +2470,8 @@ export function GamesPage() {
           </div>
           
           {/* Tab Strip + Status Controls */}
-          <div className="flex flex-wrap items-center gap-2 border-t border-slate-800/50 pb-3 pt-2">
-            <div className="inline-flex rounded-xl border border-slate-700/60 bg-slate-900/80 p-1">
+          <div className="flex flex-wrap items-center gap-2.5 border-t border-white/[0.05] pb-3 pt-2">
+            <div className="inline-flex items-center gap-1 overflow-hidden rounded-2xl border border-white/10 bg-[#0D1522]/70 px-1.5 py-1 backdrop-blur-sm shadow-[inset_0_1px_0_rgba(255,255,255,0.05),0_8px_18px_rgba(0,0,0,0.22)]">
             {([
               { key: 'scores', label: 'Scores' },
               { key: 'odds', label: 'Odds' },
@@ -1832,10 +2481,10 @@ export function GamesPage() {
                 key={key}
                 onClick={() => setActiveTab(key)}
                 className={cn(
-                  "rounded-lg px-3 py-1.5 text-xs font-semibold uppercase tracking-wide transition-all",
+                  "h-8 rounded-full border border-white/12 bg-gradient-to-b from-white/[0.07] to-white/[0.02] px-3 text-[11px] font-medium uppercase tracking-[0.08em] text-[#D1D5DB] ring-1 ring-white/10 shadow-[inset_0_1px_0_rgba(255,255,255,0.08)] transition-all duration-200",
                   activeTab === key
-                    ? "bg-cyan-500/20 text-cyan-200 shadow-[0_0_18px_rgba(34,211,238,0.25)]"
-                    : "text-slate-400 hover:bg-slate-800/70 hover:text-slate-200"
+                    ? "border-cyan-300/35 bg-cyan-500/14 text-cyan-100 shadow-[0_8px_18px_rgba(34,211,238,0.18)]"
+                    : "hover:border-white/20 hover:bg-[#16202B] hover:text-[#E5E7EB]"
                 )}
               >
                 {label}
@@ -1843,48 +2492,48 @@ export function GamesPage() {
             ))}
             </div>
 
-            <div className="inline-flex items-center rounded-xl border border-slate-700/60 bg-slate-900/70 p-1">
+            <div className="inline-flex items-center gap-1 overflow-hidden rounded-2xl border border-white/10 bg-[#0D1522]/70 px-1.5 py-1 backdrop-blur-sm shadow-[inset_0_1px_0_rgba(255,255,255,0.05),0_8px_18px_rgba(0,0,0,0.22)]">
               <button
                 onClick={() => setSelectedDate(addDays(selectedDate, -1))}
-                className="rounded-lg p-1.5 transition-colors hover:bg-slate-800/70"
+                className="h-8 w-8 rounded-full border border-white/12 bg-gradient-to-b from-white/[0.07] to-white/[0.02] p-0 text-[#D1D5DB] ring-1 ring-white/10 shadow-[inset_0_1px_0_rgba(255,255,255,0.08)] transition-all duration-200 hover:border-cyan-300/30 hover:bg-cyan-500/10 hover:text-cyan-100"
                 aria-label="Previous date"
               >
-                <ChevronLeft className="h-3.5 w-3.5 text-slate-300" />
+                <ChevronLeft className="mx-auto h-3.5 w-3.5" />
               </button>
               <button
                 onClick={() => setDateModalOpen(true)}
-                className="rounded-lg px-2.5 py-1 text-[11px] font-semibold text-slate-200 transition-colors hover:bg-slate-800/70 hover:text-white"
+                className="flex h-8 items-center rounded-full border border-white/12 bg-gradient-to-b from-white/[0.07] to-white/[0.02] px-2.5 text-[11px] font-medium tracking-[0.02em] text-[#D1D5DB] ring-1 ring-white/10 shadow-[inset_0_1px_0_rgba(255,255,255,0.08)] transition-all duration-200 hover:border-white/20 hover:bg-[#16202B] hover:text-[#E5E7EB]"
               >
-                {dateLabel}
+                {navDateLabel}
               </button>
               <button
                 onClick={() => setSelectedDate(new Date())}
-                className="rounded-lg px-2 py-1 text-[11px] font-semibold text-cyan-200 transition-colors hover:bg-cyan-500/10"
+                className="flex h-8 items-center rounded-full border border-cyan-300/30 bg-cyan-500/12 px-2 text-[11px] font-medium text-cyan-100 transition-all duration-200 hover:border-cyan-200/45 hover:bg-cyan-500/18"
               >
                 Today
               </button>
               <button
                 onClick={() => setSelectedDate(addDays(selectedDate, 1))}
-                className="rounded-lg p-1.5 transition-colors hover:bg-slate-800/70"
+                className="h-8 w-8 rounded-full border border-white/12 bg-gradient-to-b from-white/[0.07] to-white/[0.02] p-0 text-[#D1D5DB] ring-1 ring-white/10 shadow-[inset_0_1px_0_rgba(255,255,255,0.08)] transition-all duration-200 hover:border-emerald-300/30 hover:bg-emerald-500/10 hover:text-emerald-100"
                 aria-label="Next date"
               >
-                <ChevronRight className="h-3.5 w-3.5 text-slate-300" />
+                <ChevronRight className="mx-auto h-3.5 w-3.5" />
               </button>
             </div>
             
             {/* Status Filter */}
-            <div className="ml-auto inline-flex flex-wrap items-center gap-1 rounded-xl border border-slate-700/60 bg-slate-900/70 p-1 text-[10px] font-medium">
+            <div className="ml-auto inline-flex flex-wrap items-center gap-1 overflow-hidden rounded-2xl border border-white/10 bg-[#0D1522]/70 px-1.5 py-1 text-[10px] font-medium backdrop-blur-sm shadow-[inset_0_1px_0_rgba(255,255,255,0.05),0_8px_18px_rgba(0,0,0,0.22)]">
               {(['all', 'live', 'scheduled', 'final'] as StatusFilter[]).map((status) => {
-                const labels: Record<StatusFilter, string> = { all: 'All', live: '🔴 Live', scheduled: 'Soon', final: 'Final' };
+                const labels: Record<StatusFilter, string> = { all: 'All', live: 'Live', scheduled: 'Soon', final: 'Final' };
                 return (
                   <button
                     key={status}
                     onClick={() => setStatusFilter(status)}
                     className={cn(
-                      "rounded-lg px-2 py-1 transition-all",
+                      "h-8 rounded-full border border-white/12 bg-gradient-to-b from-white/[0.07] to-white/[0.02] px-2.5 tracking-[0.06em] text-[#D1D5DB] ring-1 ring-white/10 shadow-[inset_0_1px_0_rgba(255,255,255,0.08)] transition-all duration-200",
                       statusFilter === status
-                        ? "bg-cyan-500/20 text-cyan-200"
-                        : "text-slate-400 hover:bg-slate-800/70 hover:text-slate-200"
+                        ? "border-cyan-300/35 bg-cyan-500/14 text-cyan-100 shadow-[0_8px_18px_rgba(34,211,238,0.18)]"
+                        : "hover:border-white/20 hover:bg-[#16202B] hover:text-[#E5E7EB]"
                     )}
                   >
                     {labels[status]}
@@ -1900,10 +2549,29 @@ export function GamesPage() {
       </div>
 
       {/* THIN DIVIDER */}
-      <div className="h-px w-full bg-gradient-to-r from-transparent via-cyan-500/30 to-transparent" />
+      <div className="h-px w-full bg-gradient-to-r from-transparent via-cyan-400/25 to-transparent" />
 
-      <div className="mx-auto max-w-5xl px-4 pb-8 pt-5">
+      <div className="relative z-10 mx-auto max-w-5xl px-4 pb-8 pt-5">
         {/* SCORES TAB CONTENT */}
+        {staleNotice && (
+          <div className="mb-4 rounded-xl border border-cyan-500/30 bg-cyan-500/10 px-3 py-2">
+            <p className="text-[11px] text-cyan-200">{staleNotice}</p>
+          </div>
+        )}
+        {showDebugTelemetry && (
+          <div className="mb-4">
+            <OddsTelemetryDebugPanel
+              pageKey="games"
+              gamesCount={games.length}
+              oddsCoverageCount={realOddsGameCount}
+              staleNotice={staleNotice}
+              isHydrating={loading || refreshing || oddsHydrating}
+              cycleToken={refreshCycleCount}
+              lowCoverageThresholdPct={debugCoverageThresholdPct}
+            />
+          </div>
+        )}
+
         {activeTab === 'scores' && (
           <>
             {/* Loading - only on very first load when no games exist */}
@@ -1943,10 +2611,10 @@ export function GamesPage() {
             )}
 
             {/* Empty - No games for date - show helpful message */}
-            {!loading && !error && games.length === 0 && (
+            {!loading && !error && games.length === 0 && rawGames.length === 0 && (
               <div className="flex flex-col items-center justify-center rounded-2xl border border-slate-700/30 bg-[#121821] px-6 py-20 text-center">
-                <div className="mb-5 flex h-16 w-16 items-center justify-center rounded-2xl border border-slate-700/30 bg-slate-800/50">
-                  <span className="text-4xl opacity-60">{sportConfig?.emoji || '🏆'}</span>
+                <div className="mb-5 flex h-16 w-16 items-center justify-center rounded-2xl border border-slate-700/30 bg-slate-800/50 text-sm font-semibold tracking-wide text-slate-300">
+                  {String(sportConfig?.label || selectedSport || "ALL").slice(0, 3).toUpperCase()}
                 </div>
                 <p className="mb-2 text-base font-semibold text-slate-100">
                   No {selectedSport === 'ALL' ? '' : (sportConfig?.label || selectedSport) + ' '}games {dateLabel.toLowerCase()}
@@ -2038,8 +2706,10 @@ export function GamesPage() {
                                     clock: game.clock,
                                     startTime: game.startTime,
                                     channel: game.channel,
-                                    spread: game.spread,
-                                    overUnder: game.overUnder,
+                                    spread: game.spread ?? game.odds?.spread ?? null,
+                                    overUnder: game.overUnder ?? game.odds?.total ?? null,
+                                    mlHome: game.moneylineHome ?? game.odds?.mlHome ?? null,
+                                    mlAway: game.moneylineAway ?? game.odds?.mlAway ?? null,
                                     spread1H: game.odds?.spread1HHome ?? null,
                                     total1H: game.odds?.total1H ?? null,
                                     ml1HHome: game.odds?.moneyline1HHome ?? null,
@@ -2121,7 +2791,7 @@ export function GamesPage() {
         {/* ODDS TAB CONTENT - Sports Betting Intelligence Terminal */}
         {activeTab === 'odds' && (
           <div className="space-y-4 py-2">
-            {loading ? (
+            {((loading || oddsHydrating) && games.length === 0) ? (
               <div className="rounded-2xl border border-amber-500/20 bg-[#121821] p-6 md:p-8">
                 <div className="mb-4 flex items-center gap-2 text-amber-200">
                   <RefreshCw className="h-4 w-4 animate-spin" />

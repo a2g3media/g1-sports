@@ -44,9 +44,9 @@ export function CreateAlertModal({
   sport,
   gameSummary,
 }: CreateAlertModalProps) {
-  const { user } = useDemoAuth();
+  const { user, isDemoMode } = useDemoAuth();
   const { isFollowing, toggle, loading } = useFollow(
-    "PROD",
+    isDemoMode ? "DEMO" : "PROD",
     "GAME",
     gameId,
     sport

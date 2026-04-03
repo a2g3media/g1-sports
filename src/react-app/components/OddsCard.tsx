@@ -33,15 +33,22 @@ export interface OddsCardGame {
   moneylineAway?: number;
   odds?: {
     spread?: number;
+    spreadHome?: number;
     spreadOpen?: number;
     total?: number;
+    overUnder?: number;
     totalOpen?: number;
     mlHome?: number;
+    homeML?: number;
     mlAway?: number;
+    awayML?: number;
     spread1H?: number;
+    spread1HHome?: number;
     total1H?: number;
     ml1HHome?: number;
+    moneyline1HHome?: number;
     ml1HAway?: number;
+    moneyline1HAway?: number;
   };
 }
 
@@ -59,6 +66,8 @@ export function OddsCard({ game, isInWatchboard, onAlertClick, onWatchboardClick
   // Extract team info
   const awayCode = typeof game.awayTeam === 'object' ? game.awayTeam.abbr : game.awayTeam;
   const homeCode = typeof game.homeTeam === 'object' ? game.homeTeam.abbr : game.homeTeam;
+  const awayName = typeof game.awayTeam === 'object' ? (game.awayTeam.name || game.awayTeam.abbr) : game.awayTeam;
+  const homeName = typeof game.homeTeam === 'object' ? (game.homeTeam.name || game.homeTeam.abbr) : game.homeTeam;
   const awayLogo = getTeamOrCountryLogoUrl(awayCode, game.sport, game.league);
   const homeLogo = getTeamOrCountryLogoUrl(homeCode, game.sport, game.league);
   
@@ -68,17 +77,21 @@ export function OddsCard({ game, isInWatchboard, onAlertClick, onWatchboardClick
   const isFinal = statusLower === 'final' || statusLower === 'completed' || statusLower === 'closed';
   
   // Odds values
-  const spread = game.odds?.spread ?? game.spread;
-  const spreadOpen = game.odds?.spreadOpen ?? game.spreadOpen;
-  const total = game.odds?.total ?? game.overUnder;
-  const totalOpen = game.odds?.totalOpen ?? game.overUnderOpen;
-  const mlAway = game.odds?.mlAway ?? game.moneylineAway;
-  const mlHome = game.odds?.mlHome ?? game.moneylineHome;
-  const spread1H = game.odds?.spread1H;
-  const total1H = game.odds?.total1H;
-  const ml1HAway = game.odds?.ml1HAway;
-  const ml1HHome = game.odds?.ml1HHome;
-  const hasAny1H = spread1H !== undefined || total1H !== undefined || ml1HAway !== undefined || ml1HHome !== undefined;
+  const numOrUndefined = (value: unknown): number | undefined => {
+    const n = Number(value);
+    return Number.isFinite(n) ? n : undefined;
+  };
+  const spread = numOrUndefined(game.odds?.spread ?? game.odds?.spreadHome ?? game.spread);
+  const spreadOpen = numOrUndefined(game.odds?.spreadOpen ?? game.spreadOpen);
+  const total = numOrUndefined(game.odds?.total ?? game.odds?.overUnder ?? game.overUnder);
+  const totalOpen = numOrUndefined(game.odds?.totalOpen ?? game.overUnderOpen);
+  const mlAway = numOrUndefined(game.odds?.mlAway ?? game.odds?.awayML ?? game.moneylineAway);
+  const mlHome = numOrUndefined(game.odds?.mlHome ?? game.odds?.homeML ?? game.moneylineHome);
+  const spread1H = numOrUndefined(game.odds?.spread1H ?? game.odds?.spread1HHome);
+  const total1H = numOrUndefined(game.odds?.total1H);
+  const ml1HAway = numOrUndefined(game.odds?.ml1HAway ?? game.odds?.moneyline1HAway);
+  const ml1HHome = numOrUndefined(game.odds?.ml1HHome ?? game.odds?.moneyline1HHome);
+  const hasAny1H = spread1H != null || total1H != null || ml1HAway != null || ml1HHome != null;
   const periodLabels = getMarketPeriodLabels(game.sport);
   
   // Movement detection (compare current to opening)
@@ -86,11 +99,27 @@ export function OddsCard({ game, isInWatchboard, onAlertClick, onWatchboardClick
   const spreadMovedUp = spreadMoved && spread! < spreadOpen!; // Line moved toward favorite
   const totalMoved = total !== undefined && totalOpen !== undefined && total !== totalOpen;
   const totalMovedUp = totalMoved && total! > totalOpen!;
+  const hasScores = game.homeScore != null && game.awayScore != null;
+  const awayWinning = hasScores && (game.awayScore ?? 0) > (game.homeScore ?? 0);
+  const homeWinning = hasScores && (game.homeScore ?? 0) > (game.awayScore ?? 0);
   
   // Format time
   const gameTime = game.startTime 
     ? new Date(game.startTime).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' }) 
     : '';
+
+  const formatSpread = (value: number | undefined): string => {
+    if (value == null) return "—";
+    const snapped = Math.round(value * 2) / 2;
+    if (Object.is(snapped, -0) || snapped === 0) return "PK";
+    return snapped > 0 ? `+${snapped}` : `${snapped}`;
+  };
+
+  const formatMoneyline = (value: number | undefined): string => {
+    if (value == null) return "—";
+    const rounded = Math.round(value);
+    return rounded > 0 ? `+${rounded}` : `${rounded}`;
+  };
   
   const handleClick = () => {
     const gameId = game.gameId || game.id;
@@ -107,16 +136,19 @@ export function OddsCard({ game, isInWatchboard, onAlertClick, onWatchboardClick
     <div
       onClick={handleClick}
       className={cn(
-        "relative bg-slate-900/80 rounded-xl border transition-all cursor-pointer overflow-hidden group",
-        isLive 
-          ? "border-red-500/40 shadow-lg shadow-red-500/10" 
-          : "border-slate-700/50 hover:border-slate-600/60",
-        "hover:bg-slate-800/90 active:scale-[0.98]"
+        "relative w-full overflow-hidden rounded-[14px] border text-left transition-all duration-200 cursor-pointer group",
+        "min-h-[136px] border-white/[0.06] bg-[#121821] shadow-[0_12px_26px_rgba(0,0,0,0.32)]",
+        "hover:-translate-y-0.5 hover:border-cyan-400/25 hover:bg-[#16202B] hover:shadow-[0_18px_34px_rgba(0,0,0,0.36)] active:scale-[0.99]",
+        isLive && "ring-1 ring-red-500/30",
+        isInWatchboard && "ring-1 ring-cyan-400/35"
       )}
     >
+      <div className="pointer-events-none absolute inset-0 bg-gradient-to-b from-white/[0.02] to-transparent" />
+      <div className="pointer-events-none absolute inset-x-0 top-0 h-px bg-white/15" />
+      <div className="pointer-events-none absolute left-0 top-0 h-full w-[2px] bg-cyan-400/24" />
       {/* Live indicator glow */}
       {isLive && (
-        <div className="absolute inset-0 bg-gradient-to-b from-red-500/5 to-transparent pointer-events-none" />
+        <div className="pointer-events-none absolute inset-0 bg-gradient-to-br from-red-500/10 via-transparent to-transparent" />
       )}
       
       {/* Watchboard indicator */}
@@ -126,22 +158,24 @@ export function OddsCard({ game, isInWatchboard, onAlertClick, onWatchboardClick
         </div>
       )}
       
-      <div className="p-3">
+      <div className="relative z-10 p-3.5">
         {/* Header: Status + Actions */}
         <div className="flex items-center justify-between mb-2.5">
           <div className="flex items-center gap-2">
             {/* Status Badge */}
             {isLive ? (
-              <span className="flex items-center gap-1 px-1.5 py-0.5 rounded bg-red-500/20 text-red-400">
+              <span className="inline-flex items-center gap-1.5 rounded-full border border-red-400/35 bg-red-500/10 px-2.5 py-0.5">
                 <span className="w-1.5 h-1.5 rounded-full bg-red-500 animate-pulse" />
-                <span className="text-[10px] font-bold uppercase">Live</span>
+                <span className="text-[11px] font-semibold uppercase tracking-[0.08em] text-red-300">Live</span>
               </span>
             ) : isFinal ? (
-              <span className="px-1.5 py-0.5 rounded bg-slate-700/50 text-slate-500 text-[10px] font-bold uppercase">
+              <span className="inline-flex rounded-full border border-white/[0.12] bg-white/[0.04] px-2.5 py-0.5 text-[11px] font-semibold uppercase tracking-[0.08em] text-slate-300">
                 Final
               </span>
             ) : (
-              <span className="text-[11px] text-slate-400 font-medium">{gameTime}</span>
+              <span className="inline-flex rounded-full border border-cyan-400/25 bg-cyan-500/10 px-2.5 py-0.5 text-[11px] font-semibold tracking-[0.06em] text-cyan-200">
+                {gameTime}
+              </span>
             )}
             
             {/* Period/Clock for live */}
@@ -167,39 +201,55 @@ export function OddsCard({ game, isInWatchboard, onAlertClick, onWatchboardClick
           </div>
         </div>
         
-        {/* Matchup: Away @ Home with logos */}
+        {/* Matchup rows */}
         <div className="space-y-1.5 mb-3">
           {/* Away */}
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2.5 rounded-[10px] border border-white/[0.05] bg-gradient-to-r from-[#141C26] to-[#121821] px-3 py-2">
             <img 
               src={awayLogo ?? undefined} 
               alt="" 
-              className="w-5 h-5 object-contain"
+              className="h-[26px] w-[26px] object-contain"
               onError={(e) => { e.currentTarget.style.opacity = '0'; }}
             />
-            <span className="flex-1 text-xs font-semibold text-slate-200 truncate">{awayCode}</span>
-            {(isLive || isFinal) && (
+            <div className="min-w-0 flex-1">
+              <div className={cn(
+                "truncate text-xs font-semibold",
+                isFinal && awayWinning ? "text-white" : "text-slate-200"
+              )}>
+                {awayCode}
+              </div>
+              <div className="truncate text-[10px] tracking-[0.01em] text-slate-500">{awayName}</div>
+            </div>
+            {hasScores && (isLive || isFinal) && (
               <span className={cn(
-                "text-sm font-bold tabular-nums",
-                isFinal && (game.awayScore ?? 0) > (game.homeScore ?? 0) ? "text-emerald-400" : "text-slate-400"
+                "min-w-[24px] text-right text-sm font-bold tabular-nums",
+                isFinal && awayWinning ? "text-white" : isLive && awayWinning ? "text-emerald-400" : "text-slate-400"
               )}>
                 {game.awayScore ?? 0}
               </span>
             )}
           </div>
           {/* Home */}
-          <div className="flex items-center gap-2">
+          <div className="mt-1 flex items-center gap-2.5 rounded-[10px] border border-white/[0.05] bg-gradient-to-r from-[#17212D] to-[#121821] px-3 py-2">
             <img 
               src={homeLogo ?? undefined} 
               alt="" 
-              className="w-5 h-5 object-contain"
+              className="h-[26px] w-[26px] object-contain"
               onError={(e) => { e.currentTarget.style.opacity = '0'; }}
             />
-            <span className="flex-1 text-xs font-semibold text-slate-200 truncate">{homeCode}</span>
-            {(isLive || isFinal) && (
+            <div className="min-w-0 flex-1">
+              <div className={cn(
+                "truncate text-xs font-semibold",
+                isFinal && homeWinning ? "text-white" : "text-slate-200"
+              )}>
+                {homeCode}
+              </div>
+              <div className="truncate text-[10px] tracking-[0.01em] text-slate-500">{homeName}</div>
+            </div>
+            {hasScores && (isLive || isFinal) && (
               <span className={cn(
-                "text-sm font-bold tabular-nums",
-                isFinal && (game.homeScore ?? 0) > (game.awayScore ?? 0) ? "text-emerald-400" : "text-slate-400"
+                "min-w-[24px] text-right text-sm font-bold tabular-nums",
+                isFinal && homeWinning ? "text-white" : isLive && homeWinning ? "text-emerald-400" : "text-slate-400"
               )}>
                 {game.homeScore ?? 0}
               </span>
@@ -207,90 +257,61 @@ export function OddsCard({ game, isInWatchboard, onAlertClick, onWatchboardClick
           </div>
         </div>
         
-        {/* Markets: Spread, Total, Moneyline */}
-        <div className="space-y-1.5">
-          {/* Spread */}
-          <div className="flex items-center justify-between">
-            <span className="text-[10px] text-slate-500 font-medium uppercase">Spread</span>
-            <div className="flex items-center gap-1">
-              {spread !== undefined ? (
-                <>
-                  <span className="text-xs font-bold text-cyan-300 tabular-nums">
-                    {homeCode} {spread > 0 ? `+${spread}` : spread}
-                  </span>
-                  {spreadMoved && (
-                    spreadMovedUp 
-                      ? <TrendingUp className="w-3 h-3 text-emerald-400" />
-                      : <TrendingDown className="w-3 h-3 text-red-400" />
-                  )}
-                </>
-              ) : (
-                <span className="text-[10px] text-slate-600">—</span>
-              )}
-            </div>
-          </div>
-          
-          {/* Total */}
-          <div className="flex items-center justify-between">
-            <span className="text-[10px] text-slate-500 font-medium uppercase">Total</span>
-            <div className="flex items-center gap-1">
-              {total !== undefined ? (
-                <>
-                  <span className="text-xs font-bold text-amber-300 tabular-nums">{total}</span>
-                  {totalMoved && (
-                    totalMovedUp 
-                      ? <TrendingUp className="w-3 h-3 text-emerald-400" />
-                      : <TrendingDown className="w-3 h-3 text-red-400" />
-                  )}
-                </>
-              ) : (
-                <span className="text-[10px] text-slate-600">—</span>
-              )}
-            </div>
-          </div>
-          
-          {/* Moneyline - both teams */}
-          <div className="flex items-center justify-between">
-            <span className="text-[10px] text-slate-500 font-medium uppercase">ML</span>
-            {mlAway || mlHome ? (
-              <div className="flex items-center gap-2 text-xs font-bold tabular-nums">
-                <span className={cn(
-                  mlAway && mlAway < 0 ? "text-emerald-300" : "text-slate-400"
-                )}>
-                  {mlAway ? (mlAway > 0 ? `+${mlAway}` : mlAway) : '—'}
-                </span>
-                <span className="text-slate-600">/</span>
-                <span className={cn(
-                  mlHome && mlHome < 0 ? "text-emerald-300" : "text-slate-400"
-                )}>
-                  {mlHome ? (mlHome > 0 ? `+${mlHome}` : mlHome) : '—'}
-                </span>
+        {/* Markets: stat block parity */}
+        <div className="mt-2.5 border-t border-white/[0.06] pt-2.5">
+          <div className="grid grid-cols-3 gap-2">
+            <div className="rounded-[10px] border border-white/[0.05] bg-[#0F141B] px-2 py-1.5 text-center">
+              <div className="text-[10px] uppercase tracking-wide text-slate-500">Spread</div>
+              <div className="mt-0.5 text-[12px] font-mono font-semibold text-cyan-300">
+                {`${homeCode} ${formatSpread(spread)}`}
               </div>
-            ) : (
-              <span className="text-[10px] text-slate-600">—</span>
-            )}
+              {spreadMoved && (
+                <div className="mt-0.5 inline-flex items-center gap-1 text-[9px] text-slate-400">
+                  {spreadMovedUp ? <TrendingUp className="h-2.5 w-2.5 text-emerald-400" /> : <TrendingDown className="h-2.5 w-2.5 text-red-400" />}
+                  <span>{formatSpread(spreadOpen)} {"->"} {formatSpread(spread)}</span>
+                </div>
+              )}
+            </div>
+            <div className="rounded-[10px] border border-white/[0.05] bg-[#0F141B] px-2 py-1.5 text-center">
+              <div className="text-[10px] uppercase tracking-wide text-slate-500">Total</div>
+              <div className="mt-0.5 text-[12px] font-mono font-semibold text-emerald-300">
+                {total != null ? total : "—"}
+              </div>
+              {totalMoved && (
+                <div className="mt-0.5 inline-flex items-center gap-1 text-[9px] text-slate-400">
+                  {totalMovedUp ? <TrendingUp className="h-2.5 w-2.5 text-emerald-400" /> : <TrendingDown className="h-2.5 w-2.5 text-red-400" />}
+                  <span>{totalOpen ?? "—"} {"->"} {total ?? "—"}</span>
+                </div>
+              )}
+            </div>
+            <div className="rounded-[10px] border border-white/[0.05] bg-[#0F141B] px-2 py-1.5 text-center">
+              <div className="text-[10px] uppercase tracking-wide text-slate-500">Moneyline</div>
+              <div className="mt-0.5 text-[11px] font-mono font-semibold text-amber-300">
+                {`${formatMoneyline(mlAway)} / ${formatMoneyline(mlHome)}`}
+              </div>
+            </div>
           </div>
         </div>
 
         {/* Sport-specific derivative lines */}
-        <div className="mt-2 rounded-lg border border-violet-500/20 bg-violet-500/5 px-2 py-1.5">
-          <div className="mb-1 text-[9px] uppercase tracking-wider text-violet-300/80">{periodLabels.lines}</div>
-          <div className="grid grid-cols-3 gap-1 text-[10px]">
-            <div className="text-center">
+        <div className="mt-1.5 flex items-center justify-between rounded-[10px] border border-violet-400/25 bg-violet-500/10 px-2 py-1.5">
+          <div className="text-[9px] uppercase tracking-wide text-violet-200/90">{periodLabels.short}</div>
+          <div className="grid grid-cols-3 gap-2 text-[10px]">
+            <div className="text-center min-w-[58px]">
               <div className="text-slate-500">Spread</div>
-              <div className="font-semibold text-violet-200">
-                {spread1H !== undefined ? `${homeCode} ${spread1H > 0 ? `+${spread1H}` : spread1H}` : "—"}
+              <div className="font-semibold text-violet-100">
+                {spread1H != null ? `${homeCode} ${formatSpread(spread1H)}` : "—"}
               </div>
             </div>
-            <div className="text-center">
+            <div className="text-center min-w-[40px]">
               <div className="text-slate-500">Total</div>
-              <div className="font-semibold text-violet-200">{total1H !== undefined ? total1H : "—"}</div>
+              <div className="font-semibold text-violet-100">{total1H != null ? total1H : "—"}</div>
             </div>
-            <div className="text-center">
+            <div className="text-center min-w-[84px]">
               <div className="text-slate-500">ML</div>
-              <div className="font-semibold text-violet-200">
+              <div className="font-semibold text-violet-100">
                 {hasAny1H
-                  ? `${ml1HAway != null ? (ml1HAway > 0 ? `+${ml1HAway}` : ml1HAway) : "—"} / ${ml1HHome != null ? (ml1HHome > 0 ? `+${ml1HHome}` : ml1HHome) : "—"}`
+                  ? `${formatMoneyline(ml1HAway)} / ${formatMoneyline(ml1HHome)}`
                   : "—"}
               </div>
             </div>

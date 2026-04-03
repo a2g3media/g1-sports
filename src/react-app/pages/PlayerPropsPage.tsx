@@ -20,6 +20,9 @@ import { useWatchboards } from "@/react-app/hooks/useWatchboards";
 import { AddPropToWatchboardModal } from "@/react-app/components/AddPropToWatchboardModal";
 import { PlayerPhoto } from "@/react-app/components/PlayerPhoto";
 import { useFavoriteSports } from "@/react-app/components/FavoriteSportsSelector";
+import { fetchJsonCached, getFetchCacheStats } from "@/react-app/lib/fetchCache";
+import { getRouteCache, setRouteCache } from "@/react-app/lib/routeDataCache";
+import { incrementPerfCounter, logPerfSnapshot, startPerfTimer } from "@/react-app/lib/perfTelemetry";
 
 // ============================================
 // TYPES
@@ -49,6 +52,18 @@ interface GroupedProp {
   team: string;
   sport: string;
   props: PlayerProp[];
+}
+
+interface PropIntelSnapshot {
+  l5Pct: number | null;
+  l5Hits: number;
+  l5Total: number;
+  seasonPct: number | null;
+  seasonHits: number;
+  seasonTotal: number;
+  h2hPct: number | null;
+  h2hWins: number;
+  h2hTotal: number;
 }
 
 // ============================================
@@ -148,6 +163,37 @@ function normalizeFollowedPlayerKey(name: string): string {
   return normalizePlayerName(name).toLowerCase().replace(/\s+/g, ' ').trim();
 }
 
+function normalizeToken(value: string): string {
+  return String(value || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+function normalizePlayerToken(name: string): string {
+  const normalized = normalizePlayerName(name)
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[.,'’`-]/g, " ")
+    .replace(/\b(jr|sr|ii|iii|iv|v)\b/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  return normalized;
+}
+
+function getStatKeysForPropType(propType: string): string[] {
+  const t = String(propType || '').toLowerCase();
+  if (t.includes('point') && !t.includes('three')) return ['PTS', 'Points'];
+  if (t.includes('rebound') || t === 'reb') return ['REB', 'Rebounds', 'TRB'];
+  if (t.includes('assist') || t === 'ast') return ['AST', 'Assists'];
+  if (t.includes('steal')) return ['STL', 'Steals'];
+  if (t.includes('block')) return ['BLK', 'Blocks'];
+  if (t.includes('three') || t.includes('3pt') || t.includes('3pm')) return ['3PM', '3PT', 'FG3M'];
+  if (t === 'pra' || t.includes('pts_reb_ast')) return ['PRA'];
+  if (t === 'pr' || t.includes('pts_reb')) return ['PR'];
+  if (t === 'pa' || t.includes('pts_ast')) return ['PA'];
+  if (t === 'ra' || t.includes('reb_ast')) return ['RA'];
+  return [];
+}
+
 const FOLLOWED_PLAYERS_LOCAL_KEY = 'gz_followed_players';
 
 function getTeamColor(team: string): string {
@@ -245,13 +291,15 @@ function PlayerPropCard({
   onQuickAdd,
   onChooseBoard,
   isFollowed,
-  onToggleFollow
+  onToggleFollow,
+  intel
 }: { 
   group: GroupedProp;
   onQuickAdd?: (prop: PlayerProp) => void;
   onChooseBoard?: (prop: PlayerProp) => void;
   isFollowed?: boolean;
   onToggleFollow?: (playerName: string) => void;
+  intel?: PropIntelSnapshot | null;
 }) {
   const navigate = useNavigate();
   const [expanded, setExpanded] = useState(false);
@@ -437,6 +485,35 @@ function PlayerPropCard({
                 )}
               </div>
             </div>
+
+            {(intel?.l5Pct != null || intel?.seasonPct != null || intel?.h2hPct != null) && (
+              <div className="mt-2 flex items-center gap-1.5 text-[10px]">
+                {intel?.l5Pct != null && (
+                  <span
+                    title={`Last 5: ${intel.l5Hits}/${intel.l5Total} overs`}
+                    className="px-1.5 py-0.5 rounded bg-white/[0.06] text-white/70 border border-white/[0.08]"
+                  >
+                    L5 {intel.l5Pct}% {intel.l5Total > 0 ? `(${intel.l5Hits}/${intel.l5Total})` : ''}
+                  </span>
+                )}
+                {intel?.seasonPct != null && (
+                  <span
+                    title={`Season sample: ${intel.seasonHits}/${intel.seasonTotal} overs`}
+                    className="px-1.5 py-0.5 rounded bg-white/[0.06] text-white/70 border border-white/[0.08]"
+                  >
+                    SZN {intel.seasonPct}% {intel.seasonTotal > 0 ? `(${intel.seasonHits}/${intel.seasonTotal})` : ''}
+                  </span>
+                )}
+                {intel?.h2hPct != null && (
+                  <span
+                    title={`Team H2H: ${intel.h2hWins}/${intel.h2hTotal} wins`}
+                    className="px-1.5 py-0.5 rounded bg-blue-500/15 text-blue-300 border border-blue-500/25"
+                  >
+                    H2H {intel.h2hPct}% {intel.h2hTotal > 0 ? `(${intel.h2hWins}/${intel.h2hTotal})` : ''}
+                  </span>
+                )}
+              </div>
+            )}
           </div>
         </div>
         
@@ -816,6 +893,12 @@ export function PlayerPropsPage() {
   const [selectedPropForModal, setSelectedPropForModal] = useState<PlayerProp | null>(null);
   const [toast, setToast] = useState<{ message: string; type: 'success' | 'error' } | null>(null);
   const [localFollowedPlayers, setLocalFollowedPlayers] = useState<string[]>([]);
+  const [playerLogsByToken, setPlayerLogsByToken] = useState<Record<string, Array<{ stats: Record<string, string | number> }>>>({});
+  const [h2hByMatchupKey, setH2hByMatchupKey] = useState<Record<string, { sampleSize: number; teamAWins: number; teamBWins: number }>>({});
+  const propsRef = useRef<PlayerProp[]>([]);
+  const propsFetchSeqRef = useRef(0);
+  const propsAbortRef = useRef<AbortController | null>(null);
+  const autoRecoveredEmptySportRef = useRef(false);
 
   useEffect(() => {
     try {
@@ -830,6 +913,47 @@ export function PlayerPropsPage() {
     }
   }, []);
 
+  useEffect(() => {
+    propsRef.current = props;
+  }, [props]);
+
+  const statFromGame = useCallback((game: { stats?: Record<string, string | number> }, propType: string): number | null => {
+    const keys = getStatKeysForPropType(propType);
+    if (keys.length === 0) return null;
+    const numFor = (candidate: string): number | null => {
+      const raw = game?.stats?.[candidate];
+      const n = Number(raw);
+      return Number.isFinite(n) ? n : null;
+    };
+    if (keys.includes('PRA') || keys.includes('PR') || keys.includes('PA') || keys.includes('RA')) {
+      const pts = numFor('PTS') ?? numFor('Points') ?? 0;
+      const reb = numFor('REB') ?? numFor('Rebounds') ?? numFor('TRB') ?? 0;
+      const ast = numFor('AST') ?? numFor('Assists') ?? 0;
+      if (keys.includes('PRA')) return pts + reb + ast;
+      if (keys.includes('PR')) return pts + reb;
+      if (keys.includes('PA')) return pts + ast;
+      if (keys.includes('RA')) return reb + ast;
+    }
+    for (const key of keys) {
+      const value = numFor(key);
+      if (value !== null) return value;
+    }
+    return null;
+  }, []);
+
+  useEffect(() => {
+    const cacheKey = `route:props:${selectedSport}`;
+    const cached = getRouteCache<PlayerProp[]>(cacheKey, 45000);
+    if (!cached || cached.length === 0) return;
+    setProps((prev) => (prev.length > 0 ? prev : cached));
+    setLoading(false);
+  }, [selectedSport]);
+
+  useEffect(() => {
+    if (!selectedSport || props.length === 0) return;
+    setRouteCache(`route:props:${selectedSport}`, props, 90000);
+  }, [selectedSport, props]);
+
   // Pick an initial fast-path sport from favorites when available.
   useEffect(() => {
     if (favoriteSports.length === 0) return;
@@ -842,14 +966,25 @@ export function PlayerPropsPage() {
 
   const fetchPropsPage = useCallback(async (reset: boolean) => {
     if (capabilitiesLoading) return;
+    const stopPerf = startPerfTimer(reset ? 'props.fetch.reset' : 'props.fetch.more');
     if (!hasProps) {
       setLoading(false);
       return;
     }
+    if (!reset && loadingMore) return;
+
+    const requestId = ++propsFetchSeqRef.current;
+    if (reset) {
+      propsAbortRef.current?.abort();
+      propsAbortRef.current = new AbortController();
+    }
+    const controller = reset ? propsAbortRef.current : new AbortController();
+    const timer = setTimeout(() => controller?.abort(), 20000);
 
     if (reset) {
-      setLoading(true);
-      setError(null);
+      // Keep currently visible props on screen while refreshing.
+      setLoading(propsRef.current.length === 0);
+      if (propsRef.current.length === 0) setError(null);
     } else {
       setLoadingMore(true);
     }
@@ -863,22 +998,65 @@ export function PlayerPropsPage() {
         offset: String(offset),
       });
       const url = `/api/sports-data/props/today?${qs.toString()}`;
-      const res = await fetch(url, { credentials: 'include' });
-      if (!res.ok) {
-        if (res.status === 404) {
-          if (reset) setProps([]);
-          setHasMore(false);
-          setNextOffset(0);
-          return;
-        }
-        throw new Error('Failed to fetch props');
-      }
+      const data = await fetchJsonCached<any>(url, {
+        cacheKey: `props:${selectedSport}:${offset}:${limit}`,
+        ttlMs: 6000,
+        timeoutMs: 20000,
+        init: { credentials: 'include', signal: controller?.signal },
+      });
+      if (requestId !== propsFetchSeqRef.current) return;
 
-      const data = await res.json();
-      const incoming = Array.isArray(data?.props) ? data.props : [];
-      const incomingErrors = Array.isArray(data?.errors)
+      let incoming = Array.isArray(data?.props) ? data.props : [];
+      let incomingErrors = Array.isArray(data?.errors)
         ? data.errors.filter((msg: unknown): msg is string => typeof msg === 'string')
         : [];
+
+      // Guardrail: if a specific sport returns empty, auto-fallback to ALL once.
+      // This prevents a blank page when user lands on an off-season sport.
+      if (
+        reset &&
+        selectedSport !== 'ALL' &&
+        incoming.length === 0 &&
+        !autoRecoveredEmptySportRef.current
+      ) {
+        try {
+          const fallbackSports = ['NBA', 'ALL'].filter((s) => s !== selectedSport);
+          for (const fallbackSport of fallbackSports) {
+            const fallbackLimit = fallbackSport === 'ALL' ? 1200 : 3000;
+            const fallbackUrl = `/api/sports-data/props/today?sport=${encodeURIComponent(fallbackSport)}&limit=${fallbackLimit}&offset=0&fresh=1`;
+            const fallbackData = await fetchJsonCached<any>(fallbackUrl, {
+              cacheKey: `props:${fallbackSport}:0:${fallbackLimit}:fresh`,
+              ttlMs: 3000,
+              timeoutMs: 15000,
+              init: { credentials: 'include' },
+            });
+            const fallbackIncoming = Array.isArray(fallbackData?.props) ? fallbackData.props : [];
+            if (fallbackIncoming.length > 0) {
+              incoming = fallbackIncoming;
+              autoRecoveredEmptySportRef.current = true;
+              setSelectedSport(fallbackSport);
+              setSelectedPropType(null);
+              setSelectedGameId('ALL');
+              setSelectedPlayerName('ALL');
+              setToast({
+                message: `${selectedSport} has no live props right now. Showing ${fallbackSport} props.`,
+                type: 'success',
+              });
+              setTimeout(() => setToast(null), 3500);
+              break;
+            }
+            const fallbackErrors = Array.isArray(fallbackData?.errors)
+              ? fallbackData.errors.filter((msg: unknown): msg is string => typeof msg === 'string')
+              : [];
+            if (fallbackErrors.length > 0) {
+              incomingErrors = incomingErrors.concat(fallbackErrors);
+            }
+          }
+        } catch {
+          // Non-fatal: keep original empty sport response.
+        }
+      }
+
       setFeedErrors(incomingErrors);
       setProps((prev) => {
         if (reset) return incoming;
@@ -896,15 +1074,31 @@ export function PlayerPropsPage() {
       const next = Number(data?.next_offset);
       setHasMore(hasMoreValue);
       setNextOffset(Number.isFinite(next) ? next : offset + incoming.length);
+
+      if (reset) {
+        const stats = getFetchCacheStats();
+        console.debug('[PropsPage][fetch-cache]', stats);
+      }
     } catch (err) {
+      if ((err as Error)?.name === 'AbortError') return;
       console.error('Failed to fetch props:', err);
-      setFeedErrors([]);
-      setError('Unable to load player props. Check back when games are scheduled.');
+      if (propsRef.current.length === 0) {
+        setError('Unable to load player props. Check back when games are scheduled.');
+      } else {
+        incrementPerfCounter('props.staleProtected');
+      }
     } finally {
-      setLoading(false);
-      setLoadingMore(false);
+      stopPerf();
+      clearTimeout(timer);
+      if (requestId === propsFetchSeqRef.current) {
+        setLoading(false);
+        setLoadingMore(false);
+      }
+      if (reset) {
+        logPerfSnapshot('PropsPage');
+      }
     }
-  }, [capabilitiesLoading, hasProps, selectedSport, nextOffset]);
+  }, [capabilitiesLoading, hasProps, loadingMore, selectedSport, nextOffset]);
 
   // Fetch props
   useEffect(() => {
@@ -1035,6 +1229,157 @@ export function PlayerPropsPage() {
       return (b.props[0]?.line_value || 0) - (a.props[0]?.line_value || 0);
     });
   }, [props, searchQuery, selectedSport, selectedPropType, selectedGameId, selectedPlayerName]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const visibleGroups = groupedProps.slice(0, 24);
+    const uniquePlayers = Array.from(new Set(visibleGroups.map((g) => normalizePlayerToken(g.playerName)).filter(Boolean)));
+    const missingPlayers = visibleGroups
+      .map((g) => ({ token: normalizePlayerToken(g.playerName), name: normalizePlayerName(g.playerName), team: g.team, sport: g.sport }))
+      .filter((row) => row.token && !playerLogsByToken[row.token]);
+    const seen = new Set<string>();
+    const dedupedMissing = missingPlayers.filter((row) => {
+      if (seen.has(row.token)) return false;
+      seen.add(row.token);
+      return true;
+    }).slice(0, 12);
+
+    const missingMatchups = visibleGroups
+      .map((g) => {
+        const p = g.props[0];
+        const home = String(p?.home_team || '').trim();
+        const away = String(p?.away_team || '').trim();
+        if (!home || !away) return null;
+        const key = `${g.sport}|${normalizeToken(home)}|${normalizeToken(away)}`;
+        return { key, sport: g.sport, home, away };
+      })
+      .filter((row): row is { key: string; sport: string; home: string; away: string } => Boolean(row && row.key && !h2hByMatchupKey[row.key]))
+      .slice(0, 12);
+
+    if (uniquePlayers.length === 0) return;
+    if (dedupedMissing.length === 0 && missingMatchups.length === 0) return;
+
+    const run = async () => {
+      const [playerResults, h2hResults] = await Promise.all([
+        Promise.allSettled(
+          dedupedMissing.map(async (row) => {
+            const res = await fetch(
+              `/api/player/${encodeURIComponent(String(row.sport || '').toUpperCase())}/${encodeURIComponent(row.name)}?team=${encodeURIComponent(String(row.team || ''))}`,
+              { credentials: 'include', cache: 'no-store' }
+            );
+            if (!res.ok) return { token: row.token, logs: [] as Array<{ stats: Record<string, string | number> }> };
+            const json = await res.json();
+            return { token: row.token, logs: Array.isArray(json?.gameLog) ? json.gameLog : [] };
+          })
+        ),
+        Promise.allSettled(
+          missingMatchups.map(async (row) => {
+            const res = await fetch(
+              `/api/teams/${encodeURIComponent(String(row.sport || '').toUpperCase())}/h2h?teamA=${encodeURIComponent(row.home)}&teamB=${encodeURIComponent(row.away)}&window=10`,
+              { credentials: 'include', cache: 'no-store' }
+            );
+            if (!res.ok) return { key: row.key, sampleSize: 0, teamAWins: 0, teamBWins: 0 };
+            const json = await res.json();
+            return {
+              key: row.key,
+              sampleSize: Number(json?.sampleSize || 0),
+              teamAWins: Number(json?.series?.teamAWins || 0),
+              teamBWins: Number(json?.series?.teamBWins || 0),
+            };
+          })
+        ),
+      ]);
+
+      if (cancelled) return;
+
+      setPlayerLogsByToken((prev) => {
+        const next = { ...prev };
+        for (const result of playerResults) {
+          if (result.status !== 'fulfilled') continue;
+          if (!next[result.value.token]) next[result.value.token] = result.value.logs;
+        }
+        return next;
+      });
+
+      setH2hByMatchupKey((prev) => {
+        const next = { ...prev };
+        for (const result of h2hResults) {
+          if (result.status !== 'fulfilled') continue;
+          if (!next[result.value.key]) next[result.value.key] = result.value;
+        }
+        return next;
+      });
+    };
+    run();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [groupedProps, h2hByMatchupKey, playerLogsByToken]);
+
+  const intelByGroupKey = useMemo(() => {
+    const out: Record<string, PropIntelSnapshot> = {};
+    for (const group of groupedProps) {
+      const key = `${group.playerName}-${group.team}-${group.sport}`;
+      const primary = group.props[0];
+      if (!primary) continue;
+      const token = normalizePlayerToken(group.playerName);
+      const logs = playerLogsByToken[token] || [];
+      const evalRate = (scope: 'l5' | 'season'): { pct: number | null; hits: number; total: number } => {
+        const sample = (scope === 'l5' ? logs.slice(0, 5) : logs).slice(0, 12);
+        if (sample.length === 0) return { pct: null, hits: 0, total: 0 };
+        let hits = 0;
+        let total = 0;
+        for (const g of sample) {
+          const value = statFromGame(g, primary.prop_type);
+          if (value === null) continue;
+          total += 1;
+          if (value > Number(primary.line_value)) hits += 1;
+        }
+        if (total === 0) return { pct: null, hits, total };
+        return { pct: Math.round((hits / total) * 100), hits, total };
+      };
+      const l5 = evalRate('l5');
+      const season = evalRate('season');
+
+      let h2hPct: number | null = null;
+      let h2hWins = 0;
+      let h2hTotal = 0;
+      const home = String(primary.home_team || '').trim();
+      const away = String(primary.away_team || '').trim();
+      if (home && away) {
+        const matchupKey = `${group.sport}|${normalizeToken(home)}|${normalizeToken(away)}`;
+        const matchup = h2hByMatchupKey[matchupKey];
+        if (matchup && matchup.sampleSize > 0) {
+          const teamToken = normalizeToken(group.team || '');
+          const homeToken = normalizeToken(home);
+          const awayToken = normalizeToken(away);
+          if (teamToken && (teamToken.includes(homeToken) || homeToken.includes(teamToken))) {
+            h2hWins = matchup.teamAWins;
+            h2hTotal = matchup.sampleSize;
+            h2hPct = Math.round((h2hWins / h2hTotal) * 100);
+          } else if (teamToken && (teamToken.includes(awayToken) || awayToken.includes(teamToken))) {
+            h2hWins = matchup.teamBWins;
+            h2hTotal = matchup.sampleSize;
+            h2hPct = Math.round((h2hWins / h2hTotal) * 100);
+          }
+        }
+      }
+
+      out[key] = {
+        l5Pct: l5.pct,
+        l5Hits: l5.hits,
+        l5Total: l5.total,
+        seasonPct: season.pct,
+        seasonHits: season.hits,
+        seasonTotal: season.total,
+        h2hPct,
+        h2hWins,
+        h2hTotal,
+      };
+    }
+    return out;
+  }, [groupedProps, h2hByMatchupKey, playerLogsByToken, statFromGame]);
 
   // Quick add to active board
   const handleQuickAdd = useCallback(async (prop: PlayerProp) => {
@@ -1436,6 +1781,7 @@ export function PlayerPropsPage() {
               <PlayerPropCard
                 key={`${group.playerName}-${group.team}-${group.sport}`}
                 group={group}
+                intel={intelByGroupKey[`${group.playerName}-${group.team}-${group.sport}`] || null}
                 onQuickAdd={handleQuickAdd}
                 onChooseBoard={handleChooseBoard}
                 isFollowed={followedPlayerKeys.has(normalizeFollowedPlayerKey(group.playerName))}

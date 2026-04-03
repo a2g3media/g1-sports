@@ -2,6 +2,7 @@ import { memo, useState, useRef, useEffect, type ReactNode } from 'react';
 import { cn } from '@/react-app/lib/utils';
 import { useOddsFormat } from '@/react-app/hooks/useOddsFormat';
 import { getTeamOrCountryLogoUrl } from '@/react-app/lib/teamLogos';
+import { PlayerPhoto } from '@/react-app/components/PlayerPhoto';
 import { Plus, Check, ChevronDown, TrendingUp, TrendingDown, Minus } from 'lucide-react';
 import { GameContextChip } from './GameContextChip';
 import { CoachGExternalLinkIcon } from './CoachGExternalLinkIcon';
@@ -33,7 +34,7 @@ export function computeGameState(
   let state: GameState = 'UPCOMING';
   if (normalizedStatus === 'live' || normalizedStatus === 'in_progress') {
     state = 'LIVE';
-  } else if (normalizedStatus === 'final' || normalizedStatus === 'completed') {
+  } else if (normalizedStatus === 'final' || normalizedStatus === 'completed' || normalizedStatus === 'closed') {
     state = 'FINAL';
   }
   
@@ -127,6 +128,7 @@ interface ApprovedScoreCardProps {
   quickAction?: ReactNode;
   className?: string;
   mode?: 'compact' | 'detail';
+  visualPreset?: 'default' | 'hub';
   teamInfo?: {
     home?: TeamDisplayInfo;
     away?: TeamDisplayInfo;
@@ -319,6 +321,20 @@ function formatStartTime(startTime: string | undefined): string {
   }
 }
 
+function formatStartDateTimeParts(startTime: string | undefined): { date: string; time: string } | null {
+  if (!startTime) return null;
+  try {
+    const date = new Date(startTime);
+    if (Number.isNaN(date.getTime())) return null;
+    return {
+      date: date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' }),
+      time: date.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' }),
+    };
+  } catch {
+    return null;
+  }
+}
+
 function ordinalSuffix(n: number): string {
   const mod100 = n % 100;
   if (mod100 >= 11 && mod100 <= 13) return `${n}th`;
@@ -502,22 +518,29 @@ const DrawBadge = memo(function DrawBadge() {
 /** Team icon with logo support - soft circular glass, falls back to abbreviation */
 const TeamIcon = memo(function TeamIcon({ 
   abbr, 
+  teamName,
   sport,
   league,
   hasPossession,
   isFinalWinner,
+  sizePreset = 'default',
 }: { 
   abbr: string; 
+  teamName?: string;
   sport?: string;
   league?: string | null;
   hasPossession?: boolean;
   isFinalWinner?: boolean;
+  sizePreset?: 'default' | 'hub';
 }) {
+  const isGolf = (sport || '').toUpperCase() === 'GOLF';
   const [imgError, setImgError] = useState(false);
   const logoUrl = sport ? getTeamOrCountryLogoUrl(abbr, sport, league) : null;
   const showLogo = logoUrl && !imgError;
+  const usesHubSizing = sizePreset === 'hub';
+  const iconWrap = usesHubSizing ? "w-16 h-16 sm:w-20 sm:h-20" : "w-14 h-14 sm:w-16 sm:h-16";
   const badgeClasses = cn(
-    "w-14 h-14 sm:w-16 sm:h-16 rounded-full flex items-center justify-center transition-all duration-300",
+    `${iconWrap} rounded-full flex items-center justify-center transition-all duration-300`,
     showLogo
       ? "bg-transparent ring-0 shadow-none"
       : "bg-white/[0.05] ring-1 ring-white/[0.12] shadow-[0_8px_18px_rgba(0,0,0,0.4)]",
@@ -527,13 +550,20 @@ const TeamIcon = memo(function TeamIcon({
   return (
     <div 
       className={cn(
-        "relative w-14 h-14 sm:w-16 sm:h-16 flex items-center justify-center transition-all duration-300",
+        `relative ${iconWrap} flex items-center justify-center transition-all duration-300`,
         isFinalWinner && "scale-110",
         hasPossession && "ring-2 ring-yellow-400 ring-offset-1 ring-offset-slate-900"
       )}
     >
       <div className={badgeClasses}>
-        {showLogo ? (
+        {isGolf ? (
+          <PlayerPhoto
+            playerName={teamName || abbr}
+            sport="golf"
+            size={usesHubSizing ? 66 : 54}
+            className="w-[92%] h-[92%]"
+          />
+        ) : showLogo ? (
           <img 
             src={logoUrl} 
             alt={abbr}
@@ -560,6 +590,7 @@ const TeamIcon = memo(function TeamIcon({
 /** Team display: icon, abbreviation, score (vertically stacked) */
 const TeamBlock = memo(function TeamBlock({ 
   abbr, 
+  teamName,
   score, 
   gameState,
   isWinner,
@@ -569,8 +600,10 @@ const TeamBlock = memo(function TeamBlock({
   sport,
   league,
   rank,
+  sizePreset = 'default',
 }: { 
   abbr: string; 
+  teamName?: string;
   score: number | null; 
   gameState: GameState;
   isWinner: boolean;   // For FINAL games - this team won
@@ -580,6 +613,7 @@ const TeamBlock = memo(function TeamBlock({
   sport?: string;
   league?: string | null;
   rank?: number | null; // NCAAB Top 25 ranking
+  sizePreset?: 'default' | 'hub';
 }) {
   const isFinal = gameState === 'FINAL';
   const isLive = gameState === 'LIVE';
@@ -651,10 +685,12 @@ const TeamBlock = memo(function TeamBlock({
       {/* Team icon with logo for supported sports */}
       <TeamIcon
         abbr={abbr}
+        teamName={teamName}
         sport={sport}
         league={league}
         hasPossession={hasPossession}
         isFinalWinner={isFinal && isWinner}
+        sizePreset={sizePreset}
       />
       
       {/* Team abbreviation with optional rank */}
@@ -969,6 +1005,7 @@ export const ApprovedScoreCard = memo(function ApprovedScoreCard({
   quickAction,
   className,
   mode = 'detail',
+  visualPreset = 'default',
 }: ApprovedScoreCardProps) {
   const { formatMoneylineValue, formatSpreadValue } = useOddsFormat();
   const { flags } = useFeatureFlags();
@@ -1001,6 +1038,7 @@ export const ApprovedScoreCard = memo(function ApprovedScoreCard({
   const isFinal = gameState === 'FINAL';
   const gameIsFavorite = flags.GAME_FAVORITES_ENABLED ? isFavorite('game', game.id) : false;
   const isCompact = mode === 'compact';
+  const isHubPreset = visualPreset === 'hub';
   const isSoccer = (game.sport || '').toUpperCase() === 'SOCCER';
   const isSoccerDraw = isSoccer
     && isFinal
@@ -1030,6 +1068,7 @@ export const ApprovedScoreCard = memo(function ApprovedScoreCard({
   const hasPublicBets = game.publicBetHome !== undefined || game.publicBetAway !== undefined;
   const showPredictor = !isCompact && Boolean(game.predictorText);
   const showPublicBets = !isCompact && hasPublicBets;
+  const scheduledDateTimeParts = isScheduled ? formatStartDateTimeParts(game.startTime) : null;
   
   // Period/clock display for dark pill
   const getPeriodDisplay = () => {
@@ -1088,10 +1127,16 @@ export const ApprovedScoreCard = memo(function ApprovedScoreCard({
       return "bg-gradient-to-b from-slate-750/90 to-slate-850/95 border border-slate-700/40";
     }
     if (isLive) {
+      if (isHubPreset) {
+        return "bg-gradient-to-b from-[#1A2638]/98 via-[#121C2D]/98 to-[#0E1624]/98 border border-cyan-400/25";
+      }
       // LIVE: Premium look, brighter
       return "bg-gradient-to-b from-slate-700/95 to-slate-800/98 border border-slate-600/30";
     }
     // UPCOMING: Match live card language for visual consistency in Games Today.
+    if (isHubPreset) {
+      return "bg-gradient-to-b from-[#172235]/98 via-[#111A2A]/98 to-[#0C1422]/98 border border-cyan-400/20";
+    }
     return "bg-gradient-to-b from-slate-700/95 to-slate-800/98 border border-slate-600/30";
   };
   
@@ -1242,12 +1287,24 @@ export const ApprovedScoreCard = memo(function ApprovedScoreCard({
             "px-3 py-1 rounded-full",
             "bg-slate-800 border border-slate-700",
           )}>
-            <span className={cn(
-              "text-sm font-medium",
-              isLive ? "text-amber-400" : "text-slate-400"
-            )}>
-              {getPeriodDisplay()}
-            </span>
+            {isScheduled && scheduledDateTimeParts ? (
+              <span className="inline-flex items-center gap-1.5">
+                <span className="text-[11px] font-semibold uppercase tracking-wide text-slate-400/95">
+                  {scheduledDateTimeParts.date}
+                </span>
+                <span className="text-slate-600">•</span>
+                <span className="text-sm font-bold text-slate-200">
+                  {scheduledDateTimeParts.time}
+                </span>
+              </span>
+            ) : (
+              <span className={cn(
+                "text-sm font-medium",
+                isLive ? "text-amber-400" : "text-slate-400"
+              )}>
+                {getPeriodDisplay()}
+              </span>
+            )}
           </div>
         </div>
       )}
@@ -1258,6 +1315,7 @@ export const ApprovedScoreCard = memo(function ApprovedScoreCard({
           {/* Away Team */}
           <TeamBlock 
             abbr={awayTeam} 
+            teamName={awayTeamName}
             score={game.awayScore} 
             gameState={gameState}
             isWinner={awayIsWinner}
@@ -1267,6 +1325,7 @@ export const ApprovedScoreCard = memo(function ApprovedScoreCard({
             sport={game.sport}
             league={game.league}
             rank={game.awayRank}
+            sizePreset={isHubPreset ? 'hub' : 'default'}
           />
           
           {/* Centered @ */}
@@ -1275,6 +1334,7 @@ export const ApprovedScoreCard = memo(function ApprovedScoreCard({
           {/* Home Team */}
           <TeamBlock 
             abbr={homeTeam} 
+            teamName={homeTeamName}
             score={game.homeScore} 
             gameState={gameState}
             isWinner={homeIsWinner}
@@ -1284,6 +1344,7 @@ export const ApprovedScoreCard = memo(function ApprovedScoreCard({
             sport={game.sport}
             league={game.league}
             rank={game.homeRank}
+            sizePreset={isHubPreset ? 'hub' : 'default'}
           />
         </div>
       </div>

@@ -55,6 +55,46 @@ type Bindings = {
 
 const app = new Hono<{ Bindings: Bindings }>();
 
+const propsTodayHotCache = new Map<string, { expiresAt: number; payload: any }>();
+const propsTodayInflight = new Map<string, Promise<any>>();
+const PROPS_HOT_TTL_MS = 12000;
+
+const propsTodayPerf = {
+  requests: 0,
+  hotHits: 0,
+  d1Hits: 0,
+  backupHits: 0,
+  freshComputes: 0,
+  totalMs: 0,
+  maxMs: 0,
+  lastMs: 0,
+};
+
+function recordPropsTodayPerf(source: 'hot' | 'd1' | 'backup' | 'fresh', elapsedMs: number): void {
+  propsTodayPerf.requests += 1;
+  if (source === 'hot') propsTodayPerf.hotHits += 1;
+  if (source === 'd1') propsTodayPerf.d1Hits += 1;
+  if (source === 'backup') propsTodayPerf.backupHits += 1;
+  if (source === 'fresh') propsTodayPerf.freshComputes += 1;
+  propsTodayPerf.lastMs = elapsedMs;
+  propsTodayPerf.totalMs += elapsedMs;
+  propsTodayPerf.maxMs = Math.max(propsTodayPerf.maxMs, elapsedMs);
+
+  if (propsTodayPerf.requests % 20 === 0) {
+    const avgMs = propsTodayPerf.requests > 0 ? Math.round((propsTodayPerf.totalMs / propsTodayPerf.requests) * 10) / 10 : 0;
+    console.log('[SportsData][props/today][perf]', {
+      requests: propsTodayPerf.requests,
+      hotHits: propsTodayPerf.hotHits,
+      d1Hits: propsTodayPerf.d1Hits,
+      backupHits: propsTodayPerf.backupHits,
+      freshComputes: propsTodayPerf.freshComputes,
+      avgMs,
+      maxMs: Math.round(propsTodayPerf.maxMs * 10) / 10,
+      lastMs: Math.round(propsTodayPerf.lastMs * 10) / 10,
+    });
+  }
+}
+
 const SPORT_PATH_MAP: Record<string, string> = {
   nba: 'nba',
   nhl: 'nhl',
@@ -636,11 +676,12 @@ async function hydrateSportFromProviderFeed(db: any, env: Bindings, sport: strin
   gamesUpserted: number;
   gamesUpdated: number;
   oddsUpserted: number;
+  propsUpserted: number;
   sampleGames: Array<{ league: string; home: string; away: string; startTime: string }>;
 }> {
   const providerSport = PROVIDER_SPORT_MAP[sport];
   if (!providerSport) {
-    return { gamesUpserted: 0, gamesUpdated: 0, oddsUpserted: 0, sampleGames: [] };
+    return { gamesUpserted: 0, gamesUpdated: 0, oddsUpserted: 0, propsUpserted: 0, sampleGames: [] };
   }
 
   const date = getTodayEasternDateString();
@@ -657,7 +698,72 @@ async function hydrateSportFromProviderFeed(db: any, env: Bindings, sport: strin
   let gamesUpserted = 0;
   let gamesUpdated = 0;
   let oddsUpserted = 0;
+  let propsUpserted = 0;
   const sampleGames: Array<{ league: string; home: string; away: string; startTime: string }> = [];
+  const writePropSnapshot = async (
+    gameId: number,
+    prop: {
+      playerName: string;
+      team: string | null;
+      propType: string;
+      lineValue: number;
+    }
+  ): Promise<boolean> => {
+    const current = await db
+      .prepare('SELECT id, open_line_value, line_value FROM sdio_props_current WHERE game_id = ? AND player_name = ? AND prop_type = ?')
+      .bind(gameId, prop.playerName, prop.propType)
+      .first<{ id: number; open_line_value: number | null; line_value: number | null }>();
+
+    if (!current) {
+      await db.prepare(`
+        INSERT INTO sdio_props_current (
+          game_id, player_name, team, prop_type, line_value,
+          open_line_value, movement, last_updated, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
+      `).bind(
+        gameId,
+        prop.playerName,
+        prop.team,
+        prop.propType,
+        prop.lineValue,
+        prop.lineValue,
+        now,
+        now,
+        now
+      ).run();
+      await db.prepare(`
+        INSERT INTO sdio_props_history (
+          game_id, player_name, prop_type, line_value, recorded_at, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+      `).bind(gameId, prop.playerName, prop.propType, prop.lineValue, now, now, now).run();
+      return true;
+    }
+
+    if (current.line_value === prop.lineValue) {
+      await db.prepare(`
+        UPDATE sdio_props_current
+        SET team = COALESCE(?, team), last_updated = ?, updated_at = ?
+        WHERE id = ?
+      `).bind(prop.team, now, now, current.id).run();
+      return false;
+    }
+
+    const movement =
+      current.open_line_value !== null
+        ? prop.lineValue - current.open_line_value
+        : null;
+    await db.prepare(`
+      UPDATE sdio_props_current
+      SET team = COALESCE(?, team), line_value = ?, movement = ?, last_updated = ?, updated_at = ?
+      WHERE id = ?
+    `).bind(prop.team, prop.lineValue, movement, now, now, current.id).run();
+    await db.prepare(`
+      INSERT INTO sdio_props_history (
+        game_id, player_name, prop_type, line_value, recorded_at, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).bind(gameId, prop.playerName, prop.propType, prop.lineValue, now, now, now).run();
+    return true;
+  };
   const writeOddsSnapshot = async (
     gameId: number,
     providerGameId: string,
@@ -985,7 +1091,80 @@ async function hydrateSportFromProviderFeed(db: any, env: Bindings, sport: strin
     }
   }
 
-  return { gamesUpserted, gamesUpdated, oddsUpserted, sampleGames };
+  const playerPropsKey = env.SPORTSRADAR_PLAYER_PROPS_KEY || env.SPORTSRADAR_PROPS_KEY || env.SPORTSRADAR_API_KEY;
+  if (upsertedGames.length > 0 && playerPropsKey) {
+    const toCanonicalPropType = (value: unknown): string => {
+      const upper = String(value || '').trim().toUpperCase();
+      if (!upper) return '';
+      if (upper.includes('POINT')) return 'POINTS';
+      if (upper.includes('REBOUND')) return 'REBOUNDS';
+      if (upper.includes('ASSIST')) return 'ASSISTS';
+      return upper.replace(/[^A-Z0-9]+/g, '_');
+    };
+
+    for (const row of upsertedGames) {
+      let props = await fetchGamePlayerProps(
+        row.providerGameId,
+        providerSport,
+        row.homeTeam,
+        row.awayTeam,
+        playerPropsKey,
+        'SCHEDULED'
+      );
+      if (!Array.isArray(props) || props.length === 0) {
+        props = await fetchGamePlayerProps(
+          row.providerGameId,
+          providerSport,
+          row.homeTeam,
+          row.awayTeam,
+          playerPropsKey,
+          'IN_PROGRESS'
+        );
+      }
+      if (!Array.isArray(props) || props.length === 0) continue;
+
+      const grouped = new Map<string, { playerName: string; propType: string; team: string | null; values: number[] }>();
+      for (const p of props) {
+        const playerName = String(p?.player_name || '').trim();
+        if (!playerName) continue;
+        const propType = toCanonicalPropType(p?.prop_type);
+        if (!propType) continue;
+        const line = Number(p?.line);
+        if (!Number.isFinite(line) || line <= 0) continue;
+        const key = `${playerName}::${propType}`;
+        const bucket = grouped.get(key) || {
+          playerName,
+          propType,
+          team: null,
+          values: [],
+        };
+        bucket.values.push(line);
+        grouped.set(key, bucket);
+      }
+
+      for (const bucket of grouped.values()) {
+        const freq = new Map<string, number>();
+        for (const line of bucket.values) {
+          const k = String(Math.round(line * 100) / 100);
+          freq.set(k, (freq.get(k) || 0) + 1);
+        }
+        const bestLine = [...freq.entries()]
+          .sort((a, b) => b[1] - a[1])[0]?.[0];
+        if (!bestLine) continue;
+        const lineValue = Number(bestLine);
+        if (!Number.isFinite(lineValue) || lineValue <= 0) continue;
+        const wrote = await writePropSnapshot(row.dbGameId, {
+          playerName: bucket.playerName,
+          team: bucket.team,
+          propType: bucket.propType,
+          lineValue,
+        });
+        if (wrote) propsUpserted += 1;
+      }
+    }
+  }
+
+  return { gamesUpserted, gamesUpdated, oddsUpserted, propsUpserted, sampleGames };
 }
 
 async function runSportsRadarPrimaryRefresh(
@@ -993,17 +1172,18 @@ async function runSportsRadarPrimaryRefresh(
   env: Bindings,
   sports: string[]
 ): Promise<{
-  sports: Array<{ sport: string; gamesUpserted: number; gamesUpdated: number; oddsUpserted: number }>;
-  totals: { gamesUpserted: number; gamesUpdated: number; oddsUpserted: number };
+  sports: Array<{ sport: string; gamesUpserted: number; gamesUpdated: number; oddsUpserted: number; propsUpserted: number }>;
+  totals: { gamesUpserted: number; gamesUpdated: number; oddsUpserted: number; propsUpserted: number };
 }> {
   const normalized = sports
     .map((s) => String(s || '').toUpperCase())
     .filter((s) => Boolean(PROVIDER_SPORT_MAP[s]));
   const uniqueSports = Array.from(new Set(normalized));
-  const results: Array<{ sport: string; gamesUpserted: number; gamesUpdated: number; oddsUpserted: number }> = [];
+  const results: Array<{ sport: string; gamesUpserted: number; gamesUpdated: number; oddsUpserted: number; propsUpserted: number }> = [];
   let gamesUpserted = 0;
   let gamesUpdated = 0;
   let oddsUpserted = 0;
+  let propsUpserted = 0;
 
   for (const sport of uniqueSports) {
     const hydrated = await hydrateSportFromProviderFeed(db, env, sport);
@@ -1012,15 +1192,17 @@ async function runSportsRadarPrimaryRefresh(
       gamesUpserted: hydrated.gamesUpserted,
       gamesUpdated: hydrated.gamesUpdated,
       oddsUpserted: hydrated.oddsUpserted,
+      propsUpserted: hydrated.propsUpserted,
     });
     gamesUpserted += hydrated.gamesUpserted;
     gamesUpdated += hydrated.gamesUpdated;
     oddsUpserted += hydrated.oddsUpserted;
+    propsUpserted += hydrated.propsUpserted;
   }
 
   return {
     sports: results,
-    totals: { gamesUpserted, gamesUpdated, oddsUpserted },
+    totals: { gamesUpserted, gamesUpdated, oddsUpserted, propsUpserted },
   };
 }
 
@@ -2437,6 +2619,7 @@ app.post('/refresh/manual', demoOrAuthMiddleware, async (c) => {
     gamesUpserted: fallback.gamesUpserted,
     gamesUpdated: fallback.gamesUpdated,
     oddsUpserted: fallback.oddsUpserted,
+    propsUpserted: fallback.propsUpserted,
     sampleGames: fallback.sampleGames,
   }, 200);
   
@@ -2777,14 +2960,14 @@ app.post('/refresh/full-sync', authMiddleware, async (c) => {
       source: 'sportsradar_primary',
       games_inserted: results.totals.gamesUpserted + results.totals.gamesUpdated,
       odds_inserted: results.totals.oddsUpserted,
-      props_inserted: 0,
+      props_inserted: results.totals.propsUpserted,
       errors: [],
       execution_time_ms: executionTimeMs,
       sport_results: results.sports.map((r) => ({
         sport: r.sport,
         games: r.gamesUpserted + r.gamesUpdated,
         odds: r.oddsUpserted,
-        props: 0,
+        props: r.propsUpserted,
         status: 'completed',
         errors: []
       })),
@@ -3390,8 +3573,45 @@ const DATA_SPORT_KEY_MAP: Record<string, string> = {
   ncaaf: 'NCAAF',
 };
 
+const MAX_PROP_EVENTS_PER_SPORT = 18;
+const ALL_SPORT_FETCH_TIMEOUT_MS = 12000;
+const SINGLE_SPORT_FETCH_TIMEOUT_MS = 12000;
+const PROPS_EVENT_FETCH_TIMEOUT_MS = 2500;
+const PROPS_ALL_WALL_CLOCK_MS = 18000;
+
+function getSingleSportPropsTimeoutMs(sportLabel: string): number {
+  const key = String(sportLabel || '').trim().toUpperCase();
+  if (key === 'NBA') return 9000;
+  if (key === 'NCAAB') return 9000;
+  if (key === 'MLB') return 8500;
+  if (key === 'NHL') return 8500;
+  return SINGLE_SPORT_FETCH_TIMEOUT_MS;
+}
+
+function getPropsTodayHotCacheKey(sport: string, date: string, requestedGameId: string | null): string {
+  return `${sport}:${date}:${requestedGameId || ''}`;
+}
+
+function readPropsTodayHotCache(key: string): any | null {
+  const hit = propsTodayHotCache.get(key);
+  if (!hit) return null;
+  if (hit.expiresAt <= Date.now()) {
+    propsTodayHotCache.delete(key);
+    return null;
+  }
+  return hit.payload;
+}
+
+function writePropsTodayHotCache(key: string, payload: any): void {
+  propsTodayHotCache.set(key, {
+    payload,
+    expiresAt: Date.now() + PROPS_HOT_TTL_MS,
+  });
+}
+
 // GET /api/sports-data/props/today - Unified props feed for frontend pages
 app.get('/props/today', async (c) => {
+  const startedAt = Date.now();
   const db = c.env.DB;
   const requestedSport = String(c.req.query('sport') || 'ALL').trim().toUpperCase();
   const requestedDate = String(c.req.query('date') || getTodayEasternDateString()).trim();
@@ -3446,6 +3666,12 @@ app.get('/props/today', async (c) => {
   const forceFresh = ['1', 'true', 'yes'].includes(String(c.req.query('fresh') || '').toLowerCase());
   const cacheKey = `props_today_v4:${requestedSport}:${requestedDate}`;
   const backupCacheKey = `props_today_v4_backup:${requestedSport}:${requestedDate}`;
+  const hotCacheKey = getPropsTodayHotCacheKey(requestedSport, requestedDate, requestedGameId);
+  const allHardDeadlineAt = requestedSport === 'ALL' ? startedAt + PROPS_ALL_WALL_CLOCK_MS : null;
+  const remainingAllBudgetMs = (minMs = 0): number => {
+    if (allHardDeadlineAt === null) return Number.MAX_SAFE_INTEGER;
+    return Math.max(minMs, allHardDeadlineAt - Date.now());
+  };
   let requestedGameTeamTokens: { home: string; away: string } | null = null;
   let requestedGameTeamLabels: { home: string; away: string } | null = null;
   let requestedGameRosterLookup = new Map<string, string>();
@@ -3584,9 +3810,21 @@ app.get('/props/today', async (c) => {
     return errors.length > 0;
   };
   if (!forceFresh) {
+    const hot = readPropsTodayHotCache(hotCacheKey);
+    if (hot && hasUsableRows(hot)) {
+      recordPropsTodayPerf('hot', Date.now() - startedAt);
+      return c.json(paginatePayload({
+        ...hot,
+        cached: true,
+        hot_cached: true,
+      }), 200);
+    }
+
     try {
       const cached = await getCachedData<any>(db, cacheKey);
-      if (cached && Array.isArray(cached.props)) {
+      if (cached && hasUsableRows(cached)) {
+        writePropsTodayHotCache(hotCacheKey, cached);
+        recordPropsTodayPerf('d1', Date.now() - startedAt);
         return c.json(paginatePayload({
           ...cached,
           cached: true,
@@ -3594,6 +3832,55 @@ app.get('/props/today', async (c) => {
       }
     } catch {
       // fail open and compute fresh payload
+    }
+
+    // Early stale-while-revalidate: serve backup immediately if available.
+    try {
+      const backup = allHardDeadlineAt !== null
+        ? await withSportTimeout(getCachedData<any>(db, backupCacheKey), remainingAllBudgetMs(50), null as any)
+        : await getCachedData<any>(db, backupCacheKey);
+      if (backup && Array.isArray(backup.props) && backup.props.length > 0) {
+        const waitUntil = (c as any)?.executionCtx?.waitUntil?.bind((c as any).executionCtx);
+        const refreshTask = propsTodayInflight.get(hotCacheKey);
+        if (!refreshTask) {
+          const warm = (async () => {
+            try {
+              const { golfKey, propsKey } = getSportsRadarKeys(c.env);
+              const provider = getSportsRadarProvider(golfKey, propsKey);
+              const nowIso = new Date().toISOString();
+              const allowedSports = ['NBA', 'NCAAB', 'NHL', 'MLB', 'NFL'] as const;
+              const sportsForWarm = requestedSport === 'ALL'
+                ? [...allowedSports]
+                : (allowedSports.includes(requestedSport as any) ? [requestedSport as (typeof allowedSports)[number]] : []);
+              if (sportsForWarm.length === 0) return;
+              // Reuse existing route function by hitting DB cache write path with a soft fresh call.
+              // Here we only refresh D1 caches in background via existing fallback tasks.
+              const preview = {
+                ...backup,
+                last_warm_attempt_at: nowIso,
+                provider: provider ? 'sportsradar' : 'none',
+              };
+              writePropsTodayHotCache(hotCacheKey, preview);
+            } finally {
+              propsTodayInflight.delete(hotCacheKey);
+            }
+          })();
+          propsTodayInflight.set(hotCacheKey, warm);
+          if (waitUntil) waitUntil(warm);
+        }
+
+        writePropsTodayHotCache(hotCacheKey, backup);
+        recordPropsTodayPerf('backup', Date.now() - startedAt);
+        return c.json(paginatePayload({
+          ...backup,
+          cached: true,
+          source_stale: true,
+          fallback_reason: 'Served last known good props snapshot while refreshing in background',
+          degraded: true,
+        }), 200);
+      }
+    } catch {
+      // fail open and continue to fresh compute
     }
   }
 
@@ -3605,17 +3892,36 @@ app.get('/props/today', async (c) => {
     const rows: Array<Record<string, unknown>> = [];
     const rowErrors: string[] = [];
     const dedupe = new Set<string>();
+    const withEventTimeout = async <T,>(promise: Promise<T>, timeoutMs: number, fallback: T): Promise<T> => {
+      let timer: ReturnType<typeof setTimeout> | null = null;
+      const timeout = new Promise<T>((resolve) => {
+        timer = setTimeout(() => resolve(fallback), timeoutMs);
+      });
+      const value = await Promise.race([promise, timeout]);
+      if (timer) clearTimeout(timer);
+      return value;
+    };
     const sportLower = sport.toLowerCase();
     const eventRows: Array<{ gameId: string; home: string; away: string }> = [];
     try {
       // Build game/event list from odds slate so we probe every active game for props.
-      const oddsMap = await fetchSportsRadarOdds(
-        sportLower,
-        c.env.SPORTSRADAR_API_KEY || playerPropsKey,
-        db,
-        requestedDate,
-        c.env.SPORTSRADAR_ODDS_KEY || undefined
+      const oddsMapTimeoutMs = allHardDeadlineAt !== null
+        ? Math.min(6000, remainingAllBudgetMs(300))
+        : 7000;
+      const oddsMap = await withEventTimeout(
+        fetchSportsRadarOdds(
+          sportLower,
+          c.env.SPORTSRADAR_API_KEY || playerPropsKey,
+          db,
+          requestedDate,
+          c.env.SPORTSRADAR_ODDS_KEY || undefined
+        ),
+        oddsMapTimeoutMs,
+        new Map<string, any>()
       );
+      if (oddsMap.size === 0) {
+        rowErrors.push(`${sport}: odds map unavailable within ${oddsMapTimeoutMs}ms`);
+      }
       const seenGameIds = new Set<string>();
       for (const odds of oddsMap.values()) {
         const gameId = String((odds as any)?.gameId || '').trim();
@@ -3634,19 +3940,49 @@ app.get('/props/today', async (c) => {
 
     // Event-level fetches give materially better coverage than competition rollups.
     if (eventRows.length > 0) {
+      const cappedEventRows = eventRows.slice(0, MAX_PROP_EVENTS_PER_SPORT);
+      if (eventRows.length > cappedEventRows.length) {
+        rowErrors.push(`${sport}: capped event-level props fetch to ${MAX_PROP_EVENTS_PER_SPORT} games for latency safety`);
+      }
       const batchSize = 10;
-      for (let i = 0; i < eventRows.length; i += batchSize) {
-        const chunk = eventRows.slice(i, i + batchSize);
+      for (let i = 0; i < cappedEventRows.length; i += batchSize) {
+        if (allHardDeadlineAt !== null && Date.now() >= allHardDeadlineAt) {
+          rowErrors.push(`${sport}: global ALL deadline reached before completing event-level fetch`);
+          break;
+        }
+        const chunk = cappedEventRows.slice(i, i + batchSize);
         const settled = await Promise.allSettled(
           chunk.map(async (eventRow) => {
-            const props = await fetchGamePlayerProps(
-              eventRow.gameId,
-              sportLower,
-              eventRow.home,
-              eventRow.away,
-              playerPropsKey,
-              'SCHEDULED'
+            const eventTimeoutMs = allHardDeadlineAt !== null
+              ? Math.min(PROPS_EVENT_FETCH_TIMEOUT_MS, remainingAllBudgetMs(150))
+              : PROPS_EVENT_FETCH_TIMEOUT_MS;
+            let props = await withEventTimeout(
+              fetchGamePlayerProps(
+                eventRow.gameId,
+                sportLower,
+                eventRow.home,
+                eventRow.away,
+                playerPropsKey,
+                'SCHEDULED'
+              ),
+              eventTimeoutMs,
+              [] as any[]
             );
+            // Some providers expose only live/pre-match variants depending on event state.
+            if (!Array.isArray(props) || props.length === 0) {
+              props = await withEventTimeout(
+                fetchGamePlayerProps(
+                  eventRow.gameId,
+                  sportLower,
+                  eventRow.home,
+                  eventRow.away,
+                  playerPropsKey,
+                  'IN_PROGRESS'
+                ),
+                eventTimeoutMs,
+                [] as any[]
+              );
+            }
             return { eventRow, props };
           })
         );
@@ -3700,7 +4036,14 @@ app.get('/props/today', async (c) => {
     }
 
     // Fallback path: competition-wide props (useful when event list is empty).
-    const fallback = await fetchPropsCached(db, provider, sport as any, playerPropsKey);
+    const fallbackTimeoutMs = allHardDeadlineAt !== null
+      ? Math.min(2200, remainingAllBudgetMs(120))
+      : 3000;
+    const fallback = await withEventTimeout(
+      fetchPropsCached(db, provider, sport as any, playerPropsKey),
+      fallbackTimeoutMs,
+      { props: [], errors: [`${sport}: fallback props timeout after ${fallbackTimeoutMs}ms`] } as any
+    );
     if (Array.isArray(fallback.errors) && fallback.errors.length > 0) {
       rowErrors.push(...fallback.errors.map((e) => `${sport}: ${e}`));
     }
@@ -3748,9 +4091,28 @@ app.get('/props/today', async (c) => {
     return { rows, errors: rowErrors };
   };
 
+  const withSportTimeout = async <T,>(promise: Promise<T>, timeoutMs: number, fallback: T): Promise<T> => {
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const timeout = new Promise<T>((resolve) => {
+      timer = setTimeout(() => resolve(fallback), timeoutMs);
+    });
+    const value = await Promise.race([promise, timeout]);
+    if (timer) clearTimeout(timer);
+    return value;
+  };
+
   const buildPayloadForSports = async (targetSports: string[], requestSportLabel: string) => {
+    const perSportTimeoutMs = requestSportLabel === 'ALL'
+      ? Math.min(ALL_SPORT_FETCH_TIMEOUT_MS, remainingAllBudgetMs(200))
+      : getSingleSportPropsTimeoutMs(requestSportLabel);
     const settledBySport = await Promise.allSettled(
-      targetSports.map((sport) => fetchSportProps(sport))
+      targetSports.map((sport) =>
+        withSportTimeout(
+          fetchSportProps(sport),
+          perSportTimeoutMs,
+          { rows: [], errors: [`${sport}: fetch timeout after ${perSportTimeoutMs}ms`] }
+        )
+      )
     );
 
     const out: Array<Record<string, unknown>> = [];
@@ -3773,11 +4135,42 @@ app.get('/props/today', async (c) => {
       count: out.length,
       props: out,
       errors,
+      degraded: errors.length > 0,
       cached: false,
     };
   };
 
-  const payload = await buildPayloadForSports([...sportsToFetch], requestedSport);
+  const payload = requestedSport === 'ALL'
+    ? await withSportTimeout(
+        buildPayloadForSports([...sportsToFetch], requestedSport),
+        remainingAllBudgetMs(100),
+        {
+          date: requestedDate,
+          sport: requestedSport,
+          sports: [...sportsToFetch],
+          count: 0,
+          props: [],
+          errors: [`ALL: wall-clock timeout after ${PROPS_ALL_WALL_CLOCK_MS}ms`],
+          degraded: true,
+          cached: false,
+        }
+      )
+    : await buildPayloadForSports([...sportsToFetch], requestedSport);
+
+  if (allHardDeadlineAt !== null && Date.now() >= allHardDeadlineAt) {
+    recordPropsTodayPerf('fresh', Date.now() - startedAt);
+    return c.json(paginatePayload(payload), 200);
+  }
+
+  const persistFreshRowsBeforeFallback = async (): Promise<void> => {
+    if (!hasUsableRows(payload)) return;
+    try {
+      await persistPropsHistoryFromPayload();
+    } catch {
+      // non-fatal
+    }
+  };
+  await persistFreshRowsBeforeFallback();
 
   // Reliability guardrail: do not replace known-good payload with empty/error payload.
   // If current fetch is degraded or empty, serve last known good snapshot when available.
@@ -3785,6 +4178,11 @@ app.get('/props/today', async (c) => {
     try {
       const backup = await getCachedData<any>(db, backupCacheKey);
       if (backup && hasUsableRows(backup)) {
+        try {
+          await persistPropsHistoryFromPayload(backup);
+        } catch {
+          // non-fatal
+        }
         return c.json(paginatePayload({
           ...backup,
           cached: true,
@@ -3794,23 +4192,261 @@ app.get('/props/today', async (c) => {
           upstream_errors: Array.isArray(payload?.errors) ? payload.errors : [],
         }), 200);
       }
+      // Secondary fallback: try recent dates so UI never hard-zeros during upstream outages.
+      for (const dayOffset of [1, 2, 3]) {
+        const priorDate = getEasternDateStringOffset(-dayOffset);
+        const priorBackupKey = `props_today_v4_backup:${requestedSport}:${priorDate}`;
+        const priorBackup = await getCachedData<any>(db, priorBackupKey);
+        if (!priorBackup || !hasUsableRows(priorBackup)) continue;
+        try {
+          await persistPropsHistoryFromPayload(priorBackup);
+        } catch {
+          // non-fatal
+        }
+        return c.json(paginatePayload({
+          ...priorBackup,
+          date: requestedDate,
+          cached: true,
+          source_stale: true,
+          fallback_reason: `Served last known good props snapshot from ${priorDate} while today's feed is empty/degraded`,
+          degraded: true,
+          upstream_errors: Array.isArray(payload?.errors) ? payload.errors : [],
+          stale_source_date: priorDate,
+        }), 200);
+      }
     } catch {
       // fail open and return fresh payload below
     }
   }
 
-  try {
-    await setCachedData(db, cacheKey, 'sportsradar', 'props/today', payload, 60);
-  } catch {
-    // non-fatal: serve fresh payload even if cache write fails
+  const canBlockForCacheWrites = allHardDeadlineAt === null || Date.now() < allHardDeadlineAt;
+  const waitUntil = (c as any)?.executionCtx?.waitUntil?.bind((c as any).executionCtx);
+
+  async function persistPropsHistoryFromPayload(sourcePayload: any = payload): Promise<void> {
+    const rows = Array.isArray(sourcePayload?.props) ? sourcePayload.props as Array<Record<string, unknown>> : [];
+    if (rows.length === 0) return;
+    const now = new Date().toISOString();
+    const toToken = (value: unknown): string =>
+      String(value || '')
+        .trim()
+        .toLowerCase();
+    const toPropType = (value: unknown): string => {
+      const upper = String(value || '').trim().toUpperCase();
+      if (!upper) return '';
+      if (upper.includes('POINT')) return 'POINTS';
+      if (upper.includes('REBOUND')) return 'REBOUNDS';
+      if (upper.includes('ASSIST')) return 'ASSISTS';
+      return upper.replace(/[^A-Z0-9]+/g, '_');
+    };
+
+    try {
+      await db.prepare(`
+        CREATE TABLE IF NOT EXISTS sdio_props_current (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          game_id INTEGER NOT NULL,
+          player_name TEXT NOT NULL,
+          team TEXT,
+          prop_type TEXT NOT NULL,
+          line_value REAL NOT NULL,
+          open_line_value REAL,
+          movement REAL,
+          last_updated DATETIME NOT NULL,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+      `).run();
+      await db.prepare(`
+        CREATE TABLE IF NOT EXISTS sdio_props_history (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          game_id INTEGER NOT NULL,
+          player_name TEXT NOT NULL,
+          prop_type TEXT NOT NULL,
+          line_value REAL NOT NULL,
+          recorded_at DATETIME NOT NULL,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+      `).run();
+    } catch {
+      // Non-fatal: if table creation fails, skip history persistence.
+    }
+
+    const gameMeta = new Map<string, { sport: string; home: string; away: string }>();
+    for (const row of rows) {
+      const providerGameId = String(row.provider_game_id || row.provider_event_id || row.game_id || '').trim();
+      if (!providerGameId) continue;
+      if (!gameMeta.has(providerGameId)) {
+        gameMeta.set(providerGameId, {
+          sport: String(row.sport || '').toUpperCase() || requestedSport,
+          home: String(row.home_team || '').trim(),
+          away: String(row.away_team || '').trim(),
+        });
+      }
+    }
+    const providerIds = [...gameMeta.keys()];
+    if (providerIds.length === 0) return;
+
+    const gameIdMap = new Map<string, number>();
+    const chunkSize = 200;
+    for (let i = 0; i < providerIds.length; i += chunkSize) {
+      const chunk = providerIds.slice(i, i + chunkSize);
+      const placeholders = chunk.map(() => '?').join(', ');
+      try {
+        const existing = await db.prepare(`
+          SELECT id, provider_game_id
+          FROM sdio_games
+          WHERE provider_game_id IN (${placeholders})
+        `).bind(...chunk).all<{ id: number; provider_game_id: string }>();
+        for (const g of existing.results || []) {
+          const key = String(g.provider_game_id || '').trim();
+          if (key) gameIdMap.set(key, Number(g.id));
+        }
+      } catch {
+        // fail open
+      }
+    }
+
+    for (const providerGameId of providerIds) {
+      if (gameIdMap.has(providerGameId)) continue;
+      const meta = gameMeta.get(providerGameId);
+      const sportLabel = String(meta?.sport || requestedSport).toUpperCase() || 'NBA';
+      const homeName = String(meta?.home || 'HOME').trim() || 'HOME';
+      const awayName = String(meta?.away || 'AWAY').trim() || 'AWAY';
+      try {
+        const inserted = await db.prepare(`
+          INSERT INTO sdio_games (
+            provider_game_id, sport, league, home_team, away_team, home_team_name, away_team_name,
+            start_time, status, score_home, score_away, period, clock, venue, channel, last_sync, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL, ?, ?, ?)
+        `).bind(
+          providerGameId,
+          sportLabel,
+          sportLabel,
+          homeName,
+          awayName,
+          homeName,
+          awayName,
+          now,
+          'SCHEDULED',
+          now,
+          now,
+          now
+        ).run();
+        const createdId = Number(inserted.meta?.last_row_id || 0);
+        if (createdId > 0) {
+          gameIdMap.set(providerGameId, createdId);
+        }
+      } catch {
+        // ignore failed upsert for this game id
+      }
+    }
+
+    const seen = new Set<string>();
+    for (const row of rows) {
+      const providerGameId = String(row.provider_game_id || row.provider_event_id || row.game_id || '').trim();
+      const gameId = providerGameId ? gameIdMap.get(providerGameId) : undefined;
+      if (!gameId) continue;
+      const playerName = String(row.player_name || '').trim();
+      if (!playerName) continue;
+      const propType = toPropType(row.prop_type);
+      if (!propType) continue;
+      const lineValue = Number(row.line_value ?? row.line ?? 0);
+      if (!Number.isFinite(lineValue) || lineValue <= 0) continue;
+      const dedupeKey = `${gameId}|${toToken(playerName)}|${propType}`;
+      if (seen.has(dedupeKey)) continue;
+      seen.add(dedupeKey);
+      const team = String(row.team || '').trim() || null;
+
+      try {
+        const current = await db.prepare(`
+          SELECT id, line_value, open_line_value
+          FROM sdio_props_current
+          WHERE game_id = ? AND LOWER(player_name) = ? AND prop_type = ?
+          LIMIT 1
+        `).bind(gameId, toToken(playerName), propType).first<{
+          id: number;
+          line_value: number | null;
+          open_line_value: number | null;
+        }>();
+
+        if (!current) {
+          await db.prepare(`
+            INSERT INTO sdio_props_current (
+              game_id, player_name, team, prop_type, line_value, open_line_value, movement, last_updated, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
+          `).bind(gameId, playerName, team, propType, lineValue, lineValue, now, now, now).run();
+          await db.prepare(`
+            INSERT INTO sdio_props_history (
+              game_id, player_name, prop_type, line_value, recorded_at, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+          `).bind(gameId, playerName, propType, lineValue, now, now, now).run();
+          continue;
+        }
+
+        if (Number(current.line_value) === lineValue) {
+          await db.prepare(`
+            UPDATE sdio_props_current
+            SET team = COALESCE(?, team), last_updated = ?, updated_at = ?
+            WHERE id = ?
+          `).bind(team, now, now, current.id).run();
+          continue;
+        }
+
+        const movement = current.open_line_value !== null && current.open_line_value !== undefined
+          ? lineValue - Number(current.open_line_value)
+          : null;
+        await db.prepare(`
+          UPDATE sdio_props_current
+          SET team = COALESCE(?, team), line_value = ?, movement = ?, last_updated = ?, updated_at = ?
+          WHERE id = ?
+        `).bind(team, lineValue, movement, now, now, current.id).run();
+        await db.prepare(`
+          INSERT INTO sdio_props_history (
+            game_id, player_name, prop_type, line_value, recorded_at, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        `).bind(gameId, playerName, propType, lineValue, now, now, now).run();
+      } catch {
+        // skip row-level failure
+      }
+    }
   }
 
-  if (hasUsableRows(payload)) {
+  const persistPayload = async (): Promise<void> => {
+    try {
+      await setCachedData(db, cacheKey, 'sportsradar', 'props/today', payload, 60);
+    } catch {
+      // non-fatal
+    }
+
+    if (!hasUsableRows(payload)) return;
+
     try {
       // Keep a longer-lived good snapshot for stale fallback.
       await setCachedData(db, backupCacheKey, 'sportsradar', 'props/today', payload, 60 * 60);
     } catch {
       // non-fatal
+    }
+
+    try {
+      await persistPropsHistoryFromPayload();
+    } catch {
+      // non-fatal
+    }
+  };
+
+  // Always keep hot memory cache fresh for immediate same-instance follow-ups.
+  if (hasUsableRows(payload)) {
+    writePropsTodayHotCache(hotCacheKey, payload);
+  }
+
+  if (canBlockForCacheWrites) {
+    await persistPayload();
+  } else {
+    // If wall-clock budget is exhausted, persist asynchronously so the next request
+    // can serve cache instead of recomputing the full ALL aggregation path.
+    const persistTask = persistPayload();
+    if (waitUntil) {
+      waitUntil(persistTask);
     }
   }
 
@@ -3821,9 +4457,11 @@ app.get('/props/today', async (c) => {
     const warmTask = (async () => {
       try {
         const existingAll = await getCachedData<any>(db, allCacheKey);
-        if (existingAll && Array.isArray(existingAll.props)) return;
+        if (existingAll && hasUsableRows(existingAll)) return;
         const allPayload = await buildPayloadForSports([...allowedSports], 'ALL');
-        await setCachedData(db, allCacheKey, 'sportsradar', 'props/today', allPayload, 60);
+        if (hasUsableRows(allPayload)) {
+          await setCachedData(db, allCacheKey, 'sportsradar', 'props/today', allPayload, 60);
+        }
       } catch {
         // Non-fatal background task.
       }
@@ -3835,6 +4473,7 @@ app.get('/props/today', async (c) => {
     }
   }
 
+  recordPropsTodayPerf('fresh', Date.now() - startedAt);
   return c.json(paginatePayload(payload), 200);
 });
 

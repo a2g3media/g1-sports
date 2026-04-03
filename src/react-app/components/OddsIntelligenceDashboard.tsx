@@ -27,11 +27,15 @@ interface TeamData {
 
 interface OddsData {
   spread?: number;
+  spreadHome?: number;
   spreadOpen?: number;
   total?: number;
+  overUnder?: number;
   totalOpen?: number;
   mlHome?: number;
+  homeML?: number;
   mlAway?: number;
+  awayML?: number;
 }
 
 interface Game {
@@ -206,7 +210,7 @@ const hashString = (str: string): number => {
 };
 
 const getSpreadMovement = (game: Game): { open: number; current: number; move: number } | null => {
-  const current = game.odds?.spread ?? game.spread;
+  const current = game.odds?.spread ?? game.odds?.spreadHome ?? game.spread;
   const open = game.odds?.spreadOpen;
   if (!Number.isFinite(current) || !Number.isFinite(open)) return null;
   const currentNum = Number(current);
@@ -215,7 +219,7 @@ const getSpreadMovement = (game: Game): { open: number; current: number; move: n
 };
 
 const getTotalMovement = (game: Game): { open: number; current: number; move: number } | null => {
-  const current = game.odds?.total ?? game.overUnder;
+  const current = game.odds?.total ?? game.odds?.overUnder ?? game.overUnder;
   const open = game.odds?.totalOpen;
   if (!Number.isFinite(current) || !Number.isFinite(open)) return null;
   const currentNum = Number(current);
@@ -431,21 +435,6 @@ const generatePlayerProps = (
   return all.map((p) => ({ ...p, isHot: hotSet.has(p.id) })).slice(0, 24);
 };
 
-// Sport colors
-const SPORT_COLORS: Record<string, { accent: string; bg: string; border: string }> = {
-  NBA: { accent: 'text-orange-400', bg: 'bg-orange-500/10', border: 'border-orange-500/30' },
-  NFL: { accent: 'text-green-400', bg: 'bg-green-500/10', border: 'border-green-500/30' },
-  MLB: { accent: 'text-blue-400', bg: 'bg-blue-500/10', border: 'border-blue-500/30' },
-  NHL: { accent: 'text-cyan-400', bg: 'bg-cyan-500/10', border: 'border-cyan-500/30' },
-  NCAAB: { accent: 'text-amber-400', bg: 'bg-amber-500/10', border: 'border-amber-500/30' },
-  NCAAF: { accent: 'text-lime-400', bg: 'bg-lime-500/10', border: 'border-lime-500/30' },
-  SOCCER: { accent: 'text-emerald-400', bg: 'bg-emerald-500/10', border: 'border-emerald-500/30' },
-};
-
-const SPORT_EMOJIS: Record<string, string> = {
-  NBA: '🏀', NFL: '🏈', MLB: '⚾', NHL: '🏒', NCAAB: '🏀', NCAAF: '🏈', SOCCER: '⚽', MMA: '🥊', GOLF: '⛳',
-};
-
 export function OddsIntelligenceDashboard({
   games,
   propsFeed = [],
@@ -470,7 +459,20 @@ export function OddsIntelligenceDashboard({
   }
   
   // Stable game IDs for memoization key
-  const gamesKey = useMemo(() => games.slice(0, 5).map(g => g.id).join(','), [games]);
+  const gamesKey = useMemo(
+    () =>
+      games
+        .slice(0, 12)
+        .map((g) => {
+          const spread = g.odds?.spread ?? g.odds?.spreadHome ?? g.spread ?? '';
+          const total = g.odds?.total ?? g.odds?.overUnder ?? g.overUnder ?? '';
+          const mlHome = g.odds?.mlHome ?? g.odds?.homeML ?? g.moneylineHome ?? '';
+          const mlAway = g.odds?.mlAway ?? g.odds?.awayML ?? g.moneylineAway ?? '';
+          return `${g.id}:${spread}:${total}:${mlHome}:${mlAway}`;
+        })
+        .join(','),
+    [games]
+  );
   
   // Generate intelligence data from games - only after initial render
   const sharpSignals = useMemo(() => isInitialRender ? [] : generateSharpSignals(games, splitFeedByGame), [gamesKey, isInitialRender, splitFeedByGame]);
@@ -539,7 +541,7 @@ export function OddsIntelligenceDashboard({
       const bTime = b.startTime ? new Date(b.startTime).getTime() : 0;
       return aTime - bTime;
     });
-  }, [gamesKey, games.length]);
+  }, [games]);
   
   // Group by sport for ALL view - only compute first 4 sports initially
   const sportGroups = useMemo(() => {
@@ -1185,8 +1187,6 @@ export function OddsIntelligenceDashboard({
         {sportGroups && (
           <div className="space-y-6">
             {sportGroups.map(([sport, sportGames]) => {
-              const colors = SPORT_COLORS[sport] || { accent: 'text-slate-400', bg: 'bg-slate-500/10', border: 'border-slate-500/30' };
-              const emoji = SPORT_EMOJIS[sport] || '🏆';
               const INITIAL_SHOW = 4;
               const sectionKey = `odds-${sport}`;
               const isExpanded = expandedSections.has(sectionKey);
@@ -1201,13 +1201,14 @@ export function OddsIntelligenceDashboard({
               return (
                 <div key={sport}>
                   <div className={cn(
-                    "flex items-center justify-between mb-3 px-3 py-2 rounded-xl border",
-                    colors.bg, colors.border
+                    "mb-3 flex items-center justify-between rounded-[12px] border border-white/[0.06] bg-[#121821]/95 px-4 py-2.5 backdrop-blur-xl shadow-[0_10px_22px_rgba(0,0,0,0.26)]"
                   )}>
                     <div className="flex items-center gap-2.5">
-                      <span className="text-lg">{emoji}</span>
+                      <div className="flex h-8 w-8 items-center justify-center rounded-lg border border-white/[0.08] bg-[#16202B] text-[11px] font-semibold text-slate-300">
+                        {String(sport).slice(0, 2).toUpperCase()}
+                      </div>
                       <div>
-                        <span className={cn("font-bold text-sm", colors.accent)}>{sport}</span>
+                        <span className="text-sm font-semibold text-[#F3F4F6]">{sport}</span>
                         <div className="flex items-center gap-2 text-[10px] text-slate-500">
                           <span>{sportGames.length} games</span>
                           {liveCount > 0 && (
@@ -1221,12 +1222,9 @@ export function OddsIntelligenceDashboard({
                     </div>
                     <button
                       onClick={() => navigate(`/sports/${sport.toLowerCase()}`)}
-                      className={cn(
-                        "text-[10px] font-medium px-2.5 py-1.5 rounded-lg border transition-opacity hover:opacity-80",
-                        colors.bg, colors.accent, colors.border
-                      )}
+                      className="inline-flex items-center gap-1 rounded-md border border-white/[0.05] bg-white/5 px-2 py-1 text-xs text-[#9CA3AF] transition-colors hover:text-[#E5E7EB]"
                     >
-                      Hub →
+                      Hub <ChevronRight className="h-3.5 w-3.5" />
                     </button>
                   </div>
                   
@@ -1244,7 +1242,7 @@ export function OddsIntelligenceDashboard({
                   {hasMore && (
                     <button
                       onClick={() => toggleSection(sectionKey)}
-                      className="w-full mt-3 px-4 py-2.5 rounded-lg bg-slate-800/30 hover:bg-slate-700/40 text-slate-400 text-xs font-medium transition-colors border border-slate-700/20"
+                      className="mt-3 w-full rounded-xl border border-white/12 bg-gradient-to-b from-white/[0.07] to-white/[0.02] px-4 py-2.5 text-[12px] font-semibold text-[#D1D5DB] ring-1 ring-white/10 shadow-[inset_0_1px_0_rgba(255,255,255,0.08)] transition-all duration-200 hover:border-white/20 hover:bg-[#16202B] hover:text-[#E5E7EB]"
                     >
                       {isExpanded ? 'Show Less' : `Show ${sportGames.length - INITIAL_SHOW} More ${sport}`}
                     </button>

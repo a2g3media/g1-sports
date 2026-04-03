@@ -1,5 +1,5 @@
 import { Link } from "react-router-dom";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { cn } from "@/react-app/lib/utils";
 import {
   Activity,
@@ -46,6 +46,15 @@ export function SportQuickAccess({ activeSportKey }: { activeSportKey?: string |
     []
   );
 
+  useEffect(() => {
+    // Warm photo avatars immediately so pills paint fast.
+    for (const sport of avatarData) {
+      const primary = new Image();
+      primary.decoding = 'async';
+      primary.src = sport.avatar.src;
+    }
+  }, [avatarData]);
+
   const markAvatarFailure = (sportKey: string) => {
     setAvatarFailures((current) => ({
       ...current,
@@ -59,8 +68,8 @@ export function SportQuickAccess({ activeSportKey }: { activeSportKey?: string |
         {avatarData.map((sport) => {
           const isActive = activeKey === sport.key;
           const failureCount = avatarFailures[sport.key] ?? 0;
-          const showFallbackIcon = failureCount > 1 || (!sport.avatar.fallbackSrc && failureCount > 0);
-          const imageSrc = failureCount > 0 && sport.avatar.fallbackSrc ? sport.avatar.fallbackSrc : sport.avatar.src;
+          const showFallbackIcon = failureCount > 0;
+          const imageSrc = sport.avatar.src;
           const FallbackIcon = sport.fallbackIcon;
 
           return (
@@ -85,7 +94,11 @@ export function SportQuickAccess({ activeSportKey }: { activeSportKey?: string |
                   <img
                     src={imageSrc}
                     alt={sport.avatar.alt}
-                    loading="lazy"
+                    loading="eager"
+                    decoding="async"
+                    fetchPriority="high"
+                    width={96}
+                    height={96}
                     className="h-full w-full object-contain"
                     onError={() => markAvatarFailure(sport.key)}
                   />

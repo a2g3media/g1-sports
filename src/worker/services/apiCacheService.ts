@@ -257,13 +257,6 @@ export async function cachedFetch<T>(
   // Check cache first
   const cached = await getCachedData<T>(db, cacheKey);
   if (cached !== null) {
-    // Check if this is a cached error response
-    if (typeof cached === 'object' && cached !== null && (cached as any).__cacheError) {
-      console.log(`[apiCache] CACHED_ERROR: ${cacheKey.substring(0, 80)}...`);
-      // Return the cached error - prevents retry storms
-      // Caller should handle empty/error data gracefully
-      return { data: { topScorers: [], topAssists: [], standings: [], schedule: [] } as unknown as T, fromCache: true };
-    }
     console.log(`[apiCache] HIT: ${cacheKey.substring(0, 80)}...`);
     return { data: cached, fromCache: true };
   }
@@ -291,11 +284,6 @@ export async function cachedFetch<T>(
       await setCachedData(db, cacheKey, provider, endpoint, data, ttlSeconds);
       
       return data;
-    } catch (err) {
-      // Cache error response briefly to prevent retry storms
-      const errorResponse = { __cacheError: true, message: String(err) } as unknown as T;
-      await setCachedData(db, cacheKey, provider, endpoint, errorResponse, API_CACHE_TTL.ERROR);
-      throw err;
     } finally {
       // Clean up in-flight tracking
       inFlightRequests.delete(cacheKey);

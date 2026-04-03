@@ -432,6 +432,14 @@ export function useFollow(
           setState({ isFollowing: true, loading: false });
           return true;
         }
+        // Treat "already following" as success to avoid stale-state failures.
+        if (res.status === 400) {
+          const data = await res.json().catch(() => null) as { error?: string } | null;
+          if (typeof data?.error === "string" && /already following/i.test(data.error)) {
+            setState({ isFollowing: true, loading: false });
+            return true;
+          }
+        }
       }
       setState(prev => ({ ...prev, loading: false }));
       return false;

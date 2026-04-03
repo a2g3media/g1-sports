@@ -229,6 +229,7 @@ export function HubSchedule({ sportKey, games: propGames, loading: propLoading }
   const { openChat } = useGlobalAI();
   const [fetchedGames, setFetchedGames] = useState<ScheduleGame[]>([]);
   const [dateSpecificGames, setDateSpecificGames] = useState<ScheduleGame[]>([]);
+  const [hasLoadedDateSpecific, setHasLoadedDateSpecific] = useState(false);
   const [fetchLoading, setFetchLoading] = useState(!propGames);
   const [dateLoading, setDateLoading] = useState(false);
   const [filter, setFilter] = useState<"all" | "live" | "upcoming" | "final">("all");
@@ -261,16 +262,18 @@ export function HubSchedule({ sportKey, games: propGames, loading: propLoading }
   useEffect(() => {
     if (isToday) {
       setDateSpecificGames([]); // Clear date-specific games when viewing today
+      setHasLoadedDateSpecific(false);
       return;
     }
 
     let mounted = true;
     setDateLoading(true);
+    setHasLoadedDateSpecific(false);
 
     async function fetchDateGames() {
       try {
         const dateParam = formatDateParam(selectedDate);
-        const res = await fetch(`/api/games?sport=${sportKey.toUpperCase()}&date=${dateParam}`);
+        const res = await fetch(`/api/games?sport=${sportKey.toUpperCase()}&date=${dateParam}&includeOdds=0`);
         if (res.ok && mounted) {
           const data = await res.json();
           const transformed = (data.games || []).map(transformGameData);
@@ -279,7 +282,10 @@ export function HubSchedule({ sportKey, games: propGames, loading: propLoading }
       } catch (err) {
         console.error('[HubSchedule] Failed to fetch date games:', err);
       } finally {
-        if (mounted) setDateLoading(false);
+        if (mounted) {
+          setDateLoading(false);
+          setHasLoadedDateSpecific(true);
+        }
       }
     }
 
@@ -379,8 +385,9 @@ export function HubSchedule({ sportKey, games: propGames, loading: propLoading }
   // Use prop games if provided, otherwise use fetched games
   // For non-today dates, use date-specific fetched games
   const games = useMemo(() => {
-    // If viewing a different date, use the date-specific games
-    if (!isToday && dateSpecificGames.length > 0) {
+    // If viewing a different date, always use date-specific feed.
+    // This avoids falling back to today's list on future/past date views.
+    if (!isToday && hasLoadedDateSpecific) {
       return dateSpecificGames;
     }
     
@@ -389,7 +396,7 @@ export function HubSchedule({ sportKey, games: propGames, loading: propLoading }
       return propGames.map(transformGameData);
     }
     return fetchedGames;
-  }, [propGames, fetchedGames, dateSpecificGames, isToday]);
+  }, [propGames, fetchedGames, dateSpecificGames, hasLoadedDateSpecific, isToday]);
 
   const loading = dateLoading || (propLoading ?? fetchLoading);
 
@@ -557,6 +564,7 @@ export function HubSchedule({ sportKey, games: propGames, loading: propLoading }
             <ApprovedScoreCard
               key={game.id}
               game={cardGame}
+              visualPreset="hub"
               onClick={() => navigate(toGameDetailPath(sportKey, game.id))}
               onCoachClick={() => {
                 const homeTeam = game.homeTeam.name;

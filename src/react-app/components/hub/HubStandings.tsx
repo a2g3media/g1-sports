@@ -10,15 +10,17 @@ interface TeamStanding {
   teamCode: string;
   teamName: string;
   city: string;
-  wins: number;
-  losses: number;
-  pct: number;
+  wins: number | null;
+  losses: number | null;
+  pct: number | null;
   gb: string;
   streak: { type: "W" | "L"; count: number };
   last10: { wins: number; losses: number };
   homeRecord?: string;
   awayRecord?: string;
   confRecord?: string;
+  isFallback?: boolean;
+  divisionName?: string | null;
 }
 
 interface ConferenceData {
@@ -74,6 +76,45 @@ const NBA_TEAM_CODE_BY_NAME: Record<string, string> = {
   "washington wizards": "WAS",
 };
 
+const NBA_DIVISION_BY_TEAM_CODE: Record<string, string> = {
+  BOS: "Atlantic",
+  BKN: "Atlantic",
+  NYK: "Atlantic",
+  PHI: "Atlantic",
+  TOR: "Atlantic",
+  CHI: "Central",
+  CLE: "Central",
+  DET: "Central",
+  IND: "Central",
+  MIL: "Central",
+  ATL: "Southeast",
+  CHA: "Southeast",
+  MIA: "Southeast",
+  ORL: "Southeast",
+  WAS: "Southeast",
+  DAL: "Southwest",
+  HOU: "Southwest",
+  MEM: "Southwest",
+  NOP: "Southwest",
+  SAS: "Southwest",
+  DEN: "Northwest",
+  MIN: "Northwest",
+  OKC: "Northwest",
+  POR: "Northwest",
+  UTA: "Northwest",
+  GSW: "Pacific",
+  LAC: "Pacific",
+  LAL: "Pacific",
+  PHX: "Pacific",
+  SAC: "Pacific",
+};
+
+const TEAM_LOGO_CODE_OVERRIDES: Record<string, Record<string, string>> = {
+  nba: {
+    UTA: "utah",
+  },
+};
+
 function deriveTeamCode(team: Record<string, unknown>, sportKey: string): string {
   const alias = typeof team.alias === "string" ? team.alias : "";
   const abbreviation = typeof team.abbreviation === "string" ? team.abbreviation : "";
@@ -91,12 +132,113 @@ function deriveTeamCode(team: Record<string, unknown>, sportKey: string): string
   return "???";
 }
 
+function formatGamesBack(value: unknown, fallback: string): string {
+  if (value == null) return fallback;
+  if (typeof value === "number" && Number.isFinite(value)) return value === 0 ? "-" : value.toFixed(1);
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) return fallback;
+    const parsed = Number(trimmed);
+    if (Number.isFinite(parsed)) return parsed === 0 ? "-" : parsed.toFixed(1);
+    return trimmed;
+  }
+  if (typeof value === "object") {
+    const obj = value as Record<string, unknown>;
+    const candidates = [
+      obj.games_back,
+      obj.gamesBack,
+      obj.value,
+      obj.display,
+      obj.text,
+      obj.description,
+    ];
+    for (const candidate of candidates) {
+      const formatted = formatGamesBack(candidate, "");
+      if (formatted) return formatted;
+    }
+  }
+  return fallback;
+}
+
+function toStringSafe(value: unknown): string {
+  if (value == null) return "";
+  if (typeof value === "string") return value;
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  if (typeof value === "object") {
+    const obj = value as Record<string, unknown>;
+    const keys = ["name", "alias", "display", "text", "description", "value"];
+    for (const key of keys) {
+      const out = toStringSafe(obj[key]);
+      if (out) return out;
+    }
+  }
+  return "";
+}
+
+function getTeamLogoUrl(sportKey: string, teamCode: string): string {
+  const sportSlug = String(sportKey || "").toLowerCase();
+  const codeUpper = String(teamCode || "").toUpperCase();
+  const override = TEAM_LOGO_CODE_OVERRIDES[sportSlug]?.[codeUpper];
+  const resolvedCode = (override || codeUpper).toLowerCase();
+  return `https://a.espncdn.com/i/teamlogos/${sportSlug}/500/${resolvedCode}.png`;
+}
+
+function normalizeStreak(value: unknown): { type: "W" | "L"; count: number } {
+  if (!value) return { type: "W", count: 0 };
+  if (typeof value === "string") {
+    const streakMatch = value.match(/^([WL])(\d+)$/i);
+    if (streakMatch) {
+      return {
+        type: streakMatch[1].toUpperCase() as "W" | "L",
+        count: Number.parseInt(streakMatch[2], 10) || 0,
+      };
+    }
+    return { type: "W", count: 0 };
+  }
+  if (typeof value === "object") {
+    const obj = value as Record<string, unknown>;
+    const typeRaw = String(obj.type || obj.kind || obj.result || "").toUpperCase();
+    const countRaw = Number(obj.count ?? obj.length ?? obj.value ?? 0);
+    if ((typeRaw === "W" || typeRaw === "WIN") && Number.isFinite(countRaw)) {
+      return { type: "W", count: Math.max(0, Math.floor(countRaw)) };
+    }
+    if ((typeRaw === "L" || typeRaw === "LOSS") && Number.isFinite(countRaw)) {
+      return { type: "L", count: Math.max(0, Math.floor(countRaw)) };
+    }
+    const text = String(obj.display || obj.text || "").trim();
+    if (text) return normalizeStreak(text);
+  }
+  return { type: "W", count: 0 };
+}
+
+function normalizeLastTen(value: unknown, fallbackPct: number | null): { wins: number; losses: number } {
+  if (typeof value === "string") {
+    const last10Match = value.match(/^(\d+)-(\d+)$/);
+    if (last10Match) {
+      return { wins: Number.parseInt(last10Match[1], 10), losses: Number.parseInt(last10Match[2], 10) };
+    }
+  }
+  if (typeof value === "object" && value) {
+    const obj = value as Record<string, unknown>;
+    const wins = Number(obj.wins ?? obj.win ?? obj.w ?? NaN);
+    const losses = Number(obj.losses ?? obj.loss ?? obj.l ?? NaN);
+    if (Number.isFinite(wins) && Number.isFinite(losses)) {
+      return { wins: Math.max(0, Math.floor(wins)), losses: Math.max(0, Math.floor(losses)) };
+    }
+  }
+  const pct = typeof fallbackPct === "number" ? fallbackPct : 0.5;
+  const wins = Math.round(pct * 10);
+  return { wins, losses: 10 - wins };
+}
+
 export function HubStandings({ sportKey }: HubStandingsProps) {
+  const sportKeyLower = String(sportKey || '').toLowerCase();
   const [activeConf, setActiveConf] = useState<"east" | "west">("east");
   const [hoveredTeam, setHoveredTeam] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [standings, setStandings] = useState<{ east: ConferenceData; west: ConferenceData } | null>(null);
+  const [activeMlbDivision, setActiveMlbDivision] = useState<string>('');
 
   // Sport-specific labels
   const labels = SPORT_LABELS[sportKey] || SPORT_LABELS.nba;
@@ -115,21 +257,42 @@ export function HubStandings({ sportKey }: HubStandingsProps) {
         
         // API returns flat teams array with conferenceName field
         const allTeams = data.teams || [];
+        const source: "live" | "fallback" = (allTeams.length > 0 ? "live" : "fallback");
         
         // Helper to filter teams by conference patterns
-        const isEasternConf = (confName: string) => {
-          const lower = confName?.toLowerCase() || '';
+        const isEasternConf = (confName: unknown) => {
+          const lower = toStringSafe(confName).toLowerCase();
           return lower.includes('east') || lower.includes('american') || lower.includes('afc');
         };
         
-        const isWesternConf = (confName: string) => {
-          const lower = confName?.toLowerCase() || '';
+        const isWesternConf = (confName: unknown) => {
+          const lower = toStringSafe(confName).toLowerCase();
           return lower.includes('west') || lower.includes('national') || lower.includes('nfc');
         };
-        
-        // Partition teams by conference
-        const eastTeams = allTeams.filter((t: any) => isEasternConf(t.conferenceName));
-        const westTeams = allTeams.filter((t: any) => isWesternConf(t.conferenceName));
+
+        const resolveNbaConferenceFromCode = (teamCode: string): "east" | "west" | null => {
+          const division = NBA_DIVISION_BY_TEAM_CODE[teamCode];
+          if (!division) return null;
+          if (division === "Atlantic" || division === "Central" || division === "Southeast") return "east";
+          if (division === "Southwest" || division === "Northwest" || division === "Pacific") return "west";
+          return null;
+        };
+
+        // Partition teams by conference with NBA-specific deterministic fallback.
+        const eastTeams: any[] = [];
+        const westTeams: any[] = [];
+        for (const team of allTeams) {
+          const teamCode = deriveTeamCode(team, sportKey);
+          const confFromName = isEasternConf(team.conferenceName)
+            ? "east"
+            : isWesternConf(team.conferenceName)
+              ? "west"
+              : null;
+          const confFromNbaMap = sportKeyLower === "nba" ? resolveNbaConferenceFromCode(teamCode) : null;
+          const confBucket = confFromName || confFromNbaMap;
+          if (confBucket === "east") eastTeams.push(team);
+          if (confBucket === "west") westTeams.push(team);
+        }
 
         const transformTeams = (teams: any[], confName: string): ConferenceData => {
           if (!teams.length) {
@@ -146,8 +309,8 @@ export function HubStandings({ sportKey }: HubStandingsProps) {
             return bPct - aPct;
           });
 
-          // Take top 8
-          const topTeams = sorted.slice(0, 8);
+          // Keep complete conference rows for MLB and NBA.
+          const topTeams = (sportKeyLower === 'mlb' || sportKeyLower === 'nba') ? sorted : sorted.slice(0, 8);
 
           // Calculate games behind leader
           const leaderWins = topTeams[0]?.wins || 0;
@@ -156,26 +319,20 @@ export function HubStandings({ sportKey }: HubStandingsProps) {
           return {
             name: confName,
             teams: topTeams.map((team: any, index: number) => {
-              const wins = team.wins || 0;
-              const losses = team.losses || 0;
-              const totalGames = wins + losses;
-              const pct = totalGames > 0 ? wins / totalGames : 0;
+              const hasTrustedRecord = source !== "fallback";
+              const wins = hasTrustedRecord ? (team.wins || 0) : null;
+              const losses = hasTrustedRecord ? (team.losses || 0) : null;
+              const winsNum = typeof wins === "number" ? wins : 0;
+              const lossesNum = typeof losses === "number" ? losses : 0;
+              const totalGames = winsNum + lossesNum;
+              const pct = hasTrustedRecord && totalGames > 0 ? winsNum / totalGames : null;
               
               // GB calculation
-              const gbNum = ((leaderWins - wins) + (losses - leaderLosses)) / 2;
-              const gb = index === 0 ? "-" : gbNum.toFixed(1);
+              const gbNum = hasTrustedRecord ? ((leaderWins - (wins || 0)) + ((losses || 0) - leaderLosses)) / 2 : null;
+              const gb = hasTrustedRecord ? (index === 0 ? "-" : gbNum!.toFixed(1)) : "—";
 
-              // Parse streak from "W5" or "L3" format
-              const streakMatch = team.streak?.match(/^([WL])(\d+)$/);
-              const streak = streakMatch 
-                ? { type: streakMatch[1] as 'W' | 'L', count: parseInt(streakMatch[2]) }
-                : { type: 'W' as 'W' | 'L', count: 0 };
-
-              // Parse last 10 from "7-3" format
-              const last10Match = team.lastTen?.match(/^(\d+)-(\d+)$/);
-              const last10 = last10Match 
-                ? { wins: parseInt(last10Match[1]), losses: parseInt(last10Match[2]) }
-                : { wins: Math.round(pct * 10), losses: 10 - Math.round(pct * 10) };
+              const streak = normalizeStreak(team.streak);
+              const last10 = normalizeLastTen(team.lastTen, pct);
 
               return {
                 rank: team.rank || index + 1,
@@ -186,10 +343,18 @@ export function HubStandings({ sportKey }: HubStandingsProps) {
                 wins,
                 losses,
                 pct,
-                gb: team.gamesBack?.toString() || gb,
+                gb: formatGamesBack(
+                  team.gamesBack ?? team.gb ?? team.games_behind ?? team.gamesBehind,
+                  gb
+                ),
                 streak,
                 last10,
                 confRecord: team.confWins !== undefined ? `${team.confWins}-${team.confLosses}` : undefined,
+                isFallback: source === "fallback",
+                divisionName:
+                  toStringSafe(team.divisionName)
+                  || toStringSafe(team.division?.name)
+                  || (sportKeyLower === "nba" ? NBA_DIVISION_BY_TEAM_CODE[deriveTeamCode(team, sportKey)] || null : null),
               };
             }),
           };
@@ -210,6 +375,27 @@ export function HubStandings({ sportKey }: HubStandingsProps) {
     fetchStandings();
   }, [sportKey, labels.conf1, labels.conf2]);
 
+  useEffect(() => {
+    const supportsDivisionFilter = sportKeyLower === 'mlb' || sportKeyLower === 'nba';
+    if (!supportsDivisionFilter || !standings) return;
+    const currentTeams = activeConf === "east" ? standings.east.teams : standings.west.teams;
+    const divisionOptions = Array.from(
+      new Set(
+        currentTeams.map((team) => String(team.divisionName || '').trim()).filter(Boolean)
+      )
+    );
+    if (divisionOptions.length === 0) {
+      setActiveMlbDivision('');
+      return;
+    }
+    if (activeMlbDivision === '') {
+      return; // Keep explicit "All" selection.
+    }
+    if (!divisionOptions.includes(activeMlbDivision)) {
+      setActiveMlbDivision(divisionOptions[0]);
+    }
+  }, [activeConf, activeMlbDivision, sportKeyLower, standings]);
+
   if (loading) {
     return (
       <div className="flex items-center justify-center py-12">
@@ -228,11 +414,35 @@ export function HubStandings({ sportKey }: HubStandingsProps) {
 
   const eastData = standings.east;
   const westData = standings.west;
+  const showDivisionFilter = sportKeyLower === 'mlb' || sportKeyLower === 'nba';
+  const selectedConference = activeConf === "east" ? eastData : westData;
+  const mlbDivisionOptions = showDivisionFilter
+    ? Array.from(
+        new Set(
+          selectedConference.teams
+            .map((team) => String(team.divisionName || '').trim())
+            .filter(Boolean)
+        )
+      )
+    : [];
+  const divisionFilteredConference = showDivisionFilter && activeMlbDivision
+    ? {
+        ...selectedConference,
+        name: activeMlbDivision,
+        teams: selectedConference.teams.filter((team) => String(team.divisionName || '').trim() === activeMlbDivision),
+      }
+    : selectedConference;
+  const visibleTeamsCount = divisionFilteredConference.teams.length;
+  const totalTeamsCount = selectedConference.teams.length;
 
   return (
     <div className="space-y-4">
       {/* Conference Toggle */}
-      <div className="flex items-center justify-center gap-2">
+      <div className="flex items-center justify-between gap-3">
+        <div className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/[0.03] px-2.5 py-1 text-[10px] uppercase tracking-wider text-white/55">
+          <span>Standings</span>
+        </div>
+        <div className="flex items-center justify-center gap-2">
         <ConferenceTab 
           label={labels.conf1Short} 
           active={activeConf === "east"} 
@@ -245,7 +455,41 @@ export function HubStandings({ sportKey }: HubStandingsProps) {
           onClick={() => setActiveConf("west")}
           color="red"
         />
+        </div>
       </div>
+
+      {showDivisionFilter && mlbDivisionOptions.length > 0 && (
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="flex flex-wrap items-center gap-2">
+          <button
+            onClick={() => setActiveMlbDivision('')}
+            className={`px-3 py-2 rounded-lg border text-xs font-semibold transition-all min-h-[36px] ${
+              !activeMlbDivision
+                ? 'bg-[var(--sport-accent)]/20 text-[var(--sport-accent)] border-[var(--sport-accent)]/40'
+                : 'bg-white/5 text-white/60 border-white/10 hover:bg-white/10'
+            }`}
+          >
+            All
+          </button>
+          {mlbDivisionOptions.map((division) => (
+            <button
+              key={division}
+              onClick={() => setActiveMlbDivision(division)}
+              className={`px-3 py-2 rounded-lg border text-xs font-semibold transition-all min-h-[36px] ${
+                activeMlbDivision === division
+                  ? 'bg-[var(--sport-accent)]/20 text-[var(--sport-accent)] border-[var(--sport-accent)]/40'
+                  : 'bg-white/5 text-white/60 border-white/10 hover:bg-white/10'
+              }`}
+            >
+              {division.replace('American League ', 'AL ').replace('National League ', 'NL ')}
+            </button>
+          ))}
+          </div>
+          <div className={`text-[11px] ${visibleTeamsCount < totalTeamsCount ? 'text-red-300' : 'text-white/45'}`}>
+            Teams shown: <span className="text-white/75">{visibleTeamsCount}</span>/<span className="text-white/65">{totalTeamsCount}</span>
+          </div>
+        </div>
+      )}
 
       {/* Standings Table */}
       <AnimatePresence mode="wait">
@@ -257,7 +501,7 @@ export function HubStandings({ sportKey }: HubStandingsProps) {
           transition={{ duration: 0.2 }}
         >
           <StandingsCard 
-            conference={activeConf === "east" ? eastData : westData}
+            conference={divisionFilteredConference}
             sportKey={sportKey}
             hoveredTeam={hoveredTeam}
             setHoveredTeam={setHoveredTeam}
@@ -389,6 +633,7 @@ function TeamRow({ team, index, sportKey, isHovered, onHover, onLeave }: TeamRow
   const isPlayoffSpot = team.rank <= 6;
   const isPlayIn = team.rank === 7 || team.rank === 8;
   const teamColors = getTeamColors(sportKey, team.teamCode);
+  const hasRecord = typeof team.wins === "number" && typeof team.losses === "number";
 
   return (
     <motion.div
@@ -425,7 +670,7 @@ function TeamRow({ team, index, sportKey, isHovered, onHover, onLeave }: TeamRow
           {/* Team logo + name */}
           <div className="flex items-center gap-2 sm:gap-2.5 min-w-0">
             <img 
-              src={`https://a.espncdn.com/i/teamlogos/${sportKey}/500/${team.teamCode.toLowerCase()}.png`}
+              src={getTeamLogoUrl(sportKey, team.teamCode)}
               alt={team.teamName}
               className="w-6 h-6 sm:w-8 sm:h-8 object-contain flex-shrink-0"
               onError={(e) => {
@@ -449,14 +694,20 @@ function TeamRow({ team, index, sportKey, isHovered, onHover, onLeave }: TeamRow
         <div className="flex items-center gap-2 sm:gap-4 text-sm">
           {/* W-L */}
           <div className="w-10 text-center font-mono">
-            <span className="text-white/90">{team.wins}</span>
-            <span className="text-white/30">-</span>
-            <span className="text-white/60">{team.losses}</span>
+            {hasRecord ? (
+              <>
+                <span className="text-white/90">{team.wins}</span>
+                <span className="text-white/30">-</span>
+                <span className="text-white/60">{team.losses}</span>
+              </>
+            ) : (
+              <span className="text-white/35">—</span>
+            )}
           </div>
 
           {/* PCT - hidden on mobile */}
           <div className="w-10 text-center hidden sm:block">
-            <span className="text-white/60 text-xs">{team.pct.toFixed(3).slice(1)}</span>
+            <span className="text-white/60 text-xs">{typeof team.pct === "number" ? team.pct.toFixed(3).slice(1) : "—"}</span>
           </div>
 
           {/* GB */}
@@ -553,7 +804,7 @@ function MiniStandingsCard({ conference, label, sportKey }: MiniStandingsCardPro
                 {team.rank}
               </span>
               <img 
-                src={`https://a.espncdn.com/i/teamlogos/${sportKey}/500/${team.teamCode.toLowerCase()}.png`}
+                src={getTeamLogoUrl(sportKey, team.teamCode)}
                 alt={team.teamName}
                 className="w-5 h-5 object-contain"
                 onError={(e) => {
@@ -566,7 +817,7 @@ function MiniStandingsCard({ conference, label, sportKey }: MiniStandingsCardPro
               </span>
             </div>
             <span className="text-xs text-white/50 font-mono">
-              {team.wins}-{team.losses}
+              {typeof team.wins === "number" && typeof team.losses === "number" ? `${team.wins}-${team.losses}` : "—"}
             </span>
           </Link>
         ))}

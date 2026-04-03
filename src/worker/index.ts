@@ -49,6 +49,55 @@ app.onError((err, c) => {
   );
 });
 
+app.get("/api/media/player-photo", async (c) => {
+  const rawUrl = c.req.query("url");
+  if (!rawUrl) {
+    return c.json({ error: "Missing required query param: url" }, 400);
+  }
+
+  let target: URL;
+  try {
+    target = new URL(rawUrl);
+  } catch {
+    return c.json({ error: "Invalid url query param" }, 400);
+  }
+
+  // Keep this endpoint strictly image-only and host-whitelisted.
+  const allowedHosts = new Set(["a.espncdn.com", "img.mlbstatic.com", "mlbstatic.com"]);
+  if (!allowedHosts.has(target.hostname)) {
+    return c.json({ error: "Host not allowed for media proxy" }, 403);
+  }
+
+  let upstream: Response;
+  try {
+    upstream = await fetch(target.toString(), {
+      headers: {
+        "user-agent": "Mozilla/5.0 (compatible; GZSportsMediaProxy/1.0)",
+        accept: "image/*,*/*;q=0.8",
+      },
+    });
+  } catch (error) {
+    console.warn("[MediaProxy] Upstream fetch failed", { url: target.toString(), error });
+    return c.json({ error: "Failed to fetch upstream media" }, 502);
+  }
+
+  if (!upstream.ok || !upstream.body) {
+    return c.json(
+      { error: "Upstream media unavailable", status: upstream.status },
+      upstream.status === 404 ? 404 : 502
+    );
+  }
+
+  const contentType = upstream.headers.get("content-type") || "image/png";
+  return new Response(upstream.body, {
+    status: 200,
+    headers: {
+      "content-type": contentType,
+      "cache-control": "public, max-age=21600, s-maxage=21600",
+    },
+  });
+});
+
 function hasConfiguredValue(value: string | undefined): value is string {
   if (!value) return false;
   const trimmed = value.trim();
@@ -8033,6 +8082,7 @@ app.delete("/api/leagues/:id/chat/:messageId", authMiddleware, async (c) => {
 async function handleScheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext) {
   const { checkAndRunScheduledJobs: runScheduler } = await import('./services/sports-data/internalScheduler');
   const { runCoachGScheduledPipeline } = await import('./services/coachgTaskEngine');
+  const { fetchSportsRadarOdds, captureAllOddsSnapshots } = await import('./services/sportsRadarOddsService');
   
   console.log(`[Scheduled] Triggered by cron: ${event.cron}`);
   
@@ -8051,6 +8101,35 @@ async function handleScheduled(event: ScheduledEvent, env: Env, ctx: ExecutionCo
           console.log(`[Scheduled] Coach G task engine complete: ${results.length} jobs, ${produced} payloads`);
         })
         .catch((err) => console.error('[Scheduled] Coach G task engine failed:', err))
+    );
+  }
+
+  // Keep line-movement snapshots warm even when UI requests use includeOdds=0.
+  // This ensures opening/current movement data continues across all active sports.
+  const oddsApiKey = env.SPORTSRADAR_ODDS_KEY || env.SPORTSRADAR_API_KEY;
+  if (env.DB && oddsApiKey) {
+    const baseApiKey = env.SPORTSRADAR_API_KEY || oddsApiKey;
+    const oddsSports = ['nba', 'nfl', 'mlb', 'nhl', 'ncaab', 'ncaaf', 'soccer', 'mma', 'golf', 'nascar'] as const;
+    ctx.waitUntil(
+      (async () => {
+        let totalCaptured = 0;
+        let totalErrors = 0;
+        await Promise.allSettled(
+          oddsSports.map(async (sport) => {
+            try {
+              const oddsMap = await fetchSportsRadarOdds(sport, baseApiKey, env.DB, undefined, oddsApiKey);
+              if (oddsMap.size === 0) return;
+              const result = await captureAllOddsSnapshots(env.DB, oddsMap, sport);
+              totalCaptured += result.captured;
+              totalErrors += result.errors;
+            } catch (err) {
+              totalErrors += 1;
+              console.error(`[Scheduled] Snapshot capture failed for ${sport}:`, err);
+            }
+          })
+        );
+        console.log(`[Scheduled] Line movement capture complete: ${totalCaptured} captured, ${totalErrors} errors`);
+      })()
     );
   }
 }
@@ -8099,11 +8178,31 @@ export default {
       }
     }
     
+    const accept = request.headers.get("accept") || "";
+    const isDocumentRequest = request.method === "GET" && accept.includes("text/html");
+    const hasFileExtension = /\.[a-zA-Z0-9]+$/.test(url.pathname);
+
     // For non-API routes in production, serve from assets
     // In dev mode, the Cloudflare Vite plugin handles static files
     if (assets) {
       try {
-        return await assets.fetch(request);
+        const assetResponse = await assets.fetch(request);
+        if (assetResponse.status !== 404) {
+          return assetResponse;
+        }
+
+        // Production SPA deep-link fallback:
+        // when /games or /odds is requested directly, serve the root document.
+        if (isDocumentRequest && !hasFileExtension) {
+          const rootUrl = new URL("/", url);
+          const rootRequest = new Request(rootUrl.toString(), request);
+          const rootResponse = await assets.fetch(rootRequest);
+          if (rootResponse.ok) {
+            return rootResponse;
+          }
+        }
+
+        return assetResponse;
       } catch (error) {
         console.error("[Worker] Asset fetch failed:", error);
       }
@@ -8112,9 +8211,6 @@ export default {
     // Dev-only SPA fallback when assets binding is unavailable.
     // Serve a minimal Vite HTML shell for document navigation requests so
     // deep links like /games/... resolve to the React router instead of 404.
-    const accept = request.headers.get("accept") || "";
-    const isDocumentRequest = request.method === "GET" && accept.includes("text/html");
-    const hasFileExtension = /\.[a-zA-Z0-9]+$/.test(url.pathname);
 
     if (isDocumentRequest && !hasFileExtension) {
       return new Response(
