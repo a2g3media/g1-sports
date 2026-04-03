@@ -1311,6 +1311,29 @@ teams.get('/:sport/standings', async (c) => {
   }
 });
 
+/**
+ * Get ESPN line fallback for NBA event IDs.
+ * GET /api/teams/:sport/espn-line?eventId=401810962
+ */
+teams.get('/:sport/espn-line', async (c) => {
+  const sport = c.req.param('sport').toUpperCase();
+  if (sport !== 'NBA') {
+    return c.json({ error: 'ESPN line fallback is currently supported for NBA only' }, 400);
+  }
+  const eventId = String(c.req.query('eventId') || '').trim();
+  if (!/^\d{7,}$/.test(eventId)) {
+    return c.json({ error: 'eventId is required and must be an ESPN event id' }, 400);
+  }
+  const line = await fetchNbaEspnEventLineById(eventId);
+  return c.json({
+    sport,
+    eventId,
+    spreadHome: line.spreadHome,
+    totalLine: line.totalLine,
+    hasLine: line.spreadHome !== null || line.totalLine !== null,
+  });
+});
+
 type TeamH2HMeeting = {
   id: string;
   date: string;

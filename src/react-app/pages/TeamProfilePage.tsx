@@ -1207,7 +1207,7 @@ export function TeamProfilePage() {
 
   const fetchTeamData = async () => {
     if (!sportKey || !teamId) return;
-    const cacheKey = `team-profile:v9:${sportKey.toUpperCase()}:${teamId}`;
+    const cacheKey = `team-profile:v10:${sportKey.toUpperCase()}:${teamId}`;
     const cached = getRouteCache<TeamProfileData>(cacheKey, 180_000);
     if (cached) {
       setData(cached);
@@ -1224,20 +1224,20 @@ export function TeamProfilePage() {
       // Fetch team profile, schedule, stats, standings, and sport games in parallel
       const [profileJson, scheduleJson, statsJson, standingsJson, gamesJson, injuriesJson, splitsJson] = await Promise.all([
         fetchJsonCached<any>(`/api/teams/${sportUpper}/${teamId}`, {
-          cacheKey: `team-profile:v9:${sportUpper}:${teamId}`,
+          cacheKey: `team-profile:v10:${sportUpper}:${teamId}`,
           ttlMs: 60_000,
           timeoutMs: 7_000,
           init: { credentials: 'include' },
         }),
         fetchJsonCached<any>(`/api/teams/${sportUpper}/${teamId}/schedule`, {
-          cacheKey: `team-schedule:v9:${sportUpper}:${teamId}`,
+          cacheKey: `team-schedule:v10:${sportUpper}:${teamId}`,
           ttlMs: 45_000,
           timeoutMs: 12_000,
           init: { credentials: 'include' },
         }).catch(async () => {
           try {
             return await fetchJsonCached<any>(`/api/teams/${sportUpper}/${teamId}/schedule?fresh=1`, {
-              cacheKey: `team-schedule:v9-retry:${sportUpper}:${teamId}`,
+              cacheKey: `team-schedule:v10-retry:${sportUpper}:${teamId}`,
               ttlMs: 30_000,
               timeoutMs: 20_000,
               init: { credentials: 'include' },
@@ -1247,31 +1247,31 @@ export function TeamProfilePage() {
           }
         }),
         fetchJsonCached<any>(`/api/teams/${sportUpper}/${teamId}/stats`, {
-          cacheKey: `team-stats:v9:${sportUpper}:${teamId}`,
+          cacheKey: `team-stats:v10:${sportUpper}:${teamId}`,
           ttlMs: 120_000,
           timeoutMs: 4_500,
           init: { credentials: 'include' },
         }).catch(() => ({ stats: {}, rankings: {} })),
         fetchJsonCached<any>(`/api/teams/${sportUpper}/standings`, {
-          cacheKey: `team-standings:v9:${sportUpper}`,
+          cacheKey: `team-standings:v10:${sportUpper}`,
           ttlMs: 90_000,
           timeoutMs: 4_500,
           init: { credentials: 'include' },
         }).catch(() => ({ teams: [] })),
         fetchJsonCached<any>(`/api/games?sport=${sportUpper}&includeOdds=1`, {
-          cacheKey: `games-lite:v9:${sportUpper}`,
+          cacheKey: `games-lite:v10:${sportUpper}`,
           ttlMs: 20_000,
           timeoutMs: 4_000,
           init: { credentials: 'include' },
         }).catch(() => ({ games: [] })),
         fetchJsonCached<any>(`/api/teams/${sportUpper}/${teamId}/injuries`, {
-          cacheKey: `team-injuries:v9:${sportUpper}:${teamId}`,
+          cacheKey: `team-injuries:v10:${sportUpper}:${teamId}`,
           ttlMs: 45_000,
           timeoutMs: 4_000,
           init: { credentials: 'include' },
         }).catch(() => ({ injuries: [] })),
         fetchJsonCached<any>(`/api/teams/${sportUpper}/${teamId}/splits`, {
-          cacheKey: `team-splits:v9:${sportUpper}:${teamId}`,
+          cacheKey: `team-splits:v10:${sportUpper}:${teamId}`,
           ttlMs: 90_000,
           timeoutMs: 4_000,
           init: { credentials: 'include' },
@@ -1644,20 +1644,17 @@ export function TeamProfilePage() {
             const eventId = String(row.id || '').trim();
             if (!eventId) return;
             try {
-              const res = await fetch(`https://site.api.espn.com/apis/site/v2/sports/basketball/nba/summary?event=${encodeURIComponent(eventId)}`);
-              if (!res.ok) return;
-              const json: any = await res.json();
-              const line = (Array.isArray(json?.pickcenter) ? json.pickcenter[0] : null)
-                || (Array.isArray(json?.odds) ? json.odds[0] : null)
-                || null;
-              if (!line) return;
-              const spreadHome = parseEspnNum(line?.spread)
-                ?? parseEspnNum(line?.pointSpread?.home)
-                ?? parseEspnNum(line?.pointSpread?.away)
-                ?? parseSpreadFromDetails(line?.details);
-              const total = parseEspnNum(line?.overUnder)
-                ?? parseEspnNum(line?.pointSpread?.total)
-                ?? parseEspnNum(line?.total?.line);
+              const payload = await fetchJsonCached<{ spreadHome?: number | null; totalLine?: number | null }>(
+                `/api/teams/NBA/espn-line?eventId=${encodeURIComponent(eventId)}`,
+                {
+                  cacheKey: `espn-line:${eventId}:v1`,
+                  ttlMs: 6 * 60 * 60 * 1000,
+                  timeoutMs: 3_500,
+                  init: { credentials: 'include' },
+                }
+              );
+              const spreadHome = parseEspnNum(payload?.spreadHome);
+              const total = parseEspnNum(payload?.totalLine);
               espnLineById.set(eventId, { spreadHome, total });
             } catch {
               // Best-effort only.
