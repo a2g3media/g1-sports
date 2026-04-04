@@ -267,7 +267,23 @@ async function fetchNbaEspnTeamMaps() {
 
 async function fetchNbaEspnTeamIdByAlias(alias: string): Promise<string> {
   const maps = await fetchNbaEspnTeamMaps();
-  return String(maps.byAlias.get(alias) || '');
+  const raw = String(alias || '').trim().toUpperCase();
+  if (!raw) return '';
+  const ALIAS_FALLBACKS: Record<string, string[]> = {
+    NYK: ['NY', 'NYK'],
+    WAS: ['WSH', 'WAS'],
+    GSW: ['GS', 'GSW'],
+    SAS: ['SA', 'SAS'],
+    UTA: ['UTAH', 'UTA'],
+    NOP: ['NO', 'NOP'],
+    PHX: ['PHX', 'PHO'],
+  };
+  const candidates = [raw, ...(ALIAS_FALLBACKS[raw] || [])];
+  for (const candidate of candidates) {
+    const id = String(maps.byAlias.get(candidate) || '').trim();
+    if (id) return id;
+  }
+  return '';
 }
 
 function parseRecordSummary(summary: string): { wins?: number; losses?: number } {

@@ -76,6 +76,8 @@
     "qa:pools:release:report": "npx tsx scripts/qa-pools-release-report.ts",
     "qa:player:matchup": "npx tsx scripts/qa-player-matchup-guardrails.ts",
     "qa:team:lines": "npx tsx scripts/qa-team-lines-guardrails.ts",
+    "qa:team:schedule": "npx tsx scripts/qa-team-schedule-health.ts",
+    "qa:stability:gates": "npm run qa:player:matchup && npm run qa:team:schedule",
     "qa:pools:gates": "npm run qa:pools:evaluators && npm run qa:pools:catalog && npm run qa:pools:ui && npm run qa:pools:api && npm run qa:pools:join && npm run smoke:pools && npm run smoke:routes:deep",
     "smoke:quick": "bash scripts/smoke-quick.sh",
     "test:nascar-live-snapshot": "npx tsx scripts/test-nascar-live-snapshot.ts",
