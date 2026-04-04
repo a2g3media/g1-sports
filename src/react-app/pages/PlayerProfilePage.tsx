@@ -1691,6 +1691,7 @@ function LoadingSkeleton() {
 export default function PlayerProfilePage() {
   const { sport, playerName } = useParams<{ sport: string; playerName: string }>();
   const navigate = useNavigate();
+  const decodedPlayerName = useMemo(() => decodeURIComponent(playerName || ''), [playerName]);
   
   const [data, setData] = useState<PlayerProfileData | null>(null);
   const [loading, setLoading] = useState(true);
@@ -1706,7 +1707,14 @@ export default function PlayerProfilePage() {
   
   useEffect(() => {
     if (!sport || !playerName) return;
-    const cacheKey = `player-profile:${sport.toUpperCase()}:${decodeURIComponent(playerName)}`;
+    const normalizePlayerSlug = (value: string): string =>
+      String(value || '')
+        .normalize('NFD')
+        .replace(/[\u0300-\u036f]/g, '')
+        .replace(/\u2019/g, "'")
+        .trim();
+    const normalizedPlayerName = normalizePlayerSlug(decodedPlayerName);
+    const cacheKey = `player-profile:${sport.toUpperCase()}:${decodedPlayerName}`;
     const cached = getRouteCache<PlayerProfileData>(cacheKey, 120_000);
     if (cached) {
       setData(cached);
@@ -1720,11 +1728,15 @@ export default function PlayerProfilePage() {
       setError(null);
       
       try {
-        const apiUrl = `/api/player/${sport}/${encodeURIComponent(playerName)}`;
+        const primaryUrl = `/api/player/${sport}/${encodeURIComponent(decodedPlayerName)}`;
+        const normalizedUrl = normalizedPlayerName && normalizedPlayerName !== decodedPlayerName
+          ? `/api/player/${sport}/${encodeURIComponent(normalizedPlayerName)}`
+          : null;
+        const apiUrl = primaryUrl;
         let profileData: any;
         try {
-          profileData = await fetchJsonCached<any>(apiUrl, {
-            cacheKey: `player-api:${sport.toUpperCase()}:${decodeURIComponent(playerName)}`,
+          profileData = await fetchJsonCached<any>(primaryUrl, {
+            cacheKey: `player-api:${sport.toUpperCase()}:${decodedPlayerName}`,
             ttlMs: 45_000,
             timeoutMs: 8_000,
             init: { credentials: 'include' },
@@ -1737,9 +1749,20 @@ export default function PlayerProfilePage() {
             const retryTimeoutMs = message.includes('HTTP 404') ? 2500 : 12000;
             const timer = setTimeout(() => controller.abort(), retryTimeoutMs);
             try {
-              const fallbackRes = await fetch(apiUrl, { credentials: 'include', signal: controller.signal });
+              const fallbackRes = await fetch(primaryUrl, { credentials: 'include', signal: controller.signal });
               if (fallbackRes.ok) {
                 profileData = await fallbackRes.json();
+              } else if (fallbackRes.status === 404 && normalizedUrl) {
+                // Accent/diacritics fallback (e.g., Jokić -> Jokic).
+                const normalizedRes = await fetch(normalizedUrl, { credentials: 'include', signal: controller.signal });
+                if (normalizedRes.ok) {
+                  profileData = await normalizedRes.json();
+                } else if (normalizedRes.status === 404) {
+                  const errData = await fallbackRes.json();
+                  profileData = { __fallback404: true, errData };
+                } else {
+                  throw err;
+                }
               } else if (fallbackRes.status === 404) {
                 const errData = await fallbackRes.json();
                 profileData = { __fallback404: true, errData };
@@ -1798,7 +1821,7 @@ export default function PlayerProfilePage() {
           try {
             const freshUrl = `${apiUrl}${apiUrl.includes('?') ? '&' : '?'}fresh=1`;
             const refreshed = await fetchJsonCached<any>(freshUrl, {
-              cacheKey: `player-api-fresh:${sport.toUpperCase()}:${decodeURIComponent(playerName)}`,
+              cacheKey: `player-api-fresh:${sport.toUpperCase()}:${decodedPlayerName}`,
               ttlMs: 30_000,
               timeoutMs: 9_000,
               bypassCache: true,
@@ -1829,9 +1852,8 @@ export default function PlayerProfilePage() {
   const isFollowing = useMemo(() => {
     if (!sport || !playerName) return false;
     // Decode the URL-encoded player name for comparison
-    const decodedName = decodeURIComponent(playerName);
-    return isPlayerFollowed(decodedName, sport.toUpperCase());
-  }, [sport, playerName, isPlayerFollowed]);
+    return isPlayerFollowed(decodedPlayerName, sport.toUpperCase());
+  }, [sport, playerName, decodedPlayerName, isPlayerFollowed]);
   
   // Handle follow/unfollow toggle
   const handleFollowClick = useCallback(async () => {
