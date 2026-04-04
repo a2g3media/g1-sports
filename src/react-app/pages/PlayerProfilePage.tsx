@@ -1407,7 +1407,7 @@ function CoachGAnalysis({
   props: any[];
 }) {
   const { user } = useDemoAuth();
-  const [isOpen, setIsOpen] = useState(true);
+  const [isOpen, setIsOpen] = useState(false);
   const [message, setMessage] = useState('');
   const [chatHistory, setChatHistory] = useState<{ role: 'user' | 'assistant'; content: string }[]>([]);
   const [isLoading, setIsLoading] = useState(false);
@@ -1995,14 +1995,6 @@ export default function PlayerProfilePage() {
               hitRates={data.propHitRates}
               props={data.currentProps}
             />
-
-            {/* Coach G Analysis */}
-            <CoachGAnalysis 
-              player={data.player}
-              gameLog={data.gameLog}
-              seasonAverages={data.seasonAverages}
-              props={data.currentProps}
-            />
             
             {/* Game Log */}
             {data.gameLog.length > 0 && (
@@ -2023,6 +2015,14 @@ export default function PlayerProfilePage() {
                 </p>
               </div>
             )}
+
+            {/* Coach G Analysis */}
+            <CoachGAnalysis 
+              player={data.player}
+              gameLog={data.gameLog}
+              seasonAverages={data.seasonAverages}
+              props={data.currentProps}
+            />
           </>
         )}
       </div>
