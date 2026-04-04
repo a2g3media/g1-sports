@@ -1975,14 +1975,6 @@ export default function PlayerProfilePage() {
               </div>
             )}
             
-            {/* Coach G Analysis - Prominent placement */}
-            <CoachGAnalysis 
-              player={data.player}
-              gameLog={data.gameLog}
-              seasonAverages={data.seasonAverages}
-              props={data.currentProps}
-            />
-
             <LastFiveFormSection gameLog={data.gameLog} recentPerformance={data.recentPerformance} />
             
             {/* Matchup & Health Row */}
@@ -2001,6 +1993,14 @@ export default function PlayerProfilePage() {
             {/* Props & Hit Rates */}
             <PropHitRatesPanel 
               hitRates={data.propHitRates}
+              props={data.currentProps}
+            />
+
+            {/* Coach G Analysis */}
+            <CoachGAnalysis 
+              player={data.player}
+              gameLog={data.gameLog}
+              seasonAverages={data.seasonAverages}
               props={data.currentProps}
             />
             
