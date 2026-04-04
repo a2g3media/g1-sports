@@ -1029,6 +1029,11 @@ function TeamMatchupEdgeSection({
                 key={`${row.game.id || row.game.date}-${idx}`}
                 className="group rounded-md bg-white/[0.02] border border-white/[0.05] px-3 py-3 text-xs transition-all duration-200 hover:border-cyan-300/25 hover:bg-white/[0.04] hover:shadow-[0_0_16px_rgba(34,211,238,0.08)] hover:-translate-y-[1px]"
               >
+                {(() => {
+                  const hasSpread = typeof row.game.spread === 'number' && Number.isFinite(row.game.spread);
+                  const hasTotal = typeof row.game.total === 'number' && Number.isFinite(row.game.total);
+                  const hasAnyLine = hasSpread || hasTotal;
+                  return (
                 <div className="md:grid md:grid-cols-[1.6fr_1fr] md:items-center md:gap-4">
                   <div className="min-w-0">
                     <div className="flex flex-wrap items-center gap-1.5 text-[11px]">
@@ -1061,29 +1066,38 @@ function TeamMatchupEdgeSection({
                       {`Line: Spread ${typeof row.game.spread === 'number' && Number.isFinite(row.game.spread) ? row.game.spread : '-'} | Total ${typeof row.game.total === 'number' && Number.isFinite(row.game.total) ? row.game.total : '-'}`}
                     </div>
                   </div>
-                  <div className="relative mt-2 md:mt-0 grid grid-cols-2 divide-x divide-white/[0.08] rounded-md border border-white/[0.05] bg-white/[0.02] overflow-hidden">
-                    <div className="pointer-events-none absolute inset-0 opacity-0 transition-opacity duration-200 group-hover:opacity-100 bg-gradient-to-r from-transparent via-cyan-400/[0.06] to-transparent" />
-                    {([
-                      { key: 'ATS', value: row.ats },
-                      { key: 'TOTAL', value: row.totalOutcome },
-                    ] as const).map((item) => (
-                      <div key={item.key} className={cn('px-2 py-1.5 text-center border transition-colors', outcomeBlockTone(item.value))}>
-                        <div className="text-[9px] uppercase tracking-wide text-white/65">{item.key}</div>
-                        <div className="mt-0.5 text-[11px] font-semibold tracking-wide">
-                          <span className={cn('inline-flex items-center gap-1 rounded-full px-2 py-0.5', outcomeBadgeTone(item.value))}>
-                            <span aria-hidden className="text-[11px] opacity-95">{outcomeIcon(item.value)}</span>
-                            <span>{item.value}</span>
-                          </span>
+                  {hasAnyLine ? (
+                    <div className="relative mt-2 md:mt-0 grid grid-cols-2 divide-x divide-white/[0.08] rounded-md border border-white/[0.05] bg-white/[0.02] overflow-hidden">
+                      <div className="pointer-events-none absolute inset-0 opacity-0 transition-opacity duration-200 group-hover:opacity-100 bg-gradient-to-r from-transparent via-cyan-400/[0.06] to-transparent" />
+                      {([
+                        { key: 'ATS', value: row.ats },
+                        { key: 'TOTAL', value: row.totalOutcome },
+                      ] as const).map((item) => (
+                        <div key={item.key} className={cn('px-2 py-1.5 text-center border transition-colors', outcomeBlockTone(item.value))}>
+                          <div className="text-[9px] uppercase tracking-wide text-white/65">{item.key}</div>
+                          <div className="mt-0.5 text-[11px] font-semibold tracking-wide">
+                            <span className={cn('inline-flex items-center gap-1 rounded-full px-2 py-0.5', outcomeBadgeTone(item.value))}>
+                              <span aria-hidden className="text-[11px] opacity-95">{outcomeIcon(item.value)}</span>
+                              <span>{item.value}</span>
+                            </span>
+                          </div>
+                          <div className="mt-0.5 text-[10px] text-white/62">
+                            {item.key === 'ATS'
+                              ? `Spread ${typeof row.game.spread === 'number' && Number.isFinite(row.game.spread) ? row.game.spread : '-'}`
+                              : `Total ${typeof row.game.total === 'number' && Number.isFinite(row.game.total) ? row.game.total : '-'}`}
+                          </div>
                         </div>
-                        <div className="mt-0.5 text-[10px] text-white/62">
-                          {item.key === 'ATS'
-                            ? `Spread ${typeof row.game.spread === 'number' && Number.isFinite(row.game.spread) ? row.game.spread : '-'}`
-                            : `Total ${typeof row.game.total === 'number' && Number.isFinite(row.game.total) ? row.game.total : '-'}`}
-                        </div>
-                      </div>
-                    ))}
-                  </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <div className="mt-2 md:mt-0 rounded-md border border-amber-300/25 bg-amber-500/10 px-3 py-2 text-center">
+                      <div className="text-[10px] uppercase tracking-wide text-amber-200/85">Market Data</div>
+                      <div className="mt-0.5 text-[11px] font-semibold text-amber-100">No confirmed line for this game</div>
+                    </div>
+                  )}
                 </div>
+                  );
+                })()}
               </div>
             ))
           )}
