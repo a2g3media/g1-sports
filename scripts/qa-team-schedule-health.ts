@@ -75,10 +75,26 @@ async function main() {
       const teamId = String(team.id || "").trim();
       const label = String(team.alias || team.abbreviation || team.name || teamId);
       try {
-        const { status, json } = await readJson<TeamSchedulePayload>(
-          `${base}/api/teams/${sport}/${encodeURIComponent(teamId)}/schedule?fresh=1`,
-          timeoutMs
-        );
+        let status = 0;
+        let json: TeamSchedulePayload = {};
+        let lastError: unknown = null;
+        for (let attempt = 0; attempt < 3; attempt += 1) {
+          try {
+            const response = await readJson<TeamSchedulePayload>(
+              `${base}/api/teams/${sport}/${encodeURIComponent(teamId)}/schedule?fresh=1`,
+              timeoutMs
+            );
+            status = response.status;
+            json = response.json;
+            if (status === 200) break;
+            // Retry transient server-side misses once or twice.
+            await new Promise((r) => setTimeout(r, 300 * (attempt + 1)));
+          } catch (err) {
+            lastError = err;
+            await new Promise((r) => setTimeout(r, 300 * (attempt + 1)));
+          }
+        }
+        if (status === 0 && lastError) throw lastError;
         if (status !== 200) {
           failures.push(`${label}: HTTP ${status} ${String((json as any)?.error || "")}`.trim());
           continue;

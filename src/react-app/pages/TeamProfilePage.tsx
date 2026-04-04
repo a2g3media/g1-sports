@@ -608,7 +608,7 @@ function RosterPreview({ roster, sportKey }: { roster: RosterPlayer[]; sportKey:
   );
 }
 
-function SchedulePreview({ schedule }: { schedule: GameResult[]; teamColor?: string }) {
+export function SchedulePreview({ schedule }: { schedule: GameResult[]; teamColor?: string }) {
   const [tab, setTab] = useState<'recent' | 'upcoming'>('upcoming');
   
   const recentGames = schedule.filter(g => g.status === 'final').slice(-5).reverse();
@@ -715,7 +715,7 @@ function SchedulePreview({ schedule }: { schedule: GameResult[]; teamColor?: str
   );
 }
 
-function TeamH2HPreview({ h2h }: { h2h: TeamH2HData | null }) {
+export function TeamH2HPreview({ h2h }: { h2h: TeamH2HData | null }) {
   if (!h2h || h2h.sampleSize === 0) {
     return (
       <div className="bg-card/50 backdrop-blur-sm rounded-xl border border-border/50 p-4">
@@ -1659,15 +1659,6 @@ export function TeamProfilePage() {
           const n = Number(value);
           return Number.isFinite(n) ? n : null;
         };
-        const parseSpreadFromDetails = (value: unknown): number | null => {
-          const text = String(value || '').trim();
-          if (!text) return null;
-          const match = text.match(/([+-]?\d+(?:\.\d+)?)/);
-          if (!match) return null;
-          const n = Number(match[1]);
-          return Number.isFinite(n) ? n : null;
-        };
-
         await Promise.all(
           espnTargets.map(async (row) => {
             const eventId = String(row.id || '').trim();
