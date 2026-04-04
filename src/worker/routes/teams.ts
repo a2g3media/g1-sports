@@ -1914,6 +1914,20 @@ teams.get('/:sport/:teamId/schedule', async (c) => {
   
   try {
     const selectedSeason = season ? parseInt(season, 10) : undefined;
+    const snapshotCacheKey = makeCacheKey('team-schedule-snapshot', `${sport}/${teamId}`, {
+      season: Number.isFinite(selectedSeason as number) ? String(selectedSeason) : 'current',
+    });
+    const readScheduleSnapshot = async () => {
+      return await getCachedData<any>(c.env.DB, snapshotCacheKey);
+    };
+    const writeScheduleSnapshot = (payload: any) => {
+      const total = Number(payload?.totalGames || (Array.isArray(payload?.allGames) ? payload.allGames.length : 0));
+      if (!Number.isFinite(total) || total <= 0) return;
+      c.executionCtx.waitUntil(
+        setCachedData(c.env.DB, snapshotCacheKey, 'teams', `schedule/${sport}/${teamId}`, payload, 12 * 60 * 60)
+      );
+    };
+
     const provider = getSportsRadarProvider(apiKey, null);
     const result = await provider.fetchTeamSchedule(
       sport as SportKey, 
@@ -2095,7 +2109,7 @@ teams.get('/:sport/:teamId/schedule', async (c) => {
           .filter((g: any) => g.scheduledTime && new Date(g.scheduledTime) >= now)
           .sort((a: any, b: any) => new Date(a.scheduledTime).getTime() - new Date(b.scheduledTime).getTime())
           .slice(0, 10);
-        return c.json({
+        const fallbackPayload = {
           teamId,
           pastGames: fallbackPastGames,
           upcomingGames: fallbackUpcomingGames,
@@ -2103,11 +2117,29 @@ teams.get('/:sport/:teamId/schedule', async (c) => {
           totalGames: fallbackGamesWithLines.length,
           errors: [...result.errors, 'Used ESPN schedule fallback'],
           source: 'espn_fallback',
+        };
+        writeScheduleSnapshot(fallbackPayload);
+        return c.json(fallbackPayload);
+      }
+      const snapshot = await readScheduleSnapshot();
+      if (snapshot) {
+        return c.json({
+          ...snapshot,
+          source: 'snapshot_fallback',
+          errors: [...(Array.isArray(snapshot?.errors) ? snapshot.errors : []), ...(result.errors || []), 'Served last good schedule snapshot'],
         });
       }
       return c.json({ error: fallback.error || result.errors[0] }, 500);
     }
     if (result.errors.length > 0 && mergedResultGames.length === 0) {
+      const snapshot = await readScheduleSnapshot();
+      if (snapshot) {
+        return c.json({
+          ...snapshot,
+          source: 'snapshot_fallback',
+          errors: [...(Array.isArray(snapshot?.errors) ? snapshot.errors : []), ...(result.errors || []), 'Served last good schedule snapshot'],
+        });
+      }
       return c.json({ error: result.errors[0] }, 500);
     }
 
@@ -2237,17 +2269,34 @@ teams.get('/:sport/:teamId/schedule', async (c) => {
       .sort((a, b) => new Date(a.scheduledTime).getTime() - new Date(b.scheduledTime).getTime())
       .slice(0, 10);
     
-    return c.json({
+    const responsePayload = {
       teamId,
       pastGames,
       upcomingGames,
       allGames: gamesWithLines,
       totalGames: gamesWithLines.length,
       errors: result.errors
-    });
+    };
+    writeScheduleSnapshot(responsePayload);
+    return c.json(responsePayload);
     
   } catch (err) {
     console.error('[Teams API] Schedule error:', err);
+    try {
+      const snapshotCacheKey = makeCacheKey('team-schedule-snapshot', `${sport}/${teamId}`, {
+        season: Number.isFinite(Number(season)) ? String(Number(season)) : 'current',
+      });
+      const snapshot = await getCachedData<any>(c.env.DB, snapshotCacheKey);
+      if (snapshot) {
+        return c.json({
+          ...snapshot,
+          source: 'snapshot_fallback',
+          errors: [...(Array.isArray(snapshot?.errors) ? snapshot.errors : []), `Schedule error: ${String(err)}`, 'Served last good schedule snapshot'],
+        });
+      }
+    } catch {
+      // fallback read failed
+    }
     return c.json({ error: String(err) }, 500);
   }
 });
