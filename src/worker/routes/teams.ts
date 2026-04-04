@@ -490,6 +490,75 @@ async function enrichNbaEspnGamesWithSummaryLines(games: any[]): Promise<any[]> 
   });
 }
 
+async function enrichNbaGamesWithEspnScheduleBridgeLines(
+  db: D1Database,
+  games: any[],
+  teamId: string,
+  selectedSeason: number | undefined,
+  apiKey: string
+): Promise<any[]> {
+  if (!Array.isArray(games) || games.length === 0) return games;
+  const missingFinals = games.filter((g: any) => {
+    const statusRaw = String(g?.status?.name || g?.status || '').toUpperCase();
+    const isFinalish = statusRaw.includes('FINAL') || statusRaw.includes('CLOSED') || statusRaw.includes('COMPLETED');
+    return isFinalish && (g?.spreadHome == null || g?.totalLine == null);
+  });
+  if (missingFinals.length === 0) return games;
+
+  try {
+    const alias = await resolveNbaTeamAliasForFallback(db, teamId, apiKey);
+    const espnFallback = await fetchNbaEspnScheduleFallback(alias, selectedSeason);
+    if (!Array.isArray(espnFallback.games) || espnFallback.games.length === 0) return games;
+
+    const eventIdByComposite = new Map<string, string>();
+    for (const row of espnFallback.games) {
+      const eventId = String(row?.id || '').trim();
+      const day = toDayKey(row?.scheduledTime);
+      const homeAlias = String(row?.homeTeamAlias || row?.homeTeam?.alias || '').toUpperCase();
+      const awayAlias = String(row?.awayTeamAlias || row?.awayTeam?.alias || '').toUpperCase();
+      if (!eventId || !day || !homeAlias || !awayAlias) continue;
+      eventIdByComposite.set(`${day}:${homeAlias}:${awayAlias}`, eventId);
+    }
+    if (eventIdByComposite.size === 0) return games;
+
+    const lineByEventId = new Map<string, { spreadHome: number | null; totalLine: number | null }>();
+    for (const row of missingFinals.slice(0, 16)) {
+      const day = toDayKey(row?.scheduledTime);
+      const homeAlias = String(row?.homeTeamAlias || row?.homeTeam?.alias || '').toUpperCase();
+      const awayAlias = String(row?.awayTeamAlias || row?.awayTeam?.alias || '').toUpperCase();
+      if (!day || !homeAlias || !awayAlias) continue;
+      const eventId = eventIdByComposite.get(`${day}:${homeAlias}:${awayAlias}`);
+      if (!eventId || lineByEventId.has(eventId)) continue;
+      const line = await withTimeout(
+        fetchNbaEspnEventLineById(eventId),
+        6000,
+        { spreadHome: null, totalLine: null }
+      );
+      lineByEventId.set(eventId, line);
+    }
+
+    if (lineByEventId.size === 0) return games;
+    return games.map((g: any) => {
+      if (g?.spreadHome != null && g?.totalLine != null) return g;
+      const day = toDayKey(g?.scheduledTime);
+      const homeAlias = String(g?.homeTeamAlias || g?.homeTeam?.alias || '').toUpperCase();
+      const awayAlias = String(g?.awayTeamAlias || g?.awayTeam?.alias || '').toUpperCase();
+      if (!day || !homeAlias || !awayAlias) return g;
+      const eventId = eventIdByComposite.get(`${day}:${homeAlias}:${awayAlias}`);
+      if (!eventId) return g;
+      const line = lineByEventId.get(eventId);
+      if (!line) return g;
+      return {
+        ...g,
+        spreadHome: g?.spreadHome ?? line.spreadHome ?? null,
+        totalLine: g?.totalLine ?? line.totalLine ?? null,
+      };
+    });
+  } catch {
+    return games;
+  }
+}
+
 async function fetchNbaEspnStatsFallback(alias: string, season?: number) {
   if (!alias) return { stats: null as any, rankings: {} as any, error: 'Missing NBA alias for ESPN stats fallback' };
   const espnTeamId = await fetchNbaEspnTeamIdByAlias(alias);
@@ -1454,6 +1523,69 @@ async function fetchClosingLinesByGameId(db: D1Database, gameIds: string[]): Pro
   return out;
 }
 
+async function fetchLatestTeamLineFallback(
+  db: D1Database,
+  sport: string,
+  teamAlias: string,
+  teamId: string,
+  apiKey: string
+): Promise<{ spreadHome: number | null; total: number | null } | null> {
+  const alias = String(teamAlias || '').trim().toUpperCase();
+  const teamIdKey = String(teamId || '').trim();
+  if (!alias && !teamIdKey) return null;
+  try {
+    const candidateNames = new Set<string>();
+    if (alias) candidateNames.add(alias);
+    try {
+      const standings = await fetchStandingsCached(db, 'NBA', apiKey);
+      const teams = Array.isArray((standings as any)?.teams) ? (standings as any).teams : [];
+      const row = teams.find((t: any) =>
+        String(t?.id || '').trim() === teamIdKey
+        || (alias && String(t?.alias || '').trim().toUpperCase() === alias)
+      );
+      const fullName = `${String(row?.market || '').trim()} ${String(row?.name || '').trim()}`.trim().toUpperCase();
+      if (fullName) candidateNames.add(fullName);
+      const shortName = String(row?.name || '').trim().toUpperCase();
+      if (shortName) candidateNames.add(shortName);
+    } catch {
+      // Non-fatal: keep alias-only candidate.
+    }
+
+    const tokens = Array.from(candidateNames).filter(Boolean).slice(0, 4);
+    if (tokens.length === 0) return null;
+    const likeClauses = tokens.map(() => '(UPPER(COALESCE(home_team, \'\')) = ? OR UPPER(COALESCE(away_team, \'\')) = ? OR UPPER(COALESCE(home_team_name, \'\')) = ? OR UPPER(COALESCE(away_team_name, \'\')) = ?)').join(' OR ');
+    const bindArgs: any[] = [sport.toUpperCase()];
+    for (const t of tokens) {
+      bindArgs.push(t, t, t, t);
+    }
+
+    const rows = await db.prepare(`
+      SELECT provider_game_id, start_time
+      FROM sdio_games
+      WHERE UPPER(COALESCE(sport, '')) = ?
+        AND (${likeClauses})
+      ORDER BY datetime(start_time) DESC
+      LIMIT 60
+    `).bind(...bindArgs).all<{ provider_game_id: string; start_time: string }>();
+    const gameIds = (rows.results || []).map((r) => String(r.provider_game_id || '').trim()).filter(Boolean);
+    if (gameIds.length === 0) return null;
+    const lineByGame = await fetchClosingLinesByGameId(db, gameIds);
+    for (const id of gameIds) {
+      const line = lineByGame.get(id);
+      if (!line) continue;
+      if (line.spreadHome !== null || line.total !== null) {
+        return {
+          spreadHome: line.spreadHome ?? null,
+          total: line.total ?? null,
+        };
+      }
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 function withTimeout<T>(promise: Promise<T>, ms: number, fallback: T): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | null = null;
   return Promise.race([
@@ -1926,7 +2058,35 @@ teams.get('/:sport/:teamId/schedule', async (c) => {
           }
         }
 
+        fallbackGamesWithLines = await enrichNbaGamesWithEspnScheduleBridgeLines(
+          c.env.DB,
+          fallbackGamesWithLines,
+          teamId,
+          selectedSeason,
+          apiKey
+        );
         fallbackGamesWithLines = await enrichNbaEspnGamesWithSummaryLines(fallbackGamesWithLines);
+        const aliasForFallbackLines = await resolveNbaTeamAliasForFallback(c.env.DB, teamId, apiKey);
+        const latestTeamLine = await fetchLatestTeamLineFallback(
+          c.env.DB,
+          'NBA',
+          aliasForFallbackLines,
+          teamId,
+          apiKey
+        );
+        if (latestTeamLine) {
+          fallbackGamesWithLines = fallbackGamesWithLines.map((g: any) => {
+            const statusRaw = String(g?.status?.name || g?.status || '').toUpperCase();
+            const isFinalish = statusRaw.includes('FINAL') || statusRaw.includes('CLOSED') || statusRaw.includes('COMPLETED');
+            if (!isFinalish) return g;
+            if (g?.spreadHome != null && g?.totalLine != null) return g;
+            return {
+              ...g,
+              spreadHome: g?.spreadHome ?? latestTeamLine.spreadHome ?? null,
+              totalLine: g?.totalLine ?? latestTeamLine.total ?? null,
+            };
+          });
+        }
         const fallbackPastGames = fallbackGamesWithLines
           .filter((g: any) => g.scheduledTime && new Date(g.scheduledTime) < now)
           .sort((a: any, b: any) => new Date(b.scheduledTime).getTime() - new Date(a.scheduledTime).getTime())
@@ -2034,7 +2194,35 @@ teams.get('/:sport/:teamId/schedule', async (c) => {
       }
     }
     if (sport === 'NBA') {
+      gamesWithLines = await enrichNbaGamesWithEspnScheduleBridgeLines(
+        c.env.DB,
+        gamesWithLines,
+        teamId,
+        selectedSeason,
+        apiKey
+      );
       gamesWithLines = await enrichNbaEspnGamesWithSummaryLines(gamesWithLines);
+      const aliasForFallbackLines = await resolveNbaTeamAliasForFallback(c.env.DB, teamId, apiKey);
+      const latestTeamLine = await fetchLatestTeamLineFallback(
+        c.env.DB,
+        'NBA',
+        aliasForFallbackLines,
+        teamId,
+        apiKey
+      );
+      if (latestTeamLine) {
+        gamesWithLines = gamesWithLines.map((g: any) => {
+          const statusRaw = String(g?.status?.name || g?.status || '').toUpperCase();
+          const isFinalish = statusRaw.includes('FINAL') || statusRaw.includes('CLOSED') || statusRaw.includes('COMPLETED');
+          if (!isFinalish) return g;
+          if (g?.spreadHome != null && g?.totalLine != null) return g;
+          return {
+            ...g,
+            spreadHome: g?.spreadHome ?? latestTeamLine.spreadHome ?? null,
+            totalLine: g?.totalLine ?? latestTeamLine.total ?? null,
+          };
+        });
+      }
     }
 
     // Separate past and upcoming games
