@@ -1223,6 +1223,7 @@ export function TeamProfilePage() {
     if (!sportKey || !teamId) return;
     const cacheKey = `team-profile:v10:${sportKey.toUpperCase()}:${teamId}`;
     const cached = getRouteCache<TeamProfileData>(cacheKey, 180_000);
+    const lastGood = cached || data;
     if (cached) {
       setData(cached);
       setLoading(false);
@@ -1741,7 +1742,13 @@ export function TeamProfilePage() {
         })
         .filter((g: any) => g.id && g.date)
         .sort((a: GameResult, b: GameResult) => new Date(a.date).getTime() - new Date(b.date).getTime());
-      const schedule: GameResult[] = scheduleFromTeamEndpoint.length > 0 ? scheduleFromTeamEndpoint : fallbackSchedule;
+      let schedule: GameResult[] = scheduleFromTeamEndpoint.length > 0 ? scheduleFromTeamEndpoint : fallbackSchedule;
+      const hasScheduleData = Array.isArray(schedule) && schedule.length > 0;
+      const hasLastGoodSchedule = Array.isArray(lastGood?.schedule) && lastGood!.schedule.length > 0;
+      // Stability lock: never replace a previously good schedule with an empty transient payload.
+      if (!hasScheduleData && hasLastGoodSchedule) {
+        schedule = lastGood!.schedule;
+      }
       const h2hOpponent = schedule.find((g) => g.status === 'scheduled' || g.status === 'live')?.opponent
         || schedule.find((g) => g.status === 'final')?.opponent
         || null;
@@ -1844,7 +1851,15 @@ export function TeamProfilePage() {
         division: team.division || standingsMatch?.divisionName,
       };
 
-      const nextData = { team: hydratedTeam, record, roster, schedule, stats, injuries, teamH2H };
+      const nextData = {
+        team: hydratedTeam,
+        record,
+        roster,
+        schedule,
+        stats,
+        injuries,
+        teamH2H: teamH2H || lastGood?.teamH2H || null,
+      };
       setData(nextData);
       setRouteCache(cacheKey, nextData, 240_000);
     } catch (err: any) {
