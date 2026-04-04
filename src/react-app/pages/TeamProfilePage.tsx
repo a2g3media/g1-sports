@@ -1247,16 +1247,27 @@ export function TeamProfilePage() {
         fetchJsonCached<any>(`/api/teams/${sportUpper}/${teamId}/schedule`, {
           cacheKey: `team-schedule:v10:${sportUpper}:${teamId}`,
           ttlMs: 45_000,
-          timeoutMs: 12_000,
+          timeoutMs: 20_000,
           init: { credentials: 'include' },
         }).catch(async () => {
           try {
-            return await fetchJsonCached<any>(`/api/teams/${sportUpper}/${teamId}/schedule?fresh=1`, {
-              cacheKey: `team-schedule:v10-retry:${sportUpper}:${teamId}`,
-              ttlMs: 30_000,
-              timeoutMs: 20_000,
-              init: { credentials: 'include' },
-            });
+            const controller = new AbortController();
+            const timer = setTimeout(() => controller.abort(), 45_000);
+            try {
+              const res = await fetch(`/api/teams/${sportUpper}/${teamId}/schedule?fresh=1`, {
+                credentials: 'include',
+                signal: controller.signal,
+              });
+              if (res.ok) return await res.json();
+              return await fetchJsonCached<any>(`/api/teams/${sportUpper}/${teamId}/schedule?fresh=1`, {
+                cacheKey: `team-schedule:v10-retry:${sportUpper}:${teamId}`,
+                ttlMs: 30_000,
+                timeoutMs: 30_000,
+                init: { credentials: 'include' },
+              });
+            } finally {
+              clearTimeout(timer);
+            }
           } catch {
             return { pastGames: [], upcomingGames: [], allGames: [] };
           }
@@ -1521,10 +1532,13 @@ export function TeamProfilePage() {
           time: g?.scheduledTime ? new Date(g.scheduledTime).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' }) : undefined,
         };
       };
-      const scheduleFromTeamEndpointRaw: GameResult[] = [
-        ...(Array.isArray(scheduleJson.pastGames) ? scheduleJson.pastGames : []).map((g: any) => mapTeamScheduleGame(g)),
-        ...(Array.isArray(scheduleJson.upcomingGames) ? scheduleJson.upcomingGames : []).map((g: any) => mapTeamScheduleGame(g))
-      ];
+      const endpointRows: any[] = Array.isArray(scheduleJson?.allGames) && scheduleJson.allGames.length > 0
+        ? scheduleJson.allGames
+        : [
+            ...(Array.isArray(scheduleJson?.pastGames) ? scheduleJson.pastGames : []),
+            ...(Array.isArray(scheduleJson?.upcomingGames) ? scheduleJson.upcomingGames : []),
+          ];
+      const scheduleFromTeamEndpointRaw: GameResult[] = endpointRows.map((g: any) => mapTeamScheduleGame(g));
       const dateKey = (value: string | undefined) => {
         const ms = new Date(String(value || '')).getTime();
         if (!Number.isFinite(ms)) return '';
