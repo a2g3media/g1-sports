@@ -260,7 +260,6 @@ export function OddsPage() {
   const mountedRef = useRef(true);
   const activeFetchRequestRef = useRef(0);
   const visibleGamesRef = useRef<any[]>([]);
-  const autoRecoveryAttemptedRef = useRef<string>('');
   
   useEffect(() => {
     // React strict mode runs effect cleanup/re-run in development.
@@ -312,22 +311,14 @@ export function OddsPage() {
     const stopPerf = startPerfTimer('odds.fetch');
     const isCurrentRequest = () => mountedRef.current && requestId === activeFetchRequestRef.current;
 
-    const fetchWithTimeout = async (input: string, init?: RequestInit, timeoutMs = 12000) => {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), timeoutMs);
-      try {
-        return await fetch(input, { ...init, signal: controller.signal });
-      } finally {
-        clearTimeout(timer);
-      }
-    };
-
     const selectedDateParam = toDateParam(selectedDate);
     const routeCacheKey = getOddsRouteSlateCacheKey(selectedDateParam);
+    const isInitialRenderRequest = visibleGamesRef.current.length === 0;
 
     try {
       setError(null);
       setStaleNotice(null);
+      console.info("PAGE_DATA_START", { route: "odds", date: selectedDateParam, sport: "ALL" });
 
       if (visibleGamesRef.current.length === 0) {
         const routeCachedGames = readOddsRouteSlateCache(routeCacheKey, ODDS_ROUTE_SLATE_CACHE_TTL_MS);
@@ -344,7 +335,7 @@ export function OddsPage() {
         const payload = await fetchJsonCached<any>(`/api/page-data/odds?${qs.toString()}`, {
           cacheKey: `page-data:odds:${selectedDateParam}:all`,
           ttlMs: 3_000,
-          timeoutMs: 2_700,
+          timeoutMs: isInitialRenderRequest ? 2_000 : 2_700,
           init: { credentials: 'include' },
         });
         const pageGames = Array.isArray(payload?.games) ? payload.games : [];
@@ -370,6 +361,16 @@ export function OddsPage() {
             // ignore cache write failures
           }
         }
+        if (pageGames.length === 0 && visibleGamesRef.current.length === 0) {
+          console.warn("PAGE_DATA_FALLBACK_USED", { route: "odds", reason: "empty_payload_no_existing_data", date: selectedDateParam });
+        }
+        console.info("PAGE_DATA_SUCCESS", {
+          route: "odds",
+          date: selectedDateParam,
+          games: pageGames.length,
+          oddsSummary: Object.keys(pageOdds).length,
+          degraded: Boolean(payload?.degraded),
+        });
         if (flags.PAGE_DATA_OBSERVABILITY_ENABLED) {
           const loadMs = Math.max(0, Math.round(performance.now() - startedAt));
           void fetch('/api/page-data/telemetry', {
@@ -385,30 +386,36 @@ export function OddsPage() {
           }).catch(() => {});
         }
         // Optional props intelligence feed remains independent of route assembly.
-        try {
-          const propsRes = await fetchWithTimeout('/api/sports-data/props/today', { credentials: 'include' });
-          if (propsRes?.ok && isCurrentRequest()) {
-            const propsData = await propsRes.json();
-            const nextProps = Array.isArray(propsData?.props) ? propsData.props : [];
+        void fetch('/api/sports-data/props/today', { credentials: 'include' })
+          .then((propsRes) => (propsRes?.ok ? propsRes.json() : null))
+          .then((propsData) => {
+            if (!isCurrentRequest() || !propsData) return;
+            const nextProps = Array.isArray((propsData as any)?.props) ? (propsData as any).props : [];
             setRawProps(nextProps);
-          }
-        } catch {
-          // non-fatal
-        }
+          })
+          .catch(() => {
+            // non-fatal
+          });
         return;
       }
 
     } catch (err) {
       if (!isCurrentRequest()) return;
       console.error('[OddsPage] Fetch error:', err);
+      const msg = String((err as any)?.message || "");
+      if (msg.toLowerCase().includes("timeout") || String((err as any)?.name || "") === "AbortError") {
+        console.warn("PAGE_DATA_TIMEOUT", { route: "odds", date: selectedDateParam });
+      }
       if (visibleGamesRef.current.length === 0) {
         const routeCachedGames = readOddsRouteSlateCache(routeCacheKey, ODDS_ROUTE_SLATE_CACHE_TTL_MS);
         if (Array.isArray(routeCachedGames) && routeCachedGames.length > 0) {
           setRawGames(routeCachedGames as any[]);
           setStaleNotice('Network issue during refresh. Showing last known valid data.');
           hasFetchedRef.current = true;
+          console.warn("PAGE_DATA_FALLBACK_USED", { route: "odds", reason: "route_cache_used_after_error", date: selectedDateParam });
         } else {
           setError('Network error loading games');
+          console.warn("PAGE_DATA_FALLBACK_USED", { route: "odds", reason: "request_failed_no_existing_data", date: selectedDateParam });
         }
       } else {
         incrementPerfCounter('odds.staleProtected');
@@ -551,21 +558,6 @@ export function OddsPage() {
     () => games.some((g) => Boolean(g.hasRealOdds)),
     [games]
   );
-
-  useEffect(() => {
-    if (loading || refreshing) return;
-    if (games.length === 0 || hasAnyRealOdds) return;
-    const dateKey = toDateParam(selectedDate);
-    if (autoRecoveryAttemptedRef.current === dateKey) return;
-    autoRecoveryAttemptedRef.current = dateKey;
-
-    const timer = window.setTimeout(() => {
-      // One-shot self-heal retry for blank-odds slates.
-      incrementPerfCounter('odds.guardrail.autoRecovery');
-      void handleRefresh();
-    }, 1500);
-    return () => window.clearTimeout(timer);
-  }, [games.length, hasAnyRealOdds, loading, refreshing, selectedDate, handleRefresh]);
 
   // Filter games by sport (fallback to schedule view when real odds are unavailable)
   const filteredGames = useMemo(() => {

@@ -832,7 +832,6 @@ export function GamesPage() {
   const hasFetchedRef = useRef(false);
   const currentDateRef = useRef<string>(''); // Track which date is currently displayed
   const currentGamesRef = useRef<any[]>([]);
-  const firstLoadRetryRef = useRef<Set<string>>(new Set());
   const mountedRef = useRef(true);
   const oddsAutoRecoveryAttemptRef = useRef<string>('');
   
@@ -863,11 +862,12 @@ export function GamesPage() {
     const sportKey = (sportToFetch || 'ALL').toUpperCase();
     const routeCacheKey = getRouteSlateCacheKey(dateStr, sportKey);
     const hasExisting = currentGamesRef.current.length > 0;
-    const retryKey = `${dateStr}|${sportKey}|${activeTab}`;
+    const isInitialRenderRequest = !hasExisting && !forceRefresh;
     try {
       setHubError(null);
       setStaleNotice(null);
       setHubLoading(!hasExisting);
+      console.info("PAGE_DATA_START", { route: "games", date: dateStr, sport: sportKey, tab: activeTab, forceRefresh });
       const qs = new URLSearchParams({
         date: dateStr,
         sport: sportKey,
@@ -877,7 +877,7 @@ export function GamesPage() {
       const payload = await fetchJsonCached<any>(`/api/page-data/games?${qs.toString()}`, {
         cacheKey: `page-data:games:${sportKey}:${dateStr}:${activeTab}:${forceRefresh ? 'fresh' : 'cached'}`,
         ttlMs: forceRefresh ? 0 : 3_000,
-        timeoutMs: 3_500,
+        timeoutMs: isInitialRenderRequest ? 2_000 : 3_500,
         bypassCache: forceRefresh,
         init: { credentials: 'include' },
       });
@@ -891,15 +891,10 @@ export function GamesPage() {
         writeRouteSlateCache(routeCacheKey, nextGames);
         saveCachedGamesForDate(dateStr, nextGames, sportKey, false);
         hasFetchedRef.current = true;
-        firstLoadRetryRef.current.delete(retryKey);
       } else if (!hasExisting) {
-        if (!forceRefresh && !firstLoadRetryRef.current.has(retryKey)) {
-          firstLoadRetryRef.current.add(retryKey);
-          await fetchGamesPageData(dateToFetch, true, sportToFetch);
-          return;
-        }
         setRawGames([]);
         setHubError('No games available for selected date');
+        console.warn("PAGE_DATA_FALLBACK_USED", { route: "games", reason: "empty_payload_no_existing_data", date: dateStr, sport: sportKey });
       }
       if (Object.keys(nextSummary).length > 0) {
         setOddsSummaryByGame((prev) => {
@@ -914,6 +909,14 @@ export function GamesPage() {
       if (payload?.degraded) {
         incrementPerfCounter('games.pageData.degraded');
       }
+      console.info("PAGE_DATA_SUCCESS", {
+        route: "games",
+        date: dateStr,
+        sport: sportKey,
+        games: nextGames.length,
+        oddsSummary: Object.keys(nextSummary).length,
+        degraded: Boolean(payload?.degraded),
+      });
       if (flags.PAGE_DATA_OBSERVABILITY_ENABLED) {
         const elapsedMs = Math.max(
           0,
@@ -940,10 +943,13 @@ export function GamesPage() {
       }
     } catch (err) {
       console.warn('[GamesPage] page-data fetch failed', err);
-      if (!hasExisting && !forceRefresh && !firstLoadRetryRef.current.has(retryKey)) {
-        firstLoadRetryRef.current.add(retryKey);
-        await fetchGamesPageData(dateToFetch, true, sportToFetch);
-        return;
+      const msg = String((err as any)?.message || "");
+      if (msg.toLowerCase().includes("timeout") || String((err as any)?.name || "") === "AbortError") {
+        console.warn("PAGE_DATA_TIMEOUT", { route: "games", date: dateStr, sport: sportKey, tab: activeTab });
+      }
+      if (!hasExisting) {
+        setHubError('Games data is still loading. Showing partial view.');
+        console.warn("PAGE_DATA_FALLBACK_USED", { route: "games", reason: "request_failed_no_existing_data", date: dateStr, sport: sportKey });
       }
     } finally {
       stopPerf();

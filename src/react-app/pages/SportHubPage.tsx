@@ -123,6 +123,8 @@ export function SportHubPage() {
       const startedAt = typeof performance !== "undefined" ? performance.now() : Date.now();
       try {
         const todayEt = getDateInEastern(new Date());
+        const isInitialRenderRequest = !hasFetchedRef.current;
+        console.info("PAGE_DATA_START", { route: "sport-hub", sport: apiSportKey, date: todayEt });
         const qs = new URLSearchParams({
           sport: apiSportKey,
           date: todayEt,
@@ -130,7 +132,7 @@ export function SportHubPage() {
         const payload = await fetchJsonCached<any>(`/api/page-data/sport-hub?${qs.toString()}`, {
           cacheKey: `page-data:sport-hub:${apiSportKey}:${todayEt}`,
           ttlMs: 3_000,
-          timeoutMs: 2_600,
+          timeoutMs: isInitialRenderRequest ? 2_000 : 2_600,
           init: { credentials: "include" },
         });
         const nextGames = Array.isArray(payload?.games) ? payload.games : [];
@@ -144,10 +146,18 @@ export function SportHubPage() {
           if (cached && cached.length > 0) {
             setAllGames(cached);
             hasFetchedRef.current = true;
+            console.warn("PAGE_DATA_FALLBACK_USED", { route: "sport-hub", reason: "session_cache_used_for_empty_payload", sport: apiSportKey });
           } else {
             setAllGames([]);
+            console.warn("PAGE_DATA_FALLBACK_USED", { route: "sport-hub", reason: "empty_payload_no_existing_data", sport: apiSportKey });
           }
         }
+        console.info("PAGE_DATA_SUCCESS", {
+          route: "sport-hub",
+          sport: apiSportKey,
+          games: nextGames.length,
+          degraded: Boolean(payload?.degraded),
+        });
         if (flags.PAGE_DATA_OBSERVABILITY_ENABLED) {
           const loadMs = Math.max(
             0,
@@ -167,10 +177,15 @@ export function SportHubPage() {
         }
       } catch (err) {
         console.warn("[SportHubPage] page-data sport-hub fetch failed", err);
+        const msg = String((err as any)?.message || "");
+        if (msg.toLowerCase().includes("timeout") || String((err as any)?.name || "") === "AbortError") {
+          console.warn("PAGE_DATA_TIMEOUT", { route: "sport-hub", sport: apiSportKey });
+        }
         const cached = loadCached();
         if (isMounted && cached && cached.length > 0) {
           setAllGames(cached);
           hasFetchedRef.current = true;
+          console.warn("PAGE_DATA_FALLBACK_USED", { route: "sport-hub", reason: "session_cache_used_after_error", sport: apiSportKey });
         }
       } finally {
         if (isMounted) setIsInitialLoad(false);

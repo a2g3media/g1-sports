@@ -8,6 +8,7 @@ import {
 } from "lucide-react";
 import { getTeamLogoUrl } from "@/react-app/lib/teamLogos";
 import { toGameDetailPath } from "@/react-app/lib/gameRoutes";
+import { fetchJsonCached } from "@/react-app/lib/fetchCache";
 
 // ============================================================
 // TYPES
@@ -792,31 +793,33 @@ export default function UniversalPlayerPage() {
         ).join(' ');
         
         apiCalls += 1;
-        const res = await fetch(`/api/page-data/player-profile?sport=${encodeURIComponent(sportLower.toUpperCase())}&playerName=${encodeURIComponent(playerName)}`, {
-          credentials: "include",
-        });
-        
-        if (!res.ok) {
-          // Try fallback with raw playerId
-          apiCalls += 1;
-          const fallbackRes = await fetch(`/api/page-data/player-profile?sport=${encodeURIComponent(sportLower.toUpperCase())}&playerName=${encodeURIComponent(playerId)}`, {
-            credentials: "include",
-          });
-          if (!fallbackRes.ok) {
-            throw new Error('Player not found');
+        console.info("PAGE_DATA_START", { route: "universal-player", sport: sportLower.toUpperCase(), playerName });
+        const payload = await fetchJsonCached<{ data?: { profile?: APIPlayerResponse; canonicalTeamRouteId?: string | null } }>(
+          `/api/page-data/player-profile?sport=${encodeURIComponent(sportLower.toUpperCase())}&playerName=${encodeURIComponent(playerName)}`,
+          {
+            cacheKey: `page-data:universal-player:${sportLower.toUpperCase()}:${playerName}`,
+            ttlMs: 45_000,
+            timeoutMs: 2_000,
+            init: { credentials: "include" },
           }
-          const payload = await fallbackRes.json() as { data?: { profile?: APIPlayerResponse; canonicalTeamRouteId?: string | null } };
-          processPlayerData(payload?.data?.profile as APIPlayerResponse);
-          setCanonicalTeamRouteId(String(payload?.data?.canonicalTeamRouteId || "").trim());
-          return;
-        }
+        );
         
-        const payload = await res.json() as { data?: { profile?: APIPlayerResponse; canonicalTeamRouteId?: string | null } };
         processPlayerData(payload?.data?.profile as APIPlayerResponse);
         setCanonicalTeamRouteId(String(payload?.data?.canonicalTeamRouteId || "").trim());
+        console.info("PAGE_DATA_SUCCESS", {
+          route: "universal-player",
+          sport: sportLower.toUpperCase(),
+          playerName,
+          hasPlayer: Boolean(payload?.data?.profile?.player),
+        });
         
       } catch (err) {
         console.error('Error fetching player:', err);
+        const msg = String((err as any)?.message || "");
+        if (msg.toLowerCase().includes("timeout") || String((err as any)?.name || "") === "AbortError") {
+          console.warn("PAGE_DATA_TIMEOUT", { route: "universal-player", sport: sportLower.toUpperCase(), playerId });
+        }
+        console.warn("PAGE_DATA_FALLBACK_USED", { route: "universal-player", reason: "request_failed_or_partial", sport: sportLower.toUpperCase(), playerId });
         setError('Unable to load player data');
         // Fall back to mock data
         const playerData = getMockPlayerData(playerId, sportLower);
@@ -929,46 +932,6 @@ export default function UniversalPlayerPage() {
     
     fetchPlayerData();
   }, [playerId, sportKey, sportLower]);
-
-  useEffect(() => {
-    if (canonicalTeamRouteId) return;
-    const teamCode = String(player?.teamCode || "").trim().toUpperCase();
-    const directTeamId = String(player?.teamId || "").trim();
-    if (!teamCode && !directTeamId) {
-      setCanonicalTeamRouteId("");
-      return;
-    }
-    const controller = new AbortController();
-    const resolveTeamId = async () => {
-      if (directTeamId) setCanonicalTeamRouteId(directTeamId);
-      try {
-        const res = await fetch(`/api/teams/${sportLower.toUpperCase()}/standings`, {
-          signal: controller.signal,
-          credentials: "include",
-          cache: "no-store",
-        });
-        if (!res.ok) return;
-        const json = await res.json().catch(() => null) as any;
-        const teams = Array.isArray(json?.teams) ? json.teams : [];
-        const aliasMap: Record<string, string[]> = {
-          GSW: ["GS"],
-          NYK: ["NY"],
-          SAS: ["SA"],
-          NOP: ["NO"],
-          PHX: ["PHO"],
-        };
-        const candidates = new Set<string>([teamCode]);
-        for (const alt of aliasMap[teamCode] || []) candidates.add(alt);
-        const match = teams.find((row: any) => candidates.has(String(row?.alias || "").trim().toUpperCase()));
-        const resolved = String(match?.id || "").trim();
-        if (resolved) setCanonicalTeamRouteId(resolved);
-      } catch (err) {
-        if (err instanceof DOMException && err.name === "AbortError") return;
-      }
-    };
-    resolveTeamId();
-    return () => controller.abort();
-  }, [canonicalTeamRouteId, player?.teamCode, player?.teamId, sportLower]);
 
   if (loading) {
     return (

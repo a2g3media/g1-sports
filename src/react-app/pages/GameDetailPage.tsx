@@ -5059,6 +5059,8 @@ export function GameDetailPage() {
     
     try {
       {
+        const isInitialRenderRequest = !game && !refreshOnly;
+        console.info("PAGE_DATA_START", { route: "game-detail", gameId: fullGameId, sport: String(league || "").toUpperCase(), refreshOnly });
         const qs = new URLSearchParams({
           gameId: fullGameId,
           ...(league ? { sport: String(league).toUpperCase() } : {}),
@@ -5066,7 +5068,7 @@ export function GameDetailPage() {
         const pagePayload = await fetchJsonCached<any>(`/api/page-data/game-detail?${qs.toString()}`, {
           cacheKey: `page-data:game-detail:${fullGameId}:${String(league || "").toUpperCase()}`,
           ttlMs: refreshOnly ? 0 : 3_000,
-          timeoutMs: 2_700,
+          timeoutMs: isInitialRenderRequest ? 2_000 : 2_700,
           bypassCache: refreshOnly,
           init: { credentials: "include", cache: "no-store" },
         });
@@ -5137,6 +5139,13 @@ export function GameDetailPage() {
               }),
             }).catch(() => {});
           }
+          console.info("PAGE_DATA_SUCCESS", {
+            route: "game-detail",
+            gameId: fullGameId,
+            hasGame: true,
+            hasOdds: Boolean(normalizedOdds),
+            degraded: Boolean(pagePayload?.degraded),
+          });
           return;
         }
         if (summary) {
@@ -5179,14 +5188,7 @@ export function GameDetailPage() {
           });
           return;
         }
-        // Transition reliability guard:
-        // On first client navigation we can occasionally receive a transient empty
-        // page-data payload before snapshots settle. Retry once with fresh bypass
-        // before surfacing a fatal empty state.
-        if (!game && !refreshOnly) {
-          await fetchGame({ refreshOnly: true });
-          return;
-        }
+        console.warn("PAGE_DATA_FALLBACK_USED", { route: "game-detail", reason: "empty_payload_without_game", gameId: fullGameId });
         if (!game) {
           setError('Failed to load game data');
         }
@@ -5196,6 +5198,11 @@ export function GameDetailPage() {
     } catch (err) {
       if (requestId !== activeGameRequestRef.current) return;
       console.error('Failed to fetch game:', err);
+      const msg = String((err as any)?.message || "");
+      if (msg.toLowerCase().includes("timeout") || String((err as any)?.name || "") === "AbortError") {
+        console.warn("PAGE_DATA_TIMEOUT", { route: "game-detail", gameId: fullGameId });
+      }
+      console.warn("PAGE_DATA_FALLBACK_USED", { route: "game-detail", reason: "request_failed", gameId: fullGameId });
       if (!game) setError('Failed to load game data');
     } finally {
       if (requestId !== activeGameRequestRef.current) return;
@@ -5206,12 +5213,9 @@ export function GameDetailPage() {
       setIsLoading(false);
     }
   }, [
-    activeTab,
-    fetchGameProps,
     flags.PAGE_DATA_OBSERVABILITY_ENABLED,
     fullGameId,
     gameId,
-    isSportsRadarGame,
     league,
   ]);
 

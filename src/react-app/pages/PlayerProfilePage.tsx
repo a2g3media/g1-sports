@@ -1816,18 +1816,10 @@ export default function PlayerProfilePage() {
   
   useEffect(() => {
     if (!sport || !playerName) return;
-    const normalizePlayerSlug = (value: string): string =>
-      String(value || '')
-        .normalize('NFD')
-        .replace(/[\u0300-\u036f]/g, '')
-        .replace(/\u2019/g, "'")
-        .trim();
-    const normalizedPlayerName = normalizePlayerSlug(decodedPlayerName);
     const cacheKey = `player-profile:v2:${sport.toUpperCase()}:${decodedPlayerName}`;
     const persistentKey = `player-profile:last-good:v2:${sport.toUpperCase()}:${decodedPlayerName}`;
     const cachedRaw = getRouteCache<PlayerProfileData>(cacheKey, 120_000);
     const cached = cachedRaw && hasCoreProfileData(cachedRaw) ? cachedRaw : readPersistentLastGood(persistentKey);
-    const cachedNeedsLineRecovery = Boolean(cached) && !hasAnyRecentPropLine(cached);
     // Player-scoped lock: reset carry-over from previous route transitions.
     lastGoodProfileRef.current = cached ?? null;
     if (cached && hasCoreProfileData(cached)) {
@@ -1853,193 +1845,28 @@ export default function PlayerProfilePage() {
           }
           return payload;
         };
-        const fetchDirectProfile = async (url: string, timeoutMs: number): Promise<any> => {
-          const controller = new AbortController();
-          const timer = setTimeout(() => controller.abort(), timeoutMs);
-          try {
-            const res = await fetch(url, { credentials: 'include', signal: controller.signal });
-            if (!res.ok) throw new Error(`HTTP ${res.status}`);
-            const json = await res.json();
-            return unwrapProfile(json);
-          } finally {
-            clearTimeout(timer);
-          }
-        };
-        const isSparseProfilePayload = (payload: any): boolean => {
-          if (!payload) return true;
-          const gameLogCount = Array.isArray(payload.gameLog) ? payload.gameLog.length : 0;
-          const seasonCount = payload?.seasonAverages ? Object.keys(payload.seasonAverages).length : 0;
-          const recentCount = Array.isArray(payload?.recentPerformance) ? payload.recentPerformance.length : 0;
-          const hasMatchup = Boolean(payload?.matchup?.opponent);
-          const hasLines = hasAnyRecentPropLine(payload);
-          // Treat "player-only" payloads as degraded so we force one hard recovery pass.
-          return gameLogCount === 0 && seasonCount === 0 && recentCount === 0 && !hasMatchup && !hasLines;
-        };
         const primaryUrl = `/api/page-data/player-profile?sport=${encodeURIComponent(sport)}&playerName=${encodeURIComponent(decodedPlayerName)}`;
-        const normalizedUrl = normalizedPlayerName && normalizedPlayerName !== decodedPlayerName
-          ? `/api/page-data/player-profile?sport=${encodeURIComponent(sport)}&playerName=${encodeURIComponent(normalizedPlayerName)}`
-          : null;
-        const apiUrl = primaryUrl;
-        const warmUrl = cachedNeedsLineRecovery
-          ? `${primaryUrl}${primaryUrl.includes('?') ? '&' : '?'}fresh=1`
-          : primaryUrl;
-        let profileData: any;
-        try {
-            apiCalls += 1;
-            const envelope = await fetchJsonCached<any>(warmUrl, {
-            cacheKey: `player-api:v2:${sport.toUpperCase()}:${decodedPlayerName}`,
-            ttlMs: 45_000,
-            timeoutMs: cachedNeedsLineRecovery ? 14_000 : 8_000,
-            bypassCache: cachedNeedsLineRecovery,
-            init: { credentials: 'include' },
-          });
-            profileData = unwrapProfile(envelope);
-        } catch (err: any) {
-          const message = String(err?.message || '');
-          // Only do an explicit fallback request for 404, and keep it tightly timed.
-          if (message.includes('HTTP 404') || message.toLowerCase().includes('timeout') || String(err?.name || '') === 'AbortError') {
-            const controller = new AbortController();
-            const retryTimeoutMs = message.includes('HTTP 404') ? 2500 : 16000;
-            const timer = setTimeout(() => controller.abort(), retryTimeoutMs);
-            try {
-              const fallbackRes = await fetch(primaryUrl, { credentials: 'include', signal: controller.signal });
-              if (fallbackRes.ok) {
-                profileData = unwrapProfile(await fallbackRes.json());
-              } else if (fallbackRes.status === 404 && normalizedUrl) {
-                // Accent/diacritics fallback (e.g., Jokić -> Jokic).
-                const normalizedRes = await fetch(normalizedUrl, { credentials: 'include', signal: controller.signal });
-                if (normalizedRes.ok) {
-                  profileData = unwrapProfile(await normalizedRes.json());
-                } else if (normalizedRes.status === 404) {
-                  const errData = await fallbackRes.json();
-                  profileData = { __fallback404: true, errData };
-                } else {
-                  throw err;
-                }
-              } else if (fallbackRes.status === 404) {
-                const errData = await fallbackRes.json();
-                profileData = { __fallback404: true, errData };
-              } else {
-                throw err;
-              }
-            } finally {
-              clearTimeout(timer);
-            }
-          } else {
-            throw err;
-          }
-        }
+        apiCalls += 1;
+        console.info("PAGE_DATA_START", { route: "player-profile", sport: sport.toUpperCase(), playerName: decodedPlayerName });
+        const envelope = await fetchJsonCached<any>(primaryUrl, {
+          cacheKey: `player-api:v2:${sport.toUpperCase()}:${decodedPlayerName}`,
+          ttlMs: 45_000,
+          timeoutMs: 2_000,
+          bypassCache: false,
+          init: { credentials: 'include' },
+        });
+        let profileData: any = unwrapProfile(envelope);
 
         if (!profileData) {
+          console.warn("PAGE_DATA_FALLBACK_USED", { route: "player-profile", reason: "empty_payload", sport: sport.toUpperCase(), playerName: decodedPlayerName });
           throw new Error('Failed to load player data');
         }
-        if (profileData?.__fallback404) {
-          const errData = profileData.errData;
-          if (lastGoodProfileRef.current) {
-            setData(lastGoodProfileRef.current);
-            return;
-          }
-          // Use fallback data if provided
-          if (errData.fallback) {
-            const fallbackData: PlayerProfileData = {
-              player: {
-                ...errData.fallback,
-                espnId: '',
-                position: '',
-                jersey: '',
-                teamAbbr: '',
-                teamColor: '3B82F6',
-              },
-              gameLog: [],
-              seasonAverages: {},
-              currentProps: [],
-              propHitRates: {},
-              matchup: null,
-              vsOpponent: null,
-              lastUpdated: new Date().toISOString(),
-            };
-            setData(fallbackData);
-            return;
-          }
-          throw new Error('Player not found');
-        }
-
-        // Self-heal stale cached profile payloads that lost matchup/logo/upcoming/prop-lines data.
-        const matchup = profileData?.matchup;
-        const upcoming = Array.isArray(matchup?.upcomingOpponents) ? matchup.upcomingOpponents : [];
-        const hasRecentRows = Array.isArray(profileData?.recentPerformance) && profileData.recentPerformance.length > 0;
-        const noRecentLines = hasRecentRows && !hasAnyRecentPropLine(profileData);
-        const needsMatchupRefresh =
-          Boolean(matchup)
-          && (
-            !matchup?.opponent?.logo
-            || (!matchup?.gameTime && upcoming.length === 0)
-          );
-        const needsOddsRefresh = noRecentLines;
-        if (needsMatchupRefresh || needsOddsRefresh) {
-          try {
-            const freshUrl = `${apiUrl}${apiUrl.includes('?') ? '&' : '?'}fresh=1`;
-            const refreshedEnvelope = await fetchJsonCached<any>(freshUrl, {
-              cacheKey: `player-api-fresh:v2:${sport.toUpperCase()}:${decodedPlayerName}`,
-              ttlMs: 30_000,
-              timeoutMs: 9_000,
-              bypassCache: true,
-              init: { credentials: 'include' },
-            });
-            const refreshed = unwrapProfile(refreshedEnvelope);
-            if (refreshed) {
-              profileData = refreshed;
-            }
-          } catch {
-            // Non-fatal: keep original payload if refresh fails.
-          }
-        }
-
-        if (!hasCoreProfileData(profileData)) {
-          // Hard self-heal: don't let transient degraded payloads replace known-good data.
-          const refreshCandidates = [
-            `${primaryUrl}${primaryUrl.includes('?') ? '&' : '?'}fresh=1`,
-            ...(normalizedUrl ? [`${normalizedUrl}${normalizedUrl.includes('?') ? '&' : '?'}fresh=1`] : []),
-          ];
-          for (const candidate of refreshCandidates) {
-            try {
-              const refreshedEnvelope = await fetchJsonCached<any>(candidate, {
-                cacheKey: `player-api-recover:v2:${sport.toUpperCase()}:${decodedPlayerName}:${candidate}`,
-                ttlMs: 20_000,
-                timeoutMs: 12_000,
-                bypassCache: true,
-                init: { credentials: 'include' },
-              });
-              const refreshed = unwrapProfile(refreshedEnvelope);
-              if (hasCoreProfileData(refreshed)) {
-                profileData = refreshed;
-                break;
-              }
-            } catch {
-              // Keep trying next candidate.
-            }
-          }
-        }
-
-        // Final hard recovery before accepting a sparse/degraded payload:
-        // bypass app-level cache fallback by using direct fetch with longer timeout.
-        if (isSparseProfilePayload(profileData)) {
-          const directCandidates = [
-            `${primaryUrl}${primaryUrl.includes('?') ? '&' : '?'}fresh=1`,
-            ...(normalizedUrl ? [`${normalizedUrl}${normalizedUrl.includes('?') ? '&' : '?'}fresh=1`] : []),
-          ];
-          for (const candidate of directCandidates) {
-            try {
-              const recovered = await fetchDirectProfile(candidate, 20_000);
-              if (!isSparseProfilePayload(recovered) || hasCoreProfileData(recovered)) {
-                profileData = recovered;
-                break;
-              }
-            } catch {
-              // Continue to next candidate.
-            }
-          }
-        }
+        console.info("PAGE_DATA_SUCCESS", {
+          route: "player-profile",
+          sport: sport.toUpperCase(),
+          playerName: decodedPlayerName,
+          hasCoreData: hasCoreProfileData(profileData),
+        });
 
         if (hasCoreProfileData(profileData)) {
           const previousGood = lastGoodProfileRef.current;
@@ -2060,13 +1887,16 @@ export default function PlayerProfilePage() {
           }
         } else if (lastGoodProfileRef.current) {
           setData(lastGoodProfileRef.current);
-        } else if (!isSparseProfilePayload(profileData)) {
-          setData(profileData);
         } else {
-          setError('Player data is temporarily delayed. Please retry in a moment.');
+          setData(profileData);
         }
       } catch (err: any) {
         console.error('Failed to fetch player profile:', err);
+        const msg = String(err?.message || '');
+        if (msg.toLowerCase().includes('timeout') || String(err?.name || '') === 'AbortError') {
+          console.warn("PAGE_DATA_TIMEOUT", { route: "player-profile", sport: sport.toUpperCase(), playerName: decodedPlayerName });
+        }
+        console.warn("PAGE_DATA_FALLBACK_USED", { route: "player-profile", reason: "request_failed_or_partial", sport: sport.toUpperCase(), playerName: decodedPlayerName });
         if (lastGoodProfileRef.current) {
           setData(lastGoodProfileRef.current);
           setError(null);
@@ -2090,7 +1920,7 @@ export default function PlayerProfilePage() {
     };
     
     fetchProfile();
-  }, [sport, playerName, decodedPlayerName, hasCoreProfileData, hasAnyRecentPropLine, profileQualityScore, readPersistentLastGood, writePersistentLastGood]);
+  }, [sport, playerName, decodedPlayerName, hasCoreProfileData, profileQualityScore, readPersistentLastGood, writePersistentLastGood]);
   
   // Check if current player is followed
   const isFollowing = useMemo(() => {
@@ -2129,7 +1959,7 @@ export default function PlayerProfilePage() {
 
   useEffect(() => {
     if (!sport || !decodedPlayerName) return;
-    if (!scoutEnabled) return;
+    if (!scoutEnabled || loading) return;
     const key = "scout-flow:recent:v1";
     try {
       const raw = window.localStorage.getItem(key);
@@ -2148,10 +1978,10 @@ export default function PlayerProfilePage() {
     } catch {
       // Ignore localStorage failures.
     }
-  }, [sport, decodedPlayerName, data?.player?.teamName, scoutEnabled]);
+  }, [sport, decodedPlayerName, data?.player?.teamName, scoutEnabled, loading]);
 
   useEffect(() => {
-    if (!scoutEnabled || !sport) return;
+    if (!scoutEnabled || !sport || loading) return;
     let cancelled = false;
     (async () => {
       const sportUpper = sport.toUpperCase();
@@ -2203,7 +2033,7 @@ export default function PlayerProfilePage() {
     return () => {
       cancelled = true;
     };
-  }, [sport, scoutEnabled]);
+  }, [sport, scoutEnabled, loading]);
 
   const scoutItems = useMemo<ScoutFlowItem[]>(() => {
     if (!scoutEnabled || !sport) return [];

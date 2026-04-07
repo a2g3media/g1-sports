@@ -1248,50 +1248,6 @@ export function TeamProfilePage() {
   const [scoutPlayers, setScoutPlayers] = useState<Array<{ name: string; team: string; sport: string }>>([]);
   const [scoutTeams, setScoutTeams] = useState<Array<{ id: string; alias: string; name: string }>>([]);
 
-  useEffect(() => {
-    if (!sportKey || !teamId) return;
-    if (sportKey.toUpperCase() !== "NBA") return;
-    const raw = String(teamId).trim();
-    if (/^[0-9a-f]{8}-[0-9a-f-]{27}$/i.test(raw)) return;
-
-    const controller = new AbortController();
-    const resolveCanonicalRoute = async () => {
-      try {
-        const res = await fetch(`/api/teams/NBA/standings`, {
-          credentials: "include",
-          cache: "no-store",
-          signal: controller.signal,
-        });
-        if (!res.ok) return;
-        const json = await res.json().catch(() => null) as any;
-        const teams = Array.isArray(json?.teams) ? json.teams : [];
-        const alias = raw.toUpperCase();
-        const aliasMap: Record<string, string[]> = {
-          GSW: ["GS"],
-          NYK: ["NY"],
-          SAS: ["SA"],
-          NOP: ["NO"],
-          PHX: ["PHO"],
-        };
-        const candidates = new Set<string>([alias]);
-        for (const alt of aliasMap[alias] || []) candidates.add(alt);
-        const row = teams.find((t: any) => {
-          const id = String(t?.id || "").trim();
-          const rowAlias = String(t?.alias || "").trim().toUpperCase();
-          return id === raw || candidates.has(rowAlias);
-        });
-        const canonical = String(row?.id || "").trim();
-        if (canonical && canonical !== raw) {
-          navigate(`/sports/${sportKey.toLowerCase()}/team/${encodeURIComponent(canonical)}`, { replace: true });
-        }
-      } catch (err) {
-        if (err instanceof DOMException && err.name === "AbortError") return;
-      }
-    };
-    resolveCanonicalRoute();
-    return () => controller.abort();
-  }, [sportKey, teamId, navigate]);
-
   const fetchTeamData = async () => {
     if (!sportKey || !teamId) return;
     const loadStartedAt = Date.now();
@@ -1311,6 +1267,7 @@ export function TeamProfilePage() {
     
     try {
       const sportUpper = sportKey.toUpperCase();
+      const pageDataOnlyMode = true;
       let profileJson: any = null;
       let scheduleJson: any = null;
       let statsJson: any = null;
@@ -1320,15 +1277,16 @@ export function TeamProfilePage() {
       let splitsJson: any = null;
 
       apiCalls += 1;
+      console.info("PAGE_DATA_START", { route: "team-profile", sport: sportUpper, teamId });
       const pageData = await fetchJsonCached<any>(
         `/api/page-data/team-profile?sport=${encodeURIComponent(sportUpper)}&teamId=${encodeURIComponent(teamId)}`,
         {
           cacheKey: `page-data-team-profile:v1:${sportUpper}:${teamId}`,
           ttlMs: 60_000,
-          timeoutMs: cached ? 2_200 : 2_800,
+          timeoutMs: 2_000,
           init: { credentials: "include" },
         }
-      ).catch(() => null);
+      );
 
       if (pageData?.data?.profileJson?.team) {
         profileJson = pageData?.data?.profileJson || {};
@@ -1339,61 +1297,18 @@ export function TeamProfilePage() {
         injuriesJson = pageData?.data?.injuriesJson || { injuries: [] };
         splitsJson = pageData?.data?.splitsJson || { splits: null };
       } else {
-        apiCalls += 7;
-        // Fallback safety path while route is being stabilized.
-        [profileJson, scheduleJson, statsJson, standingsJson, gamesJson, injuriesJson, splitsJson] = await Promise.all([
-          fetchJsonCached<any>(`/api/teams/${sportUpper}/${teamId}`, {
-            cacheKey: `team-profile:v12:${sportUpper}:${teamId}`,
-            ttlMs: 60_000,
-            timeoutMs: 7_000,
-            init: { credentials: 'include' },
-          }),
-          fetchJsonCached<any>(`/api/teams/${sportUpper}/${teamId}/schedule`, {
-            cacheKey: `team-schedule:v12:${sportUpper}:${teamId}`,
-            ttlMs: 45_000,
-            timeoutMs: cached ? 3_500 : 5_000,
-            init: { credentials: 'include' },
-          }).catch(async () => {
-            if (lastGood?.schedule?.length) {
-              return {
-                pastGames: lastGood.schedule.filter((g) => g?.status === 'final'),
-                upcomingGames: lastGood.schedule.filter((g) => g?.status !== 'final'),
-                allGames: lastGood.schedule,
-              };
-            }
-            return { pastGames: [], upcomingGames: [], allGames: [] };
-          }),
-          fetchJsonCached<any>(`/api/teams/${sportUpper}/${teamId}/stats`, {
-            cacheKey: `team-stats:v12:${sportUpper}:${teamId}`,
-            ttlMs: 120_000,
-            timeoutMs: 4_500,
-            init: { credentials: 'include' },
-          }).catch(() => ({ stats: {}, rankings: {} })),
-          fetchJsonCached<any>(`/api/teams/${sportUpper}/standings`, {
-            cacheKey: `team-standings:v12:${sportUpper}`,
-            ttlMs: 90_000,
-            timeoutMs: 4_500,
-            init: { credentials: 'include' },
-          }).catch(() => ({ teams: [] })),
-          fetchJsonCached<any>(`/api/games?sport=${sportUpper}&includeOdds=0`, {
-            cacheKey: `games-lite:v12:${sportUpper}`,
-            ttlMs: 20_000,
-            timeoutMs: 2_500,
-            init: { credentials: 'include' },
-          }).catch(() => ({ games: [] })),
-          fetchJsonCached<any>(`/api/teams/${sportUpper}/${teamId}/injuries?fresh=1`, {
-            cacheKey: `team-injuries:v12:${sportUpper}:${teamId}`,
-            ttlMs: 30_000,
-            timeoutMs: 6_500,
-            init: { credentials: 'include' },
-          }).catch(() => ({ injuries: Array.isArray(lastGood?.injuries) ? lastGood!.injuries : [] })),
-          fetchJsonCached<any>(`/api/teams/${sportUpper}/${teamId}/splits`, {
-            cacheKey: `team-splits:v12:${sportUpper}:${teamId}`,
-            ttlMs: 90_000,
-            timeoutMs: 4_000,
-            init: { credentials: 'include' },
-          }).catch(() => ({ splits: null })),
-        ]);
+        console.warn("PAGE_DATA_FALLBACK_USED", { route: "team-profile", reason: "empty_page_data_payload", sport: sportUpper, teamId });
+        if (lastGood) {
+          setData(lastGood);
+          return;
+        }
+        profileJson = { team: { id: teamId, name: "Unknown", alias: "" } };
+        scheduleJson = { allGames: [], pastGames: [], upcomingGames: [] };
+        statsJson = { stats: {}, rankings: {} };
+        standingsJson = { teams: [] };
+        gamesJson = { games: [] };
+        injuriesJson = { injuries: [] };
+        splitsJson = { splits: null };
       }
       
       // Transform SportsRadar data to our format
@@ -1690,6 +1605,7 @@ export function TeamProfilePage() {
         return new Date(ms).toISOString().slice(0, 10);
       };
       const enrichMissingLinesByDate = async (rows: GameResult[]): Promise<GameResult[]> => {
+        if (pageDataOnlyMode) return rows;
         const lineMissing = rows.filter((row) => row.status === 'final' && (row.spread == null || row.total == null));
         if (lineMissing.length === 0) return rows;
 
@@ -1843,7 +1759,7 @@ export function TeamProfilePage() {
       };
       let scheduleFromTeamEndpoint = await enrichMissingLinesByDate(scheduleFromTeamEndpointRaw.map(enrichWithGamesFeed));
       // Self-heal for degraded fast-timeout payloads: one quick fresh retry only.
-      if (sportUpper === 'NBA' && scheduleFromTeamEndpoint.filter((g) => g.status === 'final').length === 0) {
+      if (!pageDataOnlyMode && sportUpper === 'NBA' && scheduleFromTeamEndpoint.filter((g) => g.status === 'final').length === 0) {
         try {
           const controller = new AbortController();
           const timer = setTimeout(() => controller.abort(), 3_500);
@@ -1996,7 +1912,7 @@ export function TeamProfilePage() {
         || schedule.find((g) => g.status === 'final')?.opponent
         || null;
       let teamH2H: TeamH2HData | null = null;
-      if (h2hOpponent?.abbreviation) {
+      if (!pageDataOnlyMode && h2hOpponent?.abbreviation) {
         try {
           const h2hUrl = `/api/teams/${sportKey.toUpperCase()}/h2h?teamA=${encodeURIComponent(String(team.id || team.abbreviation || team.name || ''))}&teamB=${encodeURIComponent(String(h2hOpponent.abbreviation || h2hOpponent.name || ''))}&window=10`;
           const h2hJson = await fetchJsonCached<TeamH2HData>(h2hUrl, {
@@ -2109,9 +2025,20 @@ export function TeamProfilePage() {
       };
       setData(nextData);
       setRouteCache(cacheKey, nextData, 240_000);
+      console.info("PAGE_DATA_SUCCESS", {
+        route: "team-profile",
+        sport: sportUpper,
+        teamId,
+        hasTeam: Boolean(nextData?.team?.id),
+        scheduleGames: Array.isArray(nextData?.schedule) ? nextData.schedule.length : 0,
+      });
     } catch (err: any) {
       console.error('[TeamProfile] Fetch error:', err);
       const msg = String(err?.message || '');
+      if (msg.toLowerCase().includes('timeout') || String(err?.name || '') === 'AbortError') {
+        console.warn("PAGE_DATA_TIMEOUT", { route: "team-profile", sport: String(sportKey || "").toUpperCase(), teamId });
+      }
+      console.warn("PAGE_DATA_FALLBACK_USED", { route: "team-profile", reason: "request_failed", sport: String(sportKey || "").toUpperCase(), teamId });
       setError(msg.includes('404') ? 'Team not found' : (err.message || 'Failed to load team data'));
     } finally {
       void fetch("/api/page-data/telemetry", {
@@ -2134,7 +2061,7 @@ export function TeamProfilePage() {
   }, [sportKey, teamId]);
 
   useEffect(() => {
-    if (!sportKey || !teamId || !data?.team || !scoutEnabled) return;
+    if (!sportKey || !teamId || !data?.team || !scoutEnabled || loading) return;
     const key = "scout-flow:recent:v1";
     try {
       const raw = window.localStorage.getItem(key);
@@ -2153,10 +2080,10 @@ export function TeamProfilePage() {
     } catch {
       // Ignore localStorage failures.
     }
-  }, [sportKey, teamId, data?.team?.name, data?.team?.abbreviation, scoutEnabled]);
+  }, [sportKey, teamId, data?.team?.name, data?.team?.abbreviation, scoutEnabled, loading]);
 
   useEffect(() => {
-    if (!scoutEnabled || !sportKey) return;
+    if (!scoutEnabled || !sportKey || loading) return;
     let cancelled = false;
     (async () => {
       const sportUpper = sportKey.toUpperCase();
@@ -2208,7 +2135,7 @@ export function TeamProfilePage() {
     return () => {
       cancelled = true;
     };
-  }, [sportKey, scoutEnabled]);
+  }, [sportKey, scoutEnabled, loading]);
 
   const scoutItems = useMemo<ScoutFlowItem[]>(() => {
     if (!scoutEnabled || !sportKey) return [];
