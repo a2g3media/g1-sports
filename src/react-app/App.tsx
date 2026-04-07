@@ -17,7 +17,6 @@ import { LazyRoute, lazyLoad } from "@/react-app/components/LazyRoute";
 import { ErrorProvider, ErrorBoundary } from "@/react-app/components/ErrorBoundary";
 import { Loader2 } from "lucide-react";
 import { Toaster } from "sonner";
-import { buildPlayerRoute } from "@/react-app/lib/navigationRoutes";
 
 // Eager load - needed immediately for app shell
 import { Layout } from "@/react-app/components/Layout";
@@ -137,7 +136,7 @@ const MMAFightPage = lazyLoad(() => import("@/react-app/pages/MMAFightPage"), "d
 const MMAFighterPage = lazyLoad(() => import("@/react-app/pages/MMAFighterPage"), "default");
 const NASCARDriverPage = lazyLoad(() => import("@/react-app/pages/NASCARDriverPage"), "default");
 const NASCARRacePage = lazyLoad(() => import("@/react-app/pages/NASCARRacePage"), "default");
-const UniversalPlayerPage = lazyLoad(() => import("@/react-app/pages/UniversalPlayerPage"), "default");
+const PlayerProfilePage = lazyLoad(() => import("@/react-app/pages/PlayerProfilePage"), "default");
 
 // Static Pages
 const PrivacyPolicy = lazyLoad(() => import("@/react-app/pages/PrivacyPolicy"), "PrivacyPolicy");
@@ -216,6 +215,16 @@ function AdminLayoutFallback() {
   );
 }
 
+function SportsPlayerRouteRedirect() {
+  const { sportKey, playerId } = useParams<{ sportKey: string; playerId: string }>();
+  const sport = String(sportKey || "").trim();
+  const player = String(playerId || "").trim();
+  if (!sport || !player) {
+    return <Navigate to="/props" replace />;
+  }
+  return <Navigate to={`/props/player/${encodeURIComponent(sport)}/${encodeURIComponent(decodeURIComponent(player))}`} replace />;
+}
+
 function LegacyPlayerRouteRedirect() {
   const { sport, playerName } = useParams<{ sport: string; playerName: string }>();
   const sportKey = String(sport || "").trim();
@@ -223,7 +232,11 @@ function LegacyPlayerRouteRedirect() {
   if (!sportKey || !playerId) {
     return <Navigate to="/props" replace />;
   }
-  return <Navigate to={buildPlayerRoute(sportKey, decodeURIComponent(playerId))} replace />;
+  return (
+    <Layout>
+      <LazyRoute skeleton="scores"><PlayerProfilePage /></LazyRoute>
+    </Layout>
+  );
 }
 
 function AppRoutes() {
@@ -531,9 +544,9 @@ function AppRoutes() {
       <Route
         path="/sports/:sportKey/player/:playerId"
         element={
-          <Layout hideFooter>
-            <LazyRoute skeleton="detail"><UniversalPlayerPage /></LazyRoute>
-          </Layout>
+          <ProtectedRoute>
+            <SportsPlayerRouteRedirect />
+          </ProtectedRoute>
         }
       />
       <Route

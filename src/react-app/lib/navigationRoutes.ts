@@ -14,7 +14,7 @@ export function buildTeamRoute(sportKey: string, teamId: string): string {
 export function buildPlayerRoute(sportKey: string, playerId: string): string {
   const sport = normalizeSportKeyForRoute(sportKey);
   const id = encodeURIComponent(String(playerId || "").trim());
-  return `/sports/${sport}/player/${id}`;
+  return `/props/player/${sport}/${id}`;
 }
 
 export function logTeamNavigation(teamId: string, sportKey?: string): void {
