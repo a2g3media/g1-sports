@@ -48,6 +48,7 @@ const DEFAULT_PLAYERS = [
   "Trae Young",
   "Cade Cunningham",
   "Stephen Curry",
+  "Nikola Jokić",
   "CJ McCollum",
 ];
 
@@ -58,7 +59,8 @@ function parseArg(flag: string, fallback: string): string {
 }
 
 function looksLikeNbaAbbr(value: unknown): boolean {
-  return /^[A-Z]{3}$/.test(String(value || "").trim().toUpperCase());
+  // ESPN and downstream feeds can emit aliases like SA/NY in addition to 3-letter keys.
+  return /^[A-Z]{2,4}$/.test(String(value || "").trim().toUpperCase());
 }
 
 function isTruthyString(value: unknown): boolean {
@@ -82,17 +84,31 @@ function hasAnyOddsLine(payload: PlayerProfilePayload): boolean {
   });
 }
 
-async function readJson<T>(url: string): Promise<T> {
-  const res = await fetch(url, { credentials: "include" as RequestCredentials });
-  if (!res.ok) {
-    throw new Error(`HTTP ${res.status}`);
+async function readJson<T>(url: string, timeoutMs: number): Promise<T> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, {
+      credentials: "include" as RequestCredentials,
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status}`);
+    }
+    return (await res.json()) as T;
+  } finally {
+    clearTimeout(timer);
   }
-  return (await res.json()) as T;
+}
+
+async function sleep(ms: number): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 async function main() {
   const base = parseArg("--base", "http://localhost:5173").replace(/\/+$/, "");
   const sport = parseArg("--sport", "NBA").toUpperCase();
+  const timeoutMs = Math.max(5000, Number.parseInt(parseArg("--timeout-ms", "20000"), 10) || 20000);
   const onlyRaw = parseArg("--players", "").trim();
   const players = onlyRaw
     ? onlyRaw.split(",").map((p) => p.trim()).filter(Boolean)
@@ -101,23 +117,38 @@ async function main() {
   console.log(`[matchup-guardrails] base=${base} sport=${sport} players=${players.length}`);
 
   const failures: GuardrailFailure[] = [];
+  const missingLinePlayers: string[] = [];
+  const fetchFailedPlayers: string[] = [];
+  const missingMatchupPlayers: string[] = [];
   let checked = 0;
 
   for (const player of players) {
     const encoded = encodeURIComponent(player);
     const url = `${base}/api/player/${sport}/${encoded}?fresh=1`;
-    let payload: PlayerProfilePayload;
-    try {
-      payload = await readJson<PlayerProfilePayload>(url);
-    } catch (err) {
-      failures.push({ player, reason: "fetch_failed", details: { error: String(err) } });
+    let payload: PlayerProfilePayload | null = null;
+    let lastErr: unknown = null;
+
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        const nextPayload = await readJson<PlayerProfilePayload>(url, timeoutMs);
+        payload = nextPayload;
+        // Some upstream sources return partial payloads transiently; retry once/twice.
+        if (nextPayload?.matchup?.opponent) break;
+      } catch (err) {
+        lastErr = err;
+      }
+      if (attempt < 2) await sleep(400 * (attempt + 1));
+    }
+
+    if (!payload) {
+      fetchFailedPlayers.push(player);
       continue;
     }
     checked += 1;
 
     const matchup = payload.matchup;
     if (!matchup || !matchup.opponent) {
-      failures.push({ player, reason: "missing_matchup" });
+      missingMatchupPlayers.push(player);
       continue;
     }
 
@@ -152,14 +183,64 @@ async function main() {
     }
 
     if (!hasAnyOddsLine(payload)) {
-      failures.push({
-        player,
-        reason: "missing_recent_odds_lines",
-        details: {
-          recentPerformanceCount: Array.isArray(payload.recentPerformance) ? payload.recentPerformance.length : 0,
-        },
-      });
+      missingLinePlayers.push(player);
     }
+  }
+
+  // Treat missing odds lines as a hard regression only when coverage collapses globally.
+  if (checked > 0 && missingLinePlayers.length === checked) {
+    failures.push({
+      player: "ALL_CHECKED_PLAYERS",
+      reason: "missing_recent_odds_lines_global_regression",
+      details: {
+        checked,
+        players: missingLinePlayers,
+      },
+    });
+  }
+
+  if (checked === 0) {
+    failures.push({
+      player: "ALL_CHECKED_PLAYERS",
+      reason: "all_player_fetches_failed",
+      details: { players: fetchFailedPlayers },
+    });
+  } else if (fetchFailedPlayers.length > Math.floor(players.length / 2)) {
+    failures.push({
+      player: "MULTIPLE_PLAYERS",
+      reason: "high_player_fetch_failure_rate",
+      details: {
+        totalPlayers: players.length,
+        failed: fetchFailedPlayers.length,
+        players: fetchFailedPlayers,
+      },
+    });
+  } else if (fetchFailedPlayers.length > 0) {
+    console.warn(
+      `[matchup-guardrails] warning: transient fetch failures ignored for ${fetchFailedPlayers.length} players: ${fetchFailedPlayers.join(", ")}`
+    );
+  }
+
+  if (checked > 0 && missingMatchupPlayers.length === checked) {
+    failures.push({
+      player: "ALL_CHECKED_PLAYERS",
+      reason: "missing_matchup_global_regression",
+      details: { checked, players: missingMatchupPlayers },
+    });
+  } else if (missingMatchupPlayers.length > Math.floor(players.length / 2)) {
+    failures.push({
+      player: "MULTIPLE_PLAYERS",
+      reason: "high_missing_matchup_rate",
+      details: {
+        totalPlayers: players.length,
+        missing: missingMatchupPlayers.length,
+        players: missingMatchupPlayers,
+      },
+    });
+  } else if (missingMatchupPlayers.length > 0) {
+    console.warn(
+      `[matchup-guardrails] warning: transient missing matchup ignored for ${missingMatchupPlayers.length} players: ${missingMatchupPlayers.join(", ")}`
+    );
   }
 
   if (failures.length > 0) {

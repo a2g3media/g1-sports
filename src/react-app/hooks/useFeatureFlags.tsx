@@ -8,6 +8,13 @@ interface FeatureFlags {
   MARKETPLACE_ENABLED: boolean;
   GAME_FAVORITES_ENABLED: boolean;
   HOME_FAVORITES_RAIL_ENABLED: boolean;
+  PREMIUM_SCOUT_FLOW_ENABLED: boolean;
+  PAGE_DATA_GAMES_ENABLED: boolean;
+  PAGE_DATA_OBSERVABILITY_ENABLED: boolean;
+  PAGE_DATA_SPORT_HUB_ENABLED: boolean;
+  PAGE_DATA_GAME_DETAIL_ENABLED: boolean;
+  PAGE_DATA_ODDS_ENABLED: boolean;
+  PAGE_DATA_ODDS_GAME_ENABLED: boolean;
 }
 
 interface FeatureFlagsContextValue {
@@ -22,6 +29,13 @@ const defaultFlags: FeatureFlags = {
   MARKETPLACE_ENABLED: false,
   GAME_FAVORITES_ENABLED: true,
   HOME_FAVORITES_RAIL_ENABLED: true,
+  PREMIUM_SCOUT_FLOW_ENABLED: true,
+  PAGE_DATA_GAMES_ENABLED: false,
+  PAGE_DATA_OBSERVABILITY_ENABLED: true,
+  PAGE_DATA_SPORT_HUB_ENABLED: false,
+  PAGE_DATA_GAME_DETAIL_ENABLED: false,
+  PAGE_DATA_ODDS_ENABLED: false,
+  PAGE_DATA_ODDS_GAME_ENABLED: false,
 };
 
 const FeatureFlagsContext = createContext<FeatureFlagsContextValue>({
@@ -57,6 +71,13 @@ export function FeatureFlagsProvider({ children }: FeatureFlagsProviderProps) {
         MARKETPLACE_ENABLED: data.MARKETPLACE_ENABLED ?? false,
         GAME_FAVORITES_ENABLED: data.GAME_FAVORITES_ENABLED ?? true,
         HOME_FAVORITES_RAIL_ENABLED: data.HOME_FAVORITES_RAIL_ENABLED ?? true,
+        PREMIUM_SCOUT_FLOW_ENABLED: data.PREMIUM_SCOUT_FLOW_ENABLED ?? true,
+        PAGE_DATA_GAMES_ENABLED: data.PAGE_DATA_GAMES_ENABLED ?? false,
+        PAGE_DATA_OBSERVABILITY_ENABLED: data.PAGE_DATA_OBSERVABILITY_ENABLED ?? true,
+        PAGE_DATA_SPORT_HUB_ENABLED: data.PAGE_DATA_SPORT_HUB_ENABLED ?? false,
+        PAGE_DATA_GAME_DETAIL_ENABLED: data.PAGE_DATA_GAME_DETAIL_ENABLED ?? false,
+        PAGE_DATA_ODDS_ENABLED: data.PAGE_DATA_ODDS_ENABLED ?? false,
+        PAGE_DATA_ODDS_GAME_ENABLED: data.PAGE_DATA_ODDS_GAME_ENABLED ?? false,
       });
     } catch (err) {
       console.error("Failed to fetch feature flags:", err);

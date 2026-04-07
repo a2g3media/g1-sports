@@ -27,12 +27,26 @@ featureFlagsRouter.get("/public", async (c) => {
   const marketplaceEnabledFlag = await service.getFlag("MARKETPLACE_ENABLED");
   const gameFavoritesFlag = await service.getFlag("GAME_FAVORITES_ENABLED");
   const homeFavoritesRailFlag = await service.getFlag("HOME_FAVORITES_RAIL_ENABLED");
+  const premiumScoutFlowFlag = await service.getFlag("PREMIUM_SCOUT_FLOW_ENABLED");
+  const pageDataGamesEnabledFlag = await service.getFlag("PAGE_DATA_GAMES_ENABLED");
+  const pageDataObservabilityFlag = await service.getFlag("PAGE_DATA_OBSERVABILITY_ENABLED");
+  const pageDataSportHubEnabledFlag = await service.getFlag("PAGE_DATA_SPORT_HUB_ENABLED");
+  const pageDataGameDetailEnabledFlag = await service.getFlag("PAGE_DATA_GAME_DETAIL_ENABLED");
+  const pageDataOddsEnabledFlag = await service.getFlag("PAGE_DATA_ODDS_ENABLED");
+  const pageDataOddsGameEnabledFlag = await service.getFlag("PAGE_DATA_ODDS_GAME_ENABLED");
   
   return c.json({
     PUBLIC_POOLS: publicPoolsFlag?.is_enabled ?? false,
     MARKETPLACE_ENABLED: marketplaceEnabledFlag?.is_enabled ?? false,
     GAME_FAVORITES_ENABLED: gameFavoritesFlag?.is_enabled ?? true,
     HOME_FAVORITES_RAIL_ENABLED: homeFavoritesRailFlag?.is_enabled ?? true,
+    PREMIUM_SCOUT_FLOW_ENABLED: premiumScoutFlowFlag?.is_enabled ?? true,
+    PAGE_DATA_GAMES_ENABLED: pageDataGamesEnabledFlag?.is_enabled ?? false,
+    PAGE_DATA_OBSERVABILITY_ENABLED: pageDataObservabilityFlag?.is_enabled ?? true,
+    PAGE_DATA_SPORT_HUB_ENABLED: pageDataSportHubEnabledFlag?.is_enabled ?? false,
+    PAGE_DATA_GAME_DETAIL_ENABLED: pageDataGameDetailEnabledFlag?.is_enabled ?? false,
+    PAGE_DATA_ODDS_ENABLED: pageDataOddsEnabledFlag?.is_enabled ?? false,
+    PAGE_DATA_ODDS_GAME_ENABLED: pageDataOddsGameEnabledFlag?.is_enabled ?? false,
   });
 });
 

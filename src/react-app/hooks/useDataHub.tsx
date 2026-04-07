@@ -223,6 +223,12 @@ interface DbGame {
   moneylineAway?: number | null;
 }
 
+function shouldDeferDataHubGamesFetch(): boolean {
+  // DataHub is now scoped to non-route global features only.
+  // Route-level game/odds orchestration is owned by page-data endpoints.
+  return true;
+}
+
 const DATAHUB_ODDS_HYDRATION_TTL_MS = 30000;
 const dataHubOddsHydrationCache = new Map<string, { expiresAt: number; byId: Record<string, any> }>();
 
@@ -1290,10 +1296,19 @@ export function DataHubProvider({
       // Start secondary feeds, but resolve games first so homepage paints fast.
       const watchboardsPromise = timed('watchboards', () => fetchWatchboardsData(userIdRef.current));
       const alertsPromise = timed('alerts', () => fetchAlertsData(isDemoModeRef.current));
-      const gamesResult = await Promise.allSettled([timed('games', () => fetchGamesData())]);
+      const deferGamesFetch = shouldDeferDataHubGamesFetch();
+      const gamesResult = await Promise.allSettled([
+        deferGamesFetch ? Promise.resolve(gamesRef.current) : timed('games', () => fetchGamesData())
+      ]);
+      if (deferGamesFetch) {
+        timings.games = 0;
+      }
 
       // Process games result first with stale-protection (never overwrite valid with empty/transient failures)
-      if (gamesResult[0].status === 'fulfilled') {
+      if (deferGamesFetch) {
+        setGamesLoading(false);
+        setGamesError(null);
+      } else if (gamesResult[0].status === 'fulfilled') {
         const nextGames = Array.isArray(gamesResult[0].value) ? gamesResult[0].value : [];
         if (nextGames.length > 0) {
           setGames(nextGames);

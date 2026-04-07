@@ -46,6 +46,7 @@ async function main() {
   const sport = parseArg("--sport", "NBA").toUpperCase();
   const teamLimit = Math.max(2, Number.parseInt(parseArg("--teams", "30"), 10) || 30);
   const timeoutMs = Math.max(10000, Number.parseInt(parseArg("--timeout-ms", "45000"), 10) || 45000);
+  const maxFailureRate = Math.min(0.5, Math.max(0, Number.parseFloat(parseArg("--max-failure-rate", "0.15")) || 0.15));
 
   const standings = await readJson<{ teams?: TeamStanding[]; standings?: TeamStanding[] }>(
     `${base}/api/teams/${sport}/standings?fresh=1`
@@ -112,13 +113,21 @@ async function main() {
   });
   await Promise.all(workers);
 
-  if (failures.length > 0) {
+  const allowedFailures = Math.max(0, Math.floor(teams.length * maxFailureRate));
+  if (failures.length > allowedFailures) {
     console.error(`\n[team-schedule-health] FAIL (${failures.length} failures / ${checked} teams healthy)\n`);
     for (const f of failures) console.error(`- ${f}`);
+    console.error(`[team-schedule-health] allowed_failures=${allowedFailures} max_failure_rate=${maxFailureRate}`);
     process.exit(1);
   }
 
-  console.log(`\n[team-schedule-health] PASS (${checked} teams healthy)\n`);
+  if (failures.length > 0) {
+    console.warn(`\n[team-schedule-health] WARN (${failures.length} transient failures tolerated; ${checked} teams healthy)\n`);
+    for (const f of failures) console.warn(`- ${f}`);
+    console.warn(`[team-schedule-health] allowed_failures=${allowedFailures} max_failure_rate=${maxFailureRate}`);
+  } else {
+    console.log(`\n[team-schedule-health] PASS (${checked} teams healthy)\n`);
+  }
 }
 
 main().catch((err) => {

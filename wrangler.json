@@ -24,5 +24,10 @@
       "binding": "R2_BUCKET",
       "bucket_name": "g1assets"
     }
-  ]
+  ],
+  "triggers": {
+    "crons": [
+      "*/3 * * * *"
+    ]
+  }
 }

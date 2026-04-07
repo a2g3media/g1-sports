@@ -549,7 +549,7 @@ interface RecentPerformanceWithOdds {
     rebounds: number | null;
     assists: number | null;
   };
-  lineSource: 'historical' | 'latest_fallback' | 'event_fallback' | 'unavailable';
+  lineSource: 'historical' | 'latest_fallback' | 'event_fallback' | 'estimated_fallback' | 'unavailable';
 }
 
 const NBA_TEAM_ABBR_BY_NAME: Record<string, string> = {
@@ -614,6 +614,34 @@ function normalizeWordTokens(value: unknown): string[] {
     .split(/\s+/)
     .map((w) => w.trim())
     .filter(Boolean);
+}
+
+function expandNbaAliasCandidates(aliasLike: unknown): string[] {
+  const raw = String(aliasLike || '').trim().toUpperCase();
+  if (!raw) return [];
+  const map: Record<string, string[]> = {
+    GSW: ['GS'],
+    GS: ['GSW'],
+    NYK: ['NY'],
+    NY: ['NYK'],
+    SAS: ['SA'],
+    SA: ['SAS'],
+    NOP: ['NO'],
+    NO: ['NOP'],
+    PHX: ['PHO'],
+    PHO: ['PHX'],
+    UTA: ['UTAH'],
+    UTAH: ['UTA'],
+  };
+  return Array.from(new Set([raw, ...(map[raw] || [])]));
+}
+
+function normalizePlayerSlug(value: unknown): string {
+  return String(value || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/\u2019/g, "'")
+    .trim();
 }
 
 function toDisplayFirstLast(name: string): string {
@@ -1092,6 +1120,34 @@ async function buildRecentPerformanceWithOdds(
     const hasAny = [lines.points, lines.rebounds, lines.assists].some((v) => v !== null);
     return hasAny ? lines : null;
   };
+  const roundHalf = (value: number): number => Math.round(value * 2) / 2;
+  const hasAnyLine = (lines: { points: number | null; rebounds: number | null; assists: number | null } | null | undefined): boolean =>
+    Boolean(lines && [lines.points, lines.rebounds, lines.assists].some((v) => v !== null));
+  const estimatedFallbackLines = (() => {
+    const sortedGames = [...(gameLog || [])]
+      .sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime())
+      .slice(0, 12);
+    const collect = (keys: string[]): number[] =>
+      sortedGames
+        .map((g) => {
+          for (const key of keys) {
+            const n = Number((g.stats as any)?.[key]);
+            if (Number.isFinite(n)) return n;
+          }
+          return NaN;
+        })
+        .filter((n) => Number.isFinite(n));
+    const pts = collect(['PTS', 'Points']);
+    const reb = collect(['REB', 'Rebounds', 'TRB']);
+    const ast = collect(['AST', 'Assists']);
+    if (pts.length < 2 && reb.length < 2 && ast.length < 2) return null;
+    const avg = (arr: number[]) => (arr.length === 0 ? null : roundHalf(arr.reduce((sum, n) => sum + n, 0) / arr.length));
+    return {
+      points: avg(pts),
+      rebounds: avg(reb),
+      assists: avg(ast),
+    };
+  })();
 
   const fuzzyNameLineFallback = async (): Promise<{ points: number | null; rebounds: number | null; assists: number | null } | null> => {
     const firstRaw = String(toDisplayFirstLast(playerNames[0] || '') || '').trim();
@@ -1117,6 +1173,19 @@ async function buildRecentPerformanceWithOdds(
         .all<{ prop_type: string; line_value: number }>();
       const fromCurrent = extractLinesFromRows(currentRows.results || []);
       if (fromCurrent) return fromCurrent;
+      const currentNoJoinSql = `
+        SELECT UPPER(COALESCE(p.prop_type, '')) AS prop_type, p.line_value
+        FROM sdio_props_current p
+        WHERE LOWER(COALESCE(p.player_name, '')) LIKE ?
+          AND LOWER(COALESCE(p.player_name, '')) LIKE ?
+        ORDER BY datetime(COALESCE(p.last_updated, p.updated_at, p.created_at)) DESC
+        LIMIT 200
+      `;
+      const currentNoJoinRows = await db.prepare(currentNoJoinSql)
+        .bind(firstLike, lastLike)
+        .all<{ prop_type: string; line_value: number }>();
+      const fromCurrentNoJoin = extractLinesFromRows(currentNoJoinRows.results || []);
+      if (fromCurrentNoJoin) return fromCurrentNoJoin;
 
       const historySql = `
         SELECT UPPER(COALESCE(h.prop_type, '')) AS prop_type, h.line_value
@@ -1131,7 +1200,20 @@ async function buildRecentPerformanceWithOdds(
       const historyRows = await db.prepare(historySql)
         .bind(sport.toUpperCase(), firstLike, lastLike)
         .all<{ prop_type: string; line_value: number }>();
-      return extractLinesFromRows(historyRows.results || []);
+      const fromHistory = extractLinesFromRows(historyRows.results || []);
+      if (fromHistory) return fromHistory;
+      const historyNoJoinSql = `
+        SELECT UPPER(COALESCE(h.prop_type, '')) AS prop_type, h.line_value
+        FROM sdio_props_history h
+        WHERE LOWER(COALESCE(h.player_name, '')) LIKE ?
+          AND LOWER(COALESCE(h.player_name, '')) LIKE ?
+        ORDER BY datetime(COALESCE(h.recorded_at, h.updated_at, h.created_at)) DESC
+        LIMIT 400
+      `;
+      const historyNoJoinRows = await db.prepare(historyNoJoinSql)
+        .bind(firstLike, lastLike)
+        .all<{ prop_type: string; line_value: number }>();
+      return extractLinesFromRows(historyNoJoinRows.results || []);
     } catch {
       return null;
     }
@@ -1152,7 +1234,17 @@ async function buildRecentPerformanceWithOdds(
         LIMIT 100
       `;
       const result = await db.prepare(sql).bind(sport.toUpperCase(), ...candidateList).all<{ prop_type: string; line_value: number }>();
-      return extractLinesFromRows(result.results || []);
+      const fromJoined = extractLinesFromRows(result.results || []);
+      if (fromJoined) return fromJoined;
+      const noJoinSql = `
+        SELECT UPPER(COALESCE(p.prop_type, '')) AS prop_type, p.line_value
+        FROM sdio_props_current p
+        WHERE LOWER(COALESCE(p.player_name, '')) IN (${placeholders})
+        ORDER BY datetime(COALESCE(p.last_updated, p.updated_at, p.created_at)) DESC
+        LIMIT 200
+      `;
+      const noJoinResult = await db.prepare(noJoinSql).bind(...candidateList).all<{ prop_type: string; line_value: number }>();
+      return extractLinesFromRows(noJoinResult.results || []);
     } catch {
       return null;
     }
@@ -1172,14 +1264,28 @@ async function buildRecentPerformanceWithOdds(
         LIMIT 300
       `;
       const result = await db.prepare(sql).bind(sport.toUpperCase(), ...candidateList).all<{ prop_type: string; line_value: number }>();
-      return extractLinesFromRows(result.results || []);
+      const fromJoined = extractLinesFromRows(result.results || []);
+      if (fromJoined) return fromJoined;
+      const noJoinSql = `
+        SELECT UPPER(COALESCE(h.prop_type, '')) AS prop_type, h.line_value
+        FROM sdio_props_history h
+        WHERE LOWER(COALESCE(h.player_name, '')) IN (${placeholders})
+        ORDER BY datetime(COALESCE(h.recorded_at, h.updated_at, h.created_at)) DESC
+        LIMIT 400
+      `;
+      const noJoinResult = await db.prepare(noJoinSql).bind(...candidateList).all<{ prop_type: string; line_value: number }>();
+      return extractLinesFromRows(noJoinResult.results || []);
     } catch {
       return null;
     }
   };
   const playerHistoryFallback = await historyLinesFallback();
   const fuzzyFallback = await fuzzyNameLineFallback();
-  const universalFallback = currentLinesFallback || playerHistoryFallback || fuzzyFallback;
+  const universalFallback = currentLinesFallback || playerHistoryFallback || fuzzyFallback || estimatedFallbackLines;
+  const universalFallbackSource: RecentPerformanceWithOdds['lineSource'] =
+    hasAnyLine(currentLinesFallback) || hasAnyLine(playerHistoryFallback) || hasAnyLine(fuzzyFallback)
+      ? 'latest_fallback'
+      : (hasAnyLine(estimatedFallbackLines) ? 'estimated_fallback' : 'unavailable');
 
   const out: RecentPerformanceWithOdds[] = [];
   let carryForwardLines = universalFallback;
@@ -1196,7 +1302,7 @@ async function buildRecentPerformanceWithOdds(
     let lineSource: RecentPerformanceWithOdds['lineSource'] =
       ([matchedLines.points, matchedLines.rebounds, matchedLines.assists].some((v) => v !== null))
         ? 'historical'
-        : (currentLinesFallback ? 'latest_fallback' : 'unavailable');
+        : universalFallbackSource;
     if (!candidateLines) {
       const onDemand = await fetchOnDemandLines(g);
       if (onDemand) {
@@ -1206,7 +1312,7 @@ async function buildRecentPerformanceWithOdds(
     }
     if (!candidateLines && carryForwardLines) {
       candidateLines = carryForwardLines;
-      lineSource = 'latest_fallback';
+      lineSource = universalFallbackSource;
     }
     if (candidateLines) {
       carryForwardLines = candidateLines;
@@ -1249,16 +1355,21 @@ function buildPlayerVsOpponentData(
 
   const oppAbbr = String(matchup.opponent.abbr || '').trim();
   const oppName = String(matchup.opponent.name || '').trim();
+  const oppAbbrTokens = expandNbaAliasCandidates(oppAbbr).map((code) => normalizeToken(code)).filter(Boolean);
   const oppNameTail = oppName.split(' ').slice(-1).join(' ').trim();
   const oppNormalized = normalizeToken(oppName);
   const oppTailNormalized = normalizeToken(oppNameTail);
   const oppWordTokens = normalizeWordTokens(oppName).filter((w) => w.length >= 4);
+  const oppMatchTokens = new Set<string>([oppNormalized, oppTailNormalized, ...oppWordTokens, ...oppAbbrTokens].filter(Boolean));
 
   const vsGames = [...gameLog]
     .filter((g) => {
       const gameOppRaw = String(g.opponent || '');
       const gameOpp = normalizeToken(gameOppRaw);
       if (!gameOpp) return false;
+      if (oppAbbrTokens.some((abbr) => abbr === gameOpp)) {
+        return true;
+      }
       if (oppNormalized && (gameOpp === oppNormalized || gameOpp.includes(oppNormalized) || oppNormalized.includes(gameOpp))) {
         return true;
       }
@@ -1266,7 +1377,14 @@ function buildPlayerVsOpponentData(
         return true;
       }
       const gameWords = normalizeWordTokens(gameOppRaw);
-      return oppWordTokens.some((token) => gameWords.includes(token));
+      if (oppWordTokens.some((token) => gameWords.includes(token))) {
+        return true;
+      }
+      const gameTokens = new Set<string>([gameOpp, ...gameWords.map((w) => normalizeToken(w))].filter(Boolean));
+      for (const token of gameTokens) {
+        if (oppMatchTokens.has(token)) return true;
+      }
+      return false;
     })
     .sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime())
     .slice(0, 10);
@@ -1867,7 +1985,9 @@ async function fetchPlayerNews(
  */
 app.get('/:sport/:playerName', async (c) => {
   const sport = c.req.param('sport').toUpperCase();
-  const playerName = decodeURIComponent(c.req.param('playerName'));
+  const rawPlayerName = decodeURIComponent(c.req.param('playerName'));
+  const normalizedPlayerName = normalizePlayerSlug(rawPlayerName);
+  const playerName = normalizedPlayerName || rawPlayerName;
   const team = c.req.query('team');
   const bypassCache = c.req.query('fresh') === '1';
   const sportsRadarPropsKey =
@@ -1897,18 +2017,21 @@ app.get('/:sport/:playerName', async (c) => {
   }
   
   // Search for player on ESPN
-  const playerInfo = await searchEspnPlayer(playerName, sport, team || undefined);
+  let playerInfo = await searchEspnPlayer(playerName, sport, team || undefined);
+  if (!playerInfo && normalizedPlayerName && normalizedPlayerName !== rawPlayerName) {
+    playerInfo = await searchEspnPlayer(rawPlayerName, sport, team || undefined);
+  }
   
   if (!playerInfo) {
     return c.json({ 
       error: 'Player not found',
-      playerName,
+      playerName: rawPlayerName,
       sport,
       fallback: {
-        displayName: playerName,
+        displayName: rawPlayerName,
         sport,
         team: team || 'Unknown',
-        headshotUrl: `https://ui-avatars.com/api/?name=${encodeURIComponent(playerName)}&background=1e293b&color=94a3b8&size=350`,
+        headshotUrl: `https://ui-avatars.com/api/?name=${encodeURIComponent(rawPlayerName)}&background=1e293b&color=94a3b8&size=350`,
       }
     }, 404);
   }
@@ -1917,7 +2040,7 @@ app.get('/:sport/:playerName', async (c) => {
   const gameLogPromise = (async () => {
     const baseGameLog = await withTimeout(
       fetchEspnGameLog(playerInfo.espnId, sport, 60),
-      5000,
+      3500,
       null
     );
     let mergedGames = baseGameLog?.games || [];
@@ -1927,7 +2050,7 @@ app.get('/:sport/:playerName', async (c) => {
       const priorSeasons = [nowYear - 1, nowYear - 2];
       const priorLogs = await withTimeout(
         Promise.all(priorSeasons.map((yr) => fetchEspnGameLog(playerInfo.espnId, sport, 80, yr))),
-        3500,
+        2200,
         []
       );
       const seen = new Set<string>();
@@ -1949,13 +2072,13 @@ app.get('/:sport/:playerName', async (c) => {
   })();
   const matchupPromise = withTimeout(
     fetchMatchupData(playerInfo.teamAbbr, sport, playerInfo.position),
-    6000,
+    3500,
     null
   );
-  const newsPromise = withTimeout(fetchPlayerNews(playerName, sport), 2000, []);
+  const newsPromise = withTimeout(fetchPlayerNews(playerInfo.displayName || playerName, sport), 2000, []);
   
   const playerNameCandidates = Array.from(new Set(
-    [playerName, playerInfo.displayName, toDisplayFirstLast(playerName), toDisplayLastFirst(playerName)]
+    [rawPlayerName, playerName, playerInfo.displayName, toDisplayFirstLast(playerName), toDisplayLastFirst(playerName)]
       .map((n) => String(n || '').trim())
       .filter(Boolean)
   ));
@@ -1978,7 +2101,7 @@ app.get('/:sport/:playerName', async (c) => {
     return currentProps;
   })();
   const livePropsPromise = withTimeout(
-    fetchPlayerPropsFromSportsRadar(playerName, sport, sportsRadarPropsKey),
+    fetchPlayerPropsFromSportsRadar(playerInfo.displayName || playerName, sport, sportsRadarPropsKey),
     2500,
     []
   );
@@ -2132,7 +2255,7 @@ app.get('/:sport/:playerName', async (c) => {
   };
   try {
     // Keep this short for fast page-to-page navigation while preserving freshness.
-    await setCachedData(c.env.DB, profileCacheKey, 'player-profile', `${sport}/${playerName}`, payload, 180);
+    await setCachedData(c.env.DB, profileCacheKey, 'player-profile', `${sport}/${rawPlayerName}`, payload, 180);
   } catch {
     // Non-fatal cache write failure.
   }
@@ -2145,14 +2268,19 @@ app.get('/:sport/:playerName', async (c) => {
  */
 app.get('/:sport/:playerName/headshot', async (c) => {
   const sport = c.req.param('sport').toUpperCase();
-  const playerName = decodeURIComponent(c.req.param('playerName'));
+  const rawPlayerName = decodeURIComponent(c.req.param('playerName'));
+  const normalizedPlayerName = normalizePlayerSlug(rawPlayerName);
+  const playerName = normalizedPlayerName || rawPlayerName;
   const team = c.req.query('team');
   
-  const playerInfo = await searchEspnPlayer(playerName, sport, team || undefined);
+  let playerInfo = await searchEspnPlayer(playerName, sport, team || undefined);
+  if (!playerInfo && normalizedPlayerName && normalizedPlayerName !== rawPlayerName) {
+    playerInfo = await searchEspnPlayer(rawPlayerName, sport, team || undefined);
+  }
   
   if (!playerInfo) {
     return c.json({ 
-      headshotUrl: `https://ui-avatars.com/api/?name=${encodeURIComponent(playerName)}&background=1e293b&color=94a3b8&size=350`,
+      headshotUrl: `https://ui-avatars.com/api/?name=${encodeURIComponent(rawPlayerName)}&background=1e293b&color=94a3b8&size=350`,
       found: false
     });
   }

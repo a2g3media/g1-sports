@@ -15,6 +15,8 @@ import { HubSchedule } from "@/react-app/components/hub/HubSchedule";
 import { PlayerSearch } from "@/react-app/components/PlayerSearch";
 import { Trophy, Users, Calendar, Sparkles } from "lucide-react";
 import { SectionErrorBoundary } from "@/react-app/components/ErrorBoundary";
+import { fetchJsonCached } from "@/react-app/lib/fetchCache";
+import { useFeatureFlags } from "@/react-app/hooks/useFeatureFlags";
 
 interface GameData {
   id: string;
@@ -63,6 +65,7 @@ const SPORT_HUB_GAMES_CACHE_TTL_MS = 90_000;
 
 export function SportHubPage() {
   const { sportKey } = useParams<{ sportKey: string }>();
+  const { flags } = useFeatureFlags();
   // Single source of truth for all games
   const [allGames, setAllGames] = useState<any[]>([]);
   const [isInitialLoad, setIsInitialLoad] = useState(true); // Only true on first load
@@ -89,20 +92,10 @@ export function SportHubPage() {
     return <Navigate to="/sports" replace />;
   }
 
-  // SINGLE fetch for ALL games - stale-while-revalidate pattern
+  // SINGLE fetch for ALL games via page-data endpoint.
   useEffect(() => {
     let isMounted = true;
     const cacheKey = `sporthub:lastGames:${apiSportKey}`;
-
-    const fetchWithTimeout = async (url: string, timeoutMs = 5000) => {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), timeoutMs);
-      try {
-        return await fetch(url, { signal: controller.signal });
-      } finally {
-        clearTimeout(timer);
-      }
-    };
 
     const loadCached = (): any[] | null => {
       try {
@@ -125,102 +118,62 @@ export function SportHubPage() {
       }
     };
 
-    const readGames = async (endpoint: string, timeoutMs = 7000): Promise<any[] | null> => {
-      try {
-        const res = await fetchWithTimeout(endpoint, timeoutMs);
-        if (!res.ok) return null;
-        const data = await res.json();
-        return Array.isArray(data?.games) ? data.games : [];
-      } catch {
-        return null;
-      }
-    };
 
-    const readGamesWithRetry = async (
-      endpoint: string,
-      timeoutMs = 7000,
-      attempts = 2,
-      retryOnEmpty = false
-    ): Promise<any[] | null> => {
-      for (let attempt = 0; attempt < attempts; attempt += 1) {
-        const games = await readGames(endpoint, timeoutMs);
-        if (Array.isArray(games)) {
-          if (games.length > 0) return games;
-          if (!retryOnEmpty) return games;
-        }
-      }
-      return null;
-    };
-
-    async function fetchAllGames() {
+    async function fetchSportHubPageData() {
+      const startedAt = typeof performance !== "undefined" ? performance.now() : Date.now();
       try {
         const todayEt = getDateInEastern(new Date());
-        const [liveFeed, scheduledFeed, datedFeed, fallback] = await Promise.all([
-          readGamesWithRetry(
-            `/api/games/live?sport=${apiSportKey}`,
-            4500,
-            1,
-            false
-          ),
-          readGamesWithRetry(
-            `/api/games/scheduled?sport=${apiSportKey}&hours=42`,
-            6500,
-            1,
-            false
-          ),
-          readGamesWithRetry(
-            `/api/games?sport=${apiSportKey}&date=${encodeURIComponent(todayEt)}&includeOdds=0`,
-            7000,
-            1,
-            false
-          ),
-          readGamesWithRetry(
-          `/api/games?sport=${apiSportKey}&includeOdds=0`,
-          8000,
-          2,
-          true
-          ),
-        ]);
-        const mergedById = new Map<string, any>();
-        const candidateSets = [liveFeed, scheduledFeed, datedFeed, fallback];
-        for (const set of candidateSets) {
-          if (!Array.isArray(set)) continue;
-          for (const game of set) {
-            const key = String(game?.game_id || "").trim();
-            if (key) mergedById.set(key, game);
-          }
-        }
-        const nextGames = Array.from(mergedById.values());
-
-        if (isMounted) {
-          if (nextGames.length > 0) {
-            setAllGames(nextGames);
-            saveCached(nextGames);
-            hasFetchedRef.current = true;
-          } else {
-            const cached = loadCached();
-            if (cached && cached.length > 0) {
-              setAllGames(cached);
-              hasFetchedRef.current = true;
-            } else {
-              setAllGames([]);
-            }
-          }
-        }
-      } catch (err) {
-        console.error('[SportHubPage] Failed to fetch games:', err);
-        if (isMounted) {
+        const qs = new URLSearchParams({
+          sport: apiSportKey,
+          date: todayEt,
+        });
+        const payload = await fetchJsonCached<any>(`/api/page-data/sport-hub?${qs.toString()}`, {
+          cacheKey: `page-data:sport-hub:${apiSportKey}:${todayEt}`,
+          ttlMs: 3_000,
+          timeoutMs: 2_600,
+          init: { credentials: "include" },
+        });
+        const nextGames = Array.isArray(payload?.games) ? payload.games : [];
+        if (!isMounted) return;
+        if (nextGames.length > 0) {
+          setAllGames(nextGames);
+          saveCached(nextGames);
+          hasFetchedRef.current = true;
+        } else {
           const cached = loadCached();
           if (cached && cached.length > 0) {
             setAllGames(cached);
             hasFetchedRef.current = true;
+          } else {
+            setAllGames([]);
           }
         }
-      } finally {
-        // Never let first paint hang on slow/empty feeds.
-        if (isMounted) {
-          setIsInitialLoad(false);
+        if (flags.PAGE_DATA_OBSERVABILITY_ENABLED) {
+          const loadMs = Math.max(
+            0,
+            Math.round((typeof performance !== "undefined" ? performance.now() : Date.now()) - startedAt)
+          );
+          void fetch("/api/page-data/telemetry", {
+            method: "POST",
+            credentials: "include",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              route: "sport-hub",
+              loadMs,
+              apiCalls: 1,
+              oddsAvailableAtFirstRender: false,
+            }),
+          }).catch(() => {});
         }
+      } catch (err) {
+        console.warn("[SportHubPage] page-data sport-hub fetch failed", err);
+        const cached = loadCached();
+        if (isMounted && cached && cached.length > 0) {
+          setAllGames(cached);
+          hasFetchedRef.current = true;
+        }
+      } finally {
+        if (isMounted) setIsInitialLoad(false);
       }
     }
 
@@ -231,14 +184,14 @@ export function SportHubPage() {
       setIsInitialLoad(false);
     }
 
-    fetchAllGames();
-    const interval = setInterval(fetchAllGames, 30000);
+    fetchSportHubPageData();
+    const interval = setInterval(fetchSportHubPageData, 30000);
     
     return () => {
       isMounted = false;
       clearInterval(interval);
     };
-  }, [apiSportKey]);
+  }, [apiSportKey, flags.PAGE_DATA_OBSERVABILITY_ENABLED]);
 
   // Keep hub schedule aligned to "today ET" and always include live games.
   const todayEt = getDateInEastern(new Date());

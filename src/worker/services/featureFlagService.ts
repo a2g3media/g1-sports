@@ -50,6 +50,41 @@ const DEFAULT_FLAGS: { flag_key: string; is_enabled: boolean; description: strin
     is_enabled: true,
     description: "Enable compact favorites rail on the dashboard home surface.",
   },
+  {
+    flag_key: "PREMIUM_SCOUT_FLOW_ENABLED",
+    is_enabled: true,
+    description: "Enable premium quick-switch navigation overlay on player and team profile pages.",
+  },
+  {
+    flag_key: "PAGE_DATA_GAMES_ENABLED",
+    is_enabled: false,
+    description: "Enable /api/page-data/games as the primary Games page data contract.",
+  },
+  {
+    flag_key: "PAGE_DATA_OBSERVABILITY_ENABLED",
+    is_enabled: true,
+    description: "Enable rollout telemetry beacons and backend metrics aggregation for page-data migration.",
+  },
+  {
+    flag_key: "PAGE_DATA_SPORT_HUB_ENABLED",
+    is_enabled: false,
+    description: "Enable /api/page-data/sport-hub as the primary SportHub page contract.",
+  },
+  {
+    flag_key: "PAGE_DATA_GAME_DETAIL_ENABLED",
+    is_enabled: false,
+    description: "Enable /api/page-data/game-detail as the primary GameDetail page contract.",
+  },
+  {
+    flag_key: "PAGE_DATA_ODDS_ENABLED",
+    is_enabled: false,
+    description: "Enable /api/page-data/odds as the primary Odds page contract.",
+  },
+  {
+    flag_key: "PAGE_DATA_ODDS_GAME_ENABLED",
+    is_enabled: false,
+    description: "Enable page-data contract for OddsGamePage route.",
+  },
 ];
 
 export class FeatureFlagService {

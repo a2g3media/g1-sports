@@ -7,7 +7,7 @@ import { getSport } from "@/react-app/data/sports";
 import { ErrorState } from "@/react-app/components/ui/states";
 import { cn } from "@/react-app/lib/utils";
 import { type LiveGame, getSportPriority } from "@/react-app/hooks/useLiveGames";
-import { DataHubProvider, useDataHub } from "@/react-app/hooks/useDataHub";
+import { useDataHub } from "@/react-app/hooks/useDataHub";
 import { ApprovedScoreCard, transformLiveGameToCard } from "@/react-app/components/ApprovedScoreCard";
 import { WatchboardPreviewHub } from "@/react-app/components/WatchboardPreview";
 import { SportQuickAccess } from "@/react-app/components/SportQuickAccess";
@@ -16,7 +16,6 @@ import { AIIntelligenceFeed } from "@/react-app/components/AIIntelligenceFeed";
 import { TeamLogo } from "@/react-app/components/TeamLogo";
 import { PlayerPhoto } from "@/react-app/components/PlayerPhoto";
 import { useFavorites } from "@/react-app/hooks/useFavorites";
-import { useDemoAuth } from "@/react-app/contexts/DemoAuthContext";
 import { Component, type ReactNode, type ErrorInfo } from "react";
 import { toGameDetailPath } from "@/react-app/lib/gameRoutes";
 import { useFeatureFlags } from "@/react-app/hooks/useFeatureFlags";
@@ -1344,18 +1343,8 @@ function DashboardInner() {
 }
 
 // ============================================
-// MAIN DASHBOARD (Wrapper with DataHubProvider)
+// MAIN DASHBOARD (global DataHubProvider lives in App shell)
 // ============================================
 export function Dashboard() {
-  const { user, isDemoMode } = useDemoAuth();
-  
-  return (
-    <DataHubProvider
-      userId={user?.id?.toString() || null}
-      isDemoMode={isDemoMode}
-      pollInterval={30000}
-    >
-      <DashboardInner />
-    </DataHubProvider>
-  );
+  return <DashboardInner />;
 }

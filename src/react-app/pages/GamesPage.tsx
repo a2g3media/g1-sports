@@ -18,8 +18,8 @@ import { useWatchboards } from '@/react-app/hooks/useWatchboards';
 import AddToWatchboardModal from '@/react-app/components/AddToWatchboardModal';
 import { cn } from '@/react-app/lib/utils';
 import { toGameDetailPath, toOddsGamePath } from '@/react-app/lib/gameRoutes';
-import { fetchJsonCached, getFetchCacheStats } from '@/react-app/lib/fetchCache';
-import { incrementPerfCounter, logPerfSnapshot, startPerfTimer } from '@/react-app/lib/perfTelemetry';
+import { fetchJsonCached } from '@/react-app/lib/fetchCache';
+import { incrementPerfCounter, startPerfTimer } from '@/react-app/lib/perfTelemetry';
 import { OddsTelemetryDebugPanel } from '@/react-app/components/debug/OddsTelemetryDebugPanel';
 import { generateCoachWhisper as _generateCoachWhisper } from '@/react-app/lib/coachWhisper';
 import { useFeatureFlags } from '@/react-app/hooks/useFeatureFlags';
@@ -89,20 +89,9 @@ type RouteSlateCacheEntry = {
 };
 
 const routeSlateCache = new Map<string, RouteSlateCacheEntry>();
-const ROUTE_SLATE_CACHE_TTL_MS = 5 * 60 * 1000;
 
 function getRouteSlateCacheKey(dateStr: string, sport: string): string {
   return `${String(sport || 'ALL').toUpperCase()}|${dateStr}`;
-}
-
-function readRouteSlateCache(key: string, maxAgeMs = ROUTE_SLATE_CACHE_TTL_MS): any[] | null {
-  const hit = routeSlateCache.get(key);
-  if (!hit) return null;
-  if (Date.now() - hit.updatedAt > maxAgeMs) {
-    routeSlateCache.delete(key);
-    return null;
-  }
-  return hit.games;
 }
 
 function writeRouteSlateCache(key: string, games: any[]): void {
@@ -841,17 +830,10 @@ export function GamesPage() {
   const [hubError, setHubError] = useState<string | null>(null);
   const [staleNotice, setStaleNotice] = useState<string | null>(null);
   const hasFetchedRef = useRef(false);
-  const isFetchingRef = useRef(false);
-  const pendingFetchRef = useRef<{
-    dateToFetch?: Date;
-    forceRefresh: boolean;
-    sportToFetch: ExtendedSportKey;
-    includeOdds: boolean;
-  } | null>(null);
   const currentDateRef = useRef<string>(''); // Track which date is currently displayed
   const currentGamesRef = useRef<any[]>([]);
+  const firstLoadRetryRef = useRef<Set<string>>(new Set());
   const mountedRef = useRef(true);
-  const [oddsHydrating, setOddsHydrating] = useState(false);
   const oddsAutoRecoveryAttemptRef = useRef<string>('');
   
   useEffect(() => {
@@ -867,361 +849,110 @@ export function GamesPage() {
     currentGamesRef.current = rawGames;
   }, [rawGames]);
   
-  // Fetch all games directly from API with date parameter
-  // Uses cache for instant display, then fetches fresh data in background
-  const fetchGames = useCallback(async (
+  const fetchGamesPageData = useCallback(async (
     dateToFetch?: Date,
     forceRefresh = false,
-    sportToFetch: ExtendedSportKey = 'ALL',
-    includeOdds = false
+    sportToFetch: ExtendedSportKey = 'ALL'
   ) => {
-    const fetchWithTimeout = async (input: string, timeoutMs = 8000) => {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), timeoutMs);
-      try {
-        return await fetch(input, { signal: controller.signal });
-      } finally {
-        clearTimeout(timer);
-      }
-    };
-    const sleep = async (ms: number) => {
-      if (ms <= 0) return;
-      await new Promise((resolve) => setTimeout(resolve, ms));
-    };
-    const readGamesWithRetry = async (
-      path: string,
-      timeoutMs = 8000,
-      attempts = 3,
-      retryDelaysMs: number[] = [1200, 2600],
-      retryOnEmpty = false
-    ): Promise<any[] | null> => {
-      let lastResult: any[] | null = null;
-      for (let attempt = 0; attempt < attempts; attempt += 1) {
-        try {
-          const res = await fetchWithTimeout(path, timeoutMs);
-          if (res.ok) {
-            const data = await res.json();
-            const games = Array.isArray(data?.games) ? data.games : [];
-            if (games.length > 0) return games;
-            if (!retryOnEmpty) return games;
-            lastResult = games;
-          }
-        } catch {
-          // Retry on transient failures.
-        }
-        if (attempt < attempts - 1) {
-          await sleep(retryDelaysMs[attempt] ?? retryDelaysMs[retryDelaysMs.length - 1] ?? 0);
-        }
-      }
-      return lastResult;
-    };
-
+    const stopPerf = startPerfTimer('games.pageData.fetch');
+    const startedAt =
+      typeof performance !== 'undefined' && typeof performance.now === 'function'
+        ? performance.now()
+        : Date.now();
     const dateStr = dateToFetch ? formatDateYYYYMMDD(dateToFetch) : formatDateYYYYMMDD(new Date());
-    const todayStr = formatDateYYYYMMDD(new Date());
     const sportKey = (sportToFetch || 'ALL').toUpperCase();
-    const isDateSwitch = Boolean(currentDateRef.current && currentDateRef.current !== dateStr);
-    const allowDateAgnosticRescue = !isDateSwitch && sportKey === 'ALL' && dateStr === todayStr;
-    const includeOddsForGames = false;
     const routeCacheKey = getRouteSlateCacheKey(dateStr, sportKey);
-    const gamesPath = getGamesApiPath(dateStr, sportKey, includeOddsForGames);
-    const hasOdds = (game: any): boolean => (
-      game?.spread != null ||
-      game?.overUnder != null ||
-      game?.moneylineHome != null ||
-      game?.moneylineAway != null ||
-      game?.spread_home != null ||
-      game?.total != null ||
-      game?.moneyline_home != null ||
-      game?.moneyline_away != null
-    );
-    const mergeGamesById = (rows: any[]): any[] => {
-      const byId = new Map<string, any>();
-      for (const row of rows) {
-        const key = String(row?.game_id || row?.id || "").trim();
-        if (!key) continue;
-        const prev = byId.get(key);
-        if (!prev) {
-          byId.set(key, row);
-          continue;
-        }
-        if (!hasOdds(prev) && hasOdds(row)) {
-          byId.set(key, { ...prev, ...row });
-        } else {
-          byId.set(key, { ...row, ...prev });
-        }
-      }
-      return Array.from(byId.values());
-    };
-    const countSports = (rows: any[]): number =>
-      new Set(
-        (Array.isArray(rows) ? rows : [])
-          .map((g: any) => String(g?.sport || "").toUpperCase().trim())
-          .filter((s: string) => s.length > 0)
-      ).size;
-    const shouldRejectCollapsedAllSportsPayload = (rows: any[]): boolean => {
-      if (sportKey !== 'ALL') return false;
-      const nextSports = countSports(rows);
-      if (nextSports >= 2) return false;
-      const currentSports = countSports(currentGamesRef.current);
-      return currentSports >= 2;
-    };
-    const fetchGamesPayload = async (): Promise<any[] | null> => {
-      const primaryAttempts = sportKey === 'ALL' ? 3 : 1;
-      const primaryTimeoutMs = sportKey === 'ALL' ? 7000 : 3500;
-      const primary = await readGamesWithRetry(gamesPath, primaryTimeoutMs, primaryAttempts, [1200, 2600], sportKey === 'ALL');
-      if (Array.isArray(primary) && primary.length > 0) return primary;
-
-      if (sportKey !== 'ALL') {
-        return primary;
-      }
-
-      // Fallback to per-sport fanout only when all-sports feed is empty.
-      const scopedSports = ['NBA', 'NHL', 'MLB', 'NCAAB', 'SOCCER', 'MMA', 'GOLF'] as const;
-      const responses = await Promise.allSettled(
-        scopedSports.map((scopedSport) => readGamesWithRetry(getGamesApiPath(dateStr, scopedSport, false), 5000, 1, [0], false))
-      );
-      const merged = mergeGamesById(
-        responses
-          .filter((r): r is PromiseFulfilledResult<any[] | null> => r.status === 'fulfilled')
-          .flatMap((r) => (Array.isArray(r.value) ? r.value : []))
-      );
-      if (merged.length > 0) return merged;
-
-      const noDateFallback = await readGamesWithRetry('/api/games?includeOdds=0', 9000, 2, [1200], true);
-      return Array.isArray(noDateFallback) ? noDateFallback : [];
-    };
-    const rescueAllSportsGames = async (): Promise<any[] | null> =>
-      readGamesWithRetry('/api/games?includeOdds=0', 12000, 3, [1200, 2400], true);
-
-    // Never show a previous-date slate under the newly selected date.
-    // If no cache exists for the requested date, clear list and show loading immediately.
-    if (isDateSwitch) {
-      const hasRouteCacheForDate = Boolean(readRouteSlateCache(routeCacheKey, ROUTE_SLATE_CACHE_TTL_MS)?.length);
-      const hasLocalCacheForDate = Boolean(loadCachedGamesForDate(dateStr, sportKey, 15 * 60 * 1000, includeOddsForGames)?.length);
-      if (!hasRouteCacheForDate && !hasLocalCacheForDate) {
-        setRawGames([]);
-        setHubLoading(true);
-      }
-    }
-    
-    // Check in-memory route cache first for instant in-session revisits.
-    if (!forceRefresh) {
-      const routeCachedGames = readRouteSlateCache(routeCacheKey, ROUTE_SLATE_CACHE_TTL_MS);
-      if (routeCachedGames && routeCachedGames.length > 0) {
-        setRawGames(routeCachedGames);
-        setHubLoading(false);
-        currentDateRef.current = dateStr;
-        hasFetchedRef.current = true;
-      }
-    }
-
-    // Check cache first for instant display (unless force refresh)
-    if (!forceRefresh) {
-      const cachedGames = loadCachedGamesForDate(dateStr, sportKey, GAMES_CACHE_TTL, includeOddsForGames);
-      if (cachedGames && cachedGames.length > 0) {
-        const shouldSkipCollapsedCache =
-          sportKey === 'ALL' &&
-          countSports(cachedGames) < 2 &&
-          countSports(currentGamesRef.current) >= 2;
-        if (!shouldSkipCollapsedCache) {
-          setRawGames(cachedGames);
-          setHubLoading(false);
-          currentDateRef.current = dateStr;
-          hasFetchedRef.current = true;
-        }
-        
-        // If cache is fresh enough, don't fetch again
-        // (loadCachedGamesForDate already checks TTL)
-        // But still fetch in background to update cache
-        if (!isFetchingRef.current) {
-          isFetchingRef.current = true;
-          // Background fetch - don't set loading state
-          fetchGamesPayload()
-            .then((gamesArray) => {
-              if (gamesArray && gamesArray.length > 0) {
-                if (shouldRejectCollapsedAllSportsPayload(gamesArray)) return;
-                setRawGames(gamesArray);
-                writeRouteSlateCache(routeCacheKey, gamesArray);
-                saveCachedGamesForDate(dateStr, gamesArray, sportKey, includeOddsForGames);
-              }
-            })
-            .catch(() => {})
-            .finally(() => { isFetchingRef.current = false; });
-        }
-        if (!(
-          sportKey === 'ALL' &&
-          countSports(cachedGames) < 2 &&
-          countSports(currentGamesRef.current) >= 2
-        )) {
-          return;
-        }
-      }
-    }
-
-    // Use stale cache to avoid blank/sluggish UX while network catches up.
-    const staleCachedGames = loadCachedGamesForDate(dateStr, sportKey, 15 * 60 * 1000, includeOddsForGames);
-    if (!forceRefresh && staleCachedGames && staleCachedGames.length > 0) {
-      const shouldSkipCollapsedStaleCache =
-        sportKey === 'ALL' &&
-        countSports(staleCachedGames) < 2 &&
-        countSports(currentGamesRef.current) >= 2;
-      if (!shouldSkipCollapsedStaleCache) {
-        setRawGames(staleCachedGames);
-        setHubLoading(false);
-        currentDateRef.current = dateStr;
-        hasFetchedRef.current = true;
-      }
-    }
-    
-    // No cache - fetch with clear loading state
-    if (isFetchingRef.current) {
-      pendingFetchRef.current = { dateToFetch, forceRefresh, sportToFetch, includeOdds };
-      // On date switches, keep loading state so users don't see stale previous-date slate.
-      if (isDateSwitch) {
-        setRawGames([]);
-        setHubLoading(true);
-      } else if (!hasFetchedRef.current) {
-        // Prevent indefinite loading when overlapping requests occur.
-        setHubLoading(false);
-      }
-      return;
-    }
-    isFetchingRef.current = true;
-    const stopPerf = startPerfTimer('games.fetch');
-    
+    const hasExisting = currentGamesRef.current.length > 0;
+    const retryKey = `${dateStr}|${sportKey}|${activeTab}`;
     try {
       setHubError(null);
       setStaleNotice(null);
-      // Keep current slate visible while refreshing unless nothing is loaded yet.
-      setHubLoading(currentGamesRef.current.length === 0);
-      
-      const gamesArray = await fetchGamesPayload();
-      if (Array.isArray(gamesArray)) {
-        if (gamesArray.length > 0) {
-          if (!shouldRejectCollapsedAllSportsPayload(gamesArray)) {
-            setRawGames(gamesArray);
-            currentDateRef.current = dateStr;
-            writeRouteSlateCache(routeCacheKey, gamesArray);
-            saveCachedGamesForDate(dateStr, gamesArray, sportKey, includeOddsForGames);
-            hasFetchedRef.current = true;
-            setStaleNotice(null);
-          }
-        } else if (isDateSwitch) {
-          setRawGames([]);
-          setHubError(null);
-          setStaleNotice(null);
-          hasFetchedRef.current = true;
-        } else if (currentGamesRef.current.length > 0) {
-          incrementPerfCounter('games.staleProtected');
-          setStaleNotice('Refreshing schedule feed - showing last known valid slate.');
-        } else {
-          const routeFallback = readRouteSlateCache(routeCacheKey, ROUTE_SLATE_CACHE_TTL_MS);
-          if (routeFallback && routeFallback.length > 0) {
-            setRawGames(routeFallback);
-            setStaleNotice('Refreshing schedule feed - showing last known valid slate.');
-            hasFetchedRef.current = true;
-          } else if (allowDateAgnosticRescue) {
-            const rescue = await rescueAllSportsGames();
-            if (Array.isArray(rescue) && rescue.length > 0) {
-              setRawGames(rescue);
-              writeRouteSlateCache(routeCacheKey, rescue);
-              saveCachedGamesForDate(dateStr, rescue, 'ALL', includeOddsForGames);
-              setStaleNotice('Using last available all-sports slate while the date feed refreshes.');
-              hasFetchedRef.current = true;
-            } else {
-              setHubError('No games available yet for this slate');
-            }
-          } else {
-            setRawGames([]);
-            setHubError('No games available for selected date');
-            setStaleNotice(null);
-          }
+      setHubLoading(!hasExisting);
+      const qs = new URLSearchParams({
+        date: dateStr,
+        sport: sportKey,
+        tab: activeTab,
+      });
+      if (forceRefresh) qs.set('fresh', '1');
+      const payload = await fetchJsonCached<any>(`/api/page-data/games?${qs.toString()}`, {
+        cacheKey: `page-data:games:${sportKey}:${dateStr}:${activeTab}:${forceRefresh ? 'fresh' : 'cached'}`,
+        ttlMs: forceRefresh ? 0 : 3_000,
+        timeoutMs: 3_500,
+        bypassCache: forceRefresh,
+        init: { credentials: 'include' },
+      });
+      const nextGames = Array.isArray(payload?.games) ? payload.games : [];
+      const nextSummary = (payload?.oddsSummaryByGame && typeof payload.oddsSummaryByGame === 'object')
+        ? payload.oddsSummaryByGame
+        : {};
+      if (nextGames.length > 0) {
+        setRawGames(nextGames);
+        currentDateRef.current = dateStr;
+        writeRouteSlateCache(routeCacheKey, nextGames);
+        saveCachedGamesForDate(dateStr, nextGames, sportKey, false);
+        hasFetchedRef.current = true;
+        firstLoadRetryRef.current.delete(retryKey);
+      } else if (!hasExisting) {
+        if (!forceRefresh && !firstLoadRetryRef.current.has(retryKey)) {
+          firstLoadRetryRef.current.add(retryKey);
+          await fetchGamesPageData(dateToFetch, true, sportToFetch);
+          return;
         }
-      } else {
-        if (isDateSwitch) {
-          setRawGames([]);
-          setHubError('Failed to load selected date');
-          setStaleNotice(null);
-        } else if (currentGamesRef.current.length === 0) {
-          const routeFallback = readRouteSlateCache(routeCacheKey, ROUTE_SLATE_CACHE_TTL_MS);
-          if (routeFallback && routeFallback.length > 0) {
-            setRawGames(routeFallback);
-            setStaleNotice('Refreshing schedule feed - showing last known valid slate.');
-            hasFetchedRef.current = true;
-          } else if (allowDateAgnosticRescue) {
-            const rescue = await rescueAllSportsGames();
-            if (Array.isArray(rescue) && rescue.length > 0) {
-              setRawGames(rescue);
-              writeRouteSlateCache(routeCacheKey, rescue);
-              saveCachedGamesForDate(dateStr, rescue, 'ALL', includeOddsForGames);
-              setStaleNotice('Using last available all-sports slate while the date feed refreshes.');
-              hasFetchedRef.current = true;
-            } else {
-              setHubError('Failed to load games');
-            }
-          } else {
-            setRawGames([]);
-            setHubError('Failed to load selected date');
-            setStaleNotice(null);
-          }
-        } else {
-          incrementPerfCounter('games.staleProtected');
-          setStaleNotice('Refreshing schedule feed - showing last known valid slate.');
-        }
+        setRawGames([]);
+        setHubError('No games available for selected date');
+      }
+      if (Object.keys(nextSummary).length > 0) {
+        setOddsSummaryByGame((prev) => {
+          const merged = mergeOddsSummaryRecord(prev, nextSummary);
+          saveCachedOddsSummary(dateStr, merged);
+          return merged;
+        });
+      }
+      if (payload?.freshness?.stale) {
+        setStaleNotice('Showing last prepared snapshot while refresh completes.');
+      }
+      if (payload?.degraded) {
+        incrementPerfCounter('games.pageData.degraded');
+      }
+      if (flags.PAGE_DATA_OBSERVABILITY_ENABLED) {
+        const elapsedMs = Math.max(
+          0,
+          (typeof performance !== 'undefined' && typeof performance.now === 'function'
+            ? performance.now()
+            : Date.now()) - startedAt
+        );
+        const oddsAvailableAtFirstRender = nextGames.some((g: any) =>
+          g?.spread != null ||
+          g?.overUnder != null ||
+          g?.moneylineHome != null ||
+          g?.moneylineAway != null
+        ) || Object.keys(nextSummary).length > 0;
+        void fetch('/api/page-data/telemetry', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            route: 'games',
+            loadMs: Math.round(elapsedMs),
+            apiCalls: 1,
+            oddsAvailableAtFirstRender,
+          }),
+        }).catch(() => {});
       }
     } catch (err) {
-      if (!mountedRef.current) {
+      console.warn('[GamesPage] page-data fetch failed', err);
+      if (!hasExisting && !forceRefresh && !firstLoadRetryRef.current.has(retryKey)) {
+        firstLoadRetryRef.current.add(retryKey);
+        await fetchGamesPageData(dateToFetch, true, sportToFetch);
         return;
-      }
-      console.error('[GamesPage] Fetch error:', err);
-      if (isDateSwitch) {
-        setRawGames([]);
-        setHubError('Network error loading selected date');
-        setStaleNotice(null);
-      } else if (currentGamesRef.current.length === 0) {
-        const routeFallback = readRouteSlateCache(routeCacheKey, ROUTE_SLATE_CACHE_TTL_MS);
-        if (routeFallback && routeFallback.length > 0) {
-          setRawGames(routeFallback);
-          setStaleNotice('Network issue - showing last known valid slate while we retry.');
-          hasFetchedRef.current = true;
-        } else if (allowDateAgnosticRescue) {
-          const rescue = await rescueAllSportsGames();
-          if (Array.isArray(rescue) && rescue.length > 0) {
-            setRawGames(rescue);
-            writeRouteSlateCache(routeCacheKey, rescue);
-            saveCachedGamesForDate(dateStr, rescue, 'ALL', includeOddsForGames);
-            setStaleNotice('Using last available all-sports slate while connectivity stabilizes.');
-            hasFetchedRef.current = true;
-          } else {
-            setHubError('Network error loading games');
-          }
-        } else {
-          setRawGames([]);
-          setHubError('Network error loading selected date');
-          setStaleNotice(null);
-        }
-      } else {
-        incrementPerfCounter('games.staleProtected');
-        setStaleNotice('Network issue - showing last known valid slate while we retry.');
       }
     } finally {
       stopPerf();
-      console.debug('[GamesPage][fetch-cache]', getFetchCacheStats());
-      logPerfSnapshot('GamesPage');
-      // Always release fetch lock, even during strict-mode effect cleanup cycles.
-      isFetchingRef.current = false;
-      currentDateRef.current = dateStr;
       if (mountedRef.current) {
         setHubLoading(false);
         setRefreshCycleCount((v) => v + 1);
       }
-      const pending = pendingFetchRef.current;
-      if (pending) {
-        pendingFetchRef.current = null;
-        void fetchGames(pending.dateToFetch, pending.forceRefresh, pending.sportToFetch, pending.includeOdds);
-      }
     }
-  }, []);
+  }, [activeTab, flags.PAGE_DATA_OBSERVABILITY_ENABLED]);
   
   // Pre-fetch adjacent dates in background for instant switching
   const prefetchAdjacentDates = useCallback((baseDate: Date, sportToFetch: ExtendedSportKey = 'ALL') => {
@@ -1259,8 +990,8 @@ export function GamesPage() {
   
   // Initial fetch and refetch when date changes
   useEffect(() => {
-    fetchGames(selectedDate, false, selectedSport, activeTab === 'odds');
-  }, [activeTab, fetchGames, selectedDate, selectedSport]);
+    void fetchGamesPageData(selectedDate, false, selectedSport);
+  }, [fetchGamesPageData, selectedDate, selectedSport]);
   
   // Pre-fetch adjacent dates after initial load completes
   useEffect(() => {
@@ -1277,208 +1008,10 @@ export function GamesPage() {
     setOddsSummaryByGame((prev) => mergeOddsSummaryRecord(prev, cached));
   }, [selectedDateStr]);
 
-  useEffect(() => {
-    if (rawGames.length === 0) return;
-
-    const hasRawOdds = (game: any): boolean =>
-      game?.spread != null ||
-      game?.spread_home != null ||
-      game?.overUnder != null ||
-      game?.total != null ||
-      game?.moneylineHome != null ||
-      game?.moneylineAway != null ||
-      game?.moneyline_home != null ||
-      game?.moneyline_away != null;
-
-    const hasSummaryOdds = (game: any): boolean => {
-      const gameId = String(game?.game_id || game?.id || '').trim();
-      const idSummary = buildOddsLookupCandidates(gameId)
-        .map((candidate) => oddsSummaryByGame[candidate])
-        .find((summary) => hasRenderableOddsSummary(summary));
-      if (idSummary) return true;
-      const sportKey = String(game?.sport || '').toUpperCase();
-      const matchupCandidates = [
-        buildOddsMatchKey(sportKey, game?.home_team_code, game?.away_team_code, game?.start_time),
-        buildOddsMatchKey(sportKey, game?.home_team_name, game?.away_team_name, game?.start_time),
-        buildOddsMatchKey(sportKey, game?.home_team_code || game?.home_team_name, game?.away_team_code || game?.away_team_name, game?.start_time),
-      ].filter((key): key is string => Boolean(key));
-      return matchupCandidates.some((candidate) => hasRenderableOddsSummary(oddsSummaryByGame[candidate]));
-    };
-
-    const coverageCount = rawGames.reduce((count, game) => count + ((hasRawOdds(game) || hasSummaryOdds(game)) ? 1 : 0), 0);
-    const coverageRatio = rawGames.length > 0 ? coverageCount / rawGames.length : 0;
-    const shouldHydrate =
-      activeTab === 'odds' ||
-      coverageRatio < 0.6;
-
-    if (!shouldHydrate) return;
-    incrementPerfCounter('games.guardrail.coverageHydration');
-
-    let cancelled = false;
-    setOddsHydrating(true);
-    void (async () => {
-      try {
-        const byId: Record<string, {
-          spread?: { home_line?: number | null };
-          total?: { line?: number | null };
-          moneyline?: { home_price?: number | null; away_price?: number | null };
-          first_half?: {
-            spread?: { home_line?: number | null };
-            total?: { line?: number | null };
-            moneyline?: { home_price?: number | null; away_price?: number | null };
-          };
-          game?: {
-            game_id?: string;
-            sport?: string;
-            home_team_code?: string;
-            away_team_code?: string;
-            home_team_name?: string;
-            away_team_name?: string;
-            start_time?: string;
-          };
-        }> = {};
-
-        const addSummary = (s: any) => {
-          const nextStrength = oddsSummaryStrength(s);
-          if (nextStrength <= 0) return;
-
-          const gameId = String(s?.game?.game_id || s?.game_id || s?.game?.id || '').trim();
-          if (gameId) {
-            for (const candidate of buildOddsLookupCandidates(gameId)) {
-              const prevSummary = byId[candidate];
-              if (!prevSummary || nextStrength >= oddsSummaryStrength(prevSummary)) {
-                byId[candidate] = s;
-              }
-            }
-          }
-          const summarySport = String(s?.game?.sport || '').trim().toUpperCase();
-          const summaryHomeCode = String(s?.game?.home_team_code || '').trim();
-          const summaryAwayCode = String(s?.game?.away_team_code || '').trim();
-          const summaryHomeName = String(s?.game?.home_team_name || '').trim();
-          const summaryAwayName = String(s?.game?.away_team_name || '').trim();
-          const summaryStart = String(s?.game?.start_time || '').trim();
-          const matchKeys = [
-            buildOddsMatchKey(summarySport, summaryHomeCode, summaryAwayCode, summaryStart),
-            buildOddsMatchKey(summarySport, summaryHomeName, summaryAwayName, summaryStart),
-            buildOddsMatchKey(summarySport, summaryHomeCode || summaryHomeName, summaryAwayCode || summaryAwayName, summaryStart),
-            buildOddsMatchKey(summarySport, summaryHomeCode, summaryAwayCode, ''),
-            buildOddsMatchKey(summarySport, summaryHomeName, summaryAwayName, ''),
-          ].filter((key): key is string => Boolean(key));
-          for (const key of matchKeys) {
-            const prevSummary = byId[key];
-            if (!prevSummary || nextStrength >= oddsSummaryStrength(prevSummary)) {
-              byId[key] = s;
-            }
-          }
-        };
-
-        const requestedIds = rawGames
-          .map((g: any) => String(g?.game_id || g?.id || '').trim())
-          .filter((id: string) => id.length > 0)
-          .slice(0, 80);
-
-        // Primary path: batch odds summaries by game ids (single bundled path, chunked).
-        const chunks: string[][] = [];
-        for (let i = 0; i < requestedIds.length; i += 30) {
-          chunks.push(requestedIds.slice(i, i + 30));
-        }
-
-        const chunkResponses = await Promise.allSettled(
-          chunks.map(async (chunkIds, idx) => {
-            const qs = new URLSearchParams({
-              game_ids: chunkIds.join(','),
-              scope: 'PROD',
-              date: selectedDateStr,
-            });
-            const payload = await fetchJsonCached<any>(`/api/odds/slate?${qs.toString()}`, {
-              cacheKey: `games:odds:slate:chunk:${selectedDateStr}:${idx}:${chunkIds.join('|')}`,
-              ttlMs: 6000,
-              timeoutMs: 12000,
-              init: { credentials: 'include' },
-            });
-            return Array.isArray(payload?.summaries) ? payload.summaries : [];
-          })
-        );
-
-        for (const response of chunkResponses) {
-          if (response.status !== 'fulfilled') continue;
-          for (const s of response.value) addSummary(s);
-        }
-
-        // Fallback path: if bundled coverage is weak, fan out by sport once.
-        const sports = Array.from(new Set(
-          rawGames
-            .map((g: any) => String(g?.sport || '').toUpperCase().trim())
-            .filter((s: string) => s.length > 0)
-        ));
-        const coveredRequested = requestedIds.filter((id) => Boolean(byId[id])).length;
-        const needsSportFallback = sports.length > 0 && coveredRequested < Math.min(requestedIds.length, 10) / 2;
-
-        if (needsSportFallback) {
-          incrementPerfCounter('games.guardrail.sportFallback');
-          const responses = await Promise.allSettled(
-            sports.map(async (sport) => {
-              const qs = new URLSearchParams({ sport, scope: 'PROD', date: selectedDateStr });
-              const payload = await fetchJsonCached<any>(`/api/odds/slate?${qs.toString()}`, {
-                cacheKey: `games:odds:slate:sport:${sport}:${selectedDateStr}`,
-                ttlMs: 6000,
-                timeoutMs: 12000,
-                init: { credentials: 'include' },
-              });
-              return Array.isArray(payload?.summaries) ? payload.summaries : [];
-            })
-          );
-          for (const response of responses) {
-            if (response.status !== 'fulfilled') continue;
-            for (const s of response.value) addSummary(s);
-          }
-        }
-
-        // Last-resort fallback: per-game summary when slate payloads are weak.
-        const coveredAfterSlate = requestedIds.filter((id) => Boolean(byId[id])).length;
-        if (coveredAfterSlate < Math.max(1, Math.floor(requestedIds.length * 0.6))) {
-          incrementPerfCounter('games.guardrail.perGameFallback');
-          const unresolvedIds = requestedIds.filter((id) => !byId[id]).slice(0, 24);
-          const summaryResponses = await Promise.allSettled(
-            unresolvedIds.map(async (id) => {
-              const payload = await fetchJsonCached<any>(`/api/odds/summary/${encodeURIComponent(id)}?scope=PROD`, {
-                cacheKey: `games:odds:summary:${id}`,
-                ttlMs: 6000,
-                timeoutMs: 5000,
-                init: { credentials: 'include' },
-              });
-              return payload || null;
-            })
-          );
-          for (const response of summaryResponses) {
-            if (response.status !== 'fulfilled' || !response.value) continue;
-            addSummary(response.value);
-          }
-        }
-
-        if (!cancelled && Object.keys(byId).length > 0) {
-          setOddsSummaryByGame((prev) => {
-            const merged = mergeOddsSummaryRecord(prev, byId);
-            saveCachedOddsSummary(selectedDateStr, merged);
-            return merged;
-          });
-        }
-      } catch {
-        // Keep existing odds summary on background failure.
-      } finally {
-        if (!cancelled) setOddsHydrating(false);
-      }
-    })();
-
-    return () => {
-      cancelled = true;
-    };
-  }, [activeTab, rawGames, selectedDateStr]);
-  
   // Refresh function - force bypass cache
   const hubRefresh = useCallback(async () => {
-    await fetchGames(selectedDate, true, selectedSport, activeTab === 'odds'); // forceRefresh = true
-  }, [activeTab, fetchGames, selectedDate, selectedSport]);
+    await fetchGamesPageData(selectedDate, true, selectedSport);
+  }, [fetchGamesPageData, selectedDate, selectedSport]);
   
   // Transform raw API games to LiveGame-like format
   const hubGames = useMemo(() => {
@@ -1668,7 +1201,7 @@ export function GamesPage() {
   }, [games]);
 
   useEffect(() => {
-    if (hubLoading || refreshing || oddsHydrating) return;
+    if (hubLoading || refreshing) return;
     if (games.length === 0) return;
     if (realOddsGameCount > 0) return;
     const recoveryKey = `${selectedDateStr}|${selectedSport}|${activeTab}`;
@@ -1684,7 +1217,6 @@ export function GamesPage() {
     games.length,
     hubLoading,
     hubRefresh,
-    oddsHydrating,
     realOddsGameCount,
     refreshing,
     selectedDateStr,
@@ -2565,7 +2097,7 @@ export function GamesPage() {
               gamesCount={games.length}
               oddsCoverageCount={realOddsGameCount}
               staleNotice={staleNotice}
-              isHydrating={loading || refreshing || oddsHydrating}
+              isHydrating={loading || refreshing}
               cycleToken={refreshCycleCount}
               lowCoverageThresholdPct={debugCoverageThresholdPct}
             />
@@ -2791,7 +2323,7 @@ export function GamesPage() {
         {/* ODDS TAB CONTENT - Sports Betting Intelligence Terminal */}
         {activeTab === 'odds' && (
           <div className="space-y-4 py-2">
-            {((loading || oddsHydrating) && games.length === 0) ? (
+            {(loading && games.length === 0) ? (
               <div className="rounded-2xl border border-amber-500/20 bg-[#121821] p-6 md:p-8">
                 <div className="mb-4 flex items-center gap-2 text-amber-200">
                   <RefreshCw className="h-4 w-4 animate-spin" />

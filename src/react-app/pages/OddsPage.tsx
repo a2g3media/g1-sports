@@ -14,6 +14,7 @@ import { cn } from '@/react-app/lib/utils';
 import { fetchJsonCached, getFetchCacheStats, invalidateJsonCache } from '@/react-app/lib/fetchCache';
 import { incrementPerfCounter, logPerfSnapshot, startPerfTimer } from '@/react-app/lib/perfTelemetry';
 import { OddsTelemetryDebugPanel } from '@/react-app/components/debug/OddsTelemetryDebugPanel';
+import { useFeatureFlags } from '@/react-app/hooks/useFeatureFlags';
 
 interface Game {
   id: string;
@@ -153,24 +154,6 @@ function buildOddsMatchKey(home: unknown, away: unknown, startTime: unknown): st
   return `${h}|${a}|${d}`;
 }
 
-function hasNativeOdds(game: any): boolean {
-  return (
-    toFiniteNumber(game?.spread_home ?? game?.spreadHome ?? game?.spread) !== undefined ||
-    toFiniteNumber(game?.total ?? game?.overUnder ?? game?.over_under) !== undefined ||
-    toFiniteNumber(game?.moneyline_home ?? game?.moneylineHome) !== undefined ||
-    toFiniteNumber(game?.moneyline_away ?? game?.moneylineAway) !== undefined
-  );
-}
-
-function hasAnyRenderableOddsFromSummary(summary: any): boolean {
-  return oddsSummaryStrength(summary) > 0;
-}
-
-function countGamesWithNativeOdds(games: any[]): number {
-  if (!Array.isArray(games) || games.length === 0) return 0;
-  return games.reduce((acc, game) => acc + (hasNativeOdds(game) ? 1 : 0), 0);
-}
-
 function oddsSummaryStrength(summary: any): number {
   if (!summary || typeof summary !== 'object') return 0;
   let score = 0;
@@ -200,23 +183,6 @@ function mergeOddsSummaryRecord(
     }
   }
   return merged;
-}
-
-function mergeGamesById(games: any[]): any[] {
-  const byId = new Map<string, any>();
-  for (const game of games) {
-    const key = String(game?.game_id || game?.id || "");
-    if (!key) continue;
-    const existing = byId.get(key);
-    if (!existing) {
-      byId.set(key, game);
-      continue;
-    }
-    const existingHasOdds = hasNativeOdds(existing);
-    const nextHasOdds = hasNativeOdds(game);
-    byId.set(key, nextHasOdds && !existingHasOdds ? { ...existing, ...game } : { ...game, ...existing });
-  }
-  return Array.from(byId.values());
 }
 
 type OddsRouteSlateCacheEntry = {
@@ -261,6 +227,7 @@ export function OddsPage() {
   const watchboardsResult = useWatchboards();
   const boards = watchboardsResult?.boards || [];
   const { user, isDemoMode } = useDemoAuth();
+  const { flags } = useFeatureFlags();
   
   // Direct fetch for games - same pattern as GamesPage
   const [rawGames, setRawGames] = useState<any[]>([]);
@@ -277,9 +244,9 @@ export function OddsPage() {
     opening_spread?: number | null;
     opening_total?: number | null;
   }>>({});
-  const [splitFeedByGame, setSplitFeedByGame] = useState<Record<string, TicketHandleSplitRow[]>>({});
-  const [projectionFeed, setProjectionFeed] = useState<ProjectionRow[]>([]);
-  const [projectionCoverage, setProjectionCoverage] = useState<ProjectionCoverage>({
+  const [splitFeedByGame] = useState<Record<string, TicketHandleSplitRow[]>>({});
+  const [projectionFeed] = useState<ProjectionRow[]>([]);
+  const [projectionCoverage] = useState<ProjectionCoverage>({
     source: 'none',
     count: 0,
     fallbackReason: null,
@@ -341,6 +308,7 @@ export function OddsPage() {
   // Fetch all games directly from API
   const fetchGames = useCallback(async () => {
     const requestId = ++activeFetchRequestRef.current;
+    const startedAt = performance.now();
     const stopPerf = startPerfTimer('odds.fetch');
     const isCurrentRequest = () => mountedRef.current && requestId === activeFetchRequestRef.current;
 
@@ -357,120 +325,6 @@ export function OddsPage() {
     const selectedDateParam = toDateParam(selectedDate);
     const routeCacheKey = getOddsRouteSlateCacheKey(selectedDateParam);
 
-    const sleep = async (ms: number) => {
-      if (ms <= 0) return;
-      await new Promise((resolve) => setTimeout(resolve, ms));
-    };
-
-    const fetchGamesData = async (): Promise<any[] | null> => {
-      const readGames = async (endpoint: string, timeoutMs = 9000): Promise<any[] | null> => {
-        try {
-          const data = await fetchJsonCached<any>(endpoint, {
-            cacheKey: `odds:games:${endpoint}`,
-            ttlMs: 5000,
-            timeoutMs,
-          });
-          return Array.isArray(data?.games) ? data.games : null;
-        } catch {
-          return null;
-        }
-      };
-
-      const readGamesWithRetry = async (
-        endpoint: string,
-        timeoutMs = 9000,
-        attempts = 3,
-        retryDelaysMs: number[] = [1200, 2600],
-        retryOnEmpty = false
-      ): Promise<any[] | null> => {
-        let lastResult: any[] | null = null;
-        for (let attempt = 0; attempt < attempts; attempt += 1) {
-          const result = await readGames(endpoint, timeoutMs);
-          if (Array.isArray(result) && result.length > 0) return result;
-          if (Array.isArray(result)) {
-            if (!retryOnEmpty) return result;
-            lastResult = result;
-          }
-          if (attempt < attempts - 1) {
-            await sleep(retryDelaysMs[attempt] ?? retryDelaysMs[retryDelaysMs.length - 1] ?? 0);
-          }
-        }
-        return lastResult;
-      };
-
-      // First paint uses the fast no-odds bundle, but auto-escalates if slate looks incomplete.
-      const todayParam = toDateParam(new Date());
-      const isTodayRequest = selectedDateParam === todayParam;
-      const primary = await readGamesWithRetry(
-        `/api/games?date=${encodeURIComponent(selectedDateParam)}&includeOdds=0`,
-        isTodayRequest ? 6500 : 4500,
-        isTodayRequest ? 2 : 1,
-        [1200],
-        false
-      );
-      const scopedSports = ['NBA', 'NHL', 'MLB', 'NCAAB', 'SOCCER', 'MMA', 'GOLF'] as const;
-
-      if (Array.isArray(primary) && primary.length > 0) {
-        const distinctSports = new Set(primary.map((g: any) => String(g?.sport || '').toUpperCase()).filter(Boolean));
-        const nativeOddsCount = countGamesWithNativeOdds(primary);
-        const weakOddsCoverage = nativeOddsCount < Math.max(2, Math.floor(primary.length * 0.2));
-        const looksSparse = primary.length < 8 || distinctSports.size < 2;
-        if (!looksSparse && !weakOddsCoverage) return primary;
-        incrementPerfCounter('odds.guardrail.coverageFallback');
-
-        // Guardrail: sparse slate OR weak odds coverage -> enrich with per-sport includeOdds=1.
-        const enrichedResponses = await Promise.allSettled(
-          scopedSports.map((sport) =>
-            readGamesWithRetry(
-              `/api/games?date=${encodeURIComponent(selectedDateParam)}&sport=${sport}&includeOdds=1`,
-              6000,
-              1,
-              [0],
-              false
-            )
-          )
-        );
-        const enrichedMerged = mergeGamesById([
-          ...primary,
-          ...enrichedResponses
-            .filter((r): r is PromiseFulfilledResult<any[] | null> => r.status === 'fulfilled')
-            .flatMap((r) => (Array.isArray(r.value) ? r.value : [])),
-        ]);
-        if (enrichedMerged.length > primary.length) return enrichedMerged;
-        if (countGamesWithNativeOdds(enrichedMerged) > nativeOddsCount) return enrichedMerged;
-        return primary;
-      }
-
-      // Fallback: per-sport fanout when the bundled payload misses.
-      const scopedResponses = await Promise.allSettled(
-        scopedSports.map((sport) =>
-          readGamesWithRetry(
-            `/api/games?date=${encodeURIComponent(selectedDateParam)}&sport=${sport}&includeOdds=1`,
-            6000,
-            1,
-            [0],
-            false
-          )
-        )
-      );
-      const scopedMerged = mergeGamesById(
-        scopedResponses
-          .filter((r): r is PromiseFulfilledResult<any[] | null> => r.status === "fulfilled")
-          .flatMap((r) => (Array.isArray(r.value) ? r.value : []))
-      );
-      if (scopedMerged.length > 0) return scopedMerged;
-
-      const fallback = await readGamesWithRetry(
-        `/api/games?date=${encodeURIComponent(selectedDateParam)}&includeOdds=1`,
-        7000,
-        1,
-        [0],
-        false
-      );
-      if (Array.isArray(fallback)) return fallback;
-      return readGamesWithRetry('/api/games?includeOdds=1', 9000, 2, [1200], true);
-    };
-
     try {
       setError(null);
       setStaleNotice(null);
@@ -484,343 +338,73 @@ export function OddsPage() {
         }
       }
 
-      const [gamesDataResult, propsResResult] = await Promise.allSettled([
-        fetchGamesData(),
-        fetchWithTimeout('/api/sports-data/props/today', { credentials: 'include' }),
-      ]);
-
-      const gamesArray = gamesDataResult.status === "fulfilled" ? gamesDataResult.value : null;
-      const propsRes = propsResResult.status === "fulfilled" ? propsResResult.value : null;
-
-      if (gamesArray && Array.isArray(gamesArray) && gamesArray.length > 0) {
+      {
+        const selectedDateParam = toDateParam(selectedDate);
+        const qs = new URLSearchParams({ date: selectedDateParam, sport: "ALL" });
+        const payload = await fetchJsonCached<any>(`/api/page-data/odds?${qs.toString()}`, {
+          cacheKey: `page-data:odds:${selectedDateParam}:all`,
+          ttlMs: 3_000,
+          timeoutMs: 2_700,
+          init: { credentials: 'include' },
+        });
+        const pageGames = Array.isArray(payload?.games) ? payload.games : [];
+        const pageOdds = payload?.oddsSummaryByGame && typeof payload.oddsSummaryByGame === 'object'
+          ? payload.oddsSummaryByGame
+          : {};
         if (!isCurrentRequest()) return;
-        console.log('[OddsPage] Fetched games:', gamesArray.length);
-        setRawGames(gamesArray);
-        writeOddsRouteSlateCache(routeCacheKey, gamesArray);
+        if (pageGames.length > 0) {
+          setRawGames(pageGames);
+          writeOddsRouteSlateCache(routeCacheKey, pageGames);
+          try {
+            sessionStorage.setItem('odds:lastGames', JSON.stringify(pageGames));
+          } catch {
+            // ignore cache write failures
+          }
+          hasFetchedRef.current = true;
+        }
+        if (Object.keys(pageOdds).length > 0) {
+          setOddsSummaryByGame((prev) => mergeOddsSummaryRecord(prev, pageOdds));
+          try {
+            sessionStorage.setItem(`odds:lastSummary:${selectedDateParam}`, JSON.stringify(pageOdds));
+          } catch {
+            // ignore cache write failures
+          }
+        }
+        if (flags.PAGE_DATA_OBSERVABILITY_ENABLED) {
+          const loadMs = Math.max(0, Math.round(performance.now() - startedAt));
+          void fetch('/api/page-data/telemetry', {
+            method: 'POST',
+            credentials: 'include',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+              route: 'odds',
+              loadMs,
+              apiCalls: 1,
+              oddsAvailableAtFirstRender: Object.keys(pageOdds).length > 0,
+            }),
+          }).catch(() => {});
+        }
+        // Optional props intelligence feed remains independent of route assembly.
         try {
-          sessionStorage.setItem('odds:lastGames', JSON.stringify(gamesArray));
+          const propsRes = await fetchWithTimeout('/api/sports-data/props/today', { credentials: 'include' });
+          if (propsRes?.ok && isCurrentRequest()) {
+            const propsData = await propsRes.json();
+            const nextProps = Array.isArray(propsData?.props) ? propsData.props : [];
+            setRawProps(nextProps);
+          }
         } catch {
-          // ignore cache write failures
+          // non-fatal
         }
-        hasFetchedRef.current = true;
-
-        // Pull real odds summaries across sports.
-        // Keep this available for demo/guest mode; only projections remain auth-gated.
-        // Enrichment is non-blocking so page never gets stuck on slow downstream feeds.
-        void (async () => {
-          try {
-            const sports: string[] = Array.from(new Set(
-              gamesArray
-                .map((g: any) => String(g?.sport || '').toUpperCase().trim())
-                .filter((s: string) => s.length > 0)
-            ));
-            const byId: Record<string, {
-              spread?: { home_line?: number | null };
-              total?: { line?: number | null };
-              moneyline?: { home_price?: number | null; away_price?: number | null };
-              first_half?: {
-                spread?: { home_line?: number | null };
-                total?: { line?: number | null };
-                moneyline?: { home_price?: number | null; away_price?: number | null };
-              };
-              opening_spread?: number | null;
-              opening_total?: number | null;
-            }> = {};
-
-            const addSummary = (s: any) => {
-              const summaryGame = s?.game || {};
-              const gameId = String(summaryGame?.game_id || s?.game_id || '').trim();
-              const requestedGameId = String(s?.requested_game_id || '').trim();
-              if (!gameId && !requestedGameId) return;
-              const nextStrength = oddsSummaryStrength(s);
-              if (nextStrength <= 0) return;
-
-              const idCandidates = new Set<string>();
-              for (const candidate of buildOddsLookupCandidates(gameId)) idCandidates.add(candidate);
-              for (const candidate of buildOddsLookupCandidates(requestedGameId)) idCandidates.add(candidate);
-
-              for (const candidate of idCandidates) {
-                const prevById = byId[candidate];
-                if (!prevById || nextStrength >= oddsSummaryStrength(prevById)) {
-                  byId[candidate] = s;
-                }
-              }
-
-              const matchKey = buildOddsMatchKey(
-                summaryGame?.home_team_code || summaryGame?.home_team_name,
-                summaryGame?.away_team_code || summaryGame?.away_team_name,
-                summaryGame?.start_time
-              );
-              if (matchKey) {
-                const prevByMatch = byId[matchKey];
-                if (!prevByMatch || nextStrength >= oddsSummaryStrength(prevByMatch)) {
-                  byId[matchKey] = s;
-                }
-              }
-            };
-
-            // Primary path: batch by visible game ids first.
-            const requestedIds = gamesArray
-              .map((g: any) => String(g?.game_id || g?.id || '').trim())
-              .filter((id: string) => id.length > 0)
-              .slice(0, 90);
-            const chunks: string[][] = [];
-            for (let i = 0; i < requestedIds.length; i += 30) {
-              chunks.push(requestedIds.slice(i, i + 30));
-            }
-
-            const chunkResponses = await Promise.allSettled(
-              chunks.map(async (chunkIds, idx) => {
-                const qs = new URLSearchParams({
-                  game_ids: chunkIds.join(','),
-                  scope: 'PROD',
-                  date: selectedDateParam,
-                });
-                const payload = await fetchJsonCached<any>(`/api/odds/slate?${qs.toString()}`, {
-                  cacheKey: `odds:slate:chunk:${selectedDateParam}:${idx}:${chunkIds.join('|')}`,
-                  ttlMs: 6000,
-                  timeoutMs: 9000,
-                  init: { credentials: 'include' },
-                });
-                return Array.isArray(payload?.summaries) ? payload.summaries : [];
-              })
-            );
-            for (const response of chunkResponses) {
-              if (response.status !== 'fulfilled') continue;
-              for (const s of response.value) addSummary(s);
-            }
-
-            const hasSummaryForGame = (game: any): boolean => {
-              const gameId = String(game?.game_id || game?.id || '').trim();
-              for (const candidate of buildOddsLookupCandidates(gameId)) {
-                if (byId[candidate]) return true;
-              }
-              const matchKey = buildOddsMatchKey(
-                game?.home_team_code || game?.home_team_name || game?.homeTeamCode || game?.homeTeam,
-                game?.away_team_code || game?.away_team_name || game?.awayTeamCode || game?.awayTeam,
-                game?.start_time || game?.startTime
-              );
-              return matchKey ? Boolean(byId[matchKey]) : false;
-            };
-
-            // Fallback: sport fanout only when coverage across requested ids is weak.
-            const coveredRequested = gamesArray.filter((g: any) => hasSummaryForGame(g)).length;
-            const needsSportFallback = sports.length > 0 && coveredRequested < Math.min(requestedIds.length, 10) / 2;
-            if (needsSportFallback) {
-              incrementPerfCounter('odds.guardrail.sportFallback');
-              const responses = await Promise.allSettled(
-                sports.map(async (sport) => {
-                  const qs = new URLSearchParams({ sport, scope: 'PROD', date: selectedDateParam });
-                  const payload = await fetchJsonCached<any>(`/api/odds/slate?${qs.toString()}`, {
-                    cacheKey: `odds:slate:${sport}:${selectedDateParam}`,
-                    ttlMs: 6000,
-                    timeoutMs: 8000,
-                    init: { credentials: 'include' },
-                  });
-                  return Array.isArray(payload?.summaries) ? payload.summaries : [];
-                })
-              );
-              for (const response of responses) {
-                if (response.status !== 'fulfilled') continue;
-                for (const s of response.value) addSummary(s);
-              }
-            }
-
-            // Targeted per-game fallback: fetch only unresolved games so one sport with good
-            // coverage cannot mask another sport that is still blank.
-            const unresolvedIds = gamesArray
-              .filter((g: any) => !hasSummaryForGame(g))
-              .map((g: any) => String(g?.game_id || g?.id || '').trim())
-              .filter((id: string) => id.length > 0)
-              .slice(0, 36);
-
-            if (unresolvedIds.length > 0) {
-              incrementPerfCounter('odds.guardrail.perGameFallback');
-              const perGameResponses = await Promise.allSettled(
-                unresolvedIds.map(async (id) => {
-                  const payload = await fetchJsonCached<any>(`/api/odds/summary/${encodeURIComponent(id)}?scope=PROD`, {
-                    cacheKey: `odds:summary:${id}:${selectedDateParam}`,
-                    ttlMs: 8000,
-                    timeoutMs: 9000,
-                    init: { credentials: 'include' },
-                  });
-                  return payload;
-                })
-              );
-              for (const response of perGameResponses) {
-                if (response.status !== 'fulfilled') continue;
-                addSummary(response.value);
-              }
-            }
-
-            const hasFirstHalfOdds = (s: any): boolean =>
-              s?.first_half?.spread?.home_line != null ||
-              s?.first_half?.spread?.away_line != null ||
-              s?.first_half?.total?.line != null ||
-              s?.first_half?.moneyline?.home_price != null ||
-              s?.first_half?.moneyline?.away_price != null;
-
-            const needsFirstHalfRefresh = requestedIds
-              .filter((id) => {
-                const existing: any = byId[id];
-                if (!existing) return true;
-                if (hasFirstHalfOdds(existing)) return false;
-                const source = String(existing?.source || '').toLowerCase();
-                const fallbackType = String(existing?.fallback_type || '').toLowerCase();
-                return source === 'none' || fallbackType === 'no_coverage' || Boolean(existing?.fallback_reason);
-              })
-              .slice(0, 12);
-
-            if (needsFirstHalfRefresh.length > 0) {
-              const refreshResponses = await Promise.allSettled(
-                needsFirstHalfRefresh.map(async (id) => {
-                  const payload = await fetchJsonCached<any>(`/api/odds/summary/${encodeURIComponent(id)}?scope=PROD&refresh=true`, {
-                    cacheKey: `odds:summary:force:${requestId}:${id}`,
-                    ttlMs: 1000,
-                    timeoutMs: 9500,
-                    init: { credentials: 'include' },
-                  });
-                  return payload;
-                })
-              );
-              for (const response of refreshResponses) {
-                if (response.status !== 'fulfilled') continue;
-                addSummary(response.value);
-              }
-            }
-
-            if (!isCurrentRequest()) return;
-            if (Object.keys(byId).length > 0) {
-              setOddsSummaryByGame((prev) => {
-                const merged = mergeOddsSummaryRecord(prev, byId);
-                try {
-                  const trimmedEntries = Object.entries(merged)
-                    .filter(([, summary]) => hasAnyRenderableOddsFromSummary(summary))
-                    .slice(0, 600);
-                  sessionStorage.setItem(
-                    `odds:lastSummary:${selectedDateParam}`,
-                    JSON.stringify(Object.fromEntries(trimmedEntries))
-                  );
-                } catch {
-                  // ignore cache write failures
-                }
-                return merged;
-              });
-            }
-
-            // Pull optional ticket/handle split rows for games with real odds summaries.
-            try {
-              const gameIdsWithOdds = Object.keys(byId).slice(0, 24);
-              if (gameIdsWithOdds.length > 0) {
-                const splitResponses = await Promise.all(
-                  gameIdsWithOdds.map(async (id) => {
-                    const payload = await fetchJsonCached<any>(`/api/odds/splits/${encodeURIComponent(id)}`, {
-                      cacheKey: `odds:splits:${id}`,
-                      ttlMs: 8000,
-                      timeoutMs: 6000,
-                      init: { credentials: 'include' },
-                    });
-                    const rows = Array.isArray(payload?.rows) ? payload.rows : [];
-                    return [id, rows as TicketHandleSplitRow[]] as [string, TicketHandleSplitRow[]];
-                  })
-                );
-                const splitMap: Record<string, TicketHandleSplitRow[]> = {};
-                for (const [id, rows] of splitResponses) {
-                  splitMap[id] = rows;
-                }
-                if (!isCurrentRequest()) return;
-                if (Object.keys(splitMap).length > 0) {
-                  setSplitFeedByGame((prev) => ({ ...prev, ...splitMap }));
-                }
-              }
-            } catch {
-              // Preserve previous split feed on transient failures.
-            }
-
-            // Pull projection coverage for props intelligence (auth required).
-            if (isDemoMode || !user?.id) {
-              if (!isCurrentRequest()) return;
-              setProjectionCoverage({ source: 'none', count: 0, fallbackReason: 'Sign in required' });
-            } else {
-              try {
-                const payload = await fetchJsonCached<any>('/api/odds/props/projections?limit=200', {
-                  cacheKey: `odds:projections:${selectedDateParam}`,
-                  ttlMs: 10000,
-                  timeoutMs: 8000,
-                  init: { credentials: 'include' },
-                });
-                if (!isCurrentRequest()) return;
-                const nextProjections = Array.isArray(payload?.projections) ? payload.projections : [];
-                if (nextProjections.length > 0) {
-                  setProjectionFeed(nextProjections);
-                }
-                setProjectionCoverage({
-                  source: String(payload?.source || 'none'),
-                  count: Number(payload?.count || 0),
-                  fallbackReason: payload?.fallback_reason ? String(payload.fallback_reason) : null,
-                });
-              } catch {
-                if (!isCurrentRequest()) return;
-                setProjectionCoverage((prev) => ({ ...prev, fallbackReason: 'Projection fetch failed' }));
-              }
-            }
-          } catch {
-            if (!isCurrentRequest()) return;
-            incrementPerfCounter('odds.staleProtected');
-            setStaleNotice('Odds enrichment is delayed; showing last known valid data.');
-          }
-        })();
-      } else {
-        let usedFallback = false;
-
-        const routeCachedGames = readOddsRouteSlateCache(routeCacheKey, ODDS_ROUTE_SLATE_CACHE_TTL_MS);
-        if (routeCachedGames && routeCachedGames.length > 0) {
-          setRawGames(routeCachedGames);
-          usedFallback = true;
-        }
-
-        if (!usedFallback) {
-          try {
-            const cached = sessionStorage.getItem('odds:lastGames');
-            if (cached) {
-              const parsed = JSON.parse(cached);
-              if (Array.isArray(parsed) && parsed.length > 0) {
-                setRawGames(parsed);
-                usedFallback = true;
-              }
-            }
-          } catch {
-            // ignore cache read failures
-          }
-        }
-
-        if (!usedFallback) {
-          if (visibleGamesRef.current.length === 0) {
-            setError('Failed to load games');
-            setRawGames([]);
-          } else {
-            incrementPerfCounter('odds.staleProtected');
-            setStaleNotice('Refresh failed. Keeping previous games and odds visible.');
-          }
-        } else {
-          setStaleNotice('Refreshing market feeds - showing last known valid slate.');
-        }
+        return;
       }
 
-      if (propsRes?.ok) {
-        const propsData = await propsRes.json();
-        if (isCurrentRequest()) {
-          const nextProps = Array.isArray(propsData?.props) ? propsData.props : [];
-          setRawProps(nextProps);
-        }
-      }
     } catch (err) {
       if (!isCurrentRequest()) return;
       console.error('[OddsPage] Fetch error:', err);
       if (visibleGamesRef.current.length === 0) {
         const routeCachedGames = readOddsRouteSlateCache(routeCacheKey, ODDS_ROUTE_SLATE_CACHE_TTL_MS);
-        if (routeCachedGames && routeCachedGames.length > 0) {
-          setRawGames(routeCachedGames);
+        if (Array.isArray(routeCachedGames) && routeCachedGames.length > 0) {
+          setRawGames(routeCachedGames as any[]);
           setStaleNotice('Network issue during refresh. Showing last known valid data.');
           hasFetchedRef.current = true;
         } else {
@@ -838,7 +422,12 @@ export function OddsPage() {
       setLoading(false);
       setRefreshCycleCount((v) => v + 1);
     }
-  }, [isDemoMode, user?.id, selectedDate]);
+  }, [
+    flags.PAGE_DATA_OBSERVABILITY_ENABLED,
+    isDemoMode,
+    user?.id,
+    selectedDate,
+  ]);
   
   // Initial fetch
   useEffect(() => {

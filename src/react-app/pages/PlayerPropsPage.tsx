@@ -307,6 +307,23 @@ function PlayerPropCard({
   const [recentlyAdded, setRecentlyAdded] = useState(false);
   const teamColor = getTeamColor(group.team);
   const displayName = normalizePlayerName(group.playerName);
+  const hasPrefetchedRef = useRef(false);
+
+  const prefetchPlayerProfile = useCallback(() => {
+    if (hasPrefetchedRef.current) return;
+    hasPrefetchedRef.current = true;
+    const encodedName = encodeURIComponent(displayName);
+    const sportKey = String(group.sport || '').toUpperCase();
+    const url = `/api/player/${group.sport.toLowerCase()}/${encodedName}`;
+    void fetchJsonCached<any>(url, {
+      cacheKey: `player-api:${sportKey}:${displayName}`,
+      ttlMs: 45_000,
+      timeoutMs: 3_500,
+      init: { credentials: 'include' },
+    }).catch(() => {
+      hasPrefetchedRef.current = false;
+    });
+  }, [displayName, group.sport]);
   
   // Navigate to player profile
   const handlePlayerClick = (e: React.MouseEvent) => {
@@ -344,7 +361,13 @@ function PlayerPropCard({
       <div className="p-4">
         <div className="flex gap-4">
           {/* Player Photo - Clickable */}
-          <div className="shrink-0 cursor-pointer" onClick={handlePlayerClick}>
+          <div
+            className="shrink-0 cursor-pointer"
+            onClick={handlePlayerClick}
+            onMouseEnter={prefetchPlayerProfile}
+            onFocus={prefetchPlayerProfile}
+            onTouchStart={prefetchPlayerProfile}
+          >
             <div className="w-16 h-16 rounded-lg bg-gradient-to-br from-slate-700 to-slate-800 overflow-hidden shadow-lg hover:ring-2 hover:ring-blue-500/50 transition-all">
               <PlayerPhoto
                 playerName={group.playerName}
@@ -361,6 +384,9 @@ function PlayerPropCard({
               <div 
                 className="cursor-pointer group/name" 
                 onClick={handlePlayerClick}
+                onMouseEnter={prefetchPlayerProfile}
+                onFocus={prefetchPlayerProfile}
+                onTouchStart={prefetchPlayerProfile}
               >
                 <h3 className="text-base font-bold text-white truncate group-hover/name:text-blue-400 transition-colors">
                   {displayName}
@@ -979,7 +1005,7 @@ export function PlayerPropsPage() {
       propsAbortRef.current = new AbortController();
     }
     const controller = reset ? propsAbortRef.current : new AbortController();
-    const timer = setTimeout(() => controller?.abort(), 20000);
+    const timer = setTimeout(() => controller?.abort(), 8000);
 
     if (reset) {
       // Keep currently visible props on screen while refreshing.
@@ -1001,7 +1027,7 @@ export function PlayerPropsPage() {
       const data = await fetchJsonCached<any>(url, {
         cacheKey: `props:${selectedSport}:${offset}:${limit}`,
         ttlMs: 6000,
-        timeoutMs: 20000,
+        timeoutMs: 8000,
         init: { credentials: 'include', signal: controller?.signal },
       });
       if (requestId !== propsFetchSeqRef.current) return;
@@ -1027,7 +1053,7 @@ export function PlayerPropsPage() {
             const fallbackData = await fetchJsonCached<any>(fallbackUrl, {
               cacheKey: `props:${fallbackSport}:0:${fallbackLimit}:fresh`,
               ttlMs: 3000,
-              timeoutMs: 15000,
+              timeoutMs: 7000,
               init: { credentials: 'include' },
             });
             const fallbackIncoming = Array.isArray(fallbackData?.props) ? fallbackData.props : [];

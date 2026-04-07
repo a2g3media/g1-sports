@@ -169,6 +169,61 @@ function normalizeTeamKey(value: unknown): string {
     .replace(/[^a-z0-9]/g, '');
 }
 
+function expandNbaAliasCandidates(aliasLike: string): string[] {
+  const raw = String(aliasLike || '').trim().toUpperCase();
+  if (!raw) return [];
+  const map: Record<string, string[]> = {
+    GSW: ['GS'],
+    GS: ['GSW'],
+    NYK: ['NY'],
+    NY: ['NYK'],
+    SAS: ['SA'],
+    SA: ['SAS'],
+    NOP: ['NO'],
+    NO: ['NOP'],
+    PHX: ['PHO'],
+    PHO: ['PHX'],
+    UTA: ['UTAH'],
+    UTAH: ['UTA'],
+  };
+  const out = new Set<string>([raw]);
+  for (const alt of map[raw] || []) out.add(alt);
+  return Array.from(out);
+}
+
+const NBA_ALIAS_TO_TEAM_ID: Record<string, string> = {
+  DET: '583ec928-fb46-11e1-82cb-f4ce4684ea4c',
+  CLE: '583ec773-fb46-11e1-82cb-f4ce4684ea4c',
+  MIL: '583ecefd-fb46-11e1-82cb-f4ce4684ea4c',
+  CHI: '583ec5fd-fb46-11e1-82cb-f4ce4684ea4c',
+  IND: '583ec7cd-fb46-11e1-82cb-f4ce4684ea4c',
+  ATL: '583ecb8f-fb46-11e1-82cb-f4ce4684ea4c',
+  CHA: '583ec97e-fb46-11e1-82cb-f4ce4684ea4c',
+  ORL: '583ed157-fb46-11e1-82cb-f4ce4684ea4c',
+  MIA: '583ecea6-fb46-11e1-82cb-f4ce4684ea4c',
+  WSH: '583ec8d4-fb46-11e1-82cb-f4ce4684ea4c',
+  BOS: '583eccfa-fb46-11e1-82cb-f4ce4684ea4c',
+  NY: '583ec70e-fb46-11e1-82cb-f4ce4684ea4c',
+  PHI: '583ec87d-fb46-11e1-82cb-f4ce4684ea4c',
+  TOR: '583ecda6-fb46-11e1-82cb-f4ce4684ea4c',
+  BKN: '583ec9d6-fb46-11e1-82cb-f4ce4684ea4c',
+  LAL: '583ecae2-fb46-11e1-82cb-f4ce4684ea4c',
+  PHX: '583ecfa8-fb46-11e1-82cb-f4ce4684ea4c',
+  LAC: '583ecdfb-fb46-11e1-82cb-f4ce4684ea4c',
+  GS: '583ec825-fb46-11e1-82cb-f4ce4684ea4c',
+  SAC: '583ed0ac-fb46-11e1-82cb-f4ce4684ea4c',
+  OKC: '583ecfff-fb46-11e1-82cb-f4ce4684ea4c',
+  DEN: '583ed102-fb46-11e1-82cb-f4ce4684ea4c',
+  MIN: '583eca2f-fb46-11e1-82cb-f4ce4684ea4c',
+  POR: '583ed056-fb46-11e1-82cb-f4ce4684ea4c',
+  UTAH: '583ece50-fb46-11e1-82cb-f4ce4684ea4c',
+  SA: '583ecd4f-fb46-11e1-82cb-f4ce4684ea4c',
+  HOU: '583ecb3a-fb46-11e1-82cb-f4ce4684ea4c',
+  MEM: '583eca88-fb46-11e1-82cb-f4ce4684ea4c',
+  NO: '583ecc9a-fb46-11e1-82cb-f4ce4684ea4c',
+  DAL: '583ecf50-fb46-11e1-82cb-f4ce4684ea4c',
+};
+
 async function fetchJsonSafe(url: string): Promise<any | null> {
   try {
     const res = await fetch(normalizeUrlToHttps(url));
@@ -199,8 +254,37 @@ async function resolveNbaTeamAliasForFallback(
   teamId: string,
   apiKey: string
 ): Promise<string> {
+  const input = String(teamId || '').trim();
+  const normalizedInput = input.toUpperCase();
+  let alias = '';
+
+  // Route params can be ESPN numeric IDs (e.g. 583). Map those first.
+  if (/^\d+$/.test(input)) {
+    try {
+      const maps = await fetchNbaEspnTeamMaps();
+      const fromEspnMap = String(maps.byEspnId.get(input) || '').trim().toUpperCase();
+      if (fromEspnMap) alias = fromEspnMap;
+    } catch {
+      // fall through
+    }
+  }
+
+  if (!alias && /^[A-Z]{2,4}$/.test(normalizedInput)) {
+    alias = normalizedInput;
+  }
+
   const directAlias = String(teamId || '').trim().toUpperCase();
   if (/^[A-Z]{2,4}$/.test(directAlias)) {
+    try {
+      const standings = await fetchStandingsCached(db, 'NBA', apiKey);
+      const teams = Array.isArray((standings as any)?.teams) ? (standings as any).teams : [];
+      const candidates = new Set(expandNbaAliasCandidates(directAlias));
+      const row = teams.find((t: any) => candidates.has(String(t?.alias || '').trim().toUpperCase()));
+      const aliasFromRow = String(row?.alias || '').trim().toUpperCase();
+      if (aliasFromRow) return aliasFromRow;
+    } catch {
+      // fall through to direct alias
+    }
     return directAlias;
   }
   try {
@@ -213,13 +297,94 @@ async function resolveNbaTeamAliasForFallback(
   try {
     const standings = await fetchStandingsCached(db, 'NBA', apiKey);
     const teams = Array.isArray((standings as any)?.teams) ? (standings as any).teams : [];
-    const row = teams.find((t: any) => String(t?.id || '') === String(teamId));
-    const alias = String(row?.alias || '').trim().toUpperCase();
+    const rowById = teams.find((t: any) => String(t?.id || '').trim() === input);
+    const rowByAlias = alias
+      ? teams.find((t: any) => String(t?.alias || '').trim().toUpperCase() === alias)
+      : null;
+    const row = rowById || rowByAlias || null;
+    const aliasFromRow = String(row?.alias || '').trim().toUpperCase();
+    if (aliasFromRow) alias = aliasFromRow;
     if (alias) return alias;
   } catch {
     // fall through
   }
+  if (/^[A-Z]{2,4}$/.test(alias)) return alias;
   return '';
+}
+
+async function resolveNbaCanonicalTeamId(
+  db: D1Database,
+  teamId: string,
+  apiKey: string
+): Promise<string> {
+  const input = String(teamId || '').trim();
+  if (!input) return input;
+  if (/^[A-Z]{2,5}$/i.test(input)) {
+    const candidates = expandNbaAliasCandidates(input.toUpperCase());
+    for (const candidate of candidates) {
+      const mapped = String(NBA_ALIAS_TO_TEAM_ID[candidate] || '').trim();
+      if (mapped) return mapped;
+    }
+  }
+  if (/^\d+$/.test(input)) {
+    try {
+      const maps = await fetchNbaEspnTeamMaps();
+      const alias = String(maps.byEspnId.get(input) || '').trim().toUpperCase();
+      if (alias) {
+        const candidates = expandNbaAliasCandidates(alias);
+        for (const candidate of candidates) {
+          const mapped = String(NBA_ALIAS_TO_TEAM_ID[candidate] || '').trim();
+          if (mapped) return mapped;
+        }
+      }
+    } catch {
+      // fall through
+    }
+  }
+  try {
+    const standings = await fetchStandingsCached(db, 'NBA', apiKey);
+    const teams = Array.isArray((standings as any)?.teams) ? (standings as any).teams : [];
+    const inputUpper = input.toUpperCase();
+
+    // Already canonical SportsRadar id.
+    const directById = teams.find((t: any) => String(t?.id || '').trim() === input);
+    if (directById) {
+      const id = String(directById?.id || '').trim();
+      if (id) return id;
+    }
+
+    // Alias route params (e.g. LAL, GSW) should resolve to canonical id.
+    if (/^[A-Z]{2,4}$/.test(inputUpper)) {
+      const candidates = new Set(expandNbaAliasCandidates(inputUpper));
+      const byAlias = teams.find((t: any) => candidates.has(String(t?.alias || '').trim().toUpperCase()));
+      const id = String(byAlias?.id || '').trim();
+      if (id) return id;
+    }
+
+    // Numeric route params can be ESPN numeric team ids (e.g. 7 = DEN).
+    if (/^\d+$/.test(input)) {
+      let alias = '';
+      try {
+        const maps = await fetchNbaEspnTeamMaps();
+        alias = String(maps.byEspnId.get(input) || '').trim().toUpperCase();
+      } catch {
+        // fall through to existing resolver
+      }
+      if (!alias) {
+        alias = await resolveNbaTeamAliasForFallback(db, input, apiKey);
+      }
+      if (alias) {
+        const candidates = new Set(expandNbaAliasCandidates(alias));
+        const byAlias = teams.find((t: any) => candidates.has(String(t?.alias || '').trim().toUpperCase()));
+        const id = String(byAlias?.id || '').trim();
+        if (id) return id;
+      }
+    }
+
+    return input;
+  } catch {
+    return input;
+  }
 }
 
 async function fetchNbaEspnTeamMaps() {
@@ -608,17 +773,21 @@ async function fetchNbaEspnStatsFallback(alias: string, season?: number) {
   return { stats, rankings: {}, error: null as string | null };
 }
 
-async function fetchNbaEspnInjuriesByAlias(alias: string) {
-  const key = alias || 'ALL';
+async function fetchNbaEspnInjuriesByAlias(alias: string, options?: { bypassCache?: boolean }) {
+  const normalizedAlias = String(alias || '').trim().toUpperCase();
+  const aliasCandidates = normalizedAlias
+    ? Array.from(new Set(expandNbaAliasCandidates(normalizedAlias))).sort()
+    : [];
+  const key = aliasCandidates.length > 0 ? aliasCandidates.join('|') : 'ALL';
   const cached = nbaInjuriesCache.get(key);
-  if (cached && cached.expiresAt > Date.now()) {
+  if (!options?.bypassCache && cached && cached.expiresAt > Date.now()) {
     return { injuries: cached.payload, error: null as string | null, source: 'espn_cache' };
   }
+  const espnTeamId = normalizedAlias ? await fetchNbaEspnTeamIdByAlias(normalizedAlias) : '';
   const res = await fetch('https://site.api.espn.com/apis/site/v2/sports/basketball/nba/injuries?limit=300');
   if (!res.ok) return { injuries: [] as any[], error: `ESPN NBA Injuries API: HTTP ${res.status}`, source: 'espn_live' };
   const json: any = await res.json();
   const teams = Array.isArray(json?.injuries) ? json.injuries : [];
-  const normalizedAlias = String(alias || '').trim().toUpperCase();
   const injuries = teams
     .flatMap((teamBucket: any) => {
       const teamName = String(teamBucket?.displayName || '').trim();
@@ -628,8 +797,16 @@ async function fetchNbaEspnInjuriesByAlias(alias: string) {
     .filter((row: any) => {
       if (!normalizedAlias) return true;
       const athleteAlias = String(row?.athlete?.team?.abbreviation || '').trim().toUpperCase();
+      const athleteCandidates = athleteAlias
+        ? new Set(expandNbaAliasCandidates(athleteAlias))
+        : new Set<string>();
+      const aliasMatched = aliasCandidates.some((candidate) => athleteCandidates.has(candidate));
+      if (aliasMatched) return true;
+      const athleteTeamId = String(row?.athlete?.team?.id || '').trim();
+      if (espnTeamId && athleteTeamId && athleteTeamId === espnTeamId) return true;
       const teamName = String(row?.__teamName || '').toUpperCase();
-      return athleteAlias === normalizedAlias || teamName.includes(normalizedAlias);
+      if (teamName.includes(normalizedAlias)) return true;
+      return aliasCandidates.some((candidate) => teamName.includes(candidate));
     })
     .map((row: any) => ({
       id: String(row?.id || ''),
@@ -1929,25 +2106,59 @@ teams.get('/:sport/:teamId/schedule', async (c) => {
   }
   
   try {
+    const canonicalTeamId = sport === 'NBA'
+      ? await resolveNbaCanonicalTeamId(c.env.DB, teamId, apiKey)
+      : teamId;
     const selectedSeason = season ? parseInt(season, 10) : undefined;
+    const freshRequested = String(c.req.query('fresh') || '') === '1';
     const snapshotCacheKey = makeCacheKey('team-schedule-snapshot', `${sport}/${teamId}`, {
       season: Number.isFinite(selectedSeason as number) ? String(selectedSeason) : 'current',
     });
+    const statusToFinal = (value: unknown): boolean => {
+      const statusRaw = String((value as any)?.name || value || '').toUpperCase();
+      return statusRaw.includes('FINAL') || statusRaw.includes('CLOSED') || statusRaw.includes('COMPLETED');
+    };
+    const snapshotQuality = (payload: any): { total: number; finals: number } => {
+      const rows = Array.isArray(payload?.allGames)
+        ? payload.allGames
+        : [
+            ...(Array.isArray(payload?.pastGames) ? payload.pastGames : []),
+            ...(Array.isArray(payload?.upcomingGames) ? payload.upcomingGames : []),
+          ];
+      const finals = rows.filter((g: any) => statusToFinal(g?.status)).length;
+      return { total: rows.length, finals };
+    };
     const readScheduleSnapshot = async () => {
       return await getCachedData<any>(c.env.DB, snapshotCacheKey);
     };
     const writeScheduleSnapshot = (payload: any) => {
-      const total = Number(payload?.totalGames || (Array.isArray(payload?.allGames) ? payload.allGames.length : 0));
+      const quality = snapshotQuality(payload);
+      const total = Number(payload?.totalGames || quality.total);
       if (!Number.isFinite(total) || total <= 0) return;
+      // Guard against snapshot poisoning: never overwrite a good NBA snapshot
+      // with a sparse/upcoming-only payload.
+      if (sport === 'NBA' && quality.finals <= 0) return;
       c.executionCtx.waitUntil(
         setCachedData(c.env.DB, snapshotCacheKey, 'teams', `schedule/${sport}/${teamId}`, payload, 12 * 60 * 60)
       );
     };
+    if (sport === 'NBA' && !freshRequested) {
+      const hotSnapshot = await readScheduleSnapshot();
+      if (hotSnapshot) {
+        const quality = snapshotQuality(hotSnapshot);
+        if (quality.total > 0 && quality.finals > 0) {
+          return c.json({
+            ...hotSnapshot,
+            source: 'snapshot_hot',
+          });
+        }
+      }
+    }
 
     const provider = getSportsRadarProvider(apiKey, null);
     const result = await provider.fetchTeamSchedule(
       sport as SportKey, 
-      teamId, 
+      canonicalTeamId,
       apiKey,
       selectedSeason
     );
@@ -2000,6 +2211,38 @@ teams.get('/:sport/:teamId/schedule', async (c) => {
           }
           return g;
         });
+        // If SportsRadar payload is sparse, merge in missing ESPN schedule rows so
+        // downstream matchup edge always has historical finals to work with.
+        const existingIds = new Set(
+          mergedResultGames
+            .map((g: any) => String(g?.id || '').trim())
+            .filter(Boolean)
+        );
+        const existingComposite = new Set(
+          mergedResultGames
+            .map((g: any) => {
+              const ts = new Date(String(g?.scheduledTime || '')).getTime();
+              const homeAlias = String(g?.homeTeamAlias || g?.homeTeam?.alias || '').toUpperCase();
+              const awayAlias = String(g?.awayTeamAlias || g?.awayTeam?.alias || '').toUpperCase();
+              if (!Number.isFinite(ts) || !homeAlias || !awayAlias) return '';
+              const day = new Date(ts).toISOString().slice(0, 10);
+              return `${day}:${homeAlias}:${awayAlias}`;
+            })
+            .filter(Boolean)
+        );
+        const espnMissing = espnFallback.games.filter((row: any) => {
+          const id = String(row?.id || '').trim();
+          if (id && existingIds.has(id)) return false;
+          const ts = new Date(String(row?.scheduledTime || '')).getTime();
+          const homeAlias = String(row?.homeTeamAlias || row?.homeTeam?.alias || '').toUpperCase();
+          const awayAlias = String(row?.awayTeamAlias || row?.awayTeam?.alias || '').toUpperCase();
+          if (!Number.isFinite(ts) || !homeAlias || !awayAlias) return true;
+          const day = new Date(ts).toISOString().slice(0, 10);
+          return !existingComposite.has(`${day}:${homeAlias}:${awayAlias}`);
+        });
+        if (espnMissing.length > 0) {
+          mergedResultGames = [...mergedResultGames, ...espnMissing];
+        }
       }
     }
     
@@ -2336,11 +2579,14 @@ teams.get('/:sport/:teamId/stats', async (c) => {
   }
   
   try {
+    const canonicalTeamId = sport === 'NBA'
+      ? await resolveNbaCanonicalTeamId(c.env.DB, teamId, apiKey)
+      : teamId;
     const selectedSeason = season ? parseInt(season, 10) : undefined;
     const provider = getSportsRadarProvider(apiKey, null);
     const result = await provider.fetchTeamStats(
       sport as SportKey,
-      teamId,
+      canonicalTeamId,
       apiKey,
       selectedSeason
     );
@@ -2423,6 +2669,7 @@ teams.get('/:sport/:teamId/splits', async (c) => {
 teams.get('/:sport/:teamId/injuries', async (c) => {
   const sport = c.req.param('sport').toUpperCase();
   const teamId = c.req.param('teamId');
+  const fresh = String(c.req.query('fresh') || '') === '1';
   if (!VALID_SPORTS.includes(sport)) {
     return c.json({ error: `Invalid sport: ${sport}` }, 400);
   }
@@ -2433,7 +2680,7 @@ teams.get('/:sport/:teamId/injuries', async (c) => {
   try {
     if (sport === 'NBA') {
       const alias = await resolveNbaTeamAliasForFallback(c.env.DB, teamId, apiKey);
-      const fallback = await fetchNbaEspnInjuriesByAlias(alias);
+      const fallback = await fetchNbaEspnInjuriesByAlias(alias, { bypassCache: fresh });
       if (fallback.error) {
         return c.json({ error: fallback.error }, 500);
       }
@@ -2474,14 +2721,139 @@ teams.get('/:sport/:teamId', async (c) => {
   }
   
   try {
+    let canonicalTeamId = sport === 'NBA'
+      ? await resolveNbaCanonicalTeamId(c.env.DB, teamId, apiKey)
+      : teamId;
+
+    // Route-level hardening: resolve aliases/numeric ids through the public standings payload.
+    if (sport === 'NBA' && !/^[0-9a-f]{8}-[0-9a-f-]{27}$/i.test(String(canonicalTeamId || '').trim())) {
+      try {
+        const origin = new URL(c.req.url).origin;
+        const standingsRes = await fetch(`${origin}/api/teams/NBA/standings`, { headers: { 'cache-control': 'no-store' } });
+        if (standingsRes.ok) {
+          const standingsJson = await standingsRes.json() as any;
+          const teams = Array.isArray(standingsJson?.teams) ? standingsJson.teams : [];
+          const raw = String(teamId || '').trim();
+          let aliasLike = raw.toUpperCase();
+          if (/^\d+$/.test(raw)) {
+            try {
+              const maps = await fetchNbaEspnTeamMaps();
+              const mappedAlias = String(maps.byEspnId.get(raw) || '').trim().toUpperCase();
+              if (mappedAlias) aliasLike = mappedAlias;
+            } catch {
+              // fall through
+            }
+          }
+          const candidates = new Set(expandNbaAliasCandidates(aliasLike));
+          const row = teams.find((t: any) => {
+            const id = String(t?.id || '').trim();
+            const alias = String(t?.alias || '').trim().toUpperCase();
+            return id === raw || candidates.has(alias);
+          });
+          const mapped = String(row?.id || '').trim();
+          if (mapped) canonicalTeamId = mapped;
+        }
+      } catch {
+        // keep canonicalTeamId from earlier resolver
+      }
+    }
     // Use cached version - 1 hour TTL
     const result = await fetchTeamProfileCached(
       c.env.DB,
       sport as SportKey,
-      teamId,
+      canonicalTeamId,
       apiKey
     );
+    if (result.errors.length > 0 && !result.team && sport === 'NBA') {
+      try {
+        const alias = await resolveNbaTeamAliasForFallback(c.env.DB, teamId, apiKey);
+        const standings = await fetchStandingsCached(c.env.DB, 'NBA', apiKey);
+        const teams = Array.isArray((standings as any)?.teams) ? (standings as any).teams : [];
+        const candidates = new Set(expandNbaAliasCandidates(alias));
+        const row = teams.find((t: any) => {
+          const byId = String(t?.id || '').trim() === String(teamId || '').trim();
+          const byAlias = alias && candidates.has(String(t?.alias || '').trim().toUpperCase());
+          return byId || byAlias;
+        }) || null;
+        const fallbackTeamId = String(row?.id || '').trim();
+
+        if (fallbackTeamId && fallbackTeamId !== canonicalTeamId) {
+          const retried = await fetchTeamProfileCached(
+            c.env.DB,
+            sport as SportKey,
+            fallbackTeamId,
+            apiKey
+          );
+          if (retried.team) {
+            let roster = Array.isArray(retried.roster) ? retried.roster : [];
+            if (roster.length > 0) {
+              const retryAlias = String(retried.team?.alias || '').trim().toUpperCase();
+              const espnRoster = await fetchNbaEspnRosterHeadshotsByAlias(retryAlias).catch(() => ({ byName: new Map() }));
+              if (espnRoster.byName.size > 0) {
+                roster = roster.map((player: any) => {
+                  const key = normalizePersonKey(player?.name || `${player?.firstName || ''} ${player?.lastName || ''}`);
+                  const hit = key ? espnRoster.byName.get(key) : undefined;
+                  if (!hit) return player;
+                  return {
+                    ...player,
+                    headshot: player?.headshot || hit.headshot || null,
+                    jerseyNumber: player?.jerseyNumber || hit.jersey || player?.jerseyNumber,
+                    position: player?.position || hit.position || player?.position,
+                  };
+                });
+              }
+            }
+            return c.json({
+              team: retried.team,
+              roster,
+              venue: retried.venue,
+              errors: retried.errors,
+              cached: true,
+              source: 'canonical_retry',
+            });
+          }
+        }
+
+        if (row) {
+          const fallbackTeam = {
+            id: String(row?.id || ''),
+            name: String(row?.name || ''),
+            market: String(row?.market || ''),
+            alias: String(row?.alias || ''),
+            conference: String(row?.conferenceName || ''),
+            division: String(row?.divisionName || ''),
+          };
+          return c.json({
+            team: fallbackTeam,
+            roster: [],
+            venue: null,
+            errors: [...(Array.isArray(result.errors) ? result.errors : []), 'Used standings fallback profile'],
+            cached: true,
+            source: 'standings_fallback',
+          });
+        }
+      } catch {
+        // fall through to default error response
+      }
+    }
     
+    if (result.errors.length > 0 && !result.team && sport === 'NBA') {
+      const fallbackAlias = String(await resolveNbaTeamAliasForFallback(c.env.DB, teamId, apiKey).catch(() => '') || '').trim().toUpperCase();
+      return c.json({
+        team: {
+          id: String(canonicalTeamId || teamId),
+          name: fallbackAlias || String(teamId),
+          market: '',
+          alias: fallbackAlias || String(teamId).toUpperCase(),
+        },
+        roster: [],
+        venue: null,
+        errors: result.errors,
+        cached: true,
+        source: 'profile_degraded_fallback',
+      });
+    }
+
     if (result.errors.length > 0 && !result.team) {
       return c.json({ error: result.errors[0] }, 500);
     }

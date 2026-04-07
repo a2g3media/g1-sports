@@ -26,6 +26,7 @@ import { getMarketPeriodLabels } from "@/react-app/lib/marketPeriodLabels";
 import { fetchJsonCached } from "@/react-app/lib/fetchCache";
 import { useParlayBuilder } from "@/react-app/context/ParlayBuilderContext";
 import { GameContextCard } from "@/react-app/components/GameContextCard";
+import { useFeatureFlags } from "@/react-app/hooks/useFeatureFlags";
 import {
   deriveUnifiedFinalOutcomes,
   deriveUnifiedViewMode,
@@ -1392,6 +1393,7 @@ export default function OddsGamePage() {
   const { sportKey, matchId } = useParams<{ sportKey: string; matchId: string }>();
   const navigate = useNavigate();
   const { formatMoneylineValue, formatSpreadValue } = useOddsFormat();
+  const { flags } = useFeatureFlags();
   const normalizedMatchId = useMemo(() => {
     const raw = String(matchId || "").trim();
     if (raw.startsWith("soccer_sr:sport_event:")) {
@@ -1578,6 +1580,89 @@ export default function OddsGamePage() {
       }
 
       try {
+        if (flags.PAGE_DATA_ODDS_GAME_ENABLED) {
+          const qs = new URLSearchParams({
+            gameId: normalizedMatchId,
+            ...(sportKey ? { sport: String(sportKey).toUpperCase() } : {}),
+          });
+          const pagePayload = await fetchJsonCached<any>(`/api/page-data/game-detail?${qs.toString()}`, {
+            cacheKey: `page-data:odds-game:${normalizedMatchId}:${String(sportKey || "").toUpperCase()}`,
+            ttlMs: 3_000,
+            timeoutMs: 2_700,
+            init: { credentials: "include", cache: "no-store" },
+          });
+          if (cancelled || requestId !== activeFetchRequestRef.current) return;
+
+          const pageGame = pagePayload?.game?.game || pagePayload?.game || null;
+          const pageSummary = pagePayload?.oddsSummary || null;
+          const summaryGame = pageSummary?.game || null;
+          const resolvedGameId = pageGame?.game_id || pageGame?.id || summaryGame?.game_id || normalizedMatchId;
+
+          const spreadValue = pageSummary?.spread?.home_line ?? pageGame?.spread ?? null;
+          const totalValue = pageSummary?.total?.line ?? pageGame?.overUnder ?? pageGame?.over_under ?? null;
+          const mlHomeValue = pageSummary?.moneyline?.home_price ?? pageGame?.moneylineHome ?? pageGame?.moneyline_home ?? null;
+          const mlAwayValue = pageSummary?.moneyline?.away_price ?? pageGame?.moneylineAway ?? pageGame?.moneyline_away ?? null;
+          const spread1HHomeValue = pageSummary?.first_half?.spread?.home_line ?? pageGame?.spread1HHome ?? pageGame?.spread_1h_home ?? null;
+          const spread1HAwayValue =
+            pageSummary?.first_half?.spread?.away_line ??
+            pageGame?.spread1HAway ??
+            pageGame?.spread_1h_away ??
+            (spread1HHomeValue !== null ? -Number(spread1HHomeValue) : null);
+          const total1HValue = pageSummary?.first_half?.total?.line ?? pageGame?.total1H ?? pageGame?.total_1h ?? null;
+          const ml1HHomeValue = pageSummary?.first_half?.moneyline?.home_price ?? pageGame?.moneyline1HHome ?? pageGame?.moneyline_1h_home ?? null;
+          const ml1HAwayValue = pageSummary?.first_half?.moneyline?.away_price ?? pageGame?.moneyline1HAway ?? pageGame?.moneyline_1h_away ?? null;
+
+          const hasOdds =
+            spreadValue !== null ||
+            totalValue !== null ||
+            mlHomeValue !== null ||
+            mlAwayValue !== null ||
+            spread1HHomeValue !== null ||
+            spread1HAwayValue !== null ||
+            total1HValue !== null ||
+            ml1HHomeValue !== null ||
+            ml1HAwayValue !== null;
+
+          if (pageGame || summaryGame || hasOdds) {
+            setGame({
+              id: resolvedGameId,
+              homeTeam: pageGame?.home_team_name || pageGame?.home_team || pageGame?.homeTeam || summaryGame?.home_team || "Home",
+              awayTeam: pageGame?.away_team_name || pageGame?.away_team || pageGame?.awayTeam || summaryGame?.away_team || "Away",
+              homeTeamCode: pageGame?.home_team_code || pageGame?.homeTeamCode || pageGame?.home_team_abbr || summaryGame?.home_team || "",
+              awayTeamCode: pageGame?.away_team_code || pageGame?.awayTeamCode || pageGame?.away_team_abbr || summaryGame?.away_team || "",
+              homeScore: pageGame?.home_score ?? pageGame?.homeScore ?? null,
+              awayScore: pageGame?.away_score ?? pageGame?.awayScore ?? null,
+              status: pageGame?.status || summaryGame?.status || "SCHEDULED",
+              startTime: pageGame?.start_time || pageGame?.startTime || summaryGame?.start_time || "",
+              league: pageGame?.league || sportKey?.toUpperCase() || "",
+              sport: pageGame?.sport || summaryGame?.sport || sportKey || "nba",
+              odds: hasOdds
+                ? {
+                    spread: spreadValue,
+                    spreadHome: spreadValue,
+                    spreadAway: spreadValue !== null ? -spreadValue : undefined,
+                    openSpread: pageSummary?.opening_spread ?? undefined,
+                    total: totalValue,
+                    openTotal: pageSummary?.opening_total ?? undefined,
+                    mlHome: mlHomeValue,
+                    mlAway: mlAwayValue,
+                    openMlHome: pageSummary?.opening_home_ml ?? undefined,
+                    openMlAway: pageSummary?.opening_away_ml ?? undefined,
+                    spread1HHome: spread1HHomeValue ?? undefined,
+                    spread1HAway: spread1HAwayValue ?? undefined,
+                    total1H: total1HValue ?? undefined,
+                    ml1HHome: ml1HHomeValue ?? undefined,
+                    ml1HAway: ml1HAwayValue ?? undefined,
+                  }
+                : gameRef.current?.odds,
+              lineHistory: gameRef.current?.lineHistory || [],
+              sportsbooks: gameRef.current?.sportsbooks || [],
+              props: gameRef.current?.props || [],
+            });
+            return;
+          }
+        }
+
         const lookupIds: string[] = [normalizedMatchId];
         if (normalizedMatchId.startsWith('sr:sport_event:') && String(sportKey || '').toLowerCase() !== 'soccer') {
           try {
@@ -1812,7 +1897,7 @@ export default function OddsGamePage() {
     return () => {
       cancelled = true;
     };
-  }, [fetchJsonWithTimeout, normalizedMatchId, sportKey]);
+  }, [fetchJsonWithTimeout, flags.PAGE_DATA_ODDS_GAME_ENABLED, normalizedMatchId, sportKey]);
   
   // Fetch line history data
   useEffect(() => {

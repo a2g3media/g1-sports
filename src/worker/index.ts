@@ -218,6 +218,7 @@ app.route("/api/coachg", coachGIntelligenceRouter);
 
 // Mount Feature Flags routes (Super Admin only for management)
 app.route("/api/feature-flags", featureFlagsRouter);
+app.route("/api/page-data", pageDataRouter);
 
 // Mount GZ Sports Subscription routes
 app.route("/api/subscription", gzSubscriptionRoutes);
@@ -6576,6 +6577,8 @@ import { upgradeTrackingRouter } from "./routes/upgrade-tracking";
 import referralsRouter from "./routes/referrals";
 import leaderboardRouter from "./routes/leaderboard";
 import { featureFlagsRouter } from "./routes/feature-flags";
+import { pageDataRouter } from "./routes/page-data";
+import { runPageDataWarmCycle } from "./services/pageData/precompute";
 import liveSweatRouter from "./routes/live-sweat";
 import liveImpactRouter from "./routes/live-impact";
 import { weeklyRecapRouter } from "./routes/weekly-recap";
@@ -8132,6 +8135,32 @@ async function handleScheduled(event: ScheduledEvent, env: Env, ctx: ExecutionCo
       })()
     );
   }
+
+  // Warm canonical page-data snapshots so user navigation reads prepared payloads.
+  ctx.waitUntil(
+    (async () => {
+      try {
+        const summary = await runPageDataWarmCycle({
+          fetchFn: async (pathWithQuery) => {
+            try {
+              const request = new Request(`https://internal${pathWithQuery}`, {
+                method: "GET",
+                headers: { "x-page-data-warm": "1" },
+              });
+              const response = await app.fetch(request, env, ctx);
+              const body = await response.json().catch(() => null);
+              return { ok: response.ok, status: response.status, body };
+            } catch {
+              return { ok: false, status: 0, body: null };
+            }
+          },
+        });
+        console.log("[Scheduled] Page-data warm complete", summary);
+      } catch (err) {
+        console.error("[Scheduled] Page-data warm failed:", err);
+      }
+    })()
+  );
 }
 
 // Track if providers have been initialized this request
