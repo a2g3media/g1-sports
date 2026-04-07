@@ -1271,10 +1271,36 @@ export function TeamProfilePage() {
           const json = await res.json().catch(() => null) as any;
           const teams = Array.isArray(json?.teams) ? json.teams : [];
           const alias = raw.toUpperCase();
+          const aliasMap: Record<string, string[]> = {
+            GSW: ["GS"],
+            GS: ["GSW"],
+            NYK: ["NY"],
+            NY: ["NYK"],
+            SAS: ["SA"],
+            SA: ["SAS"],
+            NOP: ["NO"],
+            NO: ["NOP"],
+            PHX: ["PHO"],
+            PHO: ["PHX"],
+            CHA: ["CHO"],
+            CHO: ["CHA"],
+            BKN: ["BRK"],
+            BRK: ["BKN"],
+          };
+          const candidates = new Set<string>([alias, ...(aliasMap[alias] || [])]);
+          const normalizedRaw = alias.replace(/[^A-Z0-9]/g, "");
           const row = teams.find((t: any) => {
             const id = String(t?.id || "").trim();
             const rowAlias = String(t?.alias || t?.abbreviation || "").trim().toUpperCase();
-            return id === raw || rowAlias === alias;
+            const rowName = String(t?.name || "").trim().toUpperCase();
+            const rowMarket = String(t?.market || "").trim().toUpperCase();
+            const rowFull = `${rowMarket} ${rowName}`.trim();
+            const normalizedFull = rowFull.replace(/[^A-Z0-9]/g, "");
+            return id === raw
+              || candidates.has(rowAlias)
+              || normalizedFull === normalizedRaw
+              || normalizedRaw.includes(normalizedFull)
+              || normalizedFull.includes(normalizedRaw);
           });
           const canonical = String(row?.id || "").trim();
           if (canonical && canonical !== raw) {
@@ -1295,7 +1321,62 @@ export function TeamProfilePage() {
     if (!sportKey || !teamId) return;
     const loadStartedAt = Date.now();
     let apiCalls = 0;
-    const cacheKey = `team-profile:v12:${sportKey.toUpperCase()}:${teamId}`;
+    const sportUpper = sportKey.toUpperCase();
+    let effectiveTeamId = String(teamId || "").trim();
+    if (effectiveTeamId && !/^[0-9a-f]{8}-[0-9a-f-]{27}$/i.test(effectiveTeamId) && !effectiveTeamId.startsWith("sr:")) {
+      try {
+        apiCalls += 1;
+        const standings = await fetchJsonCached<{ teams?: Array<{ id?: string; alias?: string; abbreviation?: string; name?: string; market?: string }> }>(
+          `/api/teams/${encodeURIComponent(sportUpper)}/standings`,
+          {
+            cacheKey: `team-canonical-standings:${sportUpper}:v1`,
+            ttlMs: 90_000,
+            timeoutMs: 1_500,
+            init: { credentials: "include" },
+          }
+        ).catch(() => ({ teams: [] }));
+        const teams = Array.isArray(standings?.teams) ? standings.teams : [];
+        const alias = effectiveTeamId.toUpperCase();
+        const aliasMap: Record<string, string[]> = {
+          GSW: ["GS"],
+          GS: ["GSW"],
+          NYK: ["NY"],
+          NY: ["NYK"],
+          SAS: ["SA"],
+          SA: ["SAS"],
+          NOP: ["NO"],
+          NO: ["NOP"],
+          PHX: ["PHO"],
+          PHO: ["PHX"],
+          CHA: ["CHO"],
+          CHO: ["CHA"],
+          BKN: ["BRK"],
+          BRK: ["BKN"],
+        };
+        const candidates = new Set<string>([alias, ...(aliasMap[alias] || [])]);
+        const normalizedRaw = alias.replace(/[^A-Z0-9]/g, "");
+        const hit = teams.find((row) => {
+          const id = String(row?.id || "").trim();
+          const rowAlias = String(row?.alias || row?.abbreviation || "").trim().toUpperCase();
+          const rowName = String(row?.name || "").trim().toUpperCase();
+          const rowMarket = String(row?.market || "").trim().toUpperCase();
+          const rowFull = `${rowMarket} ${rowName}`.trim();
+          const normalizedFull = rowFull.replace(/[^A-Z0-9]/g, "");
+          return id === effectiveTeamId
+            || candidates.has(rowAlias)
+            || normalizedFull === normalizedRaw
+            || normalizedRaw.includes(normalizedFull)
+            || normalizedFull.includes(normalizedRaw);
+        });
+        const canonical = String(hit?.id || "").trim();
+        if (canonical) {
+          effectiveTeamId = canonical;
+        }
+      } catch {
+        // keep original teamId when canonical lookup fails
+      }
+    }
+    const cacheKey = `team-profile:v12:${sportUpper}:${effectiveTeamId}`;
     const cached = getRouteCache<TeamProfileData>(cacheKey, 180_000);
     const lastGood = cached || data;
     if (cached) {
@@ -1309,7 +1390,6 @@ export function TeamProfilePage() {
     setError(null);
     
     try {
-      const sportUpper = sportKey.toUpperCase();
       const pageDataOnlyMode = true;
       let profileJson: any = null;
       let scheduleJson: any = null;
@@ -1320,11 +1400,11 @@ export function TeamProfilePage() {
       let splitsJson: any = null;
 
       apiCalls += 1;
-      console.info("PAGE_DATA_START", { route: "team-profile", sport: sportUpper, teamId });
+      console.info("PAGE_DATA_START", { route: "team-profile", sport: sportUpper, teamId: effectiveTeamId, requestedTeamId: teamId });
       const pageData = await fetchJsonCached<any>(
-        `/api/page-data/team-profile?sport=${encodeURIComponent(sportUpper)}&teamId=${encodeURIComponent(teamId)}`,
+        `/api/page-data/team-profile?sport=${encodeURIComponent(sportUpper)}&teamId=${encodeURIComponent(effectiveTeamId)}`,
         {
-          cacheKey: `page-data-team-profile:v1:${sportUpper}:${teamId}`,
+          cacheKey: `page-data-team-profile:v1:${sportUpper}:${effectiveTeamId}`,
           ttlMs: 60_000,
           timeoutMs: 2_000,
           init: { credentials: "include" },
@@ -1345,7 +1425,7 @@ export function TeamProfilePage() {
           setData(lastGood);
           return;
         }
-        profileJson = { team: { id: teamId, name: "Unknown", alias: "" } };
+        profileJson = { team: { id: effectiveTeamId || teamId, name: "Unknown", alias: "" } };
         scheduleJson = { allGames: [], pastGames: [], upcomingGames: [] };
         statsJson = { stats: {}, rankings: {} };
         standingsJson = { teams: [] };
@@ -1359,7 +1439,7 @@ export function TeamProfilePage() {
       const teamColors = getTeamColors(sportKey || 'nba', teamAlias);
       
       const team: TeamInfo = {
-        id: profileJson.team?.id || teamId,
+        id: profileJson.team?.id || effectiveTeamId || teamId,
         name: profileJson.team?.name || 'Unknown',
         nickname: profileJson.team?.name || 'Unknown',
         abbreviation: teamAlias,
@@ -1378,7 +1458,7 @@ export function TeamProfilePage() {
       
       // Transform record with standings fallback (profile payload can be sparse for some leagues/seasons).
       const standingsTeams = Array.isArray(standingsJson?.teams) ? standingsJson.teams : [];
-      const profileTeamId = String(profileJson.team?.id || teamId);
+      const profileTeamId = String(profileJson.team?.id || effectiveTeamId || teamId);
       const profileAlias = String(profileJson.team?.alias || '').toLowerCase();
       const profileName = String(profileJson.team?.name || '').toLowerCase();
       const standingsMatch = standingsTeams.find((row: any) => {
