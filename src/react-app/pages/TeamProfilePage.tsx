@@ -1461,13 +1461,44 @@ export function TeamProfilePage() {
       const profileTeamId = String(profileJson.team?.id || effectiveTeamId || teamId);
       const profileAlias = String(profileJson.team?.alias || '').toLowerCase();
       const profileName = String(profileJson.team?.name || '').toLowerCase();
+      const profileMarket = String(profileJson.team?.market || '').toLowerCase();
+      const aliasBridge: Record<string, string[]> = {
+        cha: ["cho"],
+        cho: ["cha"],
+        gsw: ["gs"],
+        gs: ["gsw"],
+        nyk: ["ny"],
+        ny: ["nyk"],
+        sas: ["sa"],
+        sa: ["sas"],
+        nop: ["no"],
+        no: ["nop"],
+        phx: ["pho"],
+        pho: ["phx"],
+        bkn: ["brk"],
+        brk: ["bkn"],
+      };
+      const profileAliasCandidates = new Set<string>([
+        profileAlias,
+        ...(aliasBridge[profileAlias] || []),
+      ]);
+      const normalizedProfileToken = `${profileMarket} ${profileName}`
+        .trim()
+        .replace(/[^a-z0-9]/g, "");
       const standingsMatch = standingsTeams.find((row: any) => {
         const rowId = String(row?.id || '');
         const rowAlias = String(row?.alias || '').toLowerCase();
         const rowName = String(row?.name || '').toLowerCase();
+        const rowMarket = String(row?.market || '').toLowerCase();
+        const normalizedRowToken = `${rowMarket} ${rowName}`.trim().replace(/[^a-z0-9]/g, "");
         return rowId === profileTeamId
-          || (profileAlias && rowAlias === profileAlias)
-          || (profileName && rowName === profileName);
+          || (profileAlias && profileAliasCandidates.has(rowAlias))
+          || (profileName && rowName === profileName)
+          || (normalizedProfileToken && normalizedRowToken && (
+            normalizedProfileToken === normalizedRowToken
+            || normalizedProfileToken.includes(normalizedRowToken)
+            || normalizedRowToken.includes(normalizedProfileToken)
+          ));
       });
 
       const teamRecord = profileJson.team?.record || {};

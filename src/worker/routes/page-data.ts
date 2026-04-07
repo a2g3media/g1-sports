@@ -822,7 +822,16 @@ function hasUsableGameDetailPageDataPayload(payload: PageDataGameDetailPayload |
 
 function hasUsableTeamProfilePayload(payload: PageDataTeamProfilePayload | null | undefined): boolean {
   if (!payload) return false;
-  return Boolean(payload?.data?.profileJson?.team || Array.isArray(payload?.data?.scheduleJson?.allGames));
+  const team = payload?.data?.profileJson?.team;
+  const teamId = String(team?.id || "").trim();
+  const teamName = String(team?.name || "").trim();
+  if (!teamId && !teamName) return false;
+  const standingsTeams = Array.isArray(payload?.data?.standingsJson?.teams) ? payload.data.standingsJson.teams : [];
+  const splits = payload?.data?.splitsJson?.splits;
+  const record = payload?.data?.profileJson?.team?.record;
+  const hasRecordNumbers = Number.isFinite(Number(record?.wins)) || Number.isFinite(Number(record?.losses));
+  // Reject shallow poisoned snapshots that only contain team identity + schedule.
+  return standingsTeams.length > 0 || Boolean(splits) || hasRecordNumbers;
 }
 
 function hasUsablePlayerProfilePayload(payload: PageDataPlayerProfilePayload | null | undefined): boolean {
@@ -1482,7 +1491,7 @@ pageDataRouter.get("/team-profile", async (c) => {
     injuries: `${origin}/api/teams/${encodeURIComponent(sport)}/${encodeURIComponent(teamId)}/injuries`,
     splits: `${origin}/api/teams/${encodeURIComponent(sport)}/${encodeURIComponent(teamId)}/splits`,
   };
-  const [profileRes, scheduleRes, statsRes, standingsRes, gamesRes, injuriesRes, splitsRes] = await Promise.all([
+  let [profileRes, scheduleRes, statsRes, standingsRes, gamesRes, injuriesRes, splitsRes] = await Promise.all([
     readJsonWithBudget(endpoints.profile, 1800, { headers }),
     readJsonWithBudget(endpoints.schedule, 1600, { headers }),
     readJsonWithBudget(endpoints.stats, 1500, { headers }),
@@ -1494,6 +1503,30 @@ pageDataRouter.get("/team-profile", async (c) => {
 
   if (!profileRes.ok && hasUsableTeamProfilePayload(l1Stale)) {
     return c.json(patchFreshness(l1Stale, "l1", true));
+  }
+
+  // Team metadata card relies heavily on standings/split records; do one bounded retry if sparse.
+  const standingsTeams = Array.isArray(standingsRes.body?.teams) ? standingsRes.body.teams : [];
+  if (sport === "NBA" && standingsTeams.length === 0) {
+    try {
+      const retry = await readJsonWithBudget(endpoints.standings, 2600, { headers });
+      const retryTeams = Array.isArray(retry.body?.teams) ? retry.body.teams : [];
+      if (retry.ok && retryTeams.length > 0) {
+        standingsRes = retry;
+      }
+    } catch {
+      // non-fatal
+    }
+  }
+  if (sport === "NBA" && !splitsRes.body?.splits) {
+    try {
+      const retry = await readJsonWithBudget(endpoints.splits, 2200, { headers });
+      if (retry.ok && retry.body?.splits) {
+        splitsRes = retry;
+      }
+    } catch {
+      // non-fatal
+    }
   }
 
   const payload: PageDataTeamProfilePayload = {
