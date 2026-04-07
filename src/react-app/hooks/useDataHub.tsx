@@ -224,9 +224,12 @@ interface DbGame {
 }
 
 function shouldDeferDataHubGamesFetch(): boolean {
-  // DataHub is now scoped to non-route global features only.
-  // Route-level game/odds orchestration is owned by page-data endpoints.
-  return true;
+  // Keep DataHub scoped away from route-owned pages by default, but the home
+  // dashboard still relies on this feed for "Games Today" cards.
+  if (typeof window === 'undefined') return false;
+  const path = String(window.location.pathname || '').toLowerCase();
+  const isHomeRoute = path === '/' || path === '/home' || path.startsWith('/dashboard');
+  return !isHomeRoute;
 }
 
 const DATAHUB_ODDS_HYDRATION_TTL_MS = 30000;
