@@ -850,6 +850,24 @@ async function fetchGamesData(): Promise<LiveGame[]> {
     }
   }
 
+  // Absolute guardrail: never render a false-empty home slate when base feeds have games.
+  // If all day-bound filters still eliminate everything, surface nearest upcoming games.
+  if (currentGames.length === 0 && allDedupedGames.length > 0) {
+    const now = Date.now();
+    currentGames = [...allDedupedGames]
+      .filter((g) => {
+        if (!g.start_time) return false;
+        const ts = new Date(g.start_time).getTime();
+        return Number.isFinite(ts);
+      })
+      .sort((a, b) => {
+        const ta = new Date(a.start_time).getTime();
+        const tb = new Date(b.start_time).getTime();
+        return Math.abs(ta - now) - Math.abs(tb - now);
+      })
+      .slice(0, 30);
+  }
+
   // Soccer homepage cards should always reflect real schedule data from top leagues.
   // Strictly keep today's ET slate (live, upcoming, final).
   // Replace stale aggregate soccer rows with a schedule-driven top 3 selection.
