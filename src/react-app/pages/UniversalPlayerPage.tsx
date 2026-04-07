@@ -795,15 +795,32 @@ export default function UniversalPlayerPage() {
         
         apiCalls += 1;
         console.info("PAGE_DATA_START", { route: "universal-player", sport: sportLower.toUpperCase(), playerName });
-        const payload = await fetchJsonCached<{ data?: { profile?: APIPlayerResponse; canonicalTeamRouteId?: string | null } }>(
-          `/api/page-data/player-profile?sport=${encodeURIComponent(sportLower.toUpperCase())}&playerName=${encodeURIComponent(playerName)}`,
-          {
-            cacheKey: `page-data:universal-player:${sportLower.toUpperCase()}:${playerName}`,
-            ttlMs: 45_000,
-            timeoutMs: 2_000,
-            init: { credentials: "include" },
+        let payload: { data?: { profile?: APIPlayerResponse; canonicalTeamRouteId?: string | null } } | null = null;
+        for (let attempt = 0; attempt < 2; attempt += 1) {
+          try {
+            payload = await fetchJsonCached<{ data?: { profile?: APIPlayerResponse; canonicalTeamRouteId?: string | null } }>(
+              `/api/page-data/player-profile?sport=${encodeURIComponent(sportLower.toUpperCase())}&playerName=${encodeURIComponent(playerName)}`,
+              {
+                cacheKey: `page-data:universal-player:${sportLower.toUpperCase()}:${playerName}`,
+                ttlMs: 45_000,
+                timeoutMs: 8_000,
+                bypassCache: attempt > 0,
+                init: { credentials: "include" },
+              }
+            );
+            break;
+          } catch (attemptErr: any) {
+            const msg = String(attemptErr?.message || "").toLowerCase();
+            if (msg.includes("timeout") && attempt === 0) {
+              console.warn("PAGE_DATA_TIMEOUT", { route: "universal-player", sport: sportLower.toUpperCase(), playerId, attempt: 1 });
+              continue;
+            }
+            throw attemptErr;
           }
-        );
+        }
+        if (!payload) {
+          throw new Error("Failed to load player data");
+        }
         
         processPlayerData(payload?.data?.profile as APIPlayerResponse);
         setCanonicalTeamRouteId(String(payload?.data?.canonicalTeamRouteId || "").trim());

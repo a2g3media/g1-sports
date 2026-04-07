@@ -1840,6 +1840,11 @@ export default function PlayerProfilePage() {
       setError(null);
       
       try {
+        const isTimeoutError = (value: unknown): boolean => {
+          const msg = String((value as any)?.message || '').toLowerCase();
+          const name = String((value as any)?.name || '');
+          return msg.includes('timeout') || name === 'AbortError';
+        };
         const unwrapProfile = (payload: any): any => {
           if (payload && typeof payload === "object" && payload.data && typeof payload.data === "object") {
             return payload.data.profile ?? null;
@@ -1847,20 +1852,48 @@ export default function PlayerProfilePage() {
           return payload;
         };
         const primaryUrl = `/api/page-data/player-profile?sport=${encodeURIComponent(sport)}&playerName=${encodeURIComponent(decodedPlayerName)}`;
-        apiCalls += 1;
         console.info("PAGE_DATA_START", { route: "player-profile", sport: sport.toUpperCase(), playerName: decodedPlayerName });
-        const envelope = await fetchJsonCached<any>(primaryUrl, {
-          cacheKey: `player-api:v2:${sport.toUpperCase()}:${decodedPlayerName}`,
-          ttlMs: 45_000,
-          timeoutMs: 5_000,
-          bypassCache: false,
-          init: { credentials: 'include' },
-        });
-        let profileData: any = unwrapProfile(envelope);
+        let profileData: any = null;
+        let lastErr: unknown = null;
+        for (let attempt = 0; attempt < 2; attempt += 1) {
+          try {
+            apiCalls += 1;
+            const envelope = await fetchJsonCached<any>(primaryUrl, {
+              cacheKey: `player-api:v2:${sport.toUpperCase()}:${decodedPlayerName}`,
+              ttlMs: 45_000,
+              timeoutMs: 8_000,
+              bypassCache: attempt > 0,
+              init: { credentials: 'include' },
+            });
+            profileData = unwrapProfile(envelope);
+            if (!profileData) {
+              throw new Error('Player profile payload is empty');
+            }
+            if (!hasCoreProfileData(profileData) && attempt === 0) {
+              throw new Error('Player profile payload is partial');
+            }
+            break;
+          } catch (attemptErr) {
+            lastErr = attemptErr;
+            const timedOut = isTimeoutError(attemptErr);
+            if (timedOut) {
+              console.warn("PAGE_DATA_TIMEOUT", {
+                route: "player-profile",
+                sport: sport.toUpperCase(),
+                playerName: decodedPlayerName,
+                attempt: attempt + 1,
+              });
+            }
+            if (attempt === 0) {
+              continue;
+            }
+            throw attemptErr;
+          }
+        }
 
         if (!profileData) {
           console.warn("PAGE_DATA_FALLBACK_USED", { route: "player-profile", reason: "empty_payload", sport: sport.toUpperCase(), playerName: decodedPlayerName });
-          throw new Error('Failed to load player data');
+          throw (lastErr instanceof Error ? lastErr : new Error('Failed to load player data'));
         }
         console.info("PAGE_DATA_SUCCESS", {
           route: "player-profile",
@@ -1893,10 +1926,6 @@ export default function PlayerProfilePage() {
         }
       } catch (err: any) {
         console.error('Failed to fetch player profile:', err);
-        const msg = String(err?.message || '');
-        if (msg.toLowerCase().includes('timeout') || String(err?.name || '') === 'AbortError') {
-          console.warn("PAGE_DATA_TIMEOUT", { route: "player-profile", sport: sport.toUpperCase(), playerName: decodedPlayerName });
-        }
         console.warn("PAGE_DATA_FALLBACK_USED", { route: "player-profile", reason: "request_failed_or_partial", sport: sport.toUpperCase(), playerName: decodedPlayerName });
         if (lastGoodProfileRef.current) {
           setData(lastGoodProfileRef.current);

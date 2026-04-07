@@ -1390,6 +1390,11 @@ export function TeamProfilePage() {
     setError(null);
     
     try {
+      const isTimeoutError = (value: unknown): boolean => {
+        const msg = String((value as any)?.message || '').toLowerCase();
+        const name = String((value as any)?.name || '');
+        return msg.includes('timeout') || name === 'AbortError';
+      };
       const pageDataOnlyMode = true;
       let profileJson: any = null;
       let scheduleJson: any = null;
@@ -1401,15 +1406,39 @@ export function TeamProfilePage() {
 
       apiCalls += 1;
       console.info("PAGE_DATA_START", { route: "team-profile", sport: sportUpper, teamId: effectiveTeamId, requestedTeamId: teamId });
-      const pageData = await fetchJsonCached<any>(
-        `/api/page-data/team-profile?sport=${encodeURIComponent(sportUpper)}&teamId=${encodeURIComponent(effectiveTeamId)}`,
-        {
-          cacheKey: `page-data-team-profile:v1:${sportUpper}:${effectiveTeamId}`,
-          ttlMs: 60_000,
-          timeoutMs: 5_000,
-          init: { credentials: "include" },
+      let pageData: any = null;
+      let lastErr: unknown = null;
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        try {
+          apiCalls += attempt > 0 ? 1 : 0;
+          pageData = await fetchJsonCached<any>(
+            `/api/page-data/team-profile?sport=${encodeURIComponent(sportUpper)}&teamId=${encodeURIComponent(effectiveTeamId)}`,
+            {
+              cacheKey: `page-data-team-profile:v1:${sportUpper}:${effectiveTeamId}`,
+              ttlMs: 60_000,
+              timeoutMs: 8_000,
+              bypassCache: attempt > 0,
+              init: { credentials: "include" },
+            }
+          );
+          if (!pageData?.data?.profileJson?.team && attempt === 0) {
+            throw new Error("Team profile payload is partial");
+          }
+          break;
+        } catch (attemptErr) {
+          lastErr = attemptErr;
+          if (isTimeoutError(attemptErr)) {
+            console.warn("PAGE_DATA_TIMEOUT", {
+              route: "team-profile",
+              sport: sportUpper,
+              teamId: effectiveTeamId,
+              attempt: attempt + 1,
+            });
+          }
+          if (attempt === 0) continue;
+          throw attemptErr;
         }
-      );
+      }
 
       if (pageData?.data?.profileJson?.team) {
         profileJson = pageData?.data?.profileJson || {};
@@ -1424,6 +1453,9 @@ export function TeamProfilePage() {
         if (lastGood) {
           setData(lastGood);
           return;
+        }
+        if (lastErr) {
+          throw (lastErr instanceof Error ? lastErr : new Error("Failed to load team data"));
         }
         profileJson = { team: { id: effectiveTeamId || teamId, name: "Unknown", alias: "" } };
         scheduleJson = { allGames: [], pastGames: [], upcomingGames: [] };

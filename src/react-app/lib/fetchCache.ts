@@ -50,18 +50,9 @@ export async function fetchJsonCached<T = unknown>(url: string, options: JsonFet
   }
 
   const request = (async () => {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(new Error(`Request timeout after ${timeoutMs}ms`)), timeoutMs);
-    const initSignal = init?.signal;
-    const signal = (() => {
-      if (initSignal && typeof AbortSignal !== "undefined" && typeof (AbortSignal as any).any === "function") {
-        return (AbortSignal as any).any([controller.signal, initSignal]);
-      }
-      return controller.signal;
-    })();
     fetchCacheStats.networkFetches += 1;
     try {
-      const response = await fetch(url, { ...init, signal });
+      const response = await fetch(url, { ...init });
       if (!response.ok) {
         throw new Error(`HTTP ${response.status}`);
       }
@@ -72,27 +63,40 @@ export async function fetchJsonCached<T = unknown>(url: string, options: JsonFet
       return payload;
     } catch (err) {
       fetchCacheStats.errors += 1;
-      const name = String((err as any)?.name || "");
-      const message = String((err as any)?.message || "");
-      const isAbort = name === "AbortError" || message.toLowerCase().includes("aborted");
-      if (isAbort) {
-        if (cached && cached.value !== undefined) {
-          return cached.value as T;
-        }
-        throw new Error(`Request timeout after ${timeoutMs}ms`);
-      }
       if (cached && cached.value !== undefined) {
         return cached.value as T;
       }
       throw err;
     } finally {
-      clearTimeout(timer);
       inflightJson.delete(cacheKey);
     }
   })();
 
   inflightJson.set(cacheKey, request);
-  return request;
+
+  if (!(timeoutMs > 0)) {
+    return request;
+  }
+
+  let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
+  const timeoutPromise = new Promise<T>((_, reject) => {
+    timeoutHandle = setTimeout(() => {
+      reject(new Error(`Request timeout after ${timeoutMs}ms`));
+    }, timeoutMs);
+  });
+
+  try {
+    return await Promise.race([request as Promise<T>, timeoutPromise]);
+  } catch (err) {
+    const message = String((err as any)?.message || "");
+    const isTimeout = message.includes("Request timeout after");
+    if (isTimeout && cached && cached.value !== undefined) {
+      return cached.value as T;
+    }
+    throw err;
+  } finally {
+    if (timeoutHandle) clearTimeout(timeoutHandle);
+  }
 }
 
 export function invalidateJsonCache(prefix?: string): void {
