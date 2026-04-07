@@ -1406,6 +1406,7 @@ export function TeamProfilePage() {
 
       apiCalls += 1;
       console.info("PAGE_DATA_START", { route: "team-profile", sport: sportUpper, teamId: effectiveTeamId, requestedTeamId: teamId });
+      const baseCacheKey = `page-data-team-profile:v1:${sportUpper}:${effectiveTeamId}`;
       let pageData: any = null;
       let lastErr: unknown = null;
       for (let attempt = 0; attempt < 2; attempt += 1) {
@@ -1414,7 +1415,7 @@ export function TeamProfilePage() {
           pageData = await fetchJsonCached<any>(
             `/api/page-data/team-profile?sport=${encodeURIComponent(sportUpper)}&teamId=${encodeURIComponent(effectiveTeamId)}`,
             {
-              cacheKey: `page-data-team-profile:v1:${sportUpper}:${effectiveTeamId}`,
+              cacheKey: attempt > 0 ? `${baseCacheKey}:retry` : baseCacheKey,
               ttlMs: 60_000,
               timeoutMs: 8_000,
               bypassCache: attempt > 0,

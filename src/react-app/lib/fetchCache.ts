@@ -35,6 +35,21 @@ export async function fetchJsonCached<T = unknown>(url: string, options: JsonFet
     init,
   } = options;
 
+  const withTimeout = async (promise: Promise<T>): Promise<T> => {
+    if (!(timeoutMs > 0)) return promise;
+    let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
+    const timeoutPromise = new Promise<T>((_, reject) => {
+      timeoutHandle = setTimeout(() => {
+        reject(new Error(`Request timeout after ${timeoutMs}ms`));
+      }, timeoutMs);
+    });
+    try {
+      return await Promise.race([promise, timeoutPromise]);
+    } finally {
+      if (timeoutHandle) clearTimeout(timeoutHandle);
+    }
+  };
+
   const cached = jsonCache.get(cacheKey);
   if (!bypassCache && ttlMs > 0) {
     if (cached && cached.expiresAt > now()) {
@@ -46,7 +61,16 @@ export async function fetchJsonCached<T = unknown>(url: string, options: JsonFet
   const existing = inflightJson.get(cacheKey);
   if (existing) {
     fetchCacheStats.inflightHits += 1;
-    return existing as Promise<T>;
+    try {
+      return await withTimeout(existing as Promise<T>);
+    } catch (err) {
+      const message = String((err as any)?.message || "");
+      const isTimeout = message.includes("Request timeout after");
+      if (isTimeout && cached && cached.value !== undefined) {
+        return cached.value as T;
+      }
+      throw err;
+    }
   }
 
   const request = (async () => {
@@ -74,19 +98,8 @@ export async function fetchJsonCached<T = unknown>(url: string, options: JsonFet
 
   inflightJson.set(cacheKey, request);
 
-  if (!(timeoutMs > 0)) {
-    return request;
-  }
-
-  let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
-  const timeoutPromise = new Promise<T>((_, reject) => {
-    timeoutHandle = setTimeout(() => {
-      reject(new Error(`Request timeout after ${timeoutMs}ms`));
-    }, timeoutMs);
-  });
-
   try {
-    return await Promise.race([request as Promise<T>, timeoutPromise]);
+    return await withTimeout(request as Promise<T>);
   } catch (err) {
     const message = String((err as any)?.message || "");
     const isTimeout = message.includes("Request timeout after");
@@ -94,8 +107,6 @@ export async function fetchJsonCached<T = unknown>(url: string, options: JsonFet
       return cached.value as T;
     }
     throw err;
-  } finally {
-    if (timeoutHandle) clearTimeout(timeoutHandle);
   }
 }
 

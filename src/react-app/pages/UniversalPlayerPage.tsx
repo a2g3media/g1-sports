@@ -795,13 +795,14 @@ export default function UniversalPlayerPage() {
         
         apiCalls += 1;
         console.info("PAGE_DATA_START", { route: "universal-player", sport: sportLower.toUpperCase(), playerName });
+        const baseCacheKey = `page-data:universal-player:${sportLower.toUpperCase()}:${playerName}`;
         let payload: { data?: { profile?: APIPlayerResponse; canonicalTeamRouteId?: string | null } } | null = null;
         for (let attempt = 0; attempt < 2; attempt += 1) {
           try {
             payload = await fetchJsonCached<{ data?: { profile?: APIPlayerResponse; canonicalTeamRouteId?: string | null } }>(
               `/api/page-data/player-profile?sport=${encodeURIComponent(sportLower.toUpperCase())}&playerName=${encodeURIComponent(playerName)}`,
               {
-                cacheKey: `page-data:universal-player:${sportLower.toUpperCase()}:${playerName}`,
+                cacheKey: attempt > 0 ? `${baseCacheKey}:retry` : baseCacheKey,
                 ttlMs: 45_000,
                 timeoutMs: 8_000,
                 bypassCache: attempt > 0,

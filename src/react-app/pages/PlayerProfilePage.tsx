@@ -1852,6 +1852,7 @@ export default function PlayerProfilePage() {
           return payload;
         };
         const primaryUrl = `/api/page-data/player-profile?sport=${encodeURIComponent(sport)}&playerName=${encodeURIComponent(decodedPlayerName)}`;
+        const baseCacheKey = `player-api:v2:${sport.toUpperCase()}:${decodedPlayerName}`;
         console.info("PAGE_DATA_START", { route: "player-profile", sport: sport.toUpperCase(), playerName: decodedPlayerName });
         let profileData: any = null;
         let lastErr: unknown = null;
@@ -1859,7 +1860,7 @@ export default function PlayerProfilePage() {
           try {
             apiCalls += 1;
             const envelope = await fetchJsonCached<any>(primaryUrl, {
-              cacheKey: `player-api:v2:${sport.toUpperCase()}:${decodedPlayerName}`,
+              cacheKey: attempt > 0 ? `${baseCacheKey}:retry` : baseCacheKey,
               ttlMs: 45_000,
               timeoutMs: 8_000,
               bypassCache: attempt > 0,
