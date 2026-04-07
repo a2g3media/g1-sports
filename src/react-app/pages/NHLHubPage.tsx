@@ -10,7 +10,7 @@ import {
 import { TeamLogo } from "@/react-app/components/TeamLogo";
 import { PlayerSearch } from "@/react-app/components/PlayerSearch";
 import { CoachGAvatar } from "@/react-app/components/CoachGAvatar";
-import { buildTeamRoute, logTeamNavigation } from "@/react-app/lib/navigationRoutes";
+import { buildPlayerRoute, buildTeamRoute, logPlayerNavigation, logTeamNavigation } from "@/react-app/lib/navigationRoutes";
 
 // ============================================================
 // NHL TEAM DATA
@@ -635,7 +635,16 @@ export function NHLHubPage() {
             {/* Leaders Grid */}
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3">
               {(skaterLeaders?.[skaterTab] || SKATER_LEADERS[skaterTab]).map((player, i) => (
-                <LeaderCard key={player.id} player={player} rank={i + 1} statLabel={skaterTab === "plusMinus" ? "+/-" : skaterTab === "ppGoals" ? "PP" : skaterTab} onClick={() => navigate(`/sports/nhl/player/${player.id}`)} />
+                <LeaderCard
+                  key={player.id}
+                  player={player}
+                  rank={i + 1}
+                  statLabel={skaterTab === "plusMinus" ? "+/-" : skaterTab === "ppGoals" ? "PP" : skaterTab}
+                  onClick={() => {
+                    logPlayerNavigation(player.id, "nhl");
+                    navigate(buildPlayerRoute("nhl", player.id));
+                  }}
+                />
               ))}
             </div>
           </div>
@@ -664,7 +673,16 @@ export function NHLHubPage() {
             {/* Leaders Grid */}
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3">
               {(goalieLeaders?.[goalieTab] || GOALIE_LEADERS[goalieTab]).map((player, i) => (
-                <GoalieCard key={player.id} player={player} rank={i + 1} statKey={goalieTab} onClick={() => navigate(`/sports/nhl/player/${player.id}`)} />
+                <GoalieCard
+                  key={player.id}
+                  player={player}
+                  rank={i + 1}
+                  statKey={goalieTab}
+                  onClick={() => {
+                    logPlayerNavigation(player.id, "nhl");
+                    navigate(buildPlayerRoute("nhl", player.id));
+                  }}
+                />
               ))}
             </div>
           </div>

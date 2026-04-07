@@ -6,6 +6,7 @@ import { useState, useEffect, useRef } from "react";
 import { useNavigate } from "react-router-dom";
 import { Search, X, User, Loader2 } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
+import { buildPlayerRoute, logPlayerNavigation } from "@/react-app/lib/navigationRoutes";
 
 interface SearchResult {
   espnId: string;
@@ -87,8 +88,8 @@ export function PlayerSearch({
     } else {
       // Default navigation
       const sportKey = player.sport?.toLowerCase() || sport?.toLowerCase() || "nba";
-      const playerSlug = player.displayName.toLowerCase().replace(/\s+/g, '-');
-      navigate(`/sports/${sportKey}/player/${playerSlug}`);
+      logPlayerNavigation(player.displayName, sportKey);
+      navigate(buildPlayerRoute(sportKey, player.displayName));
     }
     setQuery("");
     setResults([]);

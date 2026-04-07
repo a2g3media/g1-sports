@@ -13,6 +13,7 @@ import { useState, useEffect, useRef } from "react";
 import { Link } from "react-router-dom";
 import { Search, X, ChevronRight } from "lucide-react";
 import { buildSoccerMatchUrl } from "@/react-app/hooks/useSoccerBackNavigation";
+import { logPlayerNavigation, logTeamNavigation } from "@/react-app/lib/navigationRoutes";
 
 // ============================================================================
 // TYPES
@@ -210,7 +211,10 @@ export default function SoccerSearchDrawer({ isOpen, onClose }: SoccerSearchDraw
                   <Link
                     key={team.id}
                     to={`/sports/soccer/team/${team.id}`}
-                    onClick={handleLinkClick}
+                    onClick={() => {
+                      logTeamNavigation(team.id, "soccer");
+                      handleLinkClick();
+                    }}
                     className="flex items-center gap-3 px-4 py-3 hover:bg-white/5 
                              active:bg-white/10 transition-colors touch-manipulation"
                   >
@@ -245,7 +249,10 @@ export default function SoccerSearchDrawer({ isOpen, onClose }: SoccerSearchDraw
                   <Link
                     key={player.id}
                     to={`/sports/soccer/player/${player.id}`}
-                    onClick={handleLinkClick}
+                    onClick={() => {
+                      logPlayerNavigation(player.id, "soccer");
+                      handleLinkClick();
+                    }}
                     className="flex items-center gap-3 px-4 py-3 hover:bg-white/5 
                              active:bg-white/10 transition-colors touch-manipulation"
                   >
