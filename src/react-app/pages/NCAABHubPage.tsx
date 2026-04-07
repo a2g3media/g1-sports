@@ -1144,8 +1144,8 @@ export default function NCAABHubPage() {
                 <div
                   key={player.id}
                   onClick={() => {
-                    logPlayerNavigation(player.id, "ncaab");
-                    navigate(buildPlayerRoute("ncaab", player.id));
+                    logPlayerNavigation(player.name, "ncaab");
+                    navigate(buildPlayerRoute("ncaab", player.name));
                   }}
                   className="flex items-center gap-4 px-4 py-3 border-t border-white/5 first:border-t-0 hover:bg-white/5 cursor-pointer transition-colors"
                 >

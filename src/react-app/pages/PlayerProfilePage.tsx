@@ -1899,6 +1899,20 @@ export default function PlayerProfilePage() {
       setLoading(false);
       setLoadStatus(isProfileIncomplete(cached) ? 'partial' : 'complete');
     }
+    const provisionalProfile = normalizeProfilePayload(
+      {
+        player: {
+          displayName: decodedPlayerName,
+          sport: String(sport || "").toUpperCase(),
+        },
+      },
+      cached ?? null
+    );
+    if (!cached && provisionalProfile) {
+      setData((prev) => prev ?? provisionalProfile);
+      setLoadStatus('partial');
+      setLoading(false);
+    }
     
     const fetchProfile = async () => {
       const loadStartedAt = Date.now();
@@ -2100,7 +2114,12 @@ export default function PlayerProfilePage() {
         console.error('Failed to fetch player profile:', err);
         console.warn("PAGE_DATA_FALLBACK_USED", { route: "player-profile", reason: "request_failed_or_partial", sport: sport.toUpperCase(), playerName: decodedPlayerName });
         const message = String(err?.message || '').toLowerCase();
-        const recoverable = message.includes('timeout') || message.includes('partial') || message.includes('empty payload');
+        const recoverable =
+          message.includes('timeout')
+          || message.includes('partial')
+          || message.includes('empty payload')
+          || message.includes('failed to fetch')
+          || message.includes('network');
         if (lastGoodProfileRef.current) {
           setData(lastGoodProfileRef.current);
           setError(null);
@@ -2110,7 +2129,7 @@ export default function PlayerProfilePage() {
           setError(null);
           return;
         }
-        if (recoverable && backgroundRetryTick < 1) {
+        if (recoverable && backgroundRetryTick < 2) {
           keepLoading = true;
           setLoadStatus('loading');
           setError(null);
@@ -2122,7 +2141,12 @@ export default function PlayerProfilePage() {
           }, 1200);
           return;
         }
-        setError('Player data is currently unavailable');
+        setError(null);
+        if (provisionalProfile) {
+          setData((prev) => prev ?? provisionalProfile);
+          setLoadStatus('partial');
+          keepLoading = false;
+        }
       } finally {
         void fetch("/api/page-data/telemetry", {
           method: "POST",

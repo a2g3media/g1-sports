@@ -641,8 +641,8 @@ export function NHLHubPage() {
                   rank={i + 1}
                   statLabel={skaterTab === "plusMinus" ? "+/-" : skaterTab === "ppGoals" ? "PP" : skaterTab}
                   onClick={() => {
-                    logPlayerNavigation(player.id, "nhl");
-                    navigate(buildPlayerRoute("nhl", player.id));
+                    logPlayerNavigation(player.name, "nhl");
+                    navigate(buildPlayerRoute("nhl", player.name));
                   }}
                 />
               ))}
@@ -679,8 +679,8 @@ export function NHLHubPage() {
                   rank={i + 1}
                   statKey={goalieTab}
                   onClick={() => {
-                    logPlayerNavigation(player.id, "nhl");
-                    navigate(buildPlayerRoute("nhl", player.id));
+                    logPlayerNavigation(player.name, "nhl");
+                    navigate(buildPlayerRoute("nhl", player.name));
                   }}
                 />
               ))}
