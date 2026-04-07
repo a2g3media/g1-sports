@@ -4849,8 +4849,41 @@ export function GameDetailPage() {
   }, [normalizedSportKey, resolveTeamIdFromStandings]);
   const handleTeamNavigate = useCallback(async (teamCode: string, teamName: string) => {
     void prefetchTeamData(teamCode, teamName);
-    const teamId = await resolveTeamIdFromStandings(teamCode, teamName);
-    if (!teamId) return;
+    const sportPath = normalizedSportKey === "SOCCER"
+      ? "soccer"
+      : String(normalizedSportKey || "").toLowerCase();
+    const rawCode = String(teamCode || "").trim();
+    const rawName = String(teamName || "").trim();
+    const fallbackToken = rawCode || rawName;
+    if (!fallbackToken || !sportPath) return;
+
+    const fallbackNavigate = () => {
+      console.info("NAVIGATE_TEAM", { teamId: fallbackToken, sportKey: sportPath });
+      console.warn("PAGE_DATA_FALLBACK_USED", {
+        route: "game-detail",
+        reason: "team_id_unresolved_fallback_token",
+        sport: sportPath,
+        token: fallbackToken,
+      });
+      navigate(`/sports/${sportPath}/team/${encodeURIComponent(fallbackToken)}`);
+    };
+
+    const looksCanonicalId = /^[0-9a-f]{8}-[0-9a-f-]{27}$/i.test(fallbackToken) || fallbackToken.startsWith("sr:");
+    if (looksCanonicalId) {
+      console.info("NAVIGATE_TEAM", { teamId: fallbackToken, sportKey: sportPath });
+      navigate(`/sports/${sportPath}/team/${encodeURIComponent(fallbackToken)}`);
+      return;
+    }
+
+    const teamId = await Promise.race<string | null>([
+      resolveTeamIdFromStandings(teamCode, teamName),
+      new Promise<string | null>((resolve) => setTimeout(() => resolve(null), 1200)),
+    ]);
+    if (!teamId) {
+      fallbackNavigate();
+      return;
+    }
+    console.info("NAVIGATE_TEAM", { teamId, sportKey: sportPath });
     if (normalizedSportKey === "SOCCER") {
       navigate(`/sports/soccer/team/${encodeURIComponent(teamId)}`);
       return;

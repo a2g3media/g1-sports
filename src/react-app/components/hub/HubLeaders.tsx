@@ -3,6 +3,7 @@ import { motion } from "framer-motion";
 import { TrendingUp, Award, Flame, Sparkles } from "lucide-react";
 import { Link } from "react-router-dom";
 import { PlayerPhoto } from "@/react-app/components/PlayerPhoto";
+import { buildPlayerRoute, logPlayerNavigation } from "@/react-app/lib/navigationRoutes";
 
 // Use centralized PlayerPhoto component instead of inline implementation
 
@@ -940,7 +941,7 @@ interface PlayerCardProps {
 function PlayerCard({ player, index, sportKey, unit }: PlayerCardProps) {
   const isFirst = player.rank === 1;
   const [headshotFailed, setHeadshotFailed] = useState(false);
-  const playerPath = `/props/player/${String(sportKey || "").toUpperCase()}/${encodeURIComponent(player.name)}`;
+  const playerPath = buildPlayerRoute(String(sportKey || ""), player.name);
   
   return (
     <motion.div
@@ -951,6 +952,7 @@ function PlayerCard({ player, index, sportKey, unit }: PlayerCardProps) {
     >
       <Link
         to={playerPath}
+        onClick={() => logPlayerNavigation(player.name, sportKey)}
         className={`block w-[160px] sm:w-[200px] rounded-xl border transition-all group ${
           isFirst 
             ? 'border-amber-500/30 bg-gradient-to-br from-amber-500/10 to-transparent' 
@@ -1071,7 +1073,7 @@ interface QuickStatCardProps {
 
 function QuickStatCard({ category, leader, sportKey, isActive, onClick }: QuickStatCardProps) {
   if (!leader) return null;
-  const playerPath = `/props/player/${String(sportKey || "").toUpperCase()}/${encodeURIComponent(leader.name)}`;
+  const playerPath = buildPlayerRoute(String(sportKey || ""), leader.name);
   return (
     <button
       onClick={onClick}
@@ -1086,7 +1088,10 @@ function QuickStatCard({ category, leader, sportKey, isActive, onClick }: QuickS
       </div>
       <Link
         to={playerPath}
-        onClick={(event) => event.stopPropagation()}
+        onClick={(event) => {
+          event.stopPropagation();
+          logPlayerNavigation(leader.name, sportKey);
+        }}
         className="font-semibold text-white text-sm truncate hover:text-[var(--sport-accent)] transition-colors"
       >
         {getDisplayLastName(leader.name)}

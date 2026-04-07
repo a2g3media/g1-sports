@@ -19,6 +19,7 @@ import { fetchJsonCached } from "@/react-app/lib/fetchCache";
 import { getRouteCache, setRouteCache } from "@/react-app/lib/routeDataCache";
 import { useFeatureFlags } from "@/react-app/hooks/useFeatureFlags";
 import PremiumScoutFlowBar, { type ScoutFlowItem } from "@/react-app/components/PremiumScoutFlowBar";
+import { buildPlayerRoute, buildTeamRoute, logPlayerNavigation, logTeamNavigation } from "@/react-app/lib/navigationRoutes";
 
 // ============================================
 // TYPES
@@ -535,7 +536,8 @@ function RosterPreview({ roster, sportKey }: { roster: RosterPlayer[]; sportKey:
               {starters.map((player) => (
                 <Link
                   key={player.id}
-                  to={`/props/player/${sportKey.toUpperCase()}/${encodeURIComponent(player.name)}`}
+                  to={buildPlayerRoute(String(sportKey || ""), player.name)}
+                  onClick={() => logPlayerNavigation(player.name, String(sportKey || ""))}
                   className="flex items-center gap-3 p-2 rounded-lg border border-emerald-300/20 bg-emerald-500/5 hover:bg-emerald-500/10 transition-colors group"
                   onMouseEnter={() => prefetchPlayer(player.name)}
                   onFocus={() => prefetchPlayer(player.name)}
@@ -583,7 +585,8 @@ function RosterPreview({ roster, sportKey }: { roster: RosterPlayer[]; sportKey:
               {depth.map((player) => (
                 <Link
                   key={player.id}
-                  to={`/props/player/${sportKey.toUpperCase()}/${encodeURIComponent(player.name)}`}
+                  to={buildPlayerRoute(String(sportKey || ""), player.name)}
+                  onClick={() => logPlayerNavigation(player.name, String(sportKey || ""))}
                   className="flex items-center gap-3 p-2 rounded-lg hover:bg-white/5 transition-colors group"
                   onMouseEnter={() => prefetchPlayer(player.name)}
                   onFocus={() => prefetchPlayer(player.name)}
@@ -1247,6 +1250,46 @@ export function TeamProfilePage() {
   const [scoutRecent, setScoutRecent] = useState<ScoutRecentEntry[]>([]);
   const [scoutPlayers, setScoutPlayers] = useState<Array<{ name: string; team: string; sport: string }>>([]);
   const [scoutTeams, setScoutTeams] = useState<Array<{ id: string; alias: string; name: string }>>([]);
+
+  useEffect(() => {
+    if (!sportKey || !teamId) return;
+    const sportUpper = sportKey.toUpperCase();
+    const raw = String(teamId).trim();
+    if (!raw) return;
+    if (/^[0-9a-f]{8}-[0-9a-f-]{27}$/i.test(raw) || raw.startsWith("sr:")) return;
+    const controller = new AbortController();
+
+    const resolveCanonicalRoute = async () => {
+      try {
+        const timeout = setTimeout(() => controller.abort(), 1800);
+        try {
+          const res = await fetch(`/api/teams/${encodeURIComponent(sportUpper)}/standings`, {
+            credentials: "include",
+            signal: controller.signal,
+          });
+          if (!res.ok) return;
+          const json = await res.json().catch(() => null) as any;
+          const teams = Array.isArray(json?.teams) ? json.teams : [];
+          const alias = raw.toUpperCase();
+          const row = teams.find((t: any) => {
+            const id = String(t?.id || "").trim();
+            const rowAlias = String(t?.alias || t?.abbreviation || "").trim().toUpperCase();
+            return id === raw || rowAlias === alias;
+          });
+          const canonical = String(row?.id || "").trim();
+          if (canonical && canonical !== raw) {
+            navigate(`/sports/${sportKey.toLowerCase()}/team/${encodeURIComponent(canonical)}`, { replace: true });
+          }
+        } finally {
+          clearTimeout(timeout);
+        }
+      } catch (err) {
+        if (err instanceof DOMException && err.name === "AbortError") return;
+      }
+    };
+    void resolveCanonicalRoute();
+    return () => controller.abort();
+  }, [sportKey, teamId, navigate]);
 
   const fetchTeamData = async () => {
     if (!sportKey || !teamId) return;
@@ -2157,7 +2200,10 @@ export function TeamProfilePage() {
         label: row.name,
         subtitle: row.team || "Player",
         kind: "player",
-        onSelect: () => navigate(`/props/player/${encodeURIComponent(sportUpper)}/${encodeURIComponent(row.name)}`),
+        onSelect: () => {
+          logPlayerNavigation(row.name, sportUpper);
+          navigate(buildPlayerRoute(sportUpper, row.name));
+        },
       }));
     const teamItems: ScoutFlowItem[] = scoutTeams
       .filter((row) => row.id !== teamId)
@@ -2167,7 +2213,10 @@ export function TeamProfilePage() {
         label: row.name || row.alias,
         subtitle: row.alias,
         kind: "team",
-        onSelect: () => navigate(`/sports/${sportKey.toLowerCase()}/team/${encodeURIComponent(row.id)}`),
+        onSelect: () => {
+          logTeamNavigation(row.id, sportKey);
+          navigate(buildTeamRoute(String(sportKey || ""), row.id));
+        },
       }));
     return [...recentItems, ...playerItems, ...teamItems];
   }, [scoutEnabled, sportKey, scoutRecent, scoutPlayers, scoutTeams, navigate, teamId]);

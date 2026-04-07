@@ -11,6 +11,7 @@ import { PlayerSearch } from "@/react-app/components/PlayerSearch";
 import { TeamLogo } from "@/react-app/components/TeamLogo";
 import { CoachGAvatar } from "@/react-app/components/CoachGAvatar";
 import { getNcaabTournamentState } from "@/react-app/lib/ncaabTournamentSeason";
+import { buildTeamRoute, logTeamNavigation } from "@/react-app/lib/navigationRoutes";
 
 function getDateInEastern(dateInput: string | Date): string {
   const date = dateInput instanceof Date ? dateInput : new Date(dateInput);
@@ -914,7 +915,10 @@ export default function NCAABHubPage() {
               {TOP_25_TEAMS.slice(0, 15).map((team) => (
                 <div
                   key={team.teamId}
-                  onClick={() => navigate(`/sports/ncaab/team/${team.teamId}`)}
+                  onClick={() => {
+                    logTeamNavigation(team.teamId, "ncaab");
+                    navigate(buildTeamRoute("ncaab", team.teamId));
+                  }}
                   className="grid grid-cols-12 gap-2 px-4 py-3 border-t border-white/5 hover:bg-white/5 cursor-pointer transition-colors"
                 >
                   <div className="col-span-1 text-amber-400 font-bold">#{team.rank}</div>
@@ -970,7 +974,10 @@ export default function NCAABHubPage() {
               {(CONFERENCE_STANDINGS[selectedConference] || []).map((team, idx) => (
                 <div
                   key={team.teamId}
-                  onClick={() => navigate(`/sports/ncaab/team/${team.teamId}`)}
+                  onClick={() => {
+                    logTeamNavigation(team.teamId, "ncaab");
+                    navigate(buildTeamRoute("ncaab", team.teamId));
+                  }}
                   className="grid grid-cols-12 gap-2 px-4 py-3 border-t border-white/5 hover:bg-white/5 cursor-pointer transition-colors"
                 >
                   <div className="col-span-5 flex items-center gap-3">
@@ -1014,7 +1021,10 @@ export default function NCAABHubPage() {
               {filteredTeams.map((team) => (
                 <div
                   key={team.teamId}
-                  onClick={() => navigate(`/sports/ncaab/team/${team.teamId}`)}
+                  onClick={() => {
+                    logTeamNavigation(team.teamId, "ncaab");
+                    navigate(buildTeamRoute("ncaab", team.teamId));
+                  }}
                   className="flex items-center gap-3 p-4 bg-white/5 rounded-xl border border-white/10 hover:border-cyan-500/30 cursor-pointer transition-all"
                 >
                   <img src={team.logo} alt={team.name} className="w-10 h-10 object-contain" />

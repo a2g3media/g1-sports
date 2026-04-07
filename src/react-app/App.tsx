@@ -1,4 +1,4 @@
-import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
+import { BrowserRouter, Routes, Route, Navigate, useParams } from "react-router-dom";
 import { lazy, Suspense } from "react";
 import { DemoAuthProvider, useDemoAuth } from "@/react-app/contexts/DemoAuthContext";
 import { SocialModeProvider } from "@/react-app/contexts/SocialModeContext";
@@ -17,6 +17,7 @@ import { LazyRoute, lazyLoad } from "@/react-app/components/LazyRoute";
 import { ErrorProvider, ErrorBoundary } from "@/react-app/components/ErrorBoundary";
 import { Loader2 } from "lucide-react";
 import { Toaster } from "sonner";
+import { buildPlayerRoute } from "@/react-app/lib/navigationRoutes";
 
 // Eager load - needed immediately for app shell
 import { Layout } from "@/react-app/components/Layout";
@@ -89,7 +90,6 @@ const AlertCenter = lazyLoad(() => import("@/react-app/pages/AlertCenter"), "Ale
 const Watchlist = lazyLoad(() => import("@/react-app/pages/Watchlist"), "Watchlist");
 const WatchboardPage = lazyLoad(() => import("@/react-app/pages/WatchboardPage"), "WatchboardPage");
 const MyFavoritesPage = lazyLoad(() => import("@/react-app/pages/MyFavoritesPage"), "default");
-const PlayerProfilePage = lazyLoad(() => import("@/react-app/pages/PlayerProfilePage"), "default");
 
 // Other Pages
 const Leaderboard = lazyLoad(() => import("@/react-app/components/Leaderboard"), "Leaderboard");
@@ -214,6 +214,16 @@ function AdminLayoutFallback() {
       <Loader2 className="h-8 w-8 animate-spin text-primary" />
     </div>
   );
+}
+
+function LegacyPlayerRouteRedirect() {
+  const { sport, playerName } = useParams<{ sport: string; playerName: string }>();
+  const sportKey = String(sport || "").trim();
+  const playerId = String(playerName || "").trim();
+  if (!sportKey || !playerId) {
+    return <Navigate to="/props" replace />;
+  }
+  return <Navigate to={buildPlayerRoute(sportKey, decodeURIComponent(playerId))} replace />;
 }
 
 function AppRoutes() {
@@ -604,9 +614,7 @@ function AppRoutes() {
         path="/props/player/:sport/:playerName"
         element={
           <ProtectedRoute>
-            <Layout>
-              <LazyRoute skeleton="scores"><PlayerProfilePage /></LazyRoute>
-            </Layout>
+            <LegacyPlayerRouteRedirect />
           </ProtectedRoute>
         }
       />

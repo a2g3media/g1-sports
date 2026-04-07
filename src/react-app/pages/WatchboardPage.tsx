@@ -49,6 +49,7 @@ import { getTeamColors } from "@/react-app/data/team-colors";
 import { useSoundEffects, type SoundType } from "@/react-app/hooks/useSoundEffects";
 import { useDataHubWatchboards } from "@/react-app/hooks/useDataHub";
 import { toGameDetailPath } from "@/react-app/lib/gameRoutes";
+import { buildPlayerRoute, logPlayerNavigation } from "@/react-app/lib/navigationRoutes";
 
 // =====================================================
 // BOARD COLOR PALETTE
@@ -1885,7 +1886,8 @@ export function WatchboardPage() {
   };
 
   const handlePlayerClick = (player: WatchboardPlayer) => {
-    navigate(`/props/player/${player.sport.toLowerCase()}/${encodeURIComponent(player.player_name)}`);
+    logPlayerNavigation(player.player_name, player.sport);
+    navigate(buildPlayerRoute(player.sport, player.player_name));
   };
 
   // Drag and drop handlers

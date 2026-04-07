@@ -3,6 +3,7 @@ import { motion, AnimatePresence } from "framer-motion";
 import { ChevronRight, TrendingUp, TrendingDown, Trophy, MapPin, Loader2 } from "lucide-react";
 import { Link } from "react-router-dom";
 import { getTeamColors } from "@/react-app/lib/teamColors";
+import { buildTeamRoute, logTeamNavigation } from "@/react-app/lib/navigationRoutes";
 
 interface TeamStanding {
   rank: number;
@@ -642,7 +643,8 @@ function TeamRow({ team, index, sportKey, isHovered, onHover, onLeave }: TeamRow
       transition={{ delay: index * 0.03 }}
     >
       <Link
-        to={`/sports/${sportKey}/team/${team.teamId}`}
+        to={buildTeamRoute(sportKey, team.teamId)}
+        onClick={() => logTeamNavigation(team.teamId, sportKey)}
         className={`relative flex items-center justify-between px-3 sm:px-4 py-3 sm:py-3 transition-all group ${
           isHovered ? 'bg-white/[0.06]' : 'hover:bg-white/[0.04]'
         }`}
@@ -792,7 +794,8 @@ function MiniStandingsCard({ conference, label, sportKey }: MiniStandingsCardPro
         {topTeams.map((team) => (
           <Link
             key={team.teamId}
-            to={`/sports/${sportKey}/team/${team.teamId}`}
+            to={buildTeamRoute(sportKey, team.teamId)}
+            onClick={() => logTeamNavigation(team.teamId, sportKey)}
             className="flex items-center justify-between py-1.5 px-2 rounded-lg hover:bg-white/5 transition-colors group"
           >
             <div className="flex items-center gap-2">

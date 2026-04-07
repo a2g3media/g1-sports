@@ -20,6 +20,7 @@ import { getRouteCache, setRouteCache } from "@/react-app/lib/routeDataCache";
 import { fetchJsonCached } from "@/react-app/lib/fetchCache";
 import { useFeatureFlags } from "@/react-app/hooks/useFeatureFlags";
 import PremiumScoutFlowBar, { type ScoutFlowItem } from "@/react-app/components/PremiumScoutFlowBar";
+import { buildPlayerRoute, buildTeamRoute, logPlayerNavigation, logTeamNavigation } from "@/react-app/lib/navigationRoutes";
 
 // ============================================
 // TYPES
@@ -1969,7 +1970,7 @@ export default function PlayerProfilePage() {
         label: decodedPlayerName,
         subtitle: data?.player?.teamName || undefined,
         sport: sport.toUpperCase(),
-        path: `/props/player/${encodeURIComponent(sport)}/${encodeURIComponent(decodedPlayerName)}`,
+        path: buildPlayerRoute(String(sport || ""), decodedPlayerName),
         ts: Date.now(),
       };
       const merged = [next, ...parsed.filter((row) => row.path !== next.path)].slice(0, 12);
@@ -2057,7 +2058,10 @@ export default function PlayerProfilePage() {
         label: row.name,
         subtitle: row.team || "Player",
         kind: "player",
-        onSelect: () => navigate(`/props/player/${encodeURIComponent(sport)}/${encodeURIComponent(row.name)}`),
+        onSelect: () => {
+          logPlayerNavigation(row.name, sport);
+          navigate(buildPlayerRoute(String(sport || ""), row.name));
+        },
       }));
 
     const teamItems: ScoutFlowItem[] = scoutTeams.slice(0, 10).map((row) => ({
@@ -2065,7 +2069,10 @@ export default function PlayerProfilePage() {
       label: row.name || row.alias,
       subtitle: row.alias,
       kind: "team",
-      onSelect: () => navigate(`/sports/${String(sport).toLowerCase()}/team/${encodeURIComponent(row.id)}`),
+      onSelect: () => {
+        logTeamNavigation(row.id, sport);
+        navigate(buildTeamRoute(String(sport || ""), row.id));
+      },
     }));
 
     return [...recentItems, ...playerItems, ...teamItems];
@@ -2144,7 +2151,10 @@ export default function PlayerProfilePage() {
                     label: data?.player?.teamName || "Team",
                     onClick: () => {
                       const hit = scoutTeams.find((t) => t.alias === String(data?.player?.teamAbbr || "").toUpperCase());
-                      if (hit?.id) navigate(`/sports/${String(sport || "").toLowerCase()}/team/${encodeURIComponent(hit.id)}`);
+                      if (hit?.id) {
+                        logTeamNavigation(hit.id, sport);
+                        navigate(buildTeamRoute(String(sport || ""), hit.id));
+                      }
                     },
                   },
                 ]}

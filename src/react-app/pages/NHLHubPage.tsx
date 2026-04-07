@@ -10,6 +10,7 @@ import {
 import { TeamLogo } from "@/react-app/components/TeamLogo";
 import { PlayerSearch } from "@/react-app/components/PlayerSearch";
 import { CoachGAvatar } from "@/react-app/components/CoachGAvatar";
+import { buildTeamRoute, logTeamNavigation } from "@/react-app/lib/navigationRoutes";
 
 // ============================================================
 // NHL TEAM DATA
@@ -580,7 +581,14 @@ export function NHLHubPage() {
                 </thead>
                 <tbody>
                   {filteredStandings.map((row, i) => (
-                    <tr key={row.team} onClick={() => navigate(`/sports/nhl/team/${row.team}`)} className="border-t border-white/5 hover:bg-white/5 cursor-pointer transition-colors">
+                    <tr
+                      key={row.team}
+                      onClick={() => {
+                        logTeamNavigation(row.team, "nhl");
+                        navigate(buildTeamRoute("nhl", row.team));
+                      }}
+                      className="border-t border-white/5 hover:bg-white/5 cursor-pointer transition-colors"
+                    >
                       <td className="py-3 px-4 flex items-center gap-3">
                         <span className="w-5 text-center text-white/40 text-xs">{i + 1}</span>
                         <TeamLogo teamCode={row.team} sport="NHL" size={24} />

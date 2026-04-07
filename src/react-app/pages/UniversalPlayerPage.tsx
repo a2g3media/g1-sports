@@ -9,6 +9,7 @@ import {
 import { getTeamLogoUrl } from "@/react-app/lib/teamLogos";
 import { toGameDetailPath } from "@/react-app/lib/gameRoutes";
 import { fetchJsonCached } from "@/react-app/lib/fetchCache";
+import { buildTeamRoute, logTeamNavigation } from "@/react-app/lib/navigationRoutes";
 
 // ============================================================
 // TYPES
@@ -951,6 +952,7 @@ export default function UniversalPlayerPage() {
 
   const teamLogoUrl = getTeamLogoUrl(player.teamCode, sportLower.toUpperCase());
   const teamRouteId = canonicalTeamRouteId || String(player.teamId || "").trim() || player.teamCode;
+  const teamPath = buildTeamRoute(sportLower, teamRouteId);
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-950 via-slate-900 to-slate-950 pb-20">
@@ -964,7 +966,8 @@ export default function UniversalPlayerPage() {
             <ArrowLeft className="w-5 h-5 text-white/70" />
           </button>
           <Link 
-            to={`/sports/${sportLower}/team/${encodeURIComponent(teamRouteId)}`}
+            to={teamPath}
+            onClick={() => logTeamNavigation(teamRouteId, sportLower)}
             className="flex items-center gap-3 hover:opacity-80 transition-opacity"
           >
             {teamLogoUrl && (
@@ -1021,7 +1024,8 @@ export default function UniversalPlayerPage() {
               </div>
               <h1 className="text-3xl md:text-4xl lg:text-5xl font-black text-white mb-2">{player.name}</h1>
               <Link 
-                to={`/sports/${sportLower}/team/${encodeURIComponent(teamRouteId)}`}
+                to={teamPath}
+                onClick={() => logTeamNavigation(teamRouteId, sportLower)}
                 className="text-white/60 text-lg hover:text-white/80 transition-colors inline-flex items-center gap-2"
               >
                 {player.team}

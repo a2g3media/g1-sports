@@ -23,6 +23,7 @@ import { useFavoriteSports } from "@/react-app/components/FavoriteSportsSelector
 import { fetchJsonCached, getFetchCacheStats } from "@/react-app/lib/fetchCache";
 import { getRouteCache, setRouteCache } from "@/react-app/lib/routeDataCache";
 import { incrementPerfCounter, logPerfSnapshot, startPerfTimer } from "@/react-app/lib/perfTelemetry";
+import { buildPlayerRoute, logPlayerNavigation } from "@/react-app/lib/navigationRoutes";
 
 // ============================================
 // TYPES
@@ -328,8 +329,8 @@ function PlayerPropCard({
   // Navigate to player profile
   const handlePlayerClick = (e: React.MouseEvent) => {
     e.stopPropagation();
-    const encodedName = encodeURIComponent(displayName);
-    navigate(`/props/player/${group.sport.toLowerCase()}/${encodedName}`);
+    logPlayerNavigation(displayName, group.sport);
+    navigate(buildPlayerRoute(group.sport, displayName));
   };
   
   // Get the primary prop (first one, usually points for basketball)

@@ -1559,10 +1559,17 @@ export default function OddsGamePage() {
     const code = String(teamCode || "").trim();
     const name = String(teamName || "").trim();
     if (!code && !name) return;
+    const sportPath = String(normalizedSportKey || "").toLowerCase();
+    const fallbackToken = code || name;
     void prefetchTeamData(code, name);
-    const teamId = await resolveTeamId(code, name);
-    if (!teamId) return;
-    navigate(`/sports/${String(normalizedSportKey || "").toLowerCase()}/team/${encodeURIComponent(teamId)}`);
+    const teamId = await Promise.race<string | null>([
+      resolveTeamId(code, name),
+      new Promise<string | null>((resolve) => setTimeout(() => resolve(null), 1200)),
+    ]);
+    const resolved = String(teamId || fallbackToken).trim();
+    if (!resolved || !sportPath) return;
+    console.info("NAVIGATE_TEAM", { teamId: resolved, sportKey: sportPath });
+    navigate(`/sports/${sportPath}/team/${encodeURIComponent(resolved)}`);
   }, [navigate, normalizedSportKey, prefetchTeamData, resolveTeamId]);
   
   // Fetch game data
