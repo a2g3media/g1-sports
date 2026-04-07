@@ -1406,7 +1406,7 @@ export function TeamProfilePage() {
         {
           cacheKey: `page-data-team-profile:v1:${sportUpper}:${effectiveTeamId}`,
           ttlMs: 60_000,
-          timeoutMs: 2_000,
+          timeoutMs: 5_000,
           init: { credentials: "include" },
         }
       );
@@ -2193,7 +2193,11 @@ export function TeamProfilePage() {
         console.warn("PAGE_DATA_TIMEOUT", { route: "team-profile", sport: String(sportKey || "").toUpperCase(), teamId });
       }
       console.warn("PAGE_DATA_FALLBACK_USED", { route: "team-profile", reason: "request_failed", sport: String(sportKey || "").toUpperCase(), teamId });
-      setError(msg.includes('404') ? 'Team not found' : (err.message || 'Failed to load team data'));
+      if (lastGood || data) {
+        setError(null);
+      } else {
+        setError(msg.includes('404') ? 'Team not found' : (err.message || 'Failed to load team data'));
+      }
     } finally {
       void fetch("/api/page-data/telemetry", {
         method: "POST",

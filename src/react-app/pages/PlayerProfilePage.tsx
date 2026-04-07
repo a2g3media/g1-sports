@@ -1852,7 +1852,7 @@ export default function PlayerProfilePage() {
         const envelope = await fetchJsonCached<any>(primaryUrl, {
           cacheKey: `player-api:v2:${sport.toUpperCase()}:${decodedPlayerName}`,
           ttlMs: 45_000,
-          timeoutMs: 2_000,
+          timeoutMs: 5_000,
           bypassCache: false,
           init: { credentials: 'include' },
         });
@@ -1889,7 +1889,7 @@ export default function PlayerProfilePage() {
         } else if (lastGoodProfileRef.current) {
           setData(lastGoodProfileRef.current);
         } else {
-          setData(profileData);
+          throw new Error('Player profile payload is partial');
         }
       } catch (err: any) {
         console.error('Failed to fetch player profile:', err);
@@ -1900,6 +1900,10 @@ export default function PlayerProfilePage() {
         console.warn("PAGE_DATA_FALLBACK_USED", { route: "player-profile", reason: "request_failed_or_partial", sport: sport.toUpperCase(), playerName: decodedPlayerName });
         if (lastGoodProfileRef.current) {
           setData(lastGoodProfileRef.current);
+          setError(null);
+          return;
+        }
+        if (data && hasCoreProfileData(data)) {
           setError(null);
           return;
         }

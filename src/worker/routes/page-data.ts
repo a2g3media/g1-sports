@@ -839,7 +839,15 @@ function hasUsableTeamProfilePayload(payload: PageDataTeamProfilePayload | null 
 
 function hasUsablePlayerProfilePayload(payload: PageDataPlayerProfilePayload | null | undefined): boolean {
   if (!payload) return false;
-  return Boolean(payload?.data?.profile?.player);
+  const profile = payload?.data?.profile;
+  if (!profile?.player) return false;
+  const hasGameLog = Array.isArray(profile?.gameLog) && profile.gameLog.length > 0;
+  const hasSeason = Boolean(profile?.seasonAverages) && Object.keys(profile.seasonAverages || {}).length > 0;
+  const hasMatchup = Boolean(profile?.matchup?.opponent);
+  const hasRecent = Array.isArray(profile?.recentPerformance) && profile.recentPerformance.length > 0;
+  const hasProps = Array.isArray(profile?.currentProps) && profile.currentProps.length > 0;
+  // Reject shallow player payloads that only include identity rows.
+  return hasGameLog || hasSeason || hasMatchup || hasRecent || hasProps;
 }
 
 function hasUsableLeagueOverviewPayload(payload: PageDataLeagueOverviewPayload | null | undefined): boolean {
@@ -1763,6 +1771,10 @@ pageDataRouter.get("/player-profile", async (c) => {
       canonicalTeamRouteId,
     },
   };
+
+  if (!hasUsablePlayerProfilePayload(payload) && hasUsablePlayerProfilePayload(l1Stale)) {
+    return c.json(patchFreshness(l1Stale, "l1", true));
+  }
 
   if (hasUsablePlayerProfilePayload(payload)) {
     writeL1Generic(pageDataPlayerProfileL1, cacheKey, payload, policy.cacheTtlMs, policy.staleWindowMs);
