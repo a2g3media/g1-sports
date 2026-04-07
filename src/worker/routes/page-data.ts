@@ -4,6 +4,8 @@ import { getCachedData, makeCacheKey, setCachedData } from "../services/apiCache
 import { pageDataGamesCacheKey, pageDataGenericKey } from "../services/pageData/cacheKeys";
 import { getFreshnessPolicy } from "../services/pageData/freshnessPolicy";
 import { runPageDataWarmCycle } from "../services/pageData/precompute";
+import { fetchStandingsCached } from "../services/sports-data/sportsRadarProvider";
+import type { SportKey } from "../services/sports-data/types";
 import {
   getRolloutMetricsSnapshot,
   incCounter,
@@ -12,6 +14,7 @@ import {
 
 type Env = {
   DB: D1Database;
+  SPORTSRADAR_API_KEY?: string;
 };
 
 const pageDataRouter = new Hono<{ Bindings: Env }>();
@@ -1526,6 +1529,91 @@ pageDataRouter.get("/team-profile", async (c) => {
       }
     } catch {
       // non-fatal
+    }
+  }
+
+  // If internal standings endpoint was sparse/unavailable, use provider cache directly.
+  const standingsTeamsAfterRetry = Array.isArray(standingsRes.body?.teams) ? standingsRes.body.teams : [];
+  if (standingsTeamsAfterRetry.length === 0 && c.env.SPORTSRADAR_API_KEY) {
+    try {
+      const supported = ["NBA", "NFL", "MLB", "NHL", "NCAAB", "NCAAF"];
+      if (supported.includes(sport)) {
+        const fallbackStandings = await fetchStandingsCached(
+          c.env.DB,
+          sport as SportKey,
+          c.env.SPORTSRADAR_API_KEY,
+        );
+        const fallbackTeams = Array.isArray(fallbackStandings?.teams) ? fallbackStandings.teams : [];
+        if (fallbackTeams.length > 0) {
+          standingsRes = {
+            ok: true,
+            status: 200,
+            body: {
+              teams: fallbackTeams,
+              conferences: fallbackStandings?.conferences || [],
+              divisions: fallbackStandings?.divisions || [],
+            },
+          };
+        }
+      }
+    } catch {
+      // non-fatal
+    }
+  }
+
+  // Last-chance synthesis: build minimal profile from standings row so team header never blanks.
+  if (!profileRes.ok || !profileRes.body?.team) {
+    const teams = Array.isArray(standingsRes.body?.teams) ? standingsRes.body.teams : [];
+    if (teams.length > 0) {
+      const raw = String(teamId || "").trim();
+      const alias = raw.toUpperCase();
+      const aliasMap: Record<string, string[]> = {
+        GSW: ["GS"], GS: ["GSW"], NYK: ["NY"], NY: ["NYK"], SAS: ["SA"], SA: ["SAS"],
+        NOP: ["NO"], NO: ["NOP"], PHX: ["PHO"], PHO: ["PHX"], CHA: ["CHO"], CHO: ["CHA"],
+        BKN: ["BRK"], BRK: ["BKN"],
+      };
+      const candidates = new Set<string>([alias, ...(aliasMap[alias] || [])]);
+      const row = teams.find((t: any) => {
+        const rowId = String(t?.id || "").trim();
+        const rowAlias = String(t?.alias || "").trim().toUpperCase();
+        return rowId === raw || candidates.has(rowAlias);
+      });
+      if (row) {
+        profileRes = {
+          ok: true,
+          status: 200,
+          body: {
+            team: {
+              id: String(row?.id || raw),
+              name: String(row?.name || raw),
+              market: String(row?.market || ""),
+              alias: String(row?.alias || alias),
+              conference: String(row?.conferenceName || ""),
+              division: String(row?.divisionName || ""),
+              record: {
+                wins: Number(row?.wins ?? 0),
+                losses: Number(row?.losses ?? 0),
+                ties: Number.isFinite(Number(row?.ties)) ? Number(row?.ties) : undefined,
+                win_pct: Number.isFinite(Number(row?.winPct)) ? Number(row?.winPct) : undefined,
+                conference: {
+                  wins: Number.isFinite(Number(row?.confWins)) ? Number(row?.confWins) : undefined,
+                  losses: Number.isFinite(Number(row?.confLosses)) ? Number(row?.confLosses) : undefined,
+                },
+                home: {
+                  wins: Number.isFinite(Number(row?.homeWins)) ? Number(row?.homeWins) : undefined,
+                  losses: Number.isFinite(Number(row?.homeLosses)) ? Number(row?.homeLosses) : undefined,
+                },
+                away: {
+                  wins: Number.isFinite(Number(row?.awayWins)) ? Number(row?.awayWins) : undefined,
+                  losses: Number.isFinite(Number(row?.awayLosses)) ? Number(row?.awayLosses) : undefined,
+                },
+              },
+            },
+            roster: [],
+            venue: null,
+          },
+        };
+      }
     }
   }
 
