@@ -68,48 +68,6 @@ interface GameWithPicks {
   picks: MemberPick[];
 }
 
-// StandingsApiResponse type handled inline via Member interface
-
-interface EventApiResponse {
-  id: number;
-  external_id: string;
-  sport_key: string;
-  period_id: string;
-  start_at: string;
-  home_team: string;
-  away_team: string;
-  home_score: number | null;
-  away_score: number | null;
-  status: string;
-  winner?: string;
-  final_result?: string;
-}
-
-interface MemberPicksApiResponse {
-  user_id: number;
-  userId?: number;
-  userName?: string;
-  display_name?: string;
-  email?: string;
-  avatar?: string;
-  avatar_url?: string;
-  picks: Array<{ event_id: number; pick_value?: string; confidence_rank?: number }>;
-  isCurrentUser?: boolean;
-}
-
-interface StandingsApiResponse {
-  user_id: number;
-  display_name?: string;
-  email?: string;
-  avatar_url?: string;
-  rank?: number;
-  previous_rank?: number;
-  total_points?: number;
-  win_percentage?: number;
-  current_streak: number;
-  streak_type?: string;
-}
-
 interface SurvivorMember {
   userId: number;
   userName: string;
@@ -148,145 +106,46 @@ export function LeagueOverview() {
     }
   }, [id]);
 
-  const generateSurvivorData = (members: Standing[]): SurvivorMember[] => {
-    const weeks = ["Week 10", "Week 11", "Week 12", "Week 13", "Week 14", "Week 15"];
-    const teams = [
-      "Kansas City Chiefs", "Buffalo Bills", "Philadelphia Eagles", "San Francisco 49ers",
-      "Dallas Cowboys", "Detroit Lions", "Miami Dolphins", "Baltimore Ravens",
-      "Cincinnati Bengals", "Jacksonville Jaguars", "Cleveland Browns", "Seattle Seahawks"
-    ];
-
-    return members.map((member, idx) => {
-      const eliminatedAt = idx > 7 ? Math.floor(Math.random() * 5) : -1;
-      const isAlive = eliminatedAt === -1;
-
-      const picksHistory = weeks.map((week, weekIdx) => {
-        const teamIdx = (member.userId + weekIdx) % teams.length;
-        const result: "win" | "loss" | "pending" = 
-          weekIdx === weeks.length - 1 ? "pending" :
-          (eliminatedAt === weekIdx ? "loss" : "win");
-        
-        return { week, team: teams[teamIdx], result };
-      });
-
-      return {
-        userId: member.userId,
-        userName: member.userName,
-        avatar: member.avatar,
-        isAlive,
-        eliminatedWeek: isAlive ? undefined : weeks[eliminatedAt],
-        currentPick: isAlive ? picksHistory[picksHistory.length - 1].team : undefined,
-        picksHistory,
-        isCurrentUser: member.isCurrentUser,
-      };
-    });
-  };
-
   const fetchLeagueData = async () => {
+    const loadStartedAt = Date.now();
+    let apiCalls = 0;
     setIsLoading(true);
     const headers: HeadersInit = isDemoMode ? { "X-Demo-Mode": "true" } : {};
     try {
-      // Fetch league info
-      const response = await fetch(`/api/leagues/${id}`, { headers });
-      let leagueData = null;
-      if (response.ok) {
-        leagueData = await response.json();
-        setLeague(leagueData);
-      }
-
-      // Fetch standings
-      const standingsRes = await fetch(`/api/leagues/${id}/standings`, { headers });
-      let standingsData: Standing[] = [];
-      if (standingsRes.ok) {
-        const data = await standingsRes.json();
-        standingsData = data.standings?.map((s: StandingsApiResponse, idx: number) => ({
-          userId: s.user_id,
-          userName: s.display_name || s.email,
-          avatar: s.avatar_url,
-          rank: s.rank || idx + 1,
-          previousRank: s.previous_rank || s.rank || idx + 1,
-          totalPoints: s.total_points || 0,
-          weeklyPoints: 0,
-          winPercentage: s.win_percentage || 0,
-          streak: s.current_streak > 0 ? { count: s.current_streak, type: s.streak_type as "win" | "loss" } : null,
-          isCurrentUser: s.user_id === data.league?.currentUserId,
-        })) || [];
-        setStandings(standingsData);
-      }
-
-      // Fetch periods
-      const periodsRes = await fetch(`/api/leagues/${id}/periods`, { headers });
-      if (periodsRes.ok) {
-        const periodsData = await periodsRes.json();
-        setAvailablePeriods(periodsData.periods || []);
-        const period = periodsData.currentPeriod || periodsData.periods?.[0] || "";
-        setCurrentPeriod(period);
-
-        // Fetch events for current period
-        if (period && leagueData) {
-          const eventsRes = await fetch(`/api/leagues/${id}/events?period=${encodeURIComponent(period)}`, { headers });
-          if (eventsRes.ok) {
-            const eventsData = await eventsRes.json();
-            const events: GameEvent[] = eventsData.map((e: EventApiResponse) => ({
-              id: e.id,
-              external_id: e.external_id,
-              sport_key: e.sport_key,
-              period_id: e.period_id,
-              start_at: e.start_at,
-              home_team: e.home_team,
-              away_team: e.away_team,
-              home_score: e.home_score,
-              away_score: e.away_score,
-              status: e.status as "scheduled" | "live" | "final",
-              final_result: e.winner || e.final_result,
-            }));
-
-            // Fetch all picks for this period
-            const allPicksRes = await fetch(`/api/leagues/${id}/all-picks?period=${encodeURIComponent(period)}`, { headers });
-            if (allPicksRes.ok) {
-              const allPicksData = await allPicksRes.json();
-              
-              // Transform into gamesWithPicks format
-              const gamesData: GameWithPicks[] = events.map(event => {
-                const isLocked = new Date(event.start_at) <= new Date() || event.status !== "scheduled";
-                
-                const picks: MemberPick[] = allPicksData.map((member: MemberPicksApiResponse) => {
-                  const memberPick = member.picks.find((p: { event_id: number }) => p.event_id === event.id);
-                  let isCorrect: boolean | null = null;
-                  
-                  if (event.status === "final" && event.final_result && memberPick?.pick_value) {
-                    isCorrect = memberPick.pick_value === event.final_result;
-                  }
-                  
-                  return {
-                    userId: member.userId,
-                    userName: member.userName,
-                    avatar: member.avatar,
-                    pickValue: isLocked ? (memberPick?.pick_value || null) : null,
-                    isCorrect,
-                    confidenceRank: memberPick?.confidence_rank,
-                    isCurrentUser: member.isCurrentUser,
-                  };
-                });
-
-                return { event, picks };
-              });
-
-              setGamesWithPicks(gamesData);
-              
-              // Generate survivor data if applicable
-              if (leagueData.format_key === "survivor" && standingsData.length > 0) {
-                const survivorData = generateSurvivorData(standingsData);
-                setSurvivorMembers(survivorData);
-                setActiveTab("survivor");
-              }
-            }
-          }
-        }
+      apiCalls += 1;
+      const res = await fetch(`/api/page-data/league-overview?leagueId=${encodeURIComponent(String(id || ""))}`, {
+        credentials: "include",
+        headers,
+      });
+      if (!res.ok) throw new Error("Failed to fetch league overview page-data");
+      const payload = await res.json().catch(() => null) as any;
+      const data = payload?.data || {};
+      const leagueData = data?.league || null;
+      setLeague(leagueData);
+      setStandings(Array.isArray(data?.standings) ? data.standings : []);
+      setAvailablePeriods(Array.isArray(data?.availablePeriods) ? data.availablePeriods : []);
+      setCurrentPeriod(String(data?.currentPeriod || ""));
+      setGamesWithPicks(Array.isArray(data?.gamesWithPicks) ? data.gamesWithPicks : []);
+      setSurvivorMembers(Array.isArray(data?.survivorMembers) ? data.survivorMembers : []);
+      if (data?.activeTab === "survivor" || data?.activeTab === "live" || data?.activeTab === "spreadsheet" || data?.activeTab === "standings") {
+        setActiveTab(data.activeTab);
+      } else if (leagueData?.format_key === "survivor" && Array.isArray(data?.standings) && data.standings.length > 0) {
+        setActiveTab("survivor");
       }
     } catch (error) {
       console.error("Failed to fetch league data:", error);
     } finally {
+      void fetch("/api/page-data/telemetry", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({
+          route: "league-overview",
+          loadMs: Math.max(0, Date.now() - loadStartedAt),
+          apiCalls: Math.max(1, apiCalls),
+          oddsAvailableAtFirstRender: false,
+        }),
+      }).catch(() => undefined);
       setIsLoading(false);
     }
   };

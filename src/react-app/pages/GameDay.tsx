@@ -103,55 +103,40 @@ export function GameDay() {
   }, [id]);
 
   const fetchData = async (silent = false) => {
+    const loadStartedAt = Date.now();
+    let apiCalls = 0;
     if (!silent) setIsLoading(true);
     else setIsRefreshing(true);
     
     try {
-      // Fetch league
-      const leagueRes = await fetch(`/api/leagues/${id}`);
-      if (leagueRes.ok) {
-        const leagueData = await leagueRes.json();
-        setLeague(leagueData);
-      }
-
-      // Fetch periods
-      const periodsRes = await fetch(`/api/leagues/${id}/periods`);
-      if (periodsRes.ok) {
-        const periodsData = await periodsRes.json();
-        const period = periodsData.currentPeriod || periodsData.periods?.[0] || "Week 1";
-        setCurrentPeriod(period);
-
-        // Fetch events
-        const eventsRes = await fetch(`/api/leagues/${id}/events?period=${encodeURIComponent(period)}`);
-        if (eventsRes.ok) {
-          const eventsData = await eventsRes.json();
-          setEvents(eventsData);
-        }
-
-        // Fetch picks
-        const picksRes = await fetch(`/api/leagues/${id}/picks?period=${encodeURIComponent(period)}`);
-        if (picksRes.ok) {
-          const picksData = await picksRes.json();
-          const resolvedPicks = Array.isArray(picksData)
-            ? picksData
-            : Array.isArray(picksData?.picks)
-              ? picksData.picks
-              : [];
-          setPicks(resolvedPicks);
-        }
-      }
-
-      // Fetch standings
-      const standingsRes = await fetch(`/api/leagues/${id}/standings`);
-      if (standingsRes.ok) {
-        const standingsData = await standingsRes.json();
-        setStandings(standingsData.standings?.slice(0, 20) || []);
-      }
+      apiCalls += 1;
+      const res = await fetch(`/api/page-data/league-gameday?leagueId=${encodeURIComponent(String(id || ""))}`, {
+        credentials: "include",
+      });
+      if (!res.ok) throw new Error("Failed to fetch game day page-data");
+      const payload = await res.json().catch(() => null) as any;
+      const data = payload?.data || {};
+      setLeague(data?.league || null);
+      setCurrentPeriod(String(data?.currentPeriod || "Week 1"));
+      setEvents(Array.isArray(data?.events) ? data.events : []);
+      setPicks(Array.isArray(data?.picks) ? data.picks : []);
+      setStandings(Array.isArray(data?.standings) ? data.standings : []);
 
       setLastUpdated(new Date());
     } catch (error) {
       console.error("Failed to fetch data:", error);
     } finally {
+      void fetch("/api/page-data/telemetry", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({
+          route: "league-gameday",
+          loadMs: Math.max(0, Date.now() - loadStartedAt),
+          apiCalls: Math.max(1, apiCalls),
+          oddsAvailableAtFirstRender: false,
+        }),
+      }).catch(() => undefined);
       setIsLoading(false);
       setIsRefreshing(false);
       setPullDistance(0);

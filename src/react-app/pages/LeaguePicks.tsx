@@ -98,11 +98,16 @@ export function LeaguePicks() {
   const [showPaymentModal, setShowPaymentModal] = useState(false);
   const [receiptInfo, setReceiptInfo] = useState<ReceiptInfo | null>(null);
   const [justSubmitted, setJustSubmitted] = useState(false);
+  const USE_PAGE_DATA_P0 = true;
 
   useEffect(() => {
     if (id) {
-      fetchLeague();
-      fetchPaymentEligibility();
+      if (USE_PAGE_DATA_P0) {
+        fetchPageData();
+      } else {
+        fetchLeague();
+        fetchPaymentEligibility();
+      }
     }
   }, [id]);
 
@@ -121,11 +126,69 @@ export function LeaguePicks() {
   };
 
   useEffect(() => {
+    if (USE_PAGE_DATA_P0) return;
     if (league && currentPeriod) {
       fetchEvents();
       fetchPicks();
     }
   }, [league, currentPeriod]);
+
+  const fetchPageData = async () => {
+    const loadStartedAt = Date.now();
+    let apiCalls = 0;
+    try {
+      apiCalls += 1;
+      const response = await fetch(`/api/page-data/league-picks?leagueId=${encodeURIComponent(String(id || ""))}`, {
+        headers,
+        credentials: "include",
+      });
+      if (!response.ok) throw new Error("Failed to fetch league picks page-data");
+      const payload = await response.json().catch(() => null) as any;
+      const data = payload?.data || {};
+      setLeague(data?.league || null);
+      const periods = Array.isArray(data?.availablePeriods) ? data.availablePeriods : [];
+      setAvailablePeriods(periods);
+      const selectedPeriod = String(data?.currentPeriod || periods?.[0] || "");
+      if (selectedPeriod) setCurrentPeriod(selectedPeriod);
+      const eventsData = Array.isArray(data?.events) ? data.events : [];
+      setEvents(eventsData);
+      const resolvedPicks = Array.isArray(data?.picks) ? data.picks : [];
+      setExistingPicks(resolvedPicks);
+      const picksMap = new Map<number, Pick>();
+      resolvedPicks.forEach((p: ExistingPick) => {
+        picksMap.set(p.event_id, {
+          event_id: p.event_id,
+          pick_value: p.pick_value,
+          confidence_rank: p.confidence_rank || undefined,
+        });
+      });
+      setPicks(picksMap);
+      setPaymentEligibility(data?.paymentEligibility || null);
+      if (resolvedPicks.length > 0) {
+        setReceiptInfo({
+          receiptCode: `PV-${Math.random().toString(36).substring(2, 7).toUpperCase()}`,
+          submittedAt: new Date(Date.now() - Math.random() * 86400000),
+        });
+      } else {
+        setReceiptInfo(null);
+      }
+    } catch {
+      setError("Failed to load league");
+    } finally {
+      void fetch("/api/page-data/telemetry", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({
+          route: "league-picks",
+          loadMs: Math.max(0, Date.now() - loadStartedAt),
+          apiCalls: Math.max(1, apiCalls),
+          oddsAvailableAtFirstRender: false,
+        }),
+      }).catch(() => undefined);
+      setIsLoading(false);
+    }
+  };
 
   const fetchLeague = async () => {
     try {

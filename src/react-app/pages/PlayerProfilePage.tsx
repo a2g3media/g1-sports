@@ -18,6 +18,8 @@ import { useWatchboards } from "@/react-app/hooks/useWatchboards";
 import FavoriteEntityButton from "@/react-app/components/FavoriteEntityButton";
 import { getRouteCache, setRouteCache } from "@/react-app/lib/routeDataCache";
 import { fetchJsonCached } from "@/react-app/lib/fetchCache";
+import { useFeatureFlags } from "@/react-app/hooks/useFeatureFlags";
+import PremiumScoutFlowBar, { type ScoutFlowItem } from "@/react-app/components/PremiumScoutFlowBar";
 
 // ============================================
 // TYPES
@@ -117,7 +119,7 @@ interface RecentPerformanceEntry {
     rebounds: number | null;
     assists: number | null;
   };
-  lineSource?: 'historical' | 'latest_fallback' | 'event_fallback' | 'unavailable';
+  lineSource?: 'historical' | 'latest_fallback' | 'event_fallback' | 'estimated_fallback' | 'unavailable';
 }
 
 interface PlayerProfileData {
@@ -131,6 +133,15 @@ interface PlayerProfileData {
   vsOpponent?: VsOpponentData | null;
   health?: HealthData;
   lastUpdated: string;
+}
+
+interface ScoutRecentEntry {
+  type: "player" | "team";
+  label: string;
+  subtitle?: string;
+  sport: string;
+  path: string;
+  ts: number;
 }
 
 // ============================================
@@ -695,6 +706,25 @@ function MatchupSection({
       .split(/\s+/)
       .map((w) => w.trim())
       .filter(Boolean);
+  const expandAliasCandidates = (raw: string): string[] => {
+    const code = String(raw || '').trim().toUpperCase();
+    if (!code) return [];
+    const map: Record<string, string[]> = {
+      GSW: ['GS'],
+      GS: ['GSW'],
+      NYK: ['NY'],
+      NY: ['NYK'],
+      SAS: ['SA'],
+      SA: ['SAS'],
+      NOP: ['NO'],
+      NO: ['NOP'],
+      PHX: ['PHO'],
+      PHO: ['PHX'],
+      UTA: ['UTAH'],
+      UTAH: ['UTA'],
+    };
+    return Array.from(new Set([code, ...(map[code] || [])]));
+  };
   const upcoming = (Array.isArray(matchup.upcomingOpponents) && matchup.upcomingOpponents.length > 0)
     ? matchup.upcomingOpponents
     : [{
@@ -718,14 +748,20 @@ function MatchupSection({
   }, [selectedOpponent?.abbr, selectedOpponent?.name, selectedOpponent?.logo]);
 
   const oppName = String(selectedOpponent?.name || '');
+  const oppAbbr = String(selectedOpponent?.abbr || '');
   const oppNorm = normalizeToken(oppName);
   const oppTailNorm = normalizeToken(oppName.split(' ').slice(-1).join(' '));
   const oppWordTokens = normalizeWords(oppName).filter((w) => w.length >= 4);
+  const oppAbbrTokens = expandAliasCandidates(oppAbbr).map((abbr) => normalizeToken(abbr)).filter(Boolean);
+  const oppMatchTokens = new Set<string>([oppNorm, oppTailNorm, ...oppWordTokens, ...oppAbbrTokens].filter(Boolean));
   const h2hRecent = [...(gameLog || [])]
     .filter((g) => {
       const gameOppRaw = String(g.opponent || '');
       const gameOpp = normalizeToken(gameOppRaw);
       if (!gameOpp) return false;
+      if (oppAbbrTokens.some((abbr) => abbr === gameOpp)) {
+        return true;
+      }
       if (oppNorm && (gameOpp === oppNorm || gameOpp.includes(oppNorm) || oppNorm.includes(gameOpp))) {
         return true;
       }
@@ -733,7 +769,17 @@ function MatchupSection({
         return true;
       }
       const gameWords = normalizeWords(gameOppRaw);
-      return oppWordTokens.some((t) => gameWords.includes(t));
+      if (oppWordTokens.some((t) => gameWords.includes(t))) {
+        return true;
+      }
+      // Handle mixed feeds where one row uses abbreviation and another full name.
+      const gameTokens = new Set<string>([gameOpp, ...gameWords.map(normalizeToken)].filter(Boolean));
+      for (const token of gameTokens) {
+        if (oppMatchTokens.has(token)) {
+          return true;
+        }
+      }
+      return false;
     })
     .sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime())
     .slice(0, 5)
@@ -1137,7 +1183,7 @@ function LastFiveFormSection({
                   </div>
                   <div className="mt-1 text-[11px] font-semibold text-cyan-200/85">
                     {game.propLines
-                      ? `Line: PTS ${game.propLines.points ?? '-'} | REB ${game.propLines.rebounds ?? '-'} | AST ${game.propLines.assists ?? '-'}`
+                      ? `${game.lineSource === 'estimated_fallback' ? 'Estimated line' : 'Line'}: PTS ${game.propLines.points ?? '-'} | REB ${game.propLines.rebounds ?? '-'} | AST ${game.propLines.assists ?? '-'}`
                       : 'No confirmed line available for this game.'}
                   </div>
                 </div>
@@ -1697,6 +1743,12 @@ export default function PlayerProfilePage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [followLoading, setFollowLoading] = useState(false);
+  const lastGoodProfileRef = useRef<PlayerProfileData | null>(null);
+  const [scoutRecent, setScoutRecent] = useState<ScoutRecentEntry[]>([]);
+  const [scoutPlayers, setScoutPlayers] = useState<Array<{ name: string; team: string; sport: string }>>([]);
+  const [scoutTeams, setScoutTeams] = useState<Array<{ id: string; alias: string; name: string }>>([]);
+  const { flags } = useFeatureFlags();
+  const scoutEnabled = Boolean(flags.PREMIUM_SCOUT_FLOW_ENABLED);
   
   // Watchboard hook for follow functionality
   const { 
@@ -1704,6 +1756,63 @@ export default function PlayerProfilePage() {
     followPlayer,
     unfollowPlayerByName
   } = useWatchboards();
+
+  const hasCoreProfileData = useCallback((payload: any): payload is PlayerProfileData => {
+    if (!payload || !payload.player) return false;
+    const hasGameLog = Array.isArray(payload.gameLog) && payload.gameLog.length > 0;
+    const hasSeason = payload.seasonAverages && Object.keys(payload.seasonAverages).length > 0;
+    const hasMatchup = Boolean(payload.matchup?.opponent);
+    return hasGameLog || hasSeason || hasMatchup;
+  }, []);
+
+  const hasAnyRecentPropLine = useCallback((payload: any): boolean => {
+    const rows = Array.isArray(payload?.recentPerformance) ? payload.recentPerformance : [];
+    if (rows.length === 0) return false;
+    return rows.some((row: any) => {
+      const lines = row?.propLines;
+      if (!lines) return false;
+      return [lines.points, lines.rebounds, lines.assists].some((v) => Number.isFinite(Number(v)));
+    });
+  }, []);
+
+  const profileQualityScore = useCallback((payload: any): number => {
+    if (!payload) return 0;
+    const gameLogCount = Array.isArray(payload.gameLog) ? payload.gameLog.length : 0;
+    const seasonCount = payload?.seasonAverages ? Object.keys(payload.seasonAverages).length : 0;
+    const recentCount = Array.isArray(payload?.recentPerformance) ? payload.recentPerformance.length : 0;
+    const hasMatchup = Boolean(payload?.matchup?.opponent) ? 1 : 0;
+    const hasProps = Array.isArray(payload?.currentProps) && payload.currentProps.length > 0 ? 1 : 0;
+    const hasRecentLines = hasAnyRecentPropLine(payload) ? 1 : 0;
+    return gameLogCount + seasonCount * 3 + recentCount * 2 + hasMatchup * 30 + hasProps * 10 + hasRecentLines * 18;
+  }, [hasAnyRecentPropLine]);
+
+  const readPersistentLastGood = useCallback((key: string): PlayerProfileData | null => {
+    if (typeof window === 'undefined') return null;
+    try {
+      const raw = window.localStorage.getItem(key);
+      if (!raw) return null;
+      const parsed = JSON.parse(raw);
+      return hasCoreProfileData(parsed) ? parsed : null;
+    } catch {
+      return null;
+    }
+  }, [hasCoreProfileData]);
+
+  const writePersistentLastGood = useCallback((key: string, payload: PlayerProfileData): void => {
+    if (typeof window === 'undefined') return;
+    if (!hasCoreProfileData(payload)) return;
+    try {
+      // Keep a compact snapshot to avoid localStorage bloat.
+      const compact: PlayerProfileData = {
+        ...payload,
+        gameLog: Array.isArray(payload.gameLog) ? payload.gameLog.slice(0, 80) : [],
+        recentPerformance: Array.isArray(payload.recentPerformance) ? payload.recentPerformance.slice(0, 10) : [],
+      };
+      window.localStorage.setItem(key, JSON.stringify(compact));
+    } catch {
+      // Non-fatal persistence failure.
+    }
+  }, [hasCoreProfileData]);
   
   useEffect(() => {
     if (!sport || !playerName) return;
@@ -1714,49 +1823,93 @@ export default function PlayerProfilePage() {
         .replace(/\u2019/g, "'")
         .trim();
     const normalizedPlayerName = normalizePlayerSlug(decodedPlayerName);
-    const cacheKey = `player-profile:${sport.toUpperCase()}:${decodedPlayerName}`;
-    const cached = getRouteCache<PlayerProfileData>(cacheKey, 120_000);
-    if (cached) {
-      setData(cached);
+    const cacheKey = `player-profile:v2:${sport.toUpperCase()}:${decodedPlayerName}`;
+    const persistentKey = `player-profile:last-good:v2:${sport.toUpperCase()}:${decodedPlayerName}`;
+    const cachedRaw = getRouteCache<PlayerProfileData>(cacheKey, 120_000);
+    const cached = cachedRaw && hasCoreProfileData(cachedRaw) ? cachedRaw : readPersistentLastGood(persistentKey);
+    const cachedNeedsLineRecovery = Boolean(cached) && !hasAnyRecentPropLine(cached);
+    // Player-scoped lock: reset carry-over from previous route transitions.
+    lastGoodProfileRef.current = cached ?? null;
+    if (cached && hasCoreProfileData(cached)) {
+      setData((prev) => {
+        if (!prev) return cached;
+        return profileQualityScore(cached) >= profileQualityScore(prev) ? cached : prev;
+      });
       setLoading(false);
     }
     
     const fetchProfile = async () => {
+      const loadStartedAt = Date.now();
+      let apiCalls = 0;
       if (!cached) {
         setLoading(true);
       }
       setError(null);
       
       try {
-        const primaryUrl = `/api/player/${sport}/${encodeURIComponent(decodedPlayerName)}`;
+        const unwrapProfile = (payload: any): any => {
+          if (payload && typeof payload === "object" && payload.data && typeof payload.data === "object") {
+            return payload.data.profile ?? null;
+          }
+          return payload;
+        };
+        const fetchDirectProfile = async (url: string, timeoutMs: number): Promise<any> => {
+          const controller = new AbortController();
+          const timer = setTimeout(() => controller.abort(), timeoutMs);
+          try {
+            const res = await fetch(url, { credentials: 'include', signal: controller.signal });
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            const json = await res.json();
+            return unwrapProfile(json);
+          } finally {
+            clearTimeout(timer);
+          }
+        };
+        const isSparseProfilePayload = (payload: any): boolean => {
+          if (!payload) return true;
+          const gameLogCount = Array.isArray(payload.gameLog) ? payload.gameLog.length : 0;
+          const seasonCount = payload?.seasonAverages ? Object.keys(payload.seasonAverages).length : 0;
+          const recentCount = Array.isArray(payload?.recentPerformance) ? payload.recentPerformance.length : 0;
+          const hasMatchup = Boolean(payload?.matchup?.opponent);
+          const hasLines = hasAnyRecentPropLine(payload);
+          // Treat "player-only" payloads as degraded so we force one hard recovery pass.
+          return gameLogCount === 0 && seasonCount === 0 && recentCount === 0 && !hasMatchup && !hasLines;
+        };
+        const primaryUrl = `/api/page-data/player-profile?sport=${encodeURIComponent(sport)}&playerName=${encodeURIComponent(decodedPlayerName)}`;
         const normalizedUrl = normalizedPlayerName && normalizedPlayerName !== decodedPlayerName
-          ? `/api/player/${sport}/${encodeURIComponent(normalizedPlayerName)}`
+          ? `/api/page-data/player-profile?sport=${encodeURIComponent(sport)}&playerName=${encodeURIComponent(normalizedPlayerName)}`
           : null;
         const apiUrl = primaryUrl;
+        const warmUrl = cachedNeedsLineRecovery
+          ? `${primaryUrl}${primaryUrl.includes('?') ? '&' : '?'}fresh=1`
+          : primaryUrl;
         let profileData: any;
         try {
-          profileData = await fetchJsonCached<any>(primaryUrl, {
-            cacheKey: `player-api:${sport.toUpperCase()}:${decodedPlayerName}`,
+            apiCalls += 1;
+            const envelope = await fetchJsonCached<any>(warmUrl, {
+            cacheKey: `player-api:v2:${sport.toUpperCase()}:${decodedPlayerName}`,
             ttlMs: 45_000,
-            timeoutMs: 8_000,
+            timeoutMs: cachedNeedsLineRecovery ? 14_000 : 8_000,
+            bypassCache: cachedNeedsLineRecovery,
             init: { credentials: 'include' },
           });
+            profileData = unwrapProfile(envelope);
         } catch (err: any) {
           const message = String(err?.message || '');
           // Only do an explicit fallback request for 404, and keep it tightly timed.
           if (message.includes('HTTP 404') || message.toLowerCase().includes('timeout') || String(err?.name || '') === 'AbortError') {
             const controller = new AbortController();
-            const retryTimeoutMs = message.includes('HTTP 404') ? 2500 : 12000;
+            const retryTimeoutMs = message.includes('HTTP 404') ? 2500 : 16000;
             const timer = setTimeout(() => controller.abort(), retryTimeoutMs);
             try {
               const fallbackRes = await fetch(primaryUrl, { credentials: 'include', signal: controller.signal });
               if (fallbackRes.ok) {
-                profileData = await fallbackRes.json();
+                profileData = unwrapProfile(await fallbackRes.json());
               } else if (fallbackRes.status === 404 && normalizedUrl) {
                 // Accent/diacritics fallback (e.g., Jokić -> Jokic).
                 const normalizedRes = await fetch(normalizedUrl, { credentials: 'include', signal: controller.signal });
                 if (normalizedRes.ok) {
-                  profileData = await normalizedRes.json();
+                  profileData = unwrapProfile(await normalizedRes.json());
                 } else if (normalizedRes.status === 404) {
                   const errData = await fallbackRes.json();
                   profileData = { __fallback404: true, errData };
@@ -1782,6 +1935,10 @@ export default function PlayerProfilePage() {
         }
         if (profileData?.__fallback404) {
           const errData = profileData.errData;
+          if (lastGoodProfileRef.current) {
+            setData(lastGoodProfileRef.current);
+            return;
+          }
           // Use fallback data if provided
           if (errData.fallback) {
             const fallbackData: PlayerProfileData = {
@@ -1802,31 +1959,34 @@ export default function PlayerProfilePage() {
               lastUpdated: new Date().toISOString(),
             };
             setData(fallbackData);
-            setRouteCache(cacheKey, fallbackData, 120_000);
             return;
           }
           throw new Error('Player not found');
         }
 
-        // Self-heal stale cached profile payloads that lost matchup logo/upcoming data.
+        // Self-heal stale cached profile payloads that lost matchup/logo/upcoming/prop-lines data.
         const matchup = profileData?.matchup;
         const upcoming = Array.isArray(matchup?.upcomingOpponents) ? matchup.upcomingOpponents : [];
+        const hasRecentRows = Array.isArray(profileData?.recentPerformance) && profileData.recentPerformance.length > 0;
+        const noRecentLines = hasRecentRows && !hasAnyRecentPropLine(profileData);
         const needsMatchupRefresh =
           Boolean(matchup)
           && (
             !matchup?.opponent?.logo
             || (!matchup?.gameTime && upcoming.length === 0)
           );
-        if (needsMatchupRefresh) {
+        const needsOddsRefresh = noRecentLines;
+        if (needsMatchupRefresh || needsOddsRefresh) {
           try {
             const freshUrl = `${apiUrl}${apiUrl.includes('?') ? '&' : '?'}fresh=1`;
-            const refreshed = await fetchJsonCached<any>(freshUrl, {
-              cacheKey: `player-api-fresh:${sport.toUpperCase()}:${decodedPlayerName}`,
+            const refreshedEnvelope = await fetchJsonCached<any>(freshUrl, {
+              cacheKey: `player-api-fresh:v2:${sport.toUpperCase()}:${decodedPlayerName}`,
               ttlMs: 30_000,
               timeoutMs: 9_000,
               bypassCache: true,
               init: { credentials: 'include' },
             });
+            const refreshed = unwrapProfile(refreshedEnvelope);
             if (refreshed) {
               profileData = refreshed;
             }
@@ -1835,18 +1995,102 @@ export default function PlayerProfilePage() {
           }
         }
 
-        setData(profileData);
-        setRouteCache(cacheKey, profileData, 180_000);
+        if (!hasCoreProfileData(profileData)) {
+          // Hard self-heal: don't let transient degraded payloads replace known-good data.
+          const refreshCandidates = [
+            `${primaryUrl}${primaryUrl.includes('?') ? '&' : '?'}fresh=1`,
+            ...(normalizedUrl ? [`${normalizedUrl}${normalizedUrl.includes('?') ? '&' : '?'}fresh=1`] : []),
+          ];
+          for (const candidate of refreshCandidates) {
+            try {
+              const refreshedEnvelope = await fetchJsonCached<any>(candidate, {
+                cacheKey: `player-api-recover:v2:${sport.toUpperCase()}:${decodedPlayerName}:${candidate}`,
+                ttlMs: 20_000,
+                timeoutMs: 12_000,
+                bypassCache: true,
+                init: { credentials: 'include' },
+              });
+              const refreshed = unwrapProfile(refreshedEnvelope);
+              if (hasCoreProfileData(refreshed)) {
+                profileData = refreshed;
+                break;
+              }
+            } catch {
+              // Keep trying next candidate.
+            }
+          }
+        }
+
+        // Final hard recovery before accepting a sparse/degraded payload:
+        // bypass app-level cache fallback by using direct fetch with longer timeout.
+        if (isSparseProfilePayload(profileData)) {
+          const directCandidates = [
+            `${primaryUrl}${primaryUrl.includes('?') ? '&' : '?'}fresh=1`,
+            ...(normalizedUrl ? [`${normalizedUrl}${normalizedUrl.includes('?') ? '&' : '?'}fresh=1`] : []),
+          ];
+          for (const candidate of directCandidates) {
+            try {
+              const recovered = await fetchDirectProfile(candidate, 20_000);
+              if (!isSparseProfilePayload(recovered) || hasCoreProfileData(recovered)) {
+                profileData = recovered;
+                break;
+              }
+            } catch {
+              // Continue to next candidate.
+            }
+          }
+        }
+
+        if (hasCoreProfileData(profileData)) {
+          const previousGood = lastGoodProfileRef.current;
+          const nextQuality = profileQualityScore(profileData);
+          const prevQuality = profileQualityScore(previousGood);
+          const isDowngrade =
+            Boolean(previousGood)
+            && nextQuality < prevQuality * 0.6
+            && (Array.isArray(previousGood?.gameLog) ? previousGood!.gameLog.length : 0)
+              > (Array.isArray(profileData?.gameLog) ? profileData.gameLog.length : 0);
+          if (!isDowngrade) {
+            setData(profileData);
+            lastGoodProfileRef.current = profileData;
+            setRouteCache(cacheKey, profileData, 180_000);
+            writePersistentLastGood(persistentKey, profileData);
+          } else if (previousGood) {
+            setData(previousGood);
+          }
+        } else if (lastGoodProfileRef.current) {
+          setData(lastGoodProfileRef.current);
+        } else if (!isSparseProfilePayload(profileData)) {
+          setData(profileData);
+        } else {
+          setError('Player data is temporarily delayed. Please retry in a moment.');
+        }
       } catch (err: any) {
         console.error('Failed to fetch player profile:', err);
+        if (lastGoodProfileRef.current) {
+          setData(lastGoodProfileRef.current);
+          setError(null);
+          return;
+        }
         setError(err.message || 'Failed to load player profile');
       } finally {
+        void fetch("/api/page-data/telemetry", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          credentials: "include",
+          body: JSON.stringify({
+            route: "player-profile",
+            loadMs: Math.max(0, Date.now() - loadStartedAt),
+            apiCalls: Math.max(1, apiCalls),
+            oddsAvailableAtFirstRender: false,
+          }),
+        }).catch(() => undefined);
         setLoading(false);
       }
     };
     
     fetchProfile();
-  }, [sport, playerName]);
+  }, [sport, playerName, decodedPlayerName, hasCoreProfileData, hasAnyRecentPropLine, profileQualityScore, readPersistentLastGood, writePersistentLastGood]);
   
   // Check if current player is followed
   const isFollowing = useMemo(() => {
@@ -1882,6 +2126,120 @@ export default function PlayerProfilePage() {
       setFollowLoading(false);
     }
   }, [data?.player, sport, isFollowing, followLoading, followPlayer, unfollowPlayerByName]);
+
+  useEffect(() => {
+    if (!sport || !decodedPlayerName) return;
+    if (!scoutEnabled) return;
+    const key = "scout-flow:recent:v1";
+    try {
+      const raw = window.localStorage.getItem(key);
+      const parsed = raw ? (JSON.parse(raw) as ScoutRecentEntry[]) : [];
+      const next: ScoutRecentEntry = {
+        type: "player",
+        label: decodedPlayerName,
+        subtitle: data?.player?.teamName || undefined,
+        sport: sport.toUpperCase(),
+        path: `/props/player/${encodeURIComponent(sport)}/${encodeURIComponent(decodedPlayerName)}`,
+        ts: Date.now(),
+      };
+      const merged = [next, ...parsed.filter((row) => row.path !== next.path)].slice(0, 12);
+      window.localStorage.setItem(key, JSON.stringify(merged));
+      setScoutRecent(merged);
+    } catch {
+      // Ignore localStorage failures.
+    }
+  }, [sport, decodedPlayerName, data?.player?.teamName, scoutEnabled]);
+
+  useEffect(() => {
+    if (!scoutEnabled || !sport) return;
+    let cancelled = false;
+    (async () => {
+      const sportUpper = sport.toUpperCase();
+      const players = await fetchJsonCached<{ props?: Array<{ player_name?: string; team?: string; sport?: string }> }>(
+        `/api/sports-data/props/today?sport=${encodeURIComponent(sportUpper)}&limit=220&offset=0`,
+        {
+          cacheKey: `scout-flow:players:${sportUpper}:v1`,
+          ttlMs: 45_000,
+          timeoutMs: 4_500,
+          init: { credentials: "include" },
+        }
+      ).catch(() => ({ props: [] }));
+      const standings = await fetchJsonCached<{ teams?: Array<{ id?: string; alias?: string; name?: string }> }>(
+        `/api/teams/${encodeURIComponent(sportUpper)}/standings`,
+        {
+          cacheKey: `scout-flow:teams:${sportUpper}:v1`,
+          ttlMs: 90_000,
+          timeoutMs: 4_500,
+          init: { credentials: "include" },
+        }
+      ).catch(() => ({ teams: [] }));
+
+      if (cancelled) return;
+      const playerMap = new Map<string, { name: string; team: string; sport: string }>();
+      for (const row of Array.isArray(players?.props) ? players.props : []) {
+        const name = String(row?.player_name || "").trim();
+        if (!name) continue;
+        const key = name.toLowerCase();
+        if (!playerMap.has(key)) {
+          playerMap.set(key, {
+            name,
+            team: String(row?.team || "").trim(),
+            sport: String(row?.sport || sportUpper).toUpperCase(),
+          });
+        }
+      }
+      setScoutPlayers(Array.from(playerMap.values()).slice(0, 150));
+      setScoutTeams(
+        (Array.isArray(standings?.teams) ? standings.teams : [])
+          .map((row) => ({
+            id: String(row?.id || "").trim(),
+            alias: String(row?.alias || "").trim().toUpperCase(),
+            name: String(row?.name || "").trim(),
+          }))
+          .filter((row) => row.id && row.alias)
+          .slice(0, 40)
+      );
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [sport, scoutEnabled]);
+
+  const scoutItems = useMemo<ScoutFlowItem[]>(() => {
+    if (!scoutEnabled || !sport) return [];
+    const sportUpper = sport.toUpperCase();
+    const recentItems: ScoutFlowItem[] = scoutRecent
+      .filter((row) => row.sport === sportUpper)
+      .slice(0, 6)
+      .map((row) => ({
+        id: `recent:${row.path}`,
+        label: row.label,
+        subtitle: row.subtitle || "Recent view",
+        kind: "recent",
+        onSelect: () => navigate(row.path),
+      }));
+
+    const playerItems: ScoutFlowItem[] = scoutPlayers
+      .filter((row) => row.name !== decodedPlayerName)
+      .slice(0, 12)
+      .map((row) => ({
+        id: `player:${row.name}`,
+        label: row.name,
+        subtitle: row.team || "Player",
+        kind: "player",
+        onSelect: () => navigate(`/props/player/${encodeURIComponent(sport)}/${encodeURIComponent(row.name)}`),
+      }));
+
+    const teamItems: ScoutFlowItem[] = scoutTeams.slice(0, 10).map((row) => ({
+      id: `team:${row.id}`,
+      label: row.name || row.alias,
+      subtitle: row.alias,
+      kind: "team",
+      onSelect: () => navigate(`/sports/${String(sport).toLowerCase()}/team/${encodeURIComponent(row.id)}`),
+    }));
+
+    return [...recentItems, ...playerItems, ...teamItems];
+  }, [scoutEnabled, sport, scoutRecent, scoutPlayers, scoutTeams, decodedPlayerName, navigate]);
   
   // Calculate season averages to display
   const displayAverages = useMemo(() => {
@@ -1944,6 +2302,24 @@ export default function PlayerProfilePage() {
         {/* Player Profile */}
         {data && !loading && (
           <>
+            {scoutEnabled && (
+              <PremiumScoutFlowBar
+                title="Coach G Flow"
+                placeholder="Jump to player or team..."
+                items={scoutItems}
+                quickActions={[
+                  { id: "props", label: "All Props", onClick: () => navigate("/props") },
+                  {
+                    id: "team",
+                    label: data?.player?.teamName || "Team",
+                    onClick: () => {
+                      const hit = scoutTeams.find((t) => t.alias === String(data?.player?.teamAbbr || "").toUpperCase());
+                      if (hit?.id) navigate(`/sports/${String(sport || "").toLowerCase()}/team/${encodeURIComponent(hit.id)}`);
+                    },
+                  },
+                ]}
+              />
+            )}
             {/* Hero Section */}
             <div className="bg-white/[0.02] rounded-2xl border border-white/[0.06] overflow-hidden">
               <PlayerHero 

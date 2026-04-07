@@ -765,6 +765,7 @@ export default function UniversalPlayerPage() {
   const [loading, setLoading] = useState(true);
   const [_error, setError] = useState<string | null>(null);
   const [player, setPlayer] = useState<PlayerData | null>(null);
+  const [canonicalTeamRouteId, setCanonicalTeamRouteId] = useState<string>("");
   const [seasonStats, setSeasonStats] = useState<SeasonStat[]>([]);
   const [recentGames, setRecentGames] = useState<RecentGame[]>([]);
   const [gameLog, setGameLog] = useState<GameLogEntry[]>([]);
@@ -779,6 +780,8 @@ export default function UniversalPlayerPage() {
     if (!playerId || !sportKey) return;
     
     const fetchPlayerData = async () => {
+      const loadStartedAt = Date.now();
+      let apiCalls = 0;
       setLoading(true);
       setError(null);
       
@@ -788,21 +791,29 @@ export default function UniversalPlayerPage() {
           p.charAt(0).toUpperCase() + p.slice(1)
         ).join(' ');
         
-        const res = await fetch(`/api/player/${sportLower.toUpperCase()}/${encodeURIComponent(playerName)}`);
+        apiCalls += 1;
+        const res = await fetch(`/api/page-data/player-profile?sport=${encodeURIComponent(sportLower.toUpperCase())}&playerName=${encodeURIComponent(playerName)}`, {
+          credentials: "include",
+        });
         
         if (!res.ok) {
           // Try fallback with raw playerId
-          const fallbackRes = await fetch(`/api/player/${sportLower.toUpperCase()}/${encodeURIComponent(playerId)}`);
+          apiCalls += 1;
+          const fallbackRes = await fetch(`/api/page-data/player-profile?sport=${encodeURIComponent(sportLower.toUpperCase())}&playerName=${encodeURIComponent(playerId)}`, {
+            credentials: "include",
+          });
           if (!fallbackRes.ok) {
             throw new Error('Player not found');
           }
-          const data = await fallbackRes.json() as APIPlayerResponse;
-          processPlayerData(data);
+          const payload = await fallbackRes.json() as { data?: { profile?: APIPlayerResponse; canonicalTeamRouteId?: string | null } };
+          processPlayerData(payload?.data?.profile as APIPlayerResponse);
+          setCanonicalTeamRouteId(String(payload?.data?.canonicalTeamRouteId || "").trim());
           return;
         }
         
-        const data = await res.json() as APIPlayerResponse;
-        processPlayerData(data);
+        const payload = await res.json() as { data?: { profile?: APIPlayerResponse; canonicalTeamRouteId?: string | null } };
+        processPlayerData(payload?.data?.profile as APIPlayerResponse);
+        setCanonicalTeamRouteId(String(payload?.data?.canonicalTeamRouteId || "").trim());
         
       } catch (err) {
         console.error('Error fetching player:', err);
@@ -817,11 +828,25 @@ export default function UniversalPlayerPage() {
         setNews(getMockNews());
         setNextGame(getMockNextGame(sportLower));
       } finally {
+        void fetch("/api/page-data/telemetry", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          credentials: "include",
+          body: JSON.stringify({
+            route: "universal-player",
+            loadMs: Math.max(0, Date.now() - loadStartedAt),
+            apiCalls: Math.max(1, apiCalls),
+            oddsAvailableAtFirstRender: false,
+          }),
+        }).catch(() => undefined);
         setLoading(false);
       }
     };
     
     const processPlayerData = (data: APIPlayerResponse) => {
+      if (!data || !data.player) {
+        throw new Error("Player not found");
+      }
       const p = data.player;
       
       // Map API response to PlayerData
@@ -832,6 +857,7 @@ export default function UniversalPlayerPage() {
         position: p.position || '',
         team: p.teamName || '',
         teamCode: p.teamAbbr || '',
+        teamId: (p as any)?.teamId ? String((p as any).teamId) : undefined,
         height: p.height || '',
         weight: p.weight || '',
         experience: p.experience,
@@ -904,6 +930,46 @@ export default function UniversalPlayerPage() {
     fetchPlayerData();
   }, [playerId, sportKey, sportLower]);
 
+  useEffect(() => {
+    if (canonicalTeamRouteId) return;
+    const teamCode = String(player?.teamCode || "").trim().toUpperCase();
+    const directTeamId = String(player?.teamId || "").trim();
+    if (!teamCode && !directTeamId) {
+      setCanonicalTeamRouteId("");
+      return;
+    }
+    const controller = new AbortController();
+    const resolveTeamId = async () => {
+      if (directTeamId) setCanonicalTeamRouteId(directTeamId);
+      try {
+        const res = await fetch(`/api/teams/${sportLower.toUpperCase()}/standings`, {
+          signal: controller.signal,
+          credentials: "include",
+          cache: "no-store",
+        });
+        if (!res.ok) return;
+        const json = await res.json().catch(() => null) as any;
+        const teams = Array.isArray(json?.teams) ? json.teams : [];
+        const aliasMap: Record<string, string[]> = {
+          GSW: ["GS"],
+          NYK: ["NY"],
+          SAS: ["SA"],
+          NOP: ["NO"],
+          PHX: ["PHO"],
+        };
+        const candidates = new Set<string>([teamCode]);
+        for (const alt of aliasMap[teamCode] || []) candidates.add(alt);
+        const match = teams.find((row: any) => candidates.has(String(row?.alias || "").trim().toUpperCase()));
+        const resolved = String(match?.id || "").trim();
+        if (resolved) setCanonicalTeamRouteId(resolved);
+      } catch (err) {
+        if (err instanceof DOMException && err.name === "AbortError") return;
+      }
+    };
+    resolveTeamId();
+    return () => controller.abort();
+  }, [canonicalTeamRouteId, player?.teamCode, player?.teamId, sportLower]);
+
   if (loading) {
     return (
       <div className="min-h-screen bg-gradient-to-br from-slate-950 via-slate-900 to-slate-950 flex items-center justify-center">
@@ -921,6 +987,7 @@ export default function UniversalPlayerPage() {
   }
 
   const teamLogoUrl = getTeamLogoUrl(player.teamCode, sportLower.toUpperCase());
+  const teamRouteId = canonicalTeamRouteId || String(player.teamId || "").trim() || player.teamCode;
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-950 via-slate-900 to-slate-950 pb-20">
@@ -934,7 +1001,7 @@ export default function UniversalPlayerPage() {
             <ArrowLeft className="w-5 h-5 text-white/70" />
           </button>
           <Link 
-            to={`/sports/${sportLower}/team/${player.teamCode}`}
+            to={`/sports/${sportLower}/team/${encodeURIComponent(teamRouteId)}`}
             className="flex items-center gap-3 hover:opacity-80 transition-opacity"
           >
             {teamLogoUrl && (
@@ -991,7 +1058,7 @@ export default function UniversalPlayerPage() {
               </div>
               <h1 className="text-3xl md:text-4xl lg:text-5xl font-black text-white mb-2">{player.name}</h1>
               <Link 
-                to={`/sports/${sportLower}/team/${player.teamCode}`}
+                to={`/sports/${sportLower}/team/${encodeURIComponent(teamRouteId)}`}
                 className="text-white/60 text-lg hover:text-white/80 transition-colors inline-flex items-center gap-2"
               >
                 {player.team}

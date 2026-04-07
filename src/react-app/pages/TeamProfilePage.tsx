@@ -17,6 +17,8 @@ import { motion, AnimatePresence } from "framer-motion";
 import FavoriteEntityButton from "@/react-app/components/FavoriteEntityButton";
 import { fetchJsonCached } from "@/react-app/lib/fetchCache";
 import { getRouteCache, setRouteCache } from "@/react-app/lib/routeDataCache";
+import { useFeatureFlags } from "@/react-app/hooks/useFeatureFlags";
+import PremiumScoutFlowBar, { type ScoutFlowItem } from "@/react-app/components/PremiumScoutFlowBar";
 
 // ============================================
 // TYPES
@@ -135,6 +137,18 @@ interface TeamH2HData {
     teamACoverResult: 'cover' | 'no_cover' | 'push' | null;
     totalResult: 'over' | 'under' | 'push' | null;
   }>;
+}
+
+const FALLBACK_AVATAR_SVG =
+  "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='32' fill='%23101724'/%3E%3Ccircle cx='32' cy='24' r='12' fill='%234b5563'/%3E%3Cpath d='M12 56c3-10 11-16 20-16s17 6 20 16' fill='%234b5563'/%3E%3C/svg%3E";
+
+interface ScoutRecentEntry {
+  type: "player" | "team";
+  label: string;
+  subtitle?: string;
+  sport: string;
+  path: string;
+  ts: number;
 }
 
 function safeNum(value: unknown): number | undefined {
@@ -534,7 +548,9 @@ function RosterPreview({ roster, sportKey }: { roster: RosterPlayer[]; sportKey:
                         className="w-full h-full object-cover"
                         onError={(e) => {
                           const target = e.target as HTMLImageElement;
-                          target.style.display = 'none';
+                          if (target.src !== FALLBACK_AVATAR_SVG) {
+                            target.src = FALLBACK_AVATAR_SVG;
+                          }
                         }}
                       />
                     ) : (
@@ -580,7 +596,9 @@ function RosterPreview({ roster, sportKey }: { roster: RosterPlayer[]; sportKey:
                         className="w-full h-full object-cover"
                         onError={(e) => {
                           const target = e.target as HTMLImageElement;
-                          target.style.display = 'none';
+                          if (target.src !== FALLBACK_AVATAR_SVG) {
+                            target.src = FALLBACK_AVATAR_SVG;
+                          }
                         }}
                       />
                     ) : (
@@ -914,6 +932,10 @@ function TeamMatchupEdgeSection({
     },
     { cover: 0, noCover: 0, push: 0 }
   );
+  const atsSampleWithLine = lineOutcomes.filter((row) => row.ats !== 'No Line').length;
+  const l5AtsLabel = atsSampleWithLine > 0
+    ? `${atsSummary.cover}-${atsSummary.noCover}-${atsSummary.push}`
+    : 'No Line';
 
   const selectedOpponent = opponents[oppIdx] || null;
   const fallbackH2H = useMemo(() => {
@@ -1002,7 +1024,7 @@ function TeamMatchupEdgeSection({
         <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
           <div className="rounded-lg bg-white/[0.04] border border-white/[0.07] p-3 text-center">
             <div className="text-xs text-white/45">L5 ATS</div>
-            <div className="mt-1 text-lg font-bold text-white">{`${atsSummary.cover}-${atsSummary.noCover}-${atsSummary.push}`}</div>
+            <div className="mt-1 text-lg font-bold text-white">{l5AtsLabel}</div>
           </div>
           <div className="rounded-lg bg-white/[0.04] border border-white/[0.07] p-3 text-center">
             <div className="text-xs text-white/45">H2H Series</div>
@@ -1132,7 +1154,9 @@ function InjuriesPreview({ injuries }: { injuries: TeamInjury[] }) {
                     className="w-full h-full object-cover"
                     onError={(e) => {
                       const target = e.target as HTMLImageElement;
-                      target.style.display = 'none';
+                      if (target.src !== FALLBACK_AVATAR_SVG) {
+                        target.src = FALLBACK_AVATAR_SVG;
+                      }
                     }}
                   />
                 ) : (
@@ -1214,14 +1238,65 @@ function ErrorState({ message, onRetry }: { message: string; onRetry: () => void
 export function TeamProfilePage() {
   const { sportKey, teamId } = useParams<{ sportKey: string; teamId: string }>();
   const navigate = useNavigate();
+  const { flags } = useFeatureFlags();
+  const scoutEnabled = Boolean(flags.PREMIUM_SCOUT_FLOW_ENABLED);
   
   const [data, setData] = useState<TeamProfileData | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [scoutRecent, setScoutRecent] = useState<ScoutRecentEntry[]>([]);
+  const [scoutPlayers, setScoutPlayers] = useState<Array<{ name: string; team: string; sport: string }>>([]);
+  const [scoutTeams, setScoutTeams] = useState<Array<{ id: string; alias: string; name: string }>>([]);
+
+  useEffect(() => {
+    if (!sportKey || !teamId) return;
+    if (sportKey.toUpperCase() !== "NBA") return;
+    const raw = String(teamId).trim();
+    if (/^[0-9a-f]{8}-[0-9a-f-]{27}$/i.test(raw)) return;
+
+    const controller = new AbortController();
+    const resolveCanonicalRoute = async () => {
+      try {
+        const res = await fetch(`/api/teams/NBA/standings`, {
+          credentials: "include",
+          cache: "no-store",
+          signal: controller.signal,
+        });
+        if (!res.ok) return;
+        const json = await res.json().catch(() => null) as any;
+        const teams = Array.isArray(json?.teams) ? json.teams : [];
+        const alias = raw.toUpperCase();
+        const aliasMap: Record<string, string[]> = {
+          GSW: ["GS"],
+          NYK: ["NY"],
+          SAS: ["SA"],
+          NOP: ["NO"],
+          PHX: ["PHO"],
+        };
+        const candidates = new Set<string>([alias]);
+        for (const alt of aliasMap[alias] || []) candidates.add(alt);
+        const row = teams.find((t: any) => {
+          const id = String(t?.id || "").trim();
+          const rowAlias = String(t?.alias || "").trim().toUpperCase();
+          return id === raw || candidates.has(rowAlias);
+        });
+        const canonical = String(row?.id || "").trim();
+        if (canonical && canonical !== raw) {
+          navigate(`/sports/${sportKey.toLowerCase()}/team/${encodeURIComponent(canonical)}`, { replace: true });
+        }
+      } catch (err) {
+        if (err instanceof DOMException && err.name === "AbortError") return;
+      }
+    };
+    resolveCanonicalRoute();
+    return () => controller.abort();
+  }, [sportKey, teamId, navigate]);
 
   const fetchTeamData = async () => {
     if (!sportKey || !teamId) return;
-    const cacheKey = `team-profile:v10:${sportKey.toUpperCase()}:${teamId}`;
+    const loadStartedAt = Date.now();
+    let apiCalls = 0;
+    const cacheKey = `team-profile:v12:${sportKey.toUpperCase()}:${teamId}`;
     const cached = getRouteCache<TeamProfileData>(cacheKey, 180_000);
     const lastGood = cached || data;
     if (cached) {
@@ -1236,73 +1311,90 @@ export function TeamProfilePage() {
     
     try {
       const sportUpper = sportKey.toUpperCase();
-      // Fetch team profile, schedule, stats, standings, and sport games in parallel
-      const [profileJson, scheduleJson, statsJson, standingsJson, gamesJson, injuriesJson, splitsJson] = await Promise.all([
-        fetchJsonCached<any>(`/api/teams/${sportUpper}/${teamId}`, {
-          cacheKey: `team-profile:v10:${sportUpper}:${teamId}`,
+      let profileJson: any = null;
+      let scheduleJson: any = null;
+      let statsJson: any = null;
+      let standingsJson: any = null;
+      let gamesJson: any = null;
+      let injuriesJson: any = null;
+      let splitsJson: any = null;
+
+      apiCalls += 1;
+      const pageData = await fetchJsonCached<any>(
+        `/api/page-data/team-profile?sport=${encodeURIComponent(sportUpper)}&teamId=${encodeURIComponent(teamId)}`,
+        {
+          cacheKey: `page-data-team-profile:v1:${sportUpper}:${teamId}`,
           ttlMs: 60_000,
-          timeoutMs: 7_000,
-          init: { credentials: 'include' },
-        }),
-        fetchJsonCached<any>(`/api/teams/${sportUpper}/${teamId}/schedule`, {
-          cacheKey: `team-schedule:v10:${sportUpper}:${teamId}`,
-          ttlMs: 45_000,
-          timeoutMs: 20_000,
-          init: { credentials: 'include' },
-        }).catch(async () => {
-          try {
-            const controller = new AbortController();
-            const timer = setTimeout(() => controller.abort(), 45_000);
-            try {
-              const res = await fetch(`/api/teams/${sportUpper}/${teamId}/schedule?fresh=1`, {
-                credentials: 'include',
-                signal: controller.signal,
-              });
-              if (res.ok) return await res.json();
-              return await fetchJsonCached<any>(`/api/teams/${sportUpper}/${teamId}/schedule?fresh=1`, {
-                cacheKey: `team-schedule:v10-retry:${sportUpper}:${teamId}`,
-                ttlMs: 30_000,
-                timeoutMs: 30_000,
-                init: { credentials: 'include' },
-              });
-            } finally {
-              clearTimeout(timer);
+          timeoutMs: cached ? 2_200 : 2_800,
+          init: { credentials: "include" },
+        }
+      ).catch(() => null);
+
+      if (pageData?.data?.profileJson?.team) {
+        profileJson = pageData?.data?.profileJson || {};
+        scheduleJson = pageData?.data?.scheduleJson || { allGames: [], pastGames: [], upcomingGames: [] };
+        statsJson = pageData?.data?.statsJson || { stats: {}, rankings: {} };
+        standingsJson = pageData?.data?.standingsJson || { teams: [] };
+        gamesJson = pageData?.data?.gamesJson || { games: [] };
+        injuriesJson = pageData?.data?.injuriesJson || { injuries: [] };
+        splitsJson = pageData?.data?.splitsJson || { splits: null };
+      } else {
+        apiCalls += 7;
+        // Fallback safety path while route is being stabilized.
+        [profileJson, scheduleJson, statsJson, standingsJson, gamesJson, injuriesJson, splitsJson] = await Promise.all([
+          fetchJsonCached<any>(`/api/teams/${sportUpper}/${teamId}`, {
+            cacheKey: `team-profile:v12:${sportUpper}:${teamId}`,
+            ttlMs: 60_000,
+            timeoutMs: 7_000,
+            init: { credentials: 'include' },
+          }),
+          fetchJsonCached<any>(`/api/teams/${sportUpper}/${teamId}/schedule`, {
+            cacheKey: `team-schedule:v12:${sportUpper}:${teamId}`,
+            ttlMs: 45_000,
+            timeoutMs: cached ? 3_500 : 5_000,
+            init: { credentials: 'include' },
+          }).catch(async () => {
+            if (lastGood?.schedule?.length) {
+              return {
+                pastGames: lastGood.schedule.filter((g) => g?.status === 'final'),
+                upcomingGames: lastGood.schedule.filter((g) => g?.status !== 'final'),
+                allGames: lastGood.schedule,
+              };
             }
-          } catch {
             return { pastGames: [], upcomingGames: [], allGames: [] };
-          }
-        }),
-        fetchJsonCached<any>(`/api/teams/${sportUpper}/${teamId}/stats`, {
-          cacheKey: `team-stats:v10:${sportUpper}:${teamId}`,
-          ttlMs: 120_000,
-          timeoutMs: 4_500,
-          init: { credentials: 'include' },
-        }).catch(() => ({ stats: {}, rankings: {} })),
-        fetchJsonCached<any>(`/api/teams/${sportUpper}/standings`, {
-          cacheKey: `team-standings:v10:${sportUpper}`,
-          ttlMs: 90_000,
-          timeoutMs: 4_500,
-          init: { credentials: 'include' },
-        }).catch(() => ({ teams: [] })),
-        fetchJsonCached<any>(`/api/games?sport=${sportUpper}&includeOdds=1`, {
-          cacheKey: `games-lite:v10:${sportUpper}`,
-          ttlMs: 20_000,
-          timeoutMs: 4_000,
-          init: { credentials: 'include' },
-        }).catch(() => ({ games: [] })),
-        fetchJsonCached<any>(`/api/teams/${sportUpper}/${teamId}/injuries`, {
-          cacheKey: `team-injuries:v10:${sportUpper}:${teamId}`,
-          ttlMs: 45_000,
-          timeoutMs: 4_000,
-          init: { credentials: 'include' },
-        }).catch(() => ({ injuries: [] })),
-        fetchJsonCached<any>(`/api/teams/${sportUpper}/${teamId}/splits`, {
-          cacheKey: `team-splits:v10:${sportUpper}:${teamId}`,
-          ttlMs: 90_000,
-          timeoutMs: 4_000,
-          init: { credentials: 'include' },
-        }).catch(() => ({ splits: null })),
-      ]);
+          }),
+          fetchJsonCached<any>(`/api/teams/${sportUpper}/${teamId}/stats`, {
+            cacheKey: `team-stats:v12:${sportUpper}:${teamId}`,
+            ttlMs: 120_000,
+            timeoutMs: 4_500,
+            init: { credentials: 'include' },
+          }).catch(() => ({ stats: {}, rankings: {} })),
+          fetchJsonCached<any>(`/api/teams/${sportUpper}/standings`, {
+            cacheKey: `team-standings:v12:${sportUpper}`,
+            ttlMs: 90_000,
+            timeoutMs: 4_500,
+            init: { credentials: 'include' },
+          }).catch(() => ({ teams: [] })),
+          fetchJsonCached<any>(`/api/games?sport=${sportUpper}&includeOdds=0`, {
+            cacheKey: `games-lite:v12:${sportUpper}`,
+            ttlMs: 20_000,
+            timeoutMs: 2_500,
+            init: { credentials: 'include' },
+          }).catch(() => ({ games: [] })),
+          fetchJsonCached<any>(`/api/teams/${sportUpper}/${teamId}/injuries?fresh=1`, {
+            cacheKey: `team-injuries:v12:${sportUpper}:${teamId}`,
+            ttlMs: 30_000,
+            timeoutMs: 6_500,
+            init: { credentials: 'include' },
+          }).catch(() => ({ injuries: Array.isArray(lastGood?.injuries) ? lastGood!.injuries : [] })),
+          fetchJsonCached<any>(`/api/teams/${sportUpper}/${teamId}/splits`, {
+            cacheKey: `team-splits:v12:${sportUpper}:${teamId}`,
+            ttlMs: 90_000,
+            timeoutMs: 4_000,
+            init: { credentials: 'include' },
+          }).catch(() => ({ splits: null })),
+        ]);
+      }
       
       // Transform SportsRadar data to our format
       const teamAlias = profileJson.team?.alias || '';
@@ -1417,6 +1509,39 @@ export function TeamProfilePage() {
         return 'scheduled';
       };
       const isBasketballSport = new Set(['NBA', 'NCAAB']).has(sportUpper);
+      const expandAliasCandidates = (raw: string): Set<string> => {
+        const code = String(raw || '').trim().toUpperCase();
+        const out = new Set<string>();
+        if (!code) return out;
+        out.add(code);
+        const map: Record<string, string[]> = {
+          GSW: ['GS'],
+          GS: ['GSW'],
+          NYK: ['NY'],
+          NY: ['NYK'],
+          SAS: ['SA'],
+          SA: ['SAS'],
+          NOP: ['NO'],
+          NO: ['NOP'],
+          PHX: ['PHO'],
+          PHO: ['PHX'],
+          UTA: ['UTAH'],
+          UTAH: ['UTA'],
+        };
+        for (const alt of map[code] || []) out.add(alt);
+        return out;
+      };
+      const teamAliasCandidates = expandAliasCandidates(teamAliasUpper);
+      const isTeamAlias = (value: unknown): boolean => {
+        const code = String(value || '').trim().toUpperCase();
+        if (!code) return false;
+        if (teamAliasCandidates.has(code)) return true;
+        const reverse = expandAliasCandidates(code);
+        for (const t of teamAliasCandidates) {
+          if (reverse.has(t)) return true;
+        }
+        return false;
+      };
       const cleanScore = (value: number | undefined, status: 'final' | 'live' | 'scheduled') => {
         if (value === undefined) return undefined;
         if (isBasketballSport && status === 'final' && value === 0) return undefined;
@@ -1425,7 +1550,7 @@ export function TeamProfilePage() {
       const findRawGameMatch = (row: GameResult): any | null => {
         const rowId = String(row.id || '').trim();
         const rowDateTs = new Date(row.date).getTime();
-        const oppAbbr = String(row.opponent.abbreviation || '').toUpperCase();
+        const oppAbbr = String(row?.opponent?.abbreviation || '').toUpperCase();
 
         const byId = rawGames.find((g: any) => {
           const gid = String(g?.game_id || g?.id || '').trim();
@@ -1437,7 +1562,7 @@ export function TeamProfilePage() {
         return rawGames.find((g: any) => {
           const homeCode = String(g?.home_team_code || '').toUpperCase();
           const awayCode = String(g?.away_team_code || '').toUpperCase();
-          const hasTeam = teamAliasUpper && (homeCode === teamAliasUpper || awayCode === teamAliasUpper);
+          const hasTeam = teamAliasUpper && (isTeamAlias(homeCode) || isTeamAlias(awayCode));
           const hasOpp = oppAbbr && (homeCode === oppAbbr || awayCode === oppAbbr);
           if (!hasTeam || !hasOpp) return false;
           const feedTs = new Date(String(g?.start_time || g?.scheduled || '')).getTime();
@@ -1453,7 +1578,12 @@ export function TeamProfilePage() {
         const feedAwayScoreRaw = safeNum(feed?.away_score);
         const feedHomeScore = cleanScore(feedHomeScoreRaw, status);
         const feedAwayScore = cleanScore(feedAwayScoreRaw, status);
-        const isHome = String(feed?.home_team_code || '').toUpperCase() === teamAliasUpper;
+        const feedHomeCode = String(feed?.home_team_code || '').toUpperCase();
+        const feedAwayCode = String(feed?.away_team_code || '').toUpperCase();
+        const hasFeedSides = Boolean(feedHomeCode && feedAwayCode);
+        const isHome = hasFeedSides
+          ? isTeamAlias(feedHomeCode)
+          : row.homeAway === 'home';
         const teamScore = feedHomeScore !== undefined && feedAwayScore !== undefined
           ? (isHome ? feedHomeScore : feedAwayScore)
           : row.teamScore;
@@ -1466,8 +1596,20 @@ export function TeamProfilePage() {
         const result = status === 'final' && typeof teamScore === 'number' && typeof oppScore === 'number'
           ? (teamScore > oppScore ? 'W' : teamScore < oppScore ? 'L' : 'T')
           : row.result;
+        const oppAlias = hasFeedSides
+          ? (isHome ? feedAwayCode : feedHomeCode)
+          : String(row?.opponent?.abbreviation || '').toUpperCase();
+        const oppName = hasFeedSides
+          ? String(isHome ? feed?.away_team_name : feed?.home_team_name || oppAlias || row?.opponent?.name || 'Opponent')
+          : String(row?.opponent?.name || oppAlias || 'Opponent');
         return {
           ...row,
+          homeAway: isHome ? 'home' : 'away',
+          opponent: {
+            name: oppName,
+            abbreviation: oppAlias,
+            logo: `https://a.espncdn.com/i/teamlogos/${sportKey}/500/${oppAlias.toLowerCase()}.png`,
+          },
           teamScore,
           oppScore,
           spread: teamSpread ?? null,
@@ -1481,7 +1623,7 @@ export function TeamProfilePage() {
         const awayAlias = String(g?.awayTeamAlias || g?.awayTeam?.alias || '').toUpperCase();
         const homeName = String(g?.homeTeamName || g?.homeTeam?.name || g?.homeTeam?.displayName || homeAlias);
         const awayName = String(g?.awayTeamName || g?.awayTeam?.name || g?.awayTeam?.displayName || awayAlias);
-        const isHome = typeof g?.isHome === 'boolean' ? g.isHome : (teamAliasUpper ? homeAlias === teamAliasUpper : true);
+        const isHome = typeof g?.isHome === 'boolean' ? g.isHome : (teamAliasUpper ? isTeamAlias(homeAlias) : true);
         const homeScoreRaw = safeNum(g?.homeScore);
         const awayScoreRaw = safeNum(g?.awayScore);
         const parsedStatus: 'final' | 'live' | 'scheduled' = forceStatus || (() => {
@@ -1532,13 +1674,16 @@ export function TeamProfilePage() {
           time: g?.scheduledTime ? new Date(g.scheduledTime).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' }) : undefined,
         };
       };
-      const endpointRows: any[] = Array.isArray(scheduleJson?.allGames) && scheduleJson.allGames.length > 0
-        ? scheduleJson.allGames
-        : [
-            ...(Array.isArray(scheduleJson?.pastGames) ? scheduleJson.pastGames : []),
-            ...(Array.isArray(scheduleJson?.upcomingGames) ? scheduleJson.upcomingGames : []),
-          ];
-      const scheduleFromTeamEndpointRaw: GameResult[] = endpointRows.map((g: any) => mapTeamScheduleGame(g));
+      const mapSchedulePayloadRows = (payload: any): GameResult[] => {
+        const rows: any[] = Array.isArray(payload?.allGames) && payload.allGames.length > 0
+          ? payload.allGames
+          : [
+              ...(Array.isArray(payload?.pastGames) ? payload.pastGames : []),
+              ...(Array.isArray(payload?.upcomingGames) ? payload.upcomingGames : []),
+            ];
+        return rows.map((g: any) => mapTeamScheduleGame(g));
+      };
+      let scheduleFromTeamEndpointRaw: GameResult[] = mapSchedulePayloadRows(scheduleJson);
       const dateKey = (value: string | undefined) => {
         const ms = new Date(String(value || '')).getTime();
         if (!Number.isFinite(ms)) return '';
@@ -1578,7 +1723,7 @@ export function TeamProfilePage() {
           if (dayGames.length === 0) return row;
 
           const rowTs = new Date(row.date).getTime();
-          const oppAbbr = String(row.opponent.abbreviation || '').toUpperCase();
+          const oppAbbr = String(row?.opponent?.abbreviation || '').toUpperCase();
           const matched = dayGames.find((g: any) => {
             const homeCode = String(g?.home_team_code || '').toUpperCase();
             const awayCode = String(g?.away_team_code || '').toUpperCase();
@@ -1696,7 +1841,35 @@ export function TeamProfilePage() {
           };
         });
       };
-      const scheduleFromTeamEndpoint = await enrichMissingLinesByDate(scheduleFromTeamEndpointRaw.map(enrichWithGamesFeed));
+      let scheduleFromTeamEndpoint = await enrichMissingLinesByDate(scheduleFromTeamEndpointRaw.map(enrichWithGamesFeed));
+      // Self-heal for degraded fast-timeout payloads: one quick fresh retry only.
+      if (sportUpper === 'NBA' && scheduleFromTeamEndpoint.filter((g) => g.status === 'final').length === 0) {
+        try {
+          const controller = new AbortController();
+          const timer = setTimeout(() => controller.abort(), 3_500);
+          try {
+            const res = await fetch(`/api/teams/${sportUpper}/${teamId}/schedule?fresh=1`, {
+              credentials: 'include',
+              signal: controller.signal,
+            });
+            if (res.ok) {
+              const freshScheduleJson = await res.json().catch(() => null);
+              if (freshScheduleJson) {
+                const freshRaw = mapSchedulePayloadRows(freshScheduleJson);
+                const freshMapped = await enrichMissingLinesByDate(freshRaw.map(enrichWithGamesFeed));
+                if (freshMapped.filter((g) => g.status === 'final').length > 0) {
+                  scheduleFromTeamEndpointRaw = freshRaw;
+                  scheduleFromTeamEndpoint = freshMapped;
+                }
+              }
+            }
+          } finally {
+            clearTimeout(timer);
+          }
+        } catch {
+          // Keep initial schedule; stability fallback paths still apply below.
+        }
+      }
       const teamAllGamesFromEndpoint: GameResult[] = (Array.isArray(scheduleJson?.allGames) ? scheduleJson.allGames : [])
         .map((g: any) => mapTeamScheduleGame(g))
         .map(enrichWithGamesFeed)
@@ -1705,10 +1878,10 @@ export function TeamProfilePage() {
         .filter((g: any) => {
           const homeCode = String(g?.home_team_code || '').toUpperCase();
           const awayCode = String(g?.away_team_code || '').toUpperCase();
-          return teamAliasUpper && (homeCode === teamAliasUpper || awayCode === teamAliasUpper);
+          return teamAliasUpper && (isTeamAlias(homeCode) || isTeamAlias(awayCode));
         })
         .map((g: any) => {
-          const isHome = String(g?.home_team_code || '').toUpperCase() === teamAliasUpper;
+          const isHome = isTeamAlias(String(g?.home_team_code || '').toUpperCase());
           const homeScoreRaw = safeNum(g?.home_score);
           const awayScoreRaw = safeNum(g?.away_score);
           const statusRaw = String(g?.status || '').toUpperCase();
@@ -1747,12 +1920,77 @@ export function TeamProfilePage() {
         })
         .filter((g: any) => g.id && g.date)
         .sort((a: GameResult, b: GameResult) => new Date(a.date).getTime() - new Date(b.date).getTime());
-      let schedule: GameResult[] = scheduleFromTeamEndpoint.length > 0 ? scheduleFromTeamEndpoint : fallbackSchedule;
+      const normalizeScheduleRows = (rows: any[]): GameResult[] => (Array.isArray(rows) ? rows : []).map((row: any) => {
+        const homeAway = row?.homeAway === 'away' ? 'away' : 'home';
+        const homeAlias = String(row?.homeTeamAlias || row?.homeTeam?.alias || row?.home_team_code || '').trim().toUpperCase();
+        const awayAlias = String(row?.awayTeamAlias || row?.awayTeam?.alias || row?.away_team_code || '').trim().toUpperCase();
+        const fallbackOppAbbr = homeAway === 'home' ? awayAlias : homeAlias;
+        const oppAbbr = String(row?.opponent?.abbreviation || fallbackOppAbbr || '').trim().toUpperCase();
+        const oppName = String(
+          row?.opponent?.name
+          || (homeAway === 'home' ? row?.awayTeamName || row?.away_team_name : row?.homeTeamName || row?.home_team_name)
+          || oppAbbr
+          || 'Opponent'
+        );
+        const logo = String(row?.opponent?.logo || `https://a.espncdn.com/i/teamlogos/${sportKey}/500/${oppAbbr.toLowerCase()}.png`);
+        const statusRaw = String(row?.status?.name || row?.status || '').toUpperCase();
+        const hasScores = Number.isFinite(Number(row?.teamScore)) && Number.isFinite(Number(row?.oppScore));
+        const status: 'final' | 'live' | 'scheduled' =
+          statusRaw.includes('FINAL') || statusRaw.includes('COMPLETED') || statusRaw.includes('CLOSED') || statusRaw.includes('STATUS_FINAL')
+            ? 'final'
+            : statusRaw.includes('LIVE') || statusRaw.includes('IN_PROGRESS') || statusRaw.includes('STATUS_IN_PROGRESS')
+              ? 'live'
+              : (hasScores ? 'final' : 'scheduled');
+        return {
+          ...row,
+          id: String(row?.id || ''),
+          date: String(row?.date || row?.scheduledTime || row?.start_time || ''),
+          opponent: {
+            name: oppName,
+            abbreviation: oppAbbr,
+            logo,
+          },
+          homeAway,
+          status,
+        } as GameResult;
+      }).filter((row) => Boolean(row.date));
+      const scheduleQuality = (rows: GameResult[]) => {
+        const total = rows.length;
+        const withOpp = rows.filter((row) => String(row?.opponent?.abbreviation || '').trim().length > 0).length;
+        const finals = rows.filter((row) => row.status === 'final').length;
+        return { total, withOpp, finals };
+      };
+      const endpointQuality = scheduleQuality(scheduleFromTeamEndpoint);
+      const fallbackQuality = scheduleQuality(fallbackSchedule);
+      const endpointLooksDegraded =
+        endpointQuality.total > 0
+        && (
+          endpointQuality.withOpp < Math.max(3, Math.floor(endpointQuality.total * 0.2))
+          || (endpointQuality.finals === 0 && fallbackQuality.finals > 0)
+        );
+      const preferredScheduleSource =
+        endpointQuality.total === 0
+          ? fallbackSchedule
+          : (endpointLooksDegraded && fallbackQuality.total > 0 ? fallbackSchedule : scheduleFromTeamEndpoint);
+      let schedule: GameResult[] = normalizeScheduleRows(preferredScheduleSource);
       const hasScheduleData = Array.isArray(schedule) && schedule.length > 0;
       const hasLastGoodSchedule = Array.isArray(lastGood?.schedule) && lastGood!.schedule.length > 0;
-      // Stability lock: never replace a previously good schedule with an empty transient payload.
-      if (!hasScheduleData && hasLastGoodSchedule) {
-        schedule = lastGood!.schedule;
+      const lastGoodSchedule = hasLastGoodSchedule ? normalizeScheduleRows(lastGood!.schedule) : [];
+      const currentQuality = scheduleQuality(schedule);
+      const lastGoodQuality = scheduleQuality(lastGoodSchedule);
+      const scheduleLooksDowngraded =
+        hasLastGoodSchedule
+        && (
+          currentQuality.total === 0
+          || (currentQuality.finals === 0 && lastGoodQuality.finals > 0)
+          || (
+            currentQuality.finals < lastGoodQuality.finals
+            && currentQuality.total < Math.max(5, Math.floor(lastGoodQuality.total * 0.35))
+          )
+        );
+      // Stability lock: never replace a previously good schedule with a degraded transient payload.
+      if ((!hasScheduleData && hasLastGoodSchedule) || scheduleLooksDowngraded) {
+        schedule = lastGoodSchedule;
       }
       const h2hOpponent = schedule.find((g) => g.status === 'scheduled' || g.status === 'live')?.opponent
         || schedule.find((g) => g.status === 'final')?.opponent
@@ -1760,9 +1998,9 @@ export function TeamProfilePage() {
       let teamH2H: TeamH2HData | null = null;
       if (h2hOpponent?.abbreviation) {
         try {
-          const h2hUrl = `/api/teams/${sportKey.toUpperCase()}/h2h?teamA=${encodeURIComponent(String(team.abbreviation || team.name || ''))}&teamB=${encodeURIComponent(String(h2hOpponent.abbreviation || h2hOpponent.name || ''))}&window=10`;
+          const h2hUrl = `/api/teams/${sportKey.toUpperCase()}/h2h?teamA=${encodeURIComponent(String(team.id || team.abbreviation || team.name || ''))}&teamB=${encodeURIComponent(String(h2hOpponent.abbreviation || h2hOpponent.name || ''))}&window=10`;
           const h2hJson = await fetchJsonCached<TeamH2HData>(h2hUrl, {
-            cacheKey: `team-h2h:${sportKey.toUpperCase()}:${String(team.abbreviation || team.name || '').toUpperCase()}:${String(h2hOpponent.abbreviation || h2hOpponent.name || '').toUpperCase()}`,
+            cacheKey: `team-h2h:${sportKey.toUpperCase()}:${String(team.id || team.abbreviation || team.name || '').toUpperCase()}:${String(h2hOpponent.abbreviation || h2hOpponent.name || '').toUpperCase()}`,
             ttlMs: 90_000,
             timeoutMs: 5_000,
             init: { credentials: 'include' },
@@ -1808,7 +2046,7 @@ export function TeamProfilePage() {
               else awayLossesDerived += 1;
             }
             if (teamConference) {
-              const oppConf = confByAlias.get(String(g.opponent.abbreviation || '').toUpperCase());
+              const oppConf = confByAlias.get(String(g?.opponent?.abbreviation || '').toUpperCase());
               if (oppConf && oppConf === teamConference) {
                 if (didWin) confWinsDerived += 1;
                 else confLossesDerived += 1;
@@ -1826,7 +2064,7 @@ export function TeamProfilePage() {
           };
         }
       }
-      const injuries: TeamInjury[] = (Array.isArray(injuriesJson?.injuries) ? injuriesJson.injuries : []).map((row: any) => ({
+      let injuries: TeamInjury[] = (Array.isArray(injuriesJson?.injuries) ? injuriesJson.injuries : []).map((row: any) => ({
         id: String(row?.id || ''),
         playerName: String(row?.playerName || ''),
         status: String(row?.status || ''),
@@ -1835,6 +2073,10 @@ export function TeamProfilePage() {
         returnDate: String(row?.returnDate || ''),
         headshot: String(row?.headshot || ''),
       }));
+      const hasLastGoodInjuries = Array.isArray(lastGood?.injuries) && lastGood!.injuries.length > 0;
+      if (injuries.length === 0 && hasLastGoodInjuries) {
+        injuries = lastGood!.injuries;
+      }
       
       // Transform stats
       const srStats = statsJson.stats || {};
@@ -1872,6 +2114,17 @@ export function TeamProfilePage() {
       const msg = String(err?.message || '');
       setError(msg.includes('404') ? 'Team not found' : (err.message || 'Failed to load team data'));
     } finally {
+      void fetch("/api/page-data/telemetry", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({
+          route: "team-profile",
+          loadMs: Math.max(0, Date.now() - loadStartedAt),
+          apiCalls,
+          oddsAvailableAtFirstRender: false,
+        }),
+      }).catch(() => undefined);
       setLoading(false);
     }
   };
@@ -1879,6 +2132,118 @@ export function TeamProfilePage() {
   useEffect(() => {
     fetchTeamData();
   }, [sportKey, teamId]);
+
+  useEffect(() => {
+    if (!sportKey || !teamId || !data?.team || !scoutEnabled) return;
+    const key = "scout-flow:recent:v1";
+    try {
+      const raw = window.localStorage.getItem(key);
+      const parsed = raw ? (JSON.parse(raw) as ScoutRecentEntry[]) : [];
+      const next: ScoutRecentEntry = {
+        type: "team",
+        label: data.team.name,
+        subtitle: data.team.abbreviation || undefined,
+        sport: sportKey.toUpperCase(),
+        path: `/sports/${sportKey.toLowerCase()}/team/${encodeURIComponent(teamId)}`,
+        ts: Date.now(),
+      };
+      const merged = [next, ...parsed.filter((row) => row.path !== next.path)].slice(0, 12);
+      window.localStorage.setItem(key, JSON.stringify(merged));
+      setScoutRecent(merged);
+    } catch {
+      // Ignore localStorage failures.
+    }
+  }, [sportKey, teamId, data?.team?.name, data?.team?.abbreviation, scoutEnabled]);
+
+  useEffect(() => {
+    if (!scoutEnabled || !sportKey) return;
+    let cancelled = false;
+    (async () => {
+      const sportUpper = sportKey.toUpperCase();
+      const players = await fetchJsonCached<{ props?: Array<{ player_name?: string; team?: string; sport?: string }> }>(
+        `/api/sports-data/props/today?sport=${encodeURIComponent(sportUpper)}&limit=220&offset=0`,
+        {
+          cacheKey: `scout-flow:players:${sportUpper}:v1`,
+          ttlMs: 45_000,
+          timeoutMs: 4_500,
+          init: { credentials: "include" },
+        }
+      ).catch(() => ({ props: [] }));
+      const standings = await fetchJsonCached<{ teams?: Array<{ id?: string; alias?: string; name?: string }> }>(
+        `/api/teams/${encodeURIComponent(sportUpper)}/standings`,
+        {
+          cacheKey: `scout-flow:teams:${sportUpper}:v1`,
+          ttlMs: 90_000,
+          timeoutMs: 4_500,
+          init: { credentials: "include" },
+        }
+      ).catch(() => ({ teams: [] }));
+      if (cancelled) return;
+
+      const playerMap = new Map<string, { name: string; team: string; sport: string }>();
+      for (const row of Array.isArray(players?.props) ? players.props : []) {
+        const name = String(row?.player_name || "").trim();
+        if (!name) continue;
+        const mapKey = name.toLowerCase();
+        if (!playerMap.has(mapKey)) {
+          playerMap.set(mapKey, {
+            name,
+            team: String(row?.team || "").trim(),
+            sport: String(row?.sport || sportUpper).toUpperCase(),
+          });
+        }
+      }
+      setScoutPlayers(Array.from(playerMap.values()).slice(0, 150));
+      setScoutTeams(
+        (Array.isArray(standings?.teams) ? standings.teams : [])
+          .map((row) => ({
+            id: String(row?.id || "").trim(),
+            alias: String(row?.alias || "").trim().toUpperCase(),
+            name: String(row?.name || "").trim(),
+          }))
+          .filter((row) => row.id && row.alias)
+          .slice(0, 40)
+      );
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [sportKey, scoutEnabled]);
+
+  const scoutItems = useMemo<ScoutFlowItem[]>(() => {
+    if (!scoutEnabled || !sportKey) return [];
+    const sportUpper = sportKey.toUpperCase();
+    const recentItems: ScoutFlowItem[] = scoutRecent
+      .filter((row) => row.sport === sportUpper)
+      .slice(0, 6)
+      .map((row) => ({
+        id: `recent:${row.path}`,
+        label: row.label,
+        subtitle: row.subtitle || "Recent view",
+        kind: "recent",
+        onSelect: () => navigate(row.path),
+      }));
+    const playerItems: ScoutFlowItem[] = scoutPlayers
+      .slice(0, 12)
+      .map((row) => ({
+        id: `player:${row.name}`,
+        label: row.name,
+        subtitle: row.team || "Player",
+        kind: "player",
+        onSelect: () => navigate(`/props/player/${encodeURIComponent(sportUpper)}/${encodeURIComponent(row.name)}`),
+      }));
+    const teamItems: ScoutFlowItem[] = scoutTeams
+      .filter((row) => row.id !== teamId)
+      .slice(0, 12)
+      .map((row) => ({
+        id: `team:${row.id}`,
+        label: row.name || row.alias,
+        subtitle: row.alias,
+        kind: "team",
+        onSelect: () => navigate(`/sports/${sportKey.toLowerCase()}/team/${encodeURIComponent(row.id)}`),
+      }));
+    return [...recentItems, ...playerItems, ...teamItems];
+  }, [scoutEnabled, sportKey, scoutRecent, scoutPlayers, scoutTeams, navigate, teamId]);
 
   if (loading) return <LoadingState />;
   if (error || !data) return <ErrorState message={error || 'Unknown error'} onRetry={fetchTeamData} />;
@@ -1908,6 +2273,17 @@ export function TeamProfilePage() {
 
       {/* Content */}
       <div className="px-4 space-y-4 -mt-4 relative z-10">
+        {scoutEnabled && (
+          <PremiumScoutFlowBar
+            title="Coach G Flow"
+            placeholder="Jump to team or player..."
+            items={scoutItems}
+            quickActions={[
+              { id: "games", label: "Games", onClick: () => navigate(`/games?sport=${String(sportKey || "").toUpperCase()}`) },
+              { id: "props", label: "Player Props", onClick: () => navigate("/props") },
+            ]}
+          />
+        )}
         {/* Stats Grid */}
         <TeamStatsGrid stats={stats} sportKey={sportKey || 'nba'} />
 

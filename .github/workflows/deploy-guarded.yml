@@ -1,0 +1,267 @@
+name: Deploy Guarded
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+concurrency:
+  group: guarded-deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  stability-gates:
+    name: Stability Gates
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      QA_BASE: ${{ secrets.STABILITY_BASE_URL }}
+      QA_COOKIE: ${{ secrets.PAGE_DATA_METRICS_COOKIE }}
+      QA_BEARER: ${{ secrets.PAGE_DATA_METRICS_BEARER }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Validate Stability Base URL
+        run: |
+          if [ -z "${QA_BASE}" ]; then
+            echo "Missing repository secret: STABILITY_BASE_URL"
+            echo "Set it to the environment URL to probe."
+            exit 1
+          fi
+
+      - name: Validate Page-Data Metrics Auth
+        run: |
+          if [ -z "${QA_COOKIE}" ] && [ -z "${QA_BEARER}" ]; then
+            echo "Missing page-data metrics auth secret."
+            echo "Set one of: PAGE_DATA_METRICS_COOKIE or PAGE_DATA_METRICS_BEARER."
+            exit 1
+          fi
+
+      - name: Run Page-Data Gates (Launch)
+        run: |
+          mkdir -p .tmp
+          echo "launch" > .tmp/page-data-profile.txt
+          node scripts/qa-page-data-gates.mjs --base "${QA_BASE}" --profile launch --json-out ".tmp/page-data-gates.json"
+
+      - name: Run Page-Data P0 Strict Check (Blocking)
+        run: |
+          mkdir -p .tmp
+          node scripts/qa-page-data-p0-routes.mjs \
+            --base "${QA_BASE}" \
+            --strict \
+            --json-out ".tmp/page-data-p0-strict.json" | tee .tmp/page-data-p0-strict.txt
+
+      - name: Summarize Page-Data Gates
+        if: always()
+        run: |
+          if [ ! -f ".tmp/page-data-gates.json" ]; then
+            echo "## Page-Data Gates" >> "${GITHUB_STEP_SUMMARY}"
+            echo "" >> "${GITHUB_STEP_SUMMARY}"
+            echo "- status: unavailable (missing report artifact)" >> "${GITHUB_STEP_SUMMARY}"
+            exit 0
+          fi
+          node -e "const fs=require('fs');const r=JSON.parse(fs.readFileSync('.tmp/page-data-gates.json','utf8'));const lines=[];lines.push('## Page-Data Gates');lines.push('');lines.push('- status: '+(r.ok?'PASS':'FAIL'));lines.push('- profile: '+r.profile);lines.push('- base: '+r.base);lines.push('- combined_hit_rate_pct: '+r.derived.combinedHitRatePct);lines.push('- cold_path_pct: '+r.derived.coldPathPct);if(Array.isArray(r.failures)&&r.failures.length){lines.push('- failures:');for(const f of r.failures.slice(0,10)) lines.push('  - '+f);}fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, lines.join('\n')+'\n');"
+
+      - name: Summarize Page-Data P0 Strict
+        if: always()
+        run: |
+          echo "## Page-Data P0 Strict" >> "${GITHUB_STEP_SUMMARY}"
+          echo "" >> "${GITHUB_STEP_SUMMARY}"
+          echo "- mode: blocking" >> "${GITHUB_STEP_SUMMARY}"
+          if [ -f ".tmp/page-data-p0-strict.txt" ]; then
+            echo "" >> "${GITHUB_STEP_SUMMARY}"
+            echo '```' >> "${GITHUB_STEP_SUMMARY}"
+            tail -n 40 .tmp/page-data-p0-strict.txt >> "${GITHUB_STEP_SUMMARY}"
+            echo '```' >> "${GITHUB_STEP_SUMMARY}"
+          fi
+
+      - name: Upload Page-Data Gate Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: page-data-gates-report
+          path: |
+            .tmp/page-data-gates.json
+            .tmp/page-data-profile.txt
+          if-no-files-found: warn
+
+      - name: Upload Page-Data P0 Strict Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: page-data-p0-strict-report
+          path: |
+            .tmp/page-data-p0-strict.txt
+            .tmp/page-data-p0-strict.json
+          if-no-files-found: warn
+
+      - name: Upload Page-Data P0 Trend Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: page-data-p0-trends-report
+          path: |
+            .tmp/page-data-p0-trends.json
+            .tmp/page-data-p0-strict-baseline.json
+          if-no-files-found: warn
+
+      - name: Find Baseline Page-Data Artifact
+        if: always()
+        id: find-baseline
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const workflow_id = context.workflow;
+            const branch = context.ref.replace("refs/heads/", "");
+            const runs = await github.paginate(
+              github.rest.actions.listWorkflowRuns,
+              {
+                owner,
+                repo,
+                workflow_id,
+                branch,
+                status: "completed",
+                per_page: 20,
+              }
+            );
+            const currentRunId = Number(context.runId);
+            let baselineRunId = "";
+            for (const run of runs) {
+              if (Number(run.id) === currentRunId) continue;
+              if (run.conclusion !== "success") continue;
+              const arts = await github.rest.actions.listWorkflowRunArtifacts({
+                owner,
+                repo,
+                run_id: run.id,
+                per_page: 100,
+              });
+              const hit = (arts.data.artifacts || []).find((a) => a.name === "page-data-gates-report" && !a.expired);
+              if (hit) {
+                baselineRunId = String(run.id);
+                break;
+              }
+            }
+            core.setOutput("baseline_run_id", baselineRunId);
+
+      - name: Download Baseline Page-Data Artifact
+        if: always() && steps.find-baseline.outputs.baseline_run_id != ''
+        uses: actions/download-artifact@v4
+        with:
+          name: page-data-gates-report
+          path: .tmp/baseline
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ steps.find-baseline.outputs.baseline_run_id }}
+
+      - name: Download Baseline Page-Data P0 Strict Artifact
+        if: always() && steps.find-baseline.outputs.baseline_run_id != ''
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: page-data-p0-strict-report
+          path: .tmp/baseline-p0
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ steps.find-baseline.outputs.baseline_run_id }}
+
+      - name: Run Page-Data Trend Check
+        if: always()
+        run: |
+          FAIL_ON_REGRESSION="false"
+          MODE_LABEL="warning (non-blocking)"
+          if [ "${GITHUB_REF_NAME}" = "main" ] || [ "${GITHUB_REF_NAME}" = "master" ]; then
+            FAIL_ON_REGRESSION="true"
+            MODE_LABEL="blocking"
+          fi
+          echo "## Page-Data Trend Mode" >> "${GITHUB_STEP_SUMMARY}"
+          echo "" >> "${GITHUB_STEP_SUMMARY}"
+          echo "- mode: ${MODE_LABEL}" >> "${GITHUB_STEP_SUMMARY}"
+          if [ -z "${{ steps.find-baseline.outputs.baseline_run_id }}" ]; then
+            echo "- baseline: unavailable (no prior successful artifact found)" >> "${GITHUB_STEP_SUMMARY}"
+            exit 0
+          fi
+          if [ -f ".tmp/baseline/page-data-gates.json" ]; then
+            cp ".tmp/baseline/page-data-gates.json" ".tmp/page-data-gates-baseline.json"
+            node scripts/qa-page-data-gate-trends.mjs \
+              --current ".tmp/page-data-gates.json" \
+              --baseline ".tmp/page-data-gates-baseline.json" \
+              --fail-on-regression "${FAIL_ON_REGRESSION}"
+          else
+            echo "Baseline page-data report not found in artifact payload."
+            echo "- baseline: unavailable (artifact downloaded without report file)" >> "${GITHUB_STEP_SUMMARY}"
+          fi
+
+      - name: Run Page-Data P0 Trend Check (Blocking)
+        if: always()
+        run: |
+          echo "## Page-Data P0 Trend Mode" >> "${GITHUB_STEP_SUMMARY}"
+          echo "" >> "${GITHUB_STEP_SUMMARY}"
+          echo "- mode: blocking" >> "${GITHUB_STEP_SUMMARY}"
+          if [ -f ".tmp/page-data-p0-strict.json" ] && [ -f ".tmp/baseline-p0/page-data-p0-strict.json" ]; then
+            cp ".tmp/baseline-p0/page-data-p0-strict.json" ".tmp/page-data-p0-strict-baseline.json"
+            node scripts/qa-page-data-p0-trends.mjs \
+              --current ".tmp/page-data-p0-strict.json" \
+              --baseline ".tmp/page-data-p0-strict-baseline.json" \
+              --fail-on-regression true \
+              --json-out ".tmp/page-data-p0-trends.json"
+            if [ -f ".tmp/page-data-p0-trends.json" ]; then
+              node -e "const fs=require('fs');const r=JSON.parse(fs.readFileSync('.tmp/page-data-p0-trends.json','utf8'));const lines=[];lines.push('- improved: '+r.summary.improved);lines.push('- regressed: '+r.summary.regressed);lines.push('- same: '+r.summary.same);fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, lines.join('\n')+'\n');"
+              node -e "const fs=require('fs');const r=JSON.parse(fs.readFileSync('.tmp/page-data-p0-trends.json','utf8'));const rows=[...(r.improved||[]).map(x=>({route:x.route,status:'improved',reasons:(x.reasons||[]).join(', ')})),...(r.regressed||[]).map(x=>({route:x.route,status:'regressed',reasons:(x.reasons||[]).join(', ')})),...(r.same||[]).map(x=>({route:x.route,status:'same',reasons:(x.reasons||[]).join(', ')}))].sort((a,b)=>String(a.route).localeCompare(String(b.route)));const lines=[];lines.push('');lines.push('| Route | Trend | Signals |');lines.push('|---|---|---|');for(const row of rows){lines.push('| '+row.route+' | '+row.status+' | '+(row.reasons||'')+' |');}fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, lines.join('\n')+'\n');"
+            fi
+          else
+            echo "- baseline: unavailable (missing current or baseline p0 strict json)" >> "${GITHUB_STEP_SUMMARY}"
+          fi
+
+      - name: Run Release Go/No-Go Gate
+        run: npm run release:go-no-go -- --skip-page-data-gates true
+
+  deploy:
+    name: Deploy To Cloudflare
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: stability-gates
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Validate Cloudflare Secrets
+        run: |
+          if [ -z "${CLOUDFLARE_API_TOKEN}" ]; then
+            echo "Missing repository secret: CLOUDFLARE_API_TOKEN"
+            exit 1
+          fi
+          if [ -z "${CLOUDFLARE_ACCOUNT_ID}" ]; then
+            echo "Missing repository secret: CLOUDFLARE_ACCOUNT_ID"
+            exit 1
+          fi
+
+      - name: Build
+        run: npm run build
+
+      - name: Deploy
+        run: npx wrangler deploy
