@@ -5,7 +5,7 @@
  * Shows team info, stats, roster preview, recent/upcoming games
  */
 
-import { useState, useEffect, useMemo } from "react";
+import { useState, useEffect, useMemo, useRef } from "react";
 import { useParams, useNavigate, Link } from "react-router-dom";
 import { 
   ArrowLeft, Trophy, Users, Calendar,
@@ -1246,10 +1246,34 @@ export function TeamProfilePage() {
   
   const [data, setData] = useState<TeamProfileData | null>(null);
   const [loading, setLoading] = useState(true);
+  const [loadStatus, setLoadStatus] = useState<'loading' | 'partial' | 'complete'>('loading');
   const [error, setError] = useState<string | null>(null);
   const [scoutRecent, setScoutRecent] = useState<ScoutRecentEntry[]>([]);
   const [scoutPlayers, setScoutPlayers] = useState<Array<{ name: string; team: string; sport: string }>>([]);
   const [scoutTeams, setScoutTeams] = useState<Array<{ id: string; alias: string; name: string }>>([]);
+  const backgroundRetryTimerRef = useRef<number | null>(null);
+  const backgroundRetryCountRef = useRef(0);
+  const partialHydrationAttemptedRef = useRef(false);
+  const finalHydrationAttemptedRef = useRef(false);
+
+  const isTeamPayloadIncomplete = (payload: TeamProfileData | null): boolean => {
+    if (!payload?.team?.id) return true;
+    const hasRoster = Array.isArray(payload.roster) && payload.roster.length > 0;
+    const hasSchedule = Array.isArray(payload.schedule) && payload.schedule.length > 0;
+    const stats = payload.stats || {};
+    const hasStats = [
+      stats.ppg,
+      stats.oppPpg,
+      stats.rpg,
+      stats.apg,
+      stats.fgPct,
+      stats.threePct,
+      stats.offRank,
+      stats.defRank,
+    ].some((value) => Number.isFinite(Number(value)));
+    const completedSlices = [hasRoster, hasSchedule, hasStats].filter(Boolean).length;
+    return completedSlices < 2;
+  };
 
   useEffect(() => {
     if (!sportKey || !teamId) return;
@@ -1317,10 +1341,11 @@ export function TeamProfilePage() {
     return () => controller.abort();
   }, [sportKey, teamId, navigate]);
 
-  const fetchTeamData = async () => {
+  const fetchTeamData = async (stage: 'primary' | 'second' | 'final' = 'primary') => {
     if (!sportKey || !teamId) return;
     const loadStartedAt = Date.now();
     let apiCalls = 0;
+    let keepLoading = false;
     const sportUpper = sportKey.toUpperCase();
     let effectiveTeamId = String(teamId || "").trim();
     if (effectiveTeamId && !/^[0-9a-f]{8}-[0-9a-f-]{27}$/i.test(effectiveTeamId) && !effectiveTeamId.startsWith("sr:")) {
@@ -1382,10 +1407,12 @@ export function TeamProfilePage() {
     if (cached) {
       setData(cached);
       setLoading(false);
+      setLoadStatus(isTeamPayloadIncomplete(cached) ? 'partial' : 'complete');
     }
     
     if (!cached) {
       setLoading(true);
+      setLoadStatus('loading');
     }
     setError(null);
     
@@ -1395,7 +1422,7 @@ export function TeamProfilePage() {
         const name = String((value as any)?.name || '');
         return msg.includes('timeout') || name === 'AbortError';
       };
-      const pageDataOnlyMode = true;
+      const pageDataOnlyMode = stage !== 'final';
       let profileJson: any = null;
       let scheduleJson: any = null;
       let statsJson: any = null;
@@ -1415,10 +1442,12 @@ export function TeamProfilePage() {
           pageData = await fetchJsonCached<any>(
             `/api/page-data/team-profile?sport=${encodeURIComponent(sportUpper)}&teamId=${encodeURIComponent(effectiveTeamId)}`,
             {
-              cacheKey: attempt > 0 ? `${baseCacheKey}:retry` : baseCacheKey,
+              cacheKey: stage !== 'primary'
+                ? `${baseCacheKey}:hydrate`
+                : (attempt > 0 ? `${baseCacheKey}:retry` : baseCacheKey),
               ttlMs: 60_000,
               timeoutMs: 8_000,
-              bypassCache: attempt > 0,
+              bypassCache: stage !== 'primary' || attempt > 0,
               init: { credentials: "include" },
             }
           );
@@ -2211,6 +2240,7 @@ export function TeamProfilePage() {
         teamH2H: teamH2H || lastGood?.teamH2H || null,
       };
       setData(nextData);
+      setLoadStatus(isTeamPayloadIncomplete(nextData) ? 'partial' : 'complete');
       setRouteCache(cacheKey, nextData, 240_000);
       console.info("PAGE_DATA_SUCCESS", {
         route: "team-profile",
@@ -2219,6 +2249,49 @@ export function TeamProfilePage() {
         hasTeam: Boolean(nextData?.team?.id),
         scheduleGames: Array.isArray(nextData?.schedule) ? nextData.schedule.length : 0,
       });
+      const incomplete = isTeamPayloadIncomplete(nextData);
+      if (stage === 'primary' && incomplete && !partialHydrationAttemptedRef.current) {
+        partialHydrationAttemptedRef.current = true;
+        console.info("PAGE_DATA_PARTIAL_DETECTED", {
+          route: "team-profile",
+          sport: sportUpper,
+          teamId: effectiveTeamId,
+        });
+        if (backgroundRetryTimerRef.current !== null) {
+          window.clearTimeout(backgroundRetryTimerRef.current);
+        }
+        backgroundRetryTimerRef.current = window.setTimeout(() => {
+          void fetchTeamData('second');
+        }, 1200);
+      } else if (stage === 'second') {
+        console.info("PAGE_DATA_SECOND_FETCH_SUCCESS", {
+          route: "team-profile",
+          sport: sportUpper,
+          teamId: effectiveTeamId,
+          complete: !incomplete,
+        });
+        if (incomplete && !finalHydrationAttemptedRef.current) {
+          finalHydrationAttemptedRef.current = true;
+          console.info("PAGE_DATA_FINAL_FETCH_START", {
+            route: "team-profile",
+            sport: sportUpper,
+            teamId: effectiveTeamId,
+          });
+          if (backgroundRetryTimerRef.current !== null) {
+            window.clearTimeout(backgroundRetryTimerRef.current);
+          }
+          backgroundRetryTimerRef.current = window.setTimeout(() => {
+            void fetchTeamData('final');
+          }, 1200);
+        }
+      } else if (stage === 'final') {
+        console.info("PAGE_DATA_FINAL_FETCH_SUCCESS", {
+          route: "team-profile",
+          sport: sportUpper,
+          teamId: effectiveTeamId,
+          complete: !incomplete,
+        });
+      }
     } catch (err: any) {
       console.error('[TeamProfile] Fetch error:', err);
       const msg = String(err?.message || '');
@@ -2228,8 +2301,24 @@ export function TeamProfilePage() {
       console.warn("PAGE_DATA_FALLBACK_USED", { route: "team-profile", reason: "request_failed", sport: String(sportKey || "").toUpperCase(), teamId });
       if (lastGood || data) {
         setError(null);
+        setLoadStatus(lastGood ? (isTeamPayloadIncomplete(lastGood) ? 'partial' : 'complete') : 'partial');
       } else {
-        setError(msg.includes('404') ? 'Team not found' : (err.message || 'Failed to load team data'));
+        const lowered = msg.toLowerCase();
+        const recoverable = lowered.includes('timeout') || lowered.includes('partial') || lowered.includes('empty');
+        if (recoverable && backgroundRetryCountRef.current < 1) {
+          backgroundRetryCountRef.current += 1;
+          keepLoading = true;
+          setLoadStatus('loading');
+          setError(null);
+          if (backgroundRetryTimerRef.current !== null) {
+            window.clearTimeout(backgroundRetryTimerRef.current);
+          }
+          backgroundRetryTimerRef.current = window.setTimeout(() => {
+            void fetchTeamData('primary');
+          }, 1200);
+          return;
+        }
+        setError(msg.includes('404') ? 'Team not found' : 'Team data is currently unavailable');
       }
     } finally {
       void fetch("/api/page-data/telemetry", {
@@ -2243,12 +2332,24 @@ export function TeamProfilePage() {
           oddsAvailableAtFirstRender: false,
         }),
       }).catch(() => undefined);
-      setLoading(false);
+      setLoading(keepLoading);
     }
   };
 
   useEffect(() => {
-    fetchTeamData();
+    backgroundRetryCountRef.current = 0;
+    partialHydrationAttemptedRef.current = false;
+    finalHydrationAttemptedRef.current = false;
+    if (backgroundRetryTimerRef.current !== null) {
+      window.clearTimeout(backgroundRetryTimerRef.current);
+      backgroundRetryTimerRef.current = null;
+    }
+    fetchTeamData('primary');
+    return () => {
+      if (backgroundRetryTimerRef.current !== null) {
+        window.clearTimeout(backgroundRetryTimerRef.current);
+      }
+    };
   }, [sportKey, teamId]);
 
   useEffect(() => {
@@ -2369,8 +2470,8 @@ export function TeamProfilePage() {
     return [...recentItems, ...playerItems, ...teamItems];
   }, [scoutEnabled, sportKey, scoutRecent, scoutPlayers, scoutTeams, navigate, teamId]);
 
-  if (loading) return <LoadingState />;
-  if (error || !data) return <ErrorState message={error || 'Unknown error'} onRetry={fetchTeamData} />;
+  if (loading && !data) return <LoadingState />;
+  if ((error && !data) || !data) return <ErrorState message={error || 'Unknown error'} onRetry={() => void fetchTeamData('primary')} />;
 
   const { team, record, roster, schedule, stats, injuries, teamH2H } = data;
 
@@ -2397,6 +2498,11 @@ export function TeamProfilePage() {
 
       {/* Content */}
       <div className="px-4 space-y-4 -mt-4 relative z-10">
+        {loadStatus === 'partial' && (
+          <div className="rounded-xl border border-amber-400/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-100">
+            Loading remaining team sections...
+          </div>
+        )}
         {scoutEnabled && (
           <PremiumScoutFlowBar
             title="Coach G Flow"

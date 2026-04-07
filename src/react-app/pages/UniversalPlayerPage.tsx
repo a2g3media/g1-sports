@@ -175,132 +175,8 @@ const SPORT_CONFIG: Record<string, {
 };
 
 // ============================================================
-// ESPN PLAYER ID MAPPINGS
-// ============================================================
-const ESPN_PLAYER_IDS: Record<string, Record<string, string>> = {
-  nba: {
-    "LeBron James": "1966",
-    "Stephen Curry": "3975",
-    "Kevin Durant": "3202",
-    "Giannis Antetokounmpo": "3032977",
-    "Luka Doncic": "3945274",
-    "Jayson Tatum": "4065648",
-    "Nikola Jokic": "3112335",
-    "Joel Embiid": "3059318",
-    "Anthony Davis": "6583",
-    "Kawhi Leonard": "6450",
-    "Damian Lillard": "6606",
-    "Devin Booker": "3136193",
-    "Ja Morant": "4279888",
-    "Trae Young": "4277905",
-    "Donovan Mitchell": "3908809",
-    "Jimmy Butler": "6430",
-    "Kyrie Irving": "6442",
-    "Jaylen Brown": "3917376",
-    "Anthony Edwards": "4594268",
-    "Shai Gilgeous-Alexander": "4278073",
-  },
-  mlb: {
-    "Shohei Ohtani": "39832",
-    "Mike Trout": "30836",
-    "Mookie Betts": "33912",
-    "Aaron Judge": "33192",
-    "Ronald Acuna Jr.": "36185",
-    "Freddie Freeman": "31097",
-    "Corey Seager": "32691",
-    "Juan Soto": "36196",
-    "Fernando Tatis Jr.": "38727",
-    "Bryce Harper": "30951",
-    "Trea Turner": "32678",
-    "Marcus Semien": "31027",
-    "Jose Ramirez": "32801",
-    "Matt Olson": "33835",
-    "Vladimir Guerrero Jr.": "39141",
-  },
-  nhl: {
-    "Connor McDavid": "3895074",
-    "Leon Draisaitl": "3114727",
-    "Nathan MacKinnon": "3041969",
-    "Auston Matthews": "4024123",
-    "Nikita Kucherov": "3622140",
-    "David Pastrnak": "3899937",
-    "Cale Makar": "4361515",
-    "Kirill Kaprizov": "4024851",
-    "Sidney Crosby": "3114",
-    "Alex Ovechkin": "3101",
-    "Connor Hellebuyck": "3042066",
-    "Igor Shesterkin": "4565243",
-  },
-  ncaab: {
-    // Top college players change each year
-  },
-};
-
-function getPlayerPhotoUrl(name: string, sport: string): string {
-  const sportIds = ESPN_PLAYER_IDS[sport.toLowerCase()];
-  const espnId = sportIds?.[name];
-  if (espnId) {
-    const sportPath = sport.toLowerCase() === 'ncaab' ? 'mens-college-basketball' : sport.toLowerCase();
-    return `https://a.espncdn.com/combiner/i?img=/i/headshots/${sportPath}/players/full/${espnId}.png&w=350&h=254`;
-  }
-  return "";
-}
-
-// ============================================================
 // MOCK DATA GENERATORS
 // ============================================================
-function getMockPlayerData(playerId: string, sport: string): PlayerData {
-  const nameParts = playerId.split('-');
-  const name = nameParts.map(p => p.charAt(0).toUpperCase() + p.slice(1)).join(' ');
-  
-  return {
-    id: playerId,
-    name,
-    number: String(Math.floor(Math.random() * 99) + 1),
-    position: getRandomPosition(sport),
-    team: getRandomTeam(sport),
-    teamCode: getRandomTeamCode(sport),
-    height: "6'4\"",
-    weight: "220 lbs",
-    experience: "5th Season",
-    status: 'active',
-    photoUrl: getPlayerPhotoUrl(name, sport),
-    sport,
-  };
-}
-
-function getRandomPosition(sport: string): string {
-  const positions: Record<string, string[]> = {
-    nba: ['PG', 'SG', 'SF', 'PF', 'C'],
-    mlb: ['P', 'C', '1B', '2B', '3B', 'SS', 'LF', 'CF', 'RF', 'DH'],
-    nhl: ['C', 'LW', 'RW', 'D', 'G'],
-    ncaab: ['PG', 'SG', 'SF', 'PF', 'C'],
-  };
-  const sportPositions = positions[sport.toLowerCase()] || positions.nba;
-  return sportPositions[Math.floor(Math.random() * sportPositions.length)];
-}
-
-function getRandomTeam(sport: string): string {
-  const teams: Record<string, string[]> = {
-    nba: ['Los Angeles Lakers', 'Boston Celtics', 'Golden State Warriors', 'Miami Heat'],
-    mlb: ['Los Angeles Dodgers', 'New York Yankees', 'Houston Astros', 'Atlanta Braves'],
-    nhl: ['Edmonton Oilers', 'Toronto Maple Leafs', 'Colorado Avalanche', 'Vegas Golden Knights'],
-    ncaab: ['Duke Blue Devils', 'Kentucky Wildcats', 'Kansas Jayhawks', 'UCLA Bruins'],
-  };
-  const sportTeams = teams[sport.toLowerCase()] || teams.nba;
-  return sportTeams[Math.floor(Math.random() * sportTeams.length)];
-}
-
-function getRandomTeamCode(sport: string): string {
-  const codes: Record<string, string[]> = {
-    nba: ['LAL', 'BOS', 'GSW', 'MIA'],
-    mlb: ['LAD', 'NYY', 'HOU', 'ATL'],
-    nhl: ['EDM', 'TOR', 'COL', 'VGK'],
-    ncaab: ['DUKE', 'UK', 'KAN', 'UCLA'],
-  };
-  const sportCodes = codes[sport.toLowerCase()] || codes.nba;
-  return sportCodes[Math.floor(Math.random() * sportCodes.length)];
-}
 
 function getMockSeasonStats(sport: string): SeasonStat[] {
   const statsByport: Record<string, SeasonStat[]> = {
@@ -334,86 +210,6 @@ function getMockSeasonStats(sport: string): SeasonStat[] {
     ],
   };
   return statsByport[sport.toLowerCase()] || statsByport.nba;
-}
-
-function getMockRecentGames(sport: string): RecentGame[] {
-  const opponents = ['BOS', 'NYK', 'MIA', 'PHI', 'CHI'];
-  return opponents.map((opp, i) => ({
-    opponent: opp,
-    opponentCode: opp,
-    date: `Jan ${20 - i}`,
-    result: i % 2 === 0 ? 'W' : 'L',
-    statLine: sport === 'nba' ? `${28 - i} PTS` : sport === 'mlb' ? `${3 - (i % 3)}-${4}` : `${2 - (i % 2)}G`,
-  }));
-}
-
-function getMockGameLog(sport: string): GameLogEntry[] {
-  const config = SPORT_CONFIG[sport.toLowerCase()];
-  const opponents = ['BOS', 'NYK', 'MIA', 'PHI', 'CHI', 'LAL', 'GSW', 'DEN'];
-  
-  return opponents.map((opp, i) => {
-    const stats: Record<string, string | number> = {};
-    config.gameLogColumns.slice(2).forEach((col, j) => {
-      if (col === 'MIN' || col === 'TOI') stats[col] = '32:' + String(i + 10).padStart(2, '0');
-      else if (col === 'FG%') stats[col] = `${45 + i}%`;
-      else stats[col] = 10 + i + j;
-    });
-    return {
-      date: `Jan ${25 - i}`,
-      opponent: opp,
-      opponentCode: opp,
-      stats,
-    };
-  });
-}
-
-function getMockProps(sport: string): PropLine[] {
-  if (sport === 'nba') {
-    return [
-      { type: 'Points', line: 27.5, overOdds: -110, underOdds: -110, trend: 'Hit 4/5 recent' },
-      { type: 'Rebounds', line: 8.5, overOdds: -115, underOdds: -105, trend: 'Over trending' },
-      { type: 'Assists', line: 7.5, overOdds: +100, underOdds: -120, trend: 'Steady' },
-    ];
-  }
-  if (sport === 'mlb') {
-    return [
-      { type: 'Hits', line: 1.5, overOdds: +120, underOdds: -140, trend: 'Hit 3/5 recent' },
-      { type: 'Total Bases', line: 2.5, overOdds: -105, underOdds: -115, trend: 'Over trending' },
-      { type: 'RBI', line: 0.5, overOdds: -135, underOdds: +115, trend: 'Consistent' },
-    ];
-  }
-  if (sport === 'nhl') {
-    return [
-      { type: 'Points', line: 1.5, overOdds: +105, underOdds: -125, trend: 'Hot streak' },
-      { type: 'Shots on Goal', line: 4.5, overOdds: -110, underOdds: -110, trend: 'Over trending' },
-    ];
-  }
-  return [];
-}
-
-function getMockNews(): NewsItem[] {
-  return [
-    {
-      headline: "Player questionable with minor ankle soreness",
-      summary: "Expected to be a game-time decision for tonight's matchup.",
-      coachGNote: "Based on practice reports, likely to play tonight.",
-      date: "2 hours ago",
-    },
-    {
-      headline: "Continuing hot streak with third straight 30+ point game",
-      summary: "Has been the primary scoring option with teammate out.",
-      date: "Yesterday",
-    },
-  ];
-}
-
-function getMockNextGame(_sport: string): NextGame {
-  return {
-    opponent: 'Warriors',
-    opponentCode: 'GSW',
-    date: 'Tonight',
-    time: '7:30 PM ET',
-  };
 }
 
 // ============================================================
@@ -778,6 +574,23 @@ export default function UniversalPlayerPage() {
   const sportLower = sportKey?.toLowerCase() || 'nba';
   const config = SPORT_CONFIG[sportLower] || SPORT_CONFIG.nba;
 
+  const buildProvisionalPlayer = (slug: string): PlayerData => {
+    const name = slug.split('-').map((part) => part.charAt(0).toUpperCase() + part.slice(1)).join(' ');
+    return {
+      id: slug,
+      name,
+      number: '--',
+      position: '',
+      team: '',
+      teamCode: '',
+      height: '',
+      weight: '',
+      status: 'active',
+      photoUrl: '',
+      sport: sportLower,
+    };
+  };
+
   useEffect(() => {
     if (!playerId || !sportKey) return;
     
@@ -792,6 +605,8 @@ export default function UniversalPlayerPage() {
         const playerName = playerId.split('-').map(p => 
           p.charAt(0).toUpperCase() + p.slice(1)
         ).join(' ');
+        setPlayer((prev) => prev ?? buildProvisionalPlayer(playerId));
+        setLoading(false);
         
         apiCalls += 1;
         console.info("PAGE_DATA_START", { route: "universal-player", sport: sportLower.toUpperCase(), playerName });
@@ -820,7 +635,8 @@ export default function UniversalPlayerPage() {
           }
         }
         if (!payload) {
-          throw new Error("Failed to load player data");
+          console.warn("PAGE_DATA_FALLBACK_USED", { route: "universal-player", reason: "empty_payload", sport: sportLower.toUpperCase(), playerId });
+          return;
         }
         
         processPlayerData(payload?.data?.profile as APIPlayerResponse);
@@ -839,16 +655,8 @@ export default function UniversalPlayerPage() {
           console.warn("PAGE_DATA_TIMEOUT", { route: "universal-player", sport: sportLower.toUpperCase(), playerId });
         }
         console.warn("PAGE_DATA_FALLBACK_USED", { route: "universal-player", reason: "request_failed_or_partial", sport: sportLower.toUpperCase(), playerId });
-        setError('Unable to load player data');
-        // Fall back to mock data
-        const playerData = getMockPlayerData(playerId, sportLower);
-        setPlayer(playerData);
-        setSeasonStats(getMockSeasonStats(sportLower));
-        setRecentGames(getMockRecentGames(sportLower));
-        setGameLog(getMockGameLog(sportLower));
-        setProps(getMockProps(sportLower));
-        setNews(getMockNews());
-        setNextGame(getMockNextGame(sportLower));
+        setError(null);
+        setPlayer((prev) => prev ?? buildProvisionalPlayer(playerId));
       } finally {
         void fetch("/api/page-data/telemetry", {
           method: "POST",
@@ -867,7 +675,7 @@ export default function UniversalPlayerPage() {
     
     const processPlayerData = (data: APIPlayerResponse) => {
       if (!data || !data.player) {
-        throw new Error("Player not found");
+        return;
       }
       const p = data.player;
       
@@ -909,8 +717,8 @@ export default function UniversalPlayerPage() {
           stats: g.stats,
         })));
       } else {
-        setRecentGames(getMockRecentGames(sportLower));
-        setGameLog(getMockGameLog(sportLower));
+        setRecentGames([]);
+        setGameLog([]);
       }
       
       // Set next game from matchup data
@@ -935,7 +743,7 @@ export default function UniversalPlayerPage() {
           trend: 'Hit 4/5 recent',
         })));
       } else {
-        setProps(getMockProps(sportLower));
+        setProps([]);
       }
       
       if (data.news && data.news.length > 0) {
@@ -945,7 +753,7 @@ export default function UniversalPlayerPage() {
           date: new Date(n.published).toLocaleDateString(),
         })));
       } else {
-        setNews(getMockNews());
+        setNews([]);
       }
     };
     
