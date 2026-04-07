@@ -1748,6 +1748,7 @@ export default function PlayerProfilePage() {
   const [followLoading, setFollowLoading] = useState(false);
   const lastGoodProfileRef = useRef<PlayerProfileData | null>(null);
   const backgroundRetryRef = useRef<number | null>(null);
+  const activeLoadRequestRef = useRef(0);
   const [scoutRecent, setScoutRecent] = useState<ScoutRecentEntry[]>([]);
   const [scoutPlayers, setScoutPlayers] = useState<Array<{ name: string; team: string; sport: string }>>([]);
   const [scoutTeams, setScoutTeams] = useState<Array<{ id: string; alias: string; name: string }>>([]);
@@ -1768,6 +1769,22 @@ export default function PlayerProfilePage() {
     const hasMatchup = Boolean(payload.matchup?.opponent);
     return hasGameLog || hasSeason || hasMatchup;
   }, []);
+
+  const normalizeEntityToken = useCallback((value: unknown): string => {
+    return String(value || "")
+      .normalize("NFD")
+      .replace(/[\u0300-\u036f]/g, "")
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, " ")
+      .trim();
+  }, []);
+
+  const isRequestedPlayer = useCallback((candidate: unknown): boolean => {
+    const requested = normalizeEntityToken(decodedPlayerName);
+    const actual = normalizeEntityToken(candidate);
+    if (!requested || !actual) return false;
+    return requested === actual;
+  }, [decodedPlayerName, normalizeEntityToken]);
 
   const isProfileIncomplete = useCallback((payload: any): boolean => {
     if (!payload?.player) return true;
@@ -1885,6 +1902,9 @@ export default function PlayerProfilePage() {
   
   useEffect(() => {
     if (!sport || !playerName) return;
+    const requestId = activeLoadRequestRef.current + 1;
+    activeLoadRequestRef.current = requestId;
+    const isActiveRequest = () => activeLoadRequestRef.current === requestId;
     const cacheKey = `player-profile:v2:${sport.toUpperCase()}:${decodedPlayerName}`;
     const persistentKey = `player-profile:last-good:v2:${sport.toUpperCase()}:${decodedPlayerName}`;
     const cachedRaw = getRouteCache<PlayerProfileData>(cacheKey, 120_000);
@@ -1892,12 +1912,11 @@ export default function PlayerProfilePage() {
     // Player-scoped lock: reset carry-over from previous route transitions.
     lastGoodProfileRef.current = cached ?? null;
     if (cached && hasCoreProfileData(cached)) {
-      setData((prev) => {
-        if (!prev) return cached;
-        return profileQualityScore(cached) >= profileQualityScore(prev) ? cached : prev;
-      });
-      setLoading(false);
-      setLoadStatus(isProfileIncomplete(cached) ? 'partial' : 'complete');
+      if (isActiveRequest()) {
+        setData(cached);
+        setLoading(false);
+        setLoadStatus(isProfileIncomplete(cached) ? 'partial' : 'complete');
+      }
     }
     const provisionalProfile = normalizeProfilePayload(
       {
@@ -1908,10 +1927,12 @@ export default function PlayerProfilePage() {
       },
       cached ?? null
     );
-    if (!cached && provisionalProfile) {
-      setData((prev) => prev ?? provisionalProfile);
-      setLoadStatus('partial');
-      setLoading(false);
+    if (!cached) {
+      if (isActiveRequest()) {
+        setData(provisionalProfile ?? null);
+        setLoadStatus(provisionalProfile ? 'partial' : 'loading');
+        setLoading(!provisionalProfile);
+      }
     }
     
     const fetchProfile = async () => {
@@ -1984,7 +2005,11 @@ export default function PlayerProfilePage() {
           hasCoreData: hasCoreProfileData(profileData),
         });
 
-        const mergedProfile = normalizeProfilePayload(profileData, lastGoodProfileRef.current || data || null);
+        if (profileData?.player?.displayName && !isRequestedPlayer(profileData.player.displayName)) {
+          throw new Error("Player identity mismatch");
+        }
+
+        const mergedProfile = normalizeProfilePayload(profileData, lastGoodProfileRef.current || null);
         if (!mergedProfile) {
           throw (lastErr instanceof Error ? lastErr : new Error("Failed to load player data"));
         }
@@ -2000,16 +2025,19 @@ export default function PlayerProfilePage() {
             && (Array.isArray(previousGood?.gameLog) ? previousGood!.gameLog.length : 0)
               > (Array.isArray(mergedProfile?.gameLog) ? mergedProfile.gameLog.length : 0);
           if (!isDowngrade) {
+            if (!isActiveRequest()) return;
             setData(mergedProfile);
             lastGoodProfileRef.current = mergedProfile;
             setRouteCache(cacheKey, mergedProfile, 180_000);
             writePersistentLastGood(persistentKey, mergedProfile);
             setLoadStatus(isProfileIncomplete(mergedProfile) ? 'partial' : 'complete');
           } else if (previousGood) {
+            if (!isActiveRequest()) return;
             setData(previousGood);
             setLoadStatus(isProfileIncomplete(previousGood) ? 'partial' : 'complete');
           }
         } else {
+          if (!isActiveRequest()) return;
           setData(mergedProfile);
           setLoadStatus('partial');
           if (lastGoodProfileRef.current) {
@@ -2040,8 +2068,12 @@ export default function PlayerProfilePage() {
               init: { credentials: 'include' },
             });
             const secondRaw = unwrapProfile(secondEnvelope);
+            if (secondRaw?.player?.displayName && !isRequestedPlayer(secondRaw.player.displayName)) {
+              throw new Error("Player identity mismatch");
+            }
             const secondMerged = normalizeProfilePayload(secondRaw, mergedProfile);
             if (secondMerged) {
+              if (!isActiveRequest()) return;
               const secondIncomplete = isProfileIncomplete(secondMerged);
               setData(secondMerged);
               setLoadStatus(secondIncomplete ? 'partial' : 'complete');
@@ -2082,8 +2114,13 @@ export default function PlayerProfilePage() {
                   finalLegacy.status === 'fulfilled' && finalLegacy.value && typeof finalLegacy.value === 'object'
                     ? (finalLegacy.value.profile ?? finalLegacy.value.data?.profile ?? finalLegacy.value)
                     : null;
-                const finalMerged = normalizeProfilePayload(finalRawFromPageData || finalRawFromLegacy, secondMerged);
+                const finalRawCandidate = finalRawFromPageData || finalRawFromLegacy;
+                if (finalRawCandidate?.player?.displayName && !isRequestedPlayer(finalRawCandidate.player.displayName)) {
+                  throw new Error("Player identity mismatch");
+                }
+                const finalMerged = normalizeProfilePayload(finalRawCandidate, secondMerged);
                 if (finalMerged) {
+                  if (!isActiveRequest()) return;
                   const finalIncomplete = isProfileIncomplete(finalMerged);
                   setData(finalMerged);
                   setLoadStatus(finalIncomplete ? 'partial' : 'complete');
@@ -2119,13 +2156,11 @@ export default function PlayerProfilePage() {
           || message.includes('partial')
           || message.includes('empty payload')
           || message.includes('failed to fetch')
-          || message.includes('network');
+          || message.includes('network')
+          || message.includes('identity mismatch');
         if (lastGoodProfileRef.current) {
+          if (!isActiveRequest()) return;
           setData(lastGoodProfileRef.current);
-          setError(null);
-          return;
-        }
-        if (data && hasCoreProfileData(data)) {
           setError(null);
           return;
         }
@@ -2141,13 +2176,15 @@ export default function PlayerProfilePage() {
           }, 1200);
           return;
         }
+        if (!isActiveRequest()) return;
         setError(null);
         if (provisionalProfile) {
-          setData((prev) => prev ?? provisionalProfile);
+          setData(provisionalProfile);
           setLoadStatus('partial');
           keepLoading = false;
         }
       } finally {
+        if (!isActiveRequest()) return;
         void fetch("/api/page-data/telemetry", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -2164,7 +2201,7 @@ export default function PlayerProfilePage() {
     };
     
     fetchProfile();
-  }, [sport, playerName, decodedPlayerName, hasCoreProfileData, isProfileIncomplete, profileQualityScore, readPersistentLastGood, writePersistentLastGood, normalizeProfilePayload, backgroundRetryTick]);
+  }, [sport, playerName, decodedPlayerName, hasCoreProfileData, isProfileIncomplete, isRequestedPlayer, profileQualityScore, readPersistentLastGood, writePersistentLastGood, normalizeProfilePayload, backgroundRetryTick]);
   
   // Check if current player is followed
   const isFollowing = useMemo(() => {
