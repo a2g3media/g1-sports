@@ -10,7 +10,13 @@ import {
 import { TeamLogo } from "@/react-app/components/TeamLogo";
 import { PlayerSearch } from "@/react-app/components/PlayerSearch";
 import { CoachGAvatar } from "@/react-app/components/CoachGAvatar";
-import { buildPlayerRoute, buildTeamRoute, logPlayerNavigation, logTeamNavigation } from "@/react-app/lib/navigationRoutes";
+import {
+  buildTeamRoute,
+  logPlayerNavigation,
+  logTeamNavigation,
+} from "@/react-app/lib/navigationRoutes";
+import { navigateToPlayerProfile } from "@/react-app/lib/playerProfileNavigation";
+import { resolvePlayerIdForNavigation } from "@/react-app/lib/resolvePlayerIdForNavigation";
 
 // ============================================================
 // NHL TEAM DATA
@@ -635,16 +641,26 @@ export function NHLHubPage() {
             {/* Leaders Grid */}
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3">
               {(skaterLeaders?.[skaterTab] || SKATER_LEADERS[skaterTab]).map((player, i) => (
+                (() => {
+                  const pid = resolvePlayerIdForNavigation(player.id, player.name, "nhl") || "";
+                  return (
                 <LeaderCard
                   key={player.id}
                   player={player}
                   rank={i + 1}
                   statLabel={skaterTab === "plusMinus" ? "+/-" : skaterTab === "ppGoals" ? "PP" : skaterTab}
-                  onClick={() => {
-                    logPlayerNavigation(player.name, "nhl");
-                    navigate(buildPlayerRoute("nhl", player.name));
-                  }}
+                  onClick={pid
+                    ? () => {
+                        logPlayerNavigation(pid, "nhl");
+                        void navigateToPlayerProfile(navigate, "nhl", pid, {
+                          displayName: player.name,
+                          source: "NHLHubSkaterLeaderCard",
+                        });
+                      }
+                    : undefined}
                 />
+                  );
+                })()
               ))}
             </div>
           </div>
@@ -673,16 +689,26 @@ export function NHLHubPage() {
             {/* Leaders Grid */}
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3">
               {(goalieLeaders?.[goalieTab] || GOALIE_LEADERS[goalieTab]).map((player, i) => (
+                (() => {
+                  const pid = resolvePlayerIdForNavigation(player.id, player.name, "nhl") || "";
+                  return (
                 <GoalieCard
                   key={player.id}
                   player={player}
                   rank={i + 1}
                   statKey={goalieTab}
-                  onClick={() => {
-                    logPlayerNavigation(player.name, "nhl");
-                    navigate(buildPlayerRoute("nhl", player.name));
-                  }}
+                  onClick={pid
+                    ? () => {
+                        logPlayerNavigation(pid, "nhl");
+                        void navigateToPlayerProfile(navigate, "nhl", pid, {
+                          displayName: player.name,
+                          source: "NHLHubGoalieLeaderCard",
+                        });
+                      }
+                    : undefined}
                 />
+                  );
+                })()
               ))}
             </div>
           </div>
@@ -915,11 +941,16 @@ function GameBoardCard({ game, onClick }: { game: GameData; onClick: () => void 
   );
 }
 
-function LeaderCard({ player, rank, statLabel, onClick }: { player: { name: string; team: string; value: number; gamesPlayed: number }; rank: number; statLabel: string; onClick: () => void }) {
+function LeaderCard({ player, rank, statLabel, onClick }: { player: { name: string; team: string; value: number; gamesPlayed: number }; rank: number; statLabel: string; onClick?: () => void }) {
   const isFirst = rank === 1;
 
   return (
-    <div onClick={onClick} className={`rounded-xl border p-4 cursor-pointer transition-all hover:scale-[1.02] ${isFirst ? "border-amber-500/30 bg-gradient-to-br from-amber-500/10 to-transparent" : "border-white/10 bg-white/[0.02]"}`}>
+    <div
+      onClick={onClick}
+      className={`rounded-xl border p-4 transition-all ${
+        onClick ? "cursor-pointer hover:scale-[1.02]" : "cursor-not-allowed opacity-70"
+      } ${isFirst ? "border-amber-500/30 bg-gradient-to-br from-amber-500/10 to-transparent" : "border-white/10 bg-white/[0.02]"}`}
+    >
       <div className="flex items-center justify-between mb-3">
         <div className={`w-7 h-7 rounded-lg flex items-center justify-center text-xs font-bold ${isFirst ? "bg-gradient-to-br from-amber-400 to-amber-600 text-black" : "bg-white/10 text-white/50"}`}>{rank}</div>
         <TeamLogo teamCode={player.team} sport="NHL" size={24} />
@@ -934,7 +965,7 @@ function LeaderCard({ player, rank, statLabel, onClick }: { player: { name: stri
   );
 }
 
-function GoalieCard({ player, rank, statKey, onClick }: { player: { name: string; team: string; value: number; gamesPlayed: number }; rank: number; statKey: string; onClick: () => void }) {
+function GoalieCard({ player, rank, statKey, onClick }: { player: { name: string; team: string; value: number; gamesPlayed: number }; rank: number; statKey: string; onClick?: () => void }) {
   const isFirst = rank === 1;
 
   const formatValue = () => {
@@ -944,7 +975,12 @@ function GoalieCard({ player, rank, statKey, onClick }: { player: { name: string
   };
 
   return (
-    <div onClick={onClick} className={`rounded-xl border p-4 cursor-pointer transition-all hover:scale-[1.02] ${isFirst ? "border-emerald-500/30 bg-gradient-to-br from-emerald-500/10 to-transparent" : "border-white/10 bg-white/[0.02]"}`}>
+    <div
+      onClick={onClick}
+      className={`rounded-xl border p-4 transition-all ${
+        onClick ? "cursor-pointer hover:scale-[1.02]" : "cursor-not-allowed opacity-70"
+      } ${isFirst ? "border-emerald-500/30 bg-gradient-to-br from-emerald-500/10 to-transparent" : "border-white/10 bg-white/[0.02]"}`}
+    >
       <div className="flex items-center justify-between mb-3">
         <div className={`w-7 h-7 rounded-lg flex items-center justify-center text-xs font-bold ${isFirst ? "bg-gradient-to-br from-emerald-400 to-emerald-600 text-black" : "bg-white/10 text-white/50"}`}>{rank}</div>
         <Shield className={`h-5 w-5 ${isFirst ? "text-emerald-400" : "text-white/30"}`} />

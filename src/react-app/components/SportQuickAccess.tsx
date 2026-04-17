@@ -70,12 +70,13 @@ export function SportQuickAccess({ activeSportKey }: { activeSportKey?: string |
           const failureCount = avatarFailures[sport.key] ?? 0;
           const showFallbackIcon = failureCount > 0;
           const imageSrc = sport.avatar.src;
+          const sportHref = sport.key === "golf" ? "/sports" : `/sports/${sport.key}`;
           const FallbackIcon = sport.fallbackIcon;
 
           return (
             <Link
               key={sport.key}
-              to={`/sports/${sport.key}`}
+              to={sportHref}
               className={cn(
                 "group flex-shrink-0 flex flex-col items-center gap-2",
                 "min-w-[72px] md:min-w-0",

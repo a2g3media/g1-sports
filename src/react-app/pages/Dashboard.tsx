@@ -1,3 +1,18 @@
+/**
+ :no_entry_sign: HOME LOCKED — DO NOT MODIFY :no_entry_sign:
+ *
+ * This page is production-stable.
+ * Any change must go through explicit override and review.
+ *
+ * Rules enforced:
+ * - schedule-only data
+ * - 3-card fallback rule (LIVE → FINAL → UPCOMING)
+ * - no stale/yesterday data
+ * - no fallback injection
+ *
+ * If you need to change Home:
+ * you MUST disable HOME_LOCKED and document why.
+ */
 import { useState, useEffect, useCallback, memo, useRef, useMemo } from "react";
 import { useDocumentTitle } from "@/react-app/hooks/useDocumentTitle";
 import { Link, useNavigate } from "react-router-dom";
@@ -19,6 +34,42 @@ import { useFavorites } from "@/react-app/hooks/useFavorites";
 import { Component, type ReactNode, type ErrorInfo } from "react";
 import { toGameDetailPath } from "@/react-app/lib/gameRoutes";
 import { useFeatureFlags } from "@/react-app/hooks/useFeatureFlags";
+import { prefetch } from "@/react-app/components/LazyRoute";
+
+let launchRouteChunksPrefetched = false;
+const HOME_LOCKED = true;
+let homeDashboardLockSelfTestRan = false;
+const HOME_NODE_ENV = String((globalThis as any)?.process?.env?.NODE_ENV || "").toLowerCase();
+const HOME_IS_DEV_RUNTIME = HOME_NODE_ENV === "development" || Boolean((import.meta as any)?.env?.DEV);
+
+function runHomeDisplayMutation<T>(action: string, override: boolean, mutation: () => T): T | null {
+  if (HOME_LOCKED && !override) {
+    console.warn("HOME LOCKED — CHANGE BLOCKED", { action });
+    return null;
+  }
+  return mutation();
+}
+
+function maybeFreezeHomeDataStructure<T>(homeDataStructure: T): T {
+  if (
+    HOME_LOCKED
+    && !HOME_IS_DEV_RUNTIME
+    && homeDataStructure
+    && typeof homeDataStructure === "object"
+  ) {
+    return Object.freeze(homeDataStructure as Record<string, unknown>) as T;
+  }
+  return homeDataStructure;
+}
+
+function prefetchLaunchRouteChunks(): void {
+  if (launchRouteChunksPrefetched) return;
+  launchRouteChunksPrefetched = true;
+  prefetch(() => import("@/react-app/pages/GamesPage"));
+  prefetch(() => import("@/react-app/pages/GameDetailPage"));
+  prefetch(() => import("@/react-app/pages/OddsGamePage"));
+  prefetch(() => import("@/react-app/pages/PlayerProfilePage"));
+}
 
 // Error boundary wrapper for isolating component crashes
 class ComponentErrorBoundary extends Component<
@@ -378,6 +429,52 @@ function CinematicBackground() {
 // ============================================
 // FEATURED GAME CARD - Using ApprovedScoreCard
 // ============================================
+function formatGolfFeaturedTime(startTime?: string): string {
+  if (!startTime) return "Time TBD";
+  const parsed = new Date(startTime);
+  if (Number.isNaN(parsed.getTime())) return "Time TBD";
+  return parsed.toLocaleString("en-US", {
+    weekday: "short",
+    hour: "numeric",
+    minute: "2-digit",
+    hour12: true,
+  });
+}
+
+function golfFeaturedStatus(game: LiveGame): string {
+  const status = String(game.status || "").toUpperCase();
+  if (status === "IN_PROGRESS" || status === "LIVE") return "In progress";
+  if (status === "FINAL" || status === "COMPLETED" || status === "CLOSED") return "Final";
+  return formatGolfFeaturedTime(game.startTime);
+}
+
+function pickGolfTourLabel(game: LiveGame): string {
+  const league = String(game.league || "").trim().toUpperCase();
+  if (league.includes("PGA")) return "PGA";
+  if (league.includes("LIV")) return "LIV";
+  if (league.includes("DP")) return "DP World Tour";
+  if (league.includes("LPGA")) return "LPGA";
+  if (league.includes("KORN")) return "Korn Ferry";
+  return league || "Golf";
+}
+
+function pickGolfEventName(game: LiveGame): string | null {
+  const eventKeyword = /\b(open|championship|masters|classic|invitational|cup|tournament|challenge)\b/i;
+  const rawCandidates = [
+    (game as any)?.eventName,
+    (game as any)?.event_name,
+    (game as any)?.tournamentName,
+    (game as any)?.tournament_name,
+    game.homeTeam?.name,
+    game.awayTeam?.name,
+  ];
+  for (const candidate of rawCandidates) {
+    const text = String(candidate || "").trim();
+    if (text && eventKeyword.test(text)) return text;
+  }
+  return null;
+}
+
 const FeaturedGameCard = memo(function FeaturedGameCard({ 
   game,
   onClick 
@@ -385,18 +482,49 @@ const FeaturedGameCard = memo(function FeaturedGameCard({
   game: LiveGame;
   onClick: (game: LiveGame) => void;
 }) {
-  // Transform LiveGame to ApprovedScoreCard format
+  const isGolf = String(game.sport || "").toUpperCase() === "GOLF";
   const cardGame = transformLiveGameToCard(game);
+  const golfEventName = pickGolfEventName(game) || "PGA Tour — Upcoming Tournament";
+  const golfSubtitle = "Details loading shortly";
+  const golfStatus = golfFeaturedStatus(game);
+  const golfTour = pickGolfTourLabel(game);
   
   return (
     <div 
       className="flex-shrink-0 w-[272px] sm:w-[286px] md:w-full cursor-pointer"
-      onClick={() => onClick(game)}
+      onMouseEnter={prefetchLaunchRouteChunks}
+      onFocus={prefetchLaunchRouteChunks}
+      onTouchStart={prefetchLaunchRouteChunks}
     >
-      <ApprovedScoreCard 
-        game={cardGame}
-        onClick={() => onClick(game)}
-      />
+      {isGolf ? (
+        <button
+          type="button"
+          onClick={() => onClick(game)}
+          className={cn(
+            "w-full rounded-xl border border-cyan-400/20 bg-gradient-to-b from-[#172235]/98 via-[#111A2A]/98 to-[#0C1422]/98",
+            "p-4 text-left shadow-2xl shadow-black/60 transition-all duration-300",
+            "hover:border-cyan-300/40 hover:shadow-[0_20px_50px_-12px_rgba(0,0,0,0.7)]",
+          )}
+        >
+          <div className="mb-3 flex items-center justify-between gap-2">
+            <span className="rounded-full border border-cyan-300/30 bg-cyan-500/10 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-cyan-100">
+              {golfTour}
+            </span>
+            <span className="text-[11px] font-medium text-white/70">{golfStatus}</span>
+          </div>
+          <h3 className="text-sm font-semibold text-white">
+            {golfEventName}
+          </h3>
+          <p className="mt-2 text-xs text-white/60">
+            {golfSubtitle}
+          </p>
+        </button>
+      ) : (
+        <ApprovedScoreCard 
+          game={cardGame}
+          onClick={() => onClick(game)}
+        />
+      )}
     </div>
   );
 });
@@ -425,7 +553,7 @@ function FeaturedGamesCarousel({
   const transitionTimeoutRef = useRef<number | null>(null);
   // Lock homepage rotation order to a predictable sequence.
   const rotationSportOrder = useMemo(
-    () => ['NBA', 'MLB', 'NHL', 'NCAAB', 'SOCCER'],
+    () => ['NBA', 'MLB', 'NHL', 'SOCCER', 'GOLF', 'NFL', 'NCAAB', 'NCAAF', 'MMA', 'NASCAR'],
     []
   );
   const normalizeSportKey = useCallback((sport: string, league?: string | null): string => {
@@ -435,9 +563,26 @@ function FeaturedGamesCarousel({
     if (upper === "CFB" || upper === "NCAAFB" || upper === "NCAA_FOOTBALL") return "NCAAF";
     if (upper === "ICEHOCKEY" || upper === "HOCKEY") return "NHL";
     if (upper === "BASEBALL") return "MLB";
+    if (
+      upper === "SOCCER" ||
+      upper === "FOOTBALL_SOCCER" ||
+      upper === "EPL" ||
+      upper === "MLS" ||
+      upper === "UCL" ||
+      upper === "UEFA" ||
+      upper === "LA_LIGA" ||
+      upper === "SERIE_A" ||
+      upper === "BUNDESLIGA" ||
+      upper === "LIGUE_1"
+    ) return "SOCCER";
+    if (upper === "PGA" || upper === "LIV" || upper === "DP" || upper === "GOLF_TOURNAMENT") return "GOLF";
     if (upper === "BASKETBALL") {
       if (leagueUpper.includes("NCAA") || leagueUpper.includes("NCAAB") || leagueUpper.includes("CBB")) return "NCAAB";
       return "NBA";
+    }
+    if (upper === "FOOTBALL") {
+      if (leagueUpper.includes("NCAA") || leagueUpper.includes("NCAAF") || leagueUpper.includes("COLLEGE")) return "NCAAF";
+      return "NFL";
     }
     return upper;
   }, []);
@@ -448,62 +593,208 @@ function FeaturedGamesCarousel({
     },
     [normalizeSportKey, rotationSportOrder]
   );
+
+  const parseDateSafe = useCallback((value?: string): Date | null => {
+    const raw = String(value || "").trim();
+    if (!raw) return null;
+    const parsed = new Date(raw);
+    return Number.isNaN(parsed.getTime()) ? null : parsed;
+  }, []);
+
+  const isTodayLocalOrUtc = useCallback((date: Date): boolean => {
+    const now = new Date();
+    const sameLocal = date.getFullYear() === now.getFullYear()
+      && date.getMonth() === now.getMonth()
+      && date.getDate() === now.getDate();
+    const sameUtc = date.getUTCFullYear() === now.getUTCFullYear()
+      && date.getUTCMonth() === now.getUTCMonth()
+      && date.getUTCDate() === now.getUTCDate();
+    return sameLocal || sameUtc;
+  }, []);
+
+  const isLiveLikeStatus = useCallback((game: LiveGame): boolean => {
+    const status = String(game.status || "").toUpperCase();
+    if (status === "IN_PROGRESS" || status === "LIVE" || status === "ACTIVE" || status === "HALFTIME") {
+      return true;
+    }
+    const period = String(game.period || "").toUpperCase();
+    const clock = String(game.clock || "").toUpperCase();
+    return period.includes("HALF") || period.includes("LIVE") || clock.includes("LIVE");
+  }, []);
+
+  const isFinalLikeStatus = useCallback((game: LiveGame): boolean => {
+    const status = String(game.status || "").toUpperCase();
+    return status === "FINAL" || status === "COMPLETED" || status === "CLOSED";
+  }, []);
+
+  const isUpcomingLikeStatus = useCallback((game: LiveGame): boolean => {
+    if (isLiveLikeStatus(game) || isFinalLikeStatus(game)) return false;
+    const status = String(game.status || "").toUpperCase();
+    return status === "SCHEDULED" || status === "NOT_STARTED" || status === "PRE_GAME" || status === "PREGAME";
+  }, [isFinalLikeStatus, isLiveLikeStatus]);
+
+  const toTime = useCallback((game: LiveGame, fallback: number): number => {
+    const parsed = parseDateSafe(game.startTime);
+    return parsed ? parsed.getTime() : fallback;
+  }, [parseDateSafe]);
+
+  const selectHomeSportCards = useCallback((sportGames: LiveGame[]): LiveGame[] => {
+    const selected = runHomeDisplayMutation("select-home-sport-cards", true, () => {
+      const todayStartTimeGames = sportGames.filter((game) => {
+        const parsed = parseDateSafe(game.startTime);
+        return parsed ? isTodayLocalOrUtc(parsed) : false;
+      });
+      const byLive = [...sportGames]
+        .filter((game) => isLiveLikeStatus(game))
+        .sort((a, b) => toTime(b, Number.NEGATIVE_INFINITY) - toTime(a, Number.NEGATIVE_INFINITY));
+      const byFinal = [...sportGames]
+        .filter((game) => isFinalLikeStatus(game))
+        .sort((a, b) => toTime(b, Number.NEGATIVE_INFINITY) - toTime(a, Number.NEGATIVE_INFINITY));
+      const byUpcoming = [...todayStartTimeGames]
+        .filter((game) => isUpcomingLikeStatus(game))
+        .sort((a, b) => toTime(a, Number.POSITIVE_INFINITY) - toTime(b, Number.POSITIVE_INFINITY));
+
+      const selectedGames: LiveGame[] = [];
+      const seenIds = new Set<string>();
+      const pushFromBucket = (bucket: LiveGame[]) => {
+        for (const game of bucket) {
+          if (selectedGames.length >= 3) break;
+          const key = String(game.id || "").trim();
+          if (!key || seenIds.has(key)) continue;
+          seenIds.add(key);
+          selectedGames.push(game);
+        }
+      };
+
+      // Hard Home display rule: LIVE first, then FINAL, then UPCOMING.
+      pushFromBucket(byLive);
+      pushFromBucket(byFinal);
+      pushFromBucket(byUpcoming);
+      return selectedGames;
+    });
+    return maybeFreezeHomeDataStructure(selected || []);
+  }, [isFinalLikeStatus, isLiveLikeStatus, isTodayLocalOrUtc, isUpcomingLikeStatus, parseDateSafe, toTime]);
   
   const sportGroups = useMemo(() => {
-    const grouped = new Map<string, LiveGame[]>();
-    for (const game of games) {
-      const key = normalizeSportKey(game.sport, game.league);
-      if (!grouped.has(key)) grouped.set(key, []);
-      grouped.get(key)!.push(game);
-    }
+    const groups = runHomeDisplayMutation("build-home-sport-groups", true, () => {
+      const grouped = new Map<string, LiveGame[]>();
+      for (const game of games) {
+        const key = normalizeSportKey(game.sport, game.league);
+        if (!grouped.has(key)) grouped.set(key, []);
+        grouped.get(key)!.push(game);
+      }
 
-    const groups = Array.from(grouped.entries()).map(([sport, sportGames]) => {
-      const sortedGames = [...sportGames].sort((a, b) => {
-        const rank = (status: LiveGame["status"]) =>
-          status === "IN_PROGRESS" ? 0 : status === "FINAL" ? 1 : 2;
-        const rankDiff = rank(a.status) - rank(b.status);
-        if (rankDiff !== 0) return rankDiff;
-        if (a.status === "FINAL" && b.status === "FINAL") {
-          const aTime = a.startTime ? new Date(a.startTime).getTime() : 0;
-          const bTime = b.startTime ? new Date(b.startTime).getTime() : 0;
-          return bTime - aTime;
-        }
-        const aTime = a.startTime ? new Date(a.startTime).getTime() : Number.POSITIVE_INFINITY;
-        const bTime = b.startTime ? new Date(b.startTime).getTime() : Number.POSITIVE_INFINITY;
-        return aTime - bTime;
+      const nextGroups = Array.from(grouped.entries()).map(([sport, sportGames]) => {
+        const selectedGames = selectHomeSportCards(sportGames);
+        const liveCount = selectedGames.filter((g) => isLiveLikeStatus(g)).length;
+        const earliestStart = selectedGames.reduce((earliest, game) => {
+          const next = game.startTime ? new Date(game.startTime).getTime() : Number.POSITIVE_INFINITY;
+          return Math.min(earliest, next);
+        }, Number.POSITIVE_INFINITY);
+
+        return maybeFreezeHomeDataStructure({
+          sport,
+          games: selectedGames,
+          hasLive: liveCount > 0,
+          liveCount,
+          earliestStart,
+        });
+      }).filter((group) => group.games.length > 0);
+
+      nextGroups.sort((a, b) => {
+        const orderDiff = getQuickAccessOrder(a.sport) - getQuickAccessOrder(b.sport);
+        if (orderDiff !== 0) return orderDiff;
+        // For sports outside the fixed sequence, keep deterministic fallback ordering.
+        const priorityDiff = getSportPriority(a.sport) - getSportPriority(b.sport);
+        if (priorityDiff !== 0) return priorityDiff;
+        if (a.earliestStart !== b.earliestStart) return a.earliestStart - b.earliestStart;
+        return a.sport.localeCompare(b.sport);
       });
 
-      const liveCount = sortedGames.filter((g) => g.status === "IN_PROGRESS").length;
-      const earliestStart = sortedGames.reduce((earliest, game) => {
-        const next = game.startTime ? new Date(game.startTime).getTime() : Number.POSITIVE_INFINITY;
-        return Math.min(earliest, next);
-      }, Number.POSITIVE_INFINITY);
-
-      return {
-        sport,
-        games: sortedGames,
-        hasLive: liveCount > 0,
-        liveCount,
-        earliestStart,
-      };
+      return nextGroups;
     });
-
-    groups.sort((a, b) => {
-      const orderDiff = getQuickAccessOrder(a.sport) - getQuickAccessOrder(b.sport);
-      if (orderDiff !== 0) return orderDiff;
-      // For sports outside the fixed sequence, keep deterministic fallback ordering.
-      const priorityDiff = getSportPriority(a.sport) - getSportPriority(b.sport);
-      if (priorityDiff !== 0) return priorityDiff;
-      if (a.earliestStart !== b.earliestStart) return a.earliestStart - b.earliestStart;
-      return a.sport.localeCompare(b.sport);
-    });
-
-    return groups;
-  }, [games, getQuickAccessOrder, normalizeSportKey]);
+    return maybeFreezeHomeDataStructure(groups || []);
+  }, [games, getQuickAccessOrder, isLiveLikeStatus, normalizeSportKey, selectHomeSportCards]);
 
   const activeGroup = sportGroups[activeSportIndex] || null;
   const visibleGames = (activeGroup?.games || games).slice(0, 3);
   const isLive = activeGroup ? activeGroup.hasLive : games.some(g => g.status === 'IN_PROGRESS');
+
+  useEffect(() => {
+    if (homeDashboardLockSelfTestRan) return;
+    homeDashboardLockSelfTestRan = true;
+    runHomeDisplayMutation("dashboard-home-lock-self-test", false, () => true);
+  }, []);
+
+  useEffect(() => {
+    const groupSports = sportGroups.map((group) => String(group.sport || "").toUpperCase());
+    const visibleSports = visibleGames.map((game) => normalizeSportKey(game.sport, game.league));
+    console.info("[Home][soccer-debug] final-render", {
+      sportGroups: groupSports,
+      activeSport: activeGroup?.sport || null,
+      visibleSports,
+      hasSoccerGroup: groupSports.includes("SOCCER"),
+    });
+  }, [activeGroup?.sport, normalizeSportKey, sportGroups, visibleGames]);
+
+  useEffect(() => {
+    const violations: Array<Record<string, unknown>> = [];
+    const seenIds = new Set<string>();
+    const hasData = games.length > 0;
+
+    for (const game of games) {
+      if (!game || typeof game !== "object") {
+        violations.push({ type: "undefined_game_object" });
+        continue;
+      }
+      const id = String(game.id || "").trim();
+      if (!id) {
+        violations.push({ type: "missing_game_id" });
+      }
+      if (!String(game.sport || "").trim()) {
+        violations.push({ type: "missing_sport", id });
+      }
+    }
+
+    if (hasData && sportGroups.length === 0) {
+      violations.push({ type: "empty_sport_groups_with_data", gamesCount: games.length });
+    }
+
+    for (const group of sportGroups) {
+      if (!group.games || group.games.length === 0) {
+        violations.push({ type: "empty_sport_group", sport: group.sport });
+      }
+      if (group.games.length > 3) {
+        violations.push({ type: "sport_group_exceeds_three_cards", sport: group.sport, count: group.games.length });
+      }
+      for (const game of group.games) {
+        const id = String(game.id || "").trim();
+        if (!id) continue;
+        if (seenIds.has(id)) {
+          violations.push({ type: "duplicate_game_id", id, sport: group.sport });
+        } else {
+          seenIds.add(id);
+        }
+        const parsed = parseDateSafe(game.startTime);
+        if (!parsed || !isTodayLocalOrUtc(parsed)) {
+          violations.push({
+            type: "non_today_game_rendered",
+            id,
+            sport: group.sport,
+            startTime: game.startTime || null,
+          });
+        }
+      }
+    }
+
+    if (violations.length > 0) {
+      console.error("[Home][render-assertions] violation detected", {
+        totalGames: games.length,
+        sportGroups: sportGroups.length,
+        violations,
+      });
+    }
+  }, [games, isTodayLocalOrUtc, parseDateSafe, sportGroups]);
 
   const rotateToSportIndex = useCallback((nextIndex: number) => {
     if (nextIndex === activeSportIndex) return;
@@ -1138,9 +1429,20 @@ function DashboardInner() {
     const timer = window.setTimeout(() => setSkeletonExpired(true), 8000);
     return () => window.clearTimeout(timer);
   }, []);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      prefetchLaunchRouteChunks();
+    }, 250);
+    return () => window.clearTimeout(timer);
+  }, []);
   
   const handleNavigateToGame = useCallback((game: LiveGame) => {
     const sport = String(game.sport || "").toLowerCase();
+    if (sport === "golf") {
+      navigate("/sports/golf");
+      return;
+    }
     const candidates = [
       (game as any).game_id,
       game.id,
@@ -1151,6 +1453,7 @@ function DashboardInner() {
       .filter(Boolean);
 
     const gameId = candidates.find((id) => !id.startsWith("gen_") && !id.startsWith("demo_")) || "";
+
     if (!gameId) {
       navigate(sport ? `/games?sport=${sport.toUpperCase()}` : "/games");
       return;
@@ -1159,18 +1462,22 @@ function DashboardInner() {
     navigate(toGameDetailPath(sport, gameId));
   }, [navigate]);
 
-  if (gamesLoading && !skeletonExpired && displayGames.length === 0) {
-    return <HomeSkeleton />;
-  }
-
   if (error && displayGames.length === 0 && leagues.length === 0) {
     return (
-      <ErrorState
-        title="Couldn't load home"
-        message={error}
-        onRetry={() => window.location.reload()}
-        size="lg"
-      />
+      <div className="relative min-h-screen -mx-4 -mt-2 px-4 pt-2 pb-8 md:-mx-6 md:px-6 lg:-mx-8 lg:px-8 lg:pt-2 lg:pb-10">
+        <CinematicBackground />
+        <div className="relative z-10 max-w-[1180px] mx-auto space-y-6 lg:space-y-8">
+          <CoachGCommandCenter />
+          <SportQuickAccess activeSportKey={activeCarouselSport} />
+          <section>
+            <div className="rounded-xl bg-white/[0.02] border border-white/[0.04] p-8 text-center">
+              <h2 className="text-sm font-black text-white/70 uppercase tracking-wider mb-2">Games Today</h2>
+              <p className="text-sm text-white/50">Loading games snapshot...</p>
+            </div>
+          </section>
+          <ErrorState title="Home feed delayed" message={error} size="sm" />
+        </div>
+      </div>
     );
   }
 
@@ -1202,6 +1509,19 @@ function DashboardInner() {
               />
               <AIIntelligenceFeed games={displayGames} />
             </>
+          ) : gamesLoading ? (
+            <section>
+              <div className="flex items-center justify-between mb-2 px-1">
+                <h2 className="text-sm font-black text-white/60 uppercase tracking-wider">
+                  Games Today
+                </h2>
+              </div>
+              <div className="rounded-xl bg-white/[0.02] border border-white/[0.04] p-8 text-center">
+                <p className="text-white/40 text-sm">
+                  {skeletonExpired ? 'Still loading live games…' : 'Loading games snapshot...'}
+                </p>
+              </div>
+            </section>
           ) : (
             <section>
               <div className="flex items-center justify-between mb-2 px-1">
@@ -1210,6 +1530,8 @@ function DashboardInner() {
                 </h2>
                 <Link 
                   to={ROUTES.SCORES} 
+                  onMouseEnter={prefetchLaunchRouteChunks}
+                  onFocus={prefetchLaunchRouteChunks}
                   className="text-[11px] font-semibold text-primary/60 hover:text-primary transition-colors flex items-center gap-0.5 group"
                 >
                   View Schedule

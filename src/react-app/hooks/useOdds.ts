@@ -109,6 +109,7 @@ export function useSlateOdds(
   const [summaries, setSummaries] = useState<(GameOddsSummary & { game?: SlateGame })[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const coldFallbackRetryRef = useRef(0);
 
   const fetchSlate = useCallback(async () => {
     if (gameIds.length === 0) {
@@ -127,6 +128,14 @@ export function useSlateOdds(
       if (!res.ok) throw new Error("Failed to fetch slate odds");
       const data = await res.json();
       setSummaries(data.summaries || []);
+      if (data?.pending_refresh === true && coldFallbackRetryRef.current < 3) {
+        coldFallbackRetryRef.current += 1;
+        setTimeout(() => {
+          void fetchSlate();
+        }, 350);
+      } else {
+        coldFallbackRetryRef.current = 0;
+      }
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to fetch slate odds");
     } finally {

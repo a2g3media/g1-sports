@@ -1,0 +1,20 @@
+{
+  "ts": "2026-04-12T05:41:21.126Z",
+  "base": "http://localhost:5173",
+  "total": 226,
+  "counts": {
+    "pass_usable": 56,
+    "pass_pending": 169,
+    "fail_http": 1
+  },
+  "failures": [
+    {
+      "sport": "GOLF",
+      "name": "tiger woods",
+      "expectedId": "462",
+      "verdict": "fail_http",
+      "pageDataId": null,
+      "partialReason": null
+    }
+  ]
+}

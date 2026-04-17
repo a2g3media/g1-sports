@@ -19,12 +19,14 @@ import AddToWatchboardModal from '@/react-app/components/AddToWatchboardModal';
 import { cn } from '@/react-app/lib/utils';
 import { toGameDetailPath, toOddsGamePath } from '@/react-app/lib/gameRoutes';
 import { fetchJsonCached } from '@/react-app/lib/fetchCache';
+import { buildPageDataGamesCacheKey, buildPageDataGamesUrl } from '@/react-app/lib/pageDataKeys';
 import { incrementPerfCounter, startPerfTimer } from '@/react-app/lib/perfTelemetry';
 import { OddsTelemetryDebugPanel } from '@/react-app/components/debug/OddsTelemetryDebugPanel';
 import { generateCoachWhisper as _generateCoachWhisper } from '@/react-app/lib/coachWhisper';
 import { useFeatureFlags } from '@/react-app/hooks/useFeatureFlags';
 import FavoriteEntityButton from '@/react-app/components/FavoriteEntityButton';
 import { useFavorites } from '@/react-app/hooks/useFavorites';
+import { prefetch } from '@/react-app/components/LazyRoute';
 // getTeamLogoUrl imported via teamLogos but unused currently
 // import { getTeamLogoUrl } from '@/react-app/lib/teamLogos';
 
@@ -88,7 +90,23 @@ type RouteSlateCacheEntry = {
   updatedAt: number;
 };
 
+type DateGamesCacheEntry = {
+  games: any[];
+  summary: Record<string, any>;
+  updatedAt: number;
+};
+
 const routeSlateCache = new Map<string, RouteSlateCacheEntry>();
+const dateGamesCache = new Map<string, DateGamesCacheEntry>();
+let gamesRouteChunksPrefetched = false;
+
+function prefetchGamesRouteChunks(): void {
+  if (gamesRouteChunksPrefetched) return;
+  gamesRouteChunksPrefetched = true;
+  prefetch(() => import('@/react-app/pages/GameDetailPage'));
+  prefetch(() => import('@/react-app/pages/OddsGamePage'));
+  prefetch(() => import('@/react-app/pages/PlayerProfilePage'));
+}
 
 function getRouteSlateCacheKey(dateStr: string, sport: string): string {
   return `${String(sport || 'ALL').toUpperCase()}|${dateStr}`;
@@ -138,6 +156,14 @@ const addDays = (date: Date, days: number): Date => {
 
 const normalizeOddsGameId = (value: unknown): string => String(value || "").trim().toLowerCase();
 
+const readSportParamFromLocation = (): string | null => {
+  if (typeof window === 'undefined') return null;
+  const raw = new URLSearchParams(window.location.search).get('sport');
+  if (!raw) return null;
+  const normalized = raw.trim().toUpperCase();
+  return normalized || null;
+};
+
 const buildOddsLookupCandidates = (value: unknown): string[] => {
   const raw = String(value || "").trim();
   if (!raw) return [];
@@ -175,6 +201,31 @@ const buildOddsLookupCandidates = (value: unknown): string[] => {
 const toFiniteNumberOrNull = (value: unknown): number | null => {
   const n = Number(value);
   return Number.isFinite(n) ? n : null;
+};
+
+const readProbablePitcherFromGame = (
+  game: any,
+  side: "away" | "home"
+): { name: string; record?: string } | undefined => {
+  const sideKey = side === "away" ? "away" : "home";
+  const nested = game?.probable_pitchers?.[sideKey] || game?.probablePitchers?.[sideKey];
+  const name = String(
+    nested?.name
+    || game?.[side === "away" ? "probable_away_pitcher_name" : "probable_home_pitcher_name"]
+    || game?.[side === "away" ? "probableAwayPitcherName" : "probableHomePitcherName"]
+    || ""
+  ).trim();
+  if (!name) return undefined;
+  const record = String(
+    nested?.record
+    || game?.[side === "away" ? "probable_away_pitcher_record" : "probable_home_pitcher_record"]
+    || game?.[side === "away" ? "probableAwayPitcherRecord" : "probableHomePitcherRecord"]
+    || ""
+  ).trim();
+  return {
+    name,
+    record: record || undefined,
+  };
 };
 
 const oddsSummaryStrength = (summary: any): number => {
@@ -264,10 +315,11 @@ const buildOddsMatchKey = (sport: unknown, home: unknown, away: unknown, startTi
 };
 
 const getGamesApiPath = (dateStr: string, sport: string, includeOdds: boolean = false): string => {
-  const params = new URLSearchParams({ date: dateStr, includeOdds: includeOdds ? "1" : "0" });
-  const normalizedSport = String(sport || "").trim().toUpperCase();
-  if (normalizedSport && normalizedSport !== 'ALL') params.set('sport', normalizedSport);
-  return `/api/games?${params.toString()}`;
+  return buildPageDataGamesUrl({
+    date: dateStr,
+    sport: String(sport || "").trim().toUpperCase() || "ALL",
+    tab: includeOdds ? "odds" : "scores",
+  });
 };
 
 // Sport validation - ALL is special, fetches from all sports
@@ -275,6 +327,52 @@ const validSportKeys = ['ALL', 'NBA', 'MLB', 'NHL', 'NCAAB', 'SOCCER', 'MMA', 'G
 type ExtendedSportKey = typeof validSportKeys[number];
 const isValidSport = (s: string | null): s is ExtendedSportKey => 
   s !== null && (validSportKeys as readonly string[]).includes(s as typeof validSportKeys[number]);
+
+function normalizeSportForGamesPage(rawSport: unknown, rawLeague?: unknown): string {
+  const upper = String(rawSport || '').toUpperCase();
+  const league = String(rawLeague || '').toUpperCase();
+  const soccerLeagueHints = [
+    'UEFA', 'EUROPA', 'CHAMPIONS', 'PREMIER', 'EPL', 'MLS',
+    'LA_LIGA', 'LA LIGA', 'SERIE_A', 'SERIE A', 'BUNDES',
+    'LIGUE_1', 'LIGUE 1', 'LIGA_MX', 'LIGA MX', 'EREDIVISIE',
+    'PRIMEIRA', 'COPA', 'WORLD CUP', 'NATIONS LEAGUE',
+  ];
+  const hasSoccerLeagueSignal = soccerLeagueHints.some((hint) => league.includes(hint));
+  if (upper === 'CBB' || upper === 'NCAAM' || upper === 'NCAA_MEN_BASKETBALL') return 'NCAAB';
+  if (upper === 'CFB' || upper === 'NCAAFB' || upper === 'NCAA_FOOTBALL') return 'NCAAF';
+  if (upper === 'ICEHOCKEY' || upper === 'HOCKEY') return 'NHL';
+  if (upper === 'BASEBALL') return 'MLB';
+  if (
+    hasSoccerLeagueSignal ||
+    upper === 'SOCCER' ||
+    upper === 'FOOTBALL_SOCCER' ||
+    upper === 'EPL' ||
+    upper === 'MLS' ||
+    upper === 'UCL' ||
+    upper === 'UEFA' ||
+    upper === 'EUROPA_LEAGUE' ||
+    upper === 'EUROPA-LEAGUE' ||
+    upper === 'CHAMPIONS_LEAGUE' ||
+    upper === 'CHAMPIONS-LEAGUE' ||
+    upper === 'PREMIER_LEAGUE' ||
+    upper === 'PREMIER-LEAGUE' ||
+    upper === 'LA_LIGA' ||
+    upper === 'SERIE_A' ||
+    upper === 'BUNDESLIGA' ||
+    upper === 'LIGUE_1'
+  ) return 'SOCCER';
+  if (upper === 'PGA' || upper === 'LIV' || upper === 'DP' || upper === 'GOLF_TOURNAMENT') return 'GOLF';
+  if (upper === 'BASKETBALL') {
+    if (league.includes('NCAA') || league.includes('NCAAB') || league.includes('CBB')) return 'NCAAB';
+    return 'NBA';
+  }
+  if (upper === 'FOOTBALL') {
+    if (league.includes('NCAA') || league.includes('NCAAF') || league.includes('COLLEGE')) return 'NCAAF';
+    if (hasSoccerLeagueSignal) return 'SOCCER';
+    return 'NFL';
+  }
+  return upper || 'NBA';
+}
 
 // Sports list for dropdown - ALL first, PROPS special (navigates to /props page)
 const DROPDOWN_SPORTS = [
@@ -422,6 +520,41 @@ const SPORT_CHIPS = [
   { key: 'MMA', label: 'MMA' },
   { key: 'GOLF', label: 'Golf' },
 ] as const;
+
+async function fetchSoccerPageDataFallback(
+  dateStr: string,
+  forceRefresh: boolean
+): Promise<{ games: any[]; summary: Record<string, any> }> {
+  try {
+    const payload = await fetchJsonCached<any>(buildPageDataGamesUrl({
+      date: dateStr,
+      sport: 'SOCCER',
+      tab: 'scores',
+      fresh: forceRefresh,
+    }), {
+      cacheKey: buildPageDataGamesCacheKey({
+        date: dateStr,
+        sport: 'SOCCER',
+        tab: 'scores',
+        fresh: forceRefresh,
+      }),
+      ttlMs: forceRefresh ? 0 : 3_000,
+      timeoutMs: 5_000,
+      bypassCache: forceRefresh,
+      init: { credentials: 'include' },
+    });
+    return {
+      games: Array.isArray(payload?.games) ? payload.games : [],
+      summary: (payload?.oddsSummaryByGame && typeof payload.oddsSummaryByGame === 'object') ? payload.oddsSummaryByGame : {},
+    };
+  } catch (err) {
+    console.warn('[GamesPage] fetchSoccerPageDataFallback failed:', err);
+    return {
+      games: [],
+      summary: {},
+    };
+  }
+}
 
 function SportQuickJump({ 
   selected, 
@@ -752,8 +885,10 @@ export function GamesPage() {
       if (parsed) date = parsed;
     }
     
-    setSelectedSportState(sport);
-    setSelectedDateState(date);
+    setSelectedSportState((prev) => (prev === sport ? prev : sport));
+    setSelectedDateState((prev) => (
+      formatDateYYYYMMDD(prev) === formatDateYYYYMMDD(date) ? prev : date
+    ));
   }, [searchParams, today]);
   
   // Mocha preview iframe workaround: re-check URL params periodically
@@ -851,7 +986,8 @@ export function GamesPage() {
   const fetchGamesPageData = useCallback(async (
     dateToFetch?: Date,
     forceRefresh = false,
-    sportToFetch: ExtendedSportKey = 'ALL'
+    sportToFetch: ExtendedSportKey = 'ALL',
+    silentRefresh = false
   ) => {
     const stopPerf = startPerfTimer('games.pageData.fetch');
     const startedAt =
@@ -860,41 +996,134 @@ export function GamesPage() {
         : Date.now();
     const dateStr = dateToFetch ? formatDateYYYYMMDD(dateToFetch) : formatDateYYYYMMDD(new Date());
     const sportKey = (sportToFetch || 'ALL').toUpperCase();
+    const routeSportParam = readSportParamFromLocation();
+    const isSingleSportRoute = Boolean(routeSportParam && routeSportParam !== 'ALL');
+    const dateScopedCacheKey = `games:${dateStr}`;
     const routeCacheKey = getRouteSlateCacheKey(dateStr, sportKey);
     const hasExisting = currentGamesRef.current.length > 0;
-    const isInitialRenderRequest = !hasExisting && !forceRefresh;
     try {
-      setHubError(null);
-      setStaleNotice(null);
-      setHubLoading(!hasExisting);
+      if (!silentRefresh) {
+        setHubError(null);
+        setStaleNotice(null);
+        setHubLoading(true);
+      }
       console.info("PAGE_DATA_START", { route: "games", date: dateStr, sport: sportKey, tab: activeTab, forceRefresh });
-      const qs = new URLSearchParams({
+      const payload = await fetchJsonCached<any>(buildPageDataGamesUrl({
         date: dateStr,
-        sport: sportKey,
-        tab: activeTab,
-      });
-      if (forceRefresh) qs.set('fresh', '1');
-      const payload = await fetchJsonCached<any>(`/api/page-data/games?${qs.toString()}`, {
-        cacheKey: `page-data:games:${sportKey}:${dateStr}:${activeTab}:${forceRefresh ? 'fresh' : 'cached'}`,
+        sport: "ALL",
+        tab: "scores",
+        fresh: forceRefresh,
+      }), {
+        cacheKey: buildPageDataGamesCacheKey({
+          date: dateStr,
+          sport: "ALL",
+          tab: "scores",
+          fresh: forceRefresh,
+        }),
         ttlMs: forceRefresh ? 0 : 3_000,
-        timeoutMs: isInitialRenderRequest ? 2_000 : 3_500,
+        timeoutMs: 2_000,
         bypassCache: forceRefresh,
         init: { credentials: 'include' },
       });
-      const nextGames = Array.isArray(payload?.games) ? payload.games : [];
+      console.log("games response:", payload);
+      const explicitPayloadError = String(payload?.error || "").trim();
+      if (payload?.ok === false || explicitPayloadError) {
+        const isGlobalSlate = sportKey === 'ALL' && !isSingleSportRoute;
+        if (!hasExisting && isGlobalSlate) {
+          setHubError(explicitPayloadError || "Unable to load games right now.");
+        } else if (!hasExisting) {
+          // Single-sport failure should degrade to an empty slate, never global error UI.
+          setRawGames([]);
+          setHubError(null);
+          setStaleNotice(explicitPayloadError || `${sportKey} slate is temporarily unavailable.`);
+        } else {
+          setStaleNotice(explicitPayloadError || "Games refresh failed. Showing available slate.");
+        }
+        return;
+      }
+      let nextGames = Array.isArray(payload?.games) ? payload.games : [];
       const nextSummary = (payload?.oddsSummaryByGame && typeof payload.oddsSummaryByGame === 'object')
         ? payload.oddsSummaryByGame
         : {};
+      if (sportKey === 'SOCCER') {
+        const soccerCount = nextGames.filter((game: any) =>
+          normalizeSportForGamesPage(game?.sport, game?.league) === 'SOCCER'
+        ).length;
+        if (soccerCount === 0) {
+          try {
+            const soccerFallback = await fetchSoccerPageDataFallback(dateStr, forceRefresh);
+            if (soccerFallback.games.length > 0) {
+              const existingIds = new Set(nextGames.map((g: any) => String(g?.game_id || g?.id || '')));
+              const additions = soccerFallback.games.filter((row: any) => !existingIds.has(String(row?.game_id || row?.id || '')));
+              if (additions.length > 0) {
+                nextGames = [...nextGames, ...additions];
+                if (Object.keys(soccerFallback.summary).length > 0) {
+                  setOddsSummaryByGame((prev) => mergeOddsSummaryRecord(prev, soccerFallback.summary));
+                }
+                setStaleNotice('Using soccer fallback slate while primary load completes.');
+              }
+            }
+          } catch (soccerFallbackErr) {
+            console.warn('[GamesPage] Soccer fallback fetch failed:', soccerFallbackErr);
+          }
+        }
+      }
+      const fetchNextAvailableSportSlate = async (): Promise<{ games: any[]; date: string; summary: Record<string, any> } | null> => {
+        if (sportKey === 'ALL') return null;
+        // Probe a short forward window so sport tabs do not look dead on off-days.
+        for (let dayOffset = 1; dayOffset <= 3; dayOffset += 1) {
+          const probeDate = new Date(`${dateStr}T12:00:00`);
+          probeDate.setDate(probeDate.getDate() + dayOffset);
+          const probeDateStr = formatDateYYYYMMDD(probeDate);
+          const probePayload = await fetchJsonCached<any>(buildPageDataGamesUrl({
+            date: probeDateStr,
+            sport: sportKey,
+            tab: "scores",
+          }), {
+            cacheKey: buildPageDataGamesCacheKey({
+              date: probeDateStr,
+              sport: sportKey,
+              tab: "scores",
+            }),
+            ttlMs: 2_500,
+            timeoutMs: 2_500,
+            init: { credentials: 'include' },
+          }).catch(() => null);
+          const probeGames = Array.isArray(probePayload?.games) ? probePayload.games : [];
+          if (probeGames.length === 0) continue;
+          const probeSummary = (probePayload?.oddsSummaryByGame && typeof probePayload.oddsSummaryByGame === 'object')
+            ? probePayload.oddsSummaryByGame
+            : {};
+          return { games: probeGames, date: probeDateStr, summary: probeSummary };
+        }
+        return null;
+      };
       if (nextGames.length > 0) {
         setRawGames(nextGames);
         currentDateRef.current = dateStr;
         writeRouteSlateCache(routeCacheKey, nextGames);
         saveCachedGamesForDate(dateStr, nextGames, sportKey, false);
+        dateGamesCache.set(dateScopedCacheKey, {
+          games: nextGames,
+          summary: nextSummary,
+          updatedAt: Date.now(),
+        });
         hasFetchedRef.current = true;
       } else if (!hasExisting) {
-        setRawGames([]);
-        setHubError('No games available for selected date');
-        console.warn("PAGE_DATA_FALLBACK_USED", { route: "games", reason: "empty_payload_no_existing_data", date: dateStr, sport: sportKey });
+        const fallback = await fetchNextAvailableSportSlate();
+        if (fallback && fallback.games.length > 0) {
+          setRawGames(fallback.games);
+          currentDateRef.current = fallback.date;
+          writeRouteSlateCache(getRouteSlateCacheKey(fallback.date, sportKey), fallback.games);
+          saveCachedGamesForDate(fallback.date, fallback.games, sportKey, false);
+          if (Object.keys(fallback.summary).length > 0) {
+            setOddsSummaryByGame((prev) => mergeOddsSummaryRecord(prev, fallback.summary));
+          }
+          setStaleNotice(`No ${sportKey} games on ${dateStr}. Showing next available slate (${fallback.date}).`);
+        } else {
+          setRawGames([]);
+          console.warn("PAGE_DATA_FALLBACK_USED", { route: "games", reason: "empty_payload_no_existing_data", date: dateStr, sport: sportKey });
+        }
       }
       if (Object.keys(nextSummary).length > 0) {
         setOddsSummaryByGame((prev) => {
@@ -916,7 +1145,19 @@ export function GamesPage() {
         games: nextGames.length,
         oddsSummary: Object.keys(nextSummary).length,
         degraded: Boolean(payload?.degraded),
+        cache: payload?.freshness?.source || "cold",
+        cache_hit: payload?.freshness?.source === "l1" || payload?.freshness?.source === "l2",
       });
+      {
+        const elapsedMs = Math.max(
+          0,
+          (typeof performance !== 'undefined' && typeof performance.now === 'function'
+            ? performance.now()
+            : Date.now()) - startedAt
+        );
+        console.info("FIRST_PAINT", { route: "games", first_paint_time_ms: Math.round(elapsedMs) });
+        console.info("FULL_HYDRATION", { route: "games", full_hydration_time_ms: Math.round(elapsedMs) });
+      }
       if (flags.PAGE_DATA_OBSERVABILITY_ENABLED) {
         const elapsedMs = Math.max(
           0,
@@ -947,13 +1188,64 @@ export function GamesPage() {
       if (msg.toLowerCase().includes("timeout") || String((err as any)?.name || "") === "AbortError") {
         console.warn("PAGE_DATA_TIMEOUT", { route: "games", date: dateStr, sport: sportKey, tab: activeTab });
       }
-      if (!hasExisting) {
-        setHubError('Games data is still loading. Showing partial view.');
+      if (sportKey === 'SOCCER' && !hasExisting) {
+        try {
+          const soccerFallback = await fetchSoccerPageDataFallback(dateStr, true);
+          setRawGames(soccerFallback.games);
+          currentDateRef.current = dateStr;
+          if (soccerFallback.games.length > 0) {
+            writeRouteSlateCache(routeCacheKey, soccerFallback.games);
+            saveCachedGamesForDate(dateStr, soccerFallback.games, sportKey, false);
+            dateGamesCache.set(dateScopedCacheKey, {
+              games: soccerFallback.games,
+              summary: soccerFallback.summary,
+              updatedAt: Date.now(),
+            });
+            if (Object.keys(soccerFallback.summary).length > 0) {
+              setOddsSummaryByGame((prev) => mergeOddsSummaryRecord(prev, soccerFallback.summary));
+            }
+            setStaleNotice('Primary request failed; showing soccer fallback slate.');
+          } else {
+            setStaleNotice('Soccer slate is temporarily unavailable.');
+          }
+          setHubError(null);
+          return;
+        } catch (soccerRecoveryErr) {
+          console.warn('[GamesPage] Soccer recovery request failed', soccerRecoveryErr);
+        }
+      }
+      const cachedByDate = dateGamesCache.get(dateScopedCacheKey)
+        || (() => {
+          const fallbackGames = loadCachedGamesForDate(dateStr, sportKey, 10 * 60_000, false);
+          if (!fallbackGames || fallbackGames.length === 0) return null;
+          return {
+            games: fallbackGames,
+            summary: loadCachedOddsSummary(dateStr) || {},
+            updatedAt: Date.now(),
+          } as DateGamesCacheEntry;
+        })();
+      if (cachedByDate && cachedByDate.games.length > 0) {
+        setRawGames(cachedByDate.games);
+        if (Object.keys(cachedByDate.summary).length > 0) {
+          setOddsSummaryByGame((prev) => mergeOddsSummaryRecord(prev, cachedByDate.summary));
+        }
+        setStaleNotice('Showing cached slate while live refresh retries.');
+      } else if (!hasExisting) {
+        if (sportKey === 'ALL' && !isSingleSportRoute) {
+          setHubError('Unable to load games right now. Please try again.');
+        } else {
+          // Single-sport request failures must render empty-state instead of failure UI.
+          setRawGames([]);
+          setHubError(null);
+          setStaleNotice(`${sportKey} slate is temporarily unavailable.`);
+        }
         console.warn("PAGE_DATA_FALLBACK_USED", { route: "games", reason: "request_failed_no_existing_data", date: dateStr, sport: sportKey });
+      } else {
+        setStaleNotice('Live refresh failed. Showing available slate.');
       }
     } finally {
       stopPerf();
-      if (mountedRef.current) {
+      if (mountedRef.current && !silentRefresh) {
         setHubLoading(false);
         setRefreshCycleCount((v) => v + 1);
       }
@@ -961,8 +1253,10 @@ export function GamesPage() {
   }, [activeTab, flags.PAGE_DATA_OBSERVABILITY_ENABLED]);
   
   // Pre-fetch adjacent dates in background for instant switching
-  const prefetchAdjacentDates = useCallback((baseDate: Date, sportToFetch: ExtendedSportKey = 'ALL') => {
-    const sportKey = (sportToFetch || 'ALL').toUpperCase();
+  const prefetchAdjacentDates = useCallback((baseDate: Date, _sportToFetch: ExtendedSportKey = 'ALL') => {
+    // Keep adjacent-date prefetch on ALL so it reuses the same page-data cache path
+    // as the primary Games route and avoids extra per-sport cold assemblies.
+    const sportKey = 'ALL';
     const yesterday = new Date(baseDate);
     yesterday.setDate(yesterday.getDate() - 1);
     const tomorrow = new Date(baseDate);
@@ -980,7 +1274,11 @@ export function GamesPage() {
       // Prefetch with delay to not compete with main request
       setTimeout(() => {
         fetchJsonCached<any>(getGamesApiPath(dateStr, sportKey, false), {
-          cacheKey: `games:prefetch:${sportKey}:${dateStr}`,
+          cacheKey: buildPageDataGamesCacheKey({
+            date: dateStr,
+            sport: sportKey,
+            tab: "scores",
+          }),
           ttlMs: 10000,
           timeoutMs: 7000,
         })
@@ -994,10 +1292,65 @@ export function GamesPage() {
     });
   }, []);
   
-  // Initial fetch and refetch when date changes
+  // Initial fetch and refetch when date/sport changes.
+  // Keep the current slate visible while refresh is in flight.
   useEffect(() => {
-    void fetchGamesPageData(selectedDate, false, selectedSport);
+    const dateStr = formatDateYYYYMMDD(selectedDate);
+    const dateScopedCacheKey = `games:${dateStr}`;
+    const sportKey = (selectedSport || 'ALL').toUpperCase();
+    setHubError(null);
+    setStaleNotice(null);
+    setHubLoading(true);
+    const cachedByDate = dateGamesCache.get(dateScopedCacheKey)
+      || (() => {
+        const fallbackGames = loadCachedGamesForDate(dateStr, sportKey, 10 * 60_000, false);
+        if (!fallbackGames || fallbackGames.length === 0) return null;
+        return {
+          games: fallbackGames,
+          summary: loadCachedOddsSummary(dateStr) || {},
+          updatedAt: Date.now(),
+        } as DateGamesCacheEntry;
+      })();
+    if (cachedByDate && cachedByDate.games.length > 0) {
+      setRawGames(cachedByDate.games);
+      if (Object.keys(cachedByDate.summary).length > 0) {
+        setOddsSummaryByGame((prev) => mergeOddsSummaryRecord(prev, cachedByDate.summary));
+      }
+      setHubLoading(false);
+      // Silent background refresh keeps cache warm without UI thrash.
+      void fetchGamesPageData(selectedDate, false, selectedSport, true);
+      return;
+    }
+    void fetchGamesPageData(selectedDate, false, selectedSport, false);
   }, [fetchGamesPageData, selectedDate, selectedSport]);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      prefetchGamesRouteChunks();
+    }, 250);
+    return () => window.clearTimeout(timer);
+  }, []);
+
+  useEffect(() => {
+    const dateStr = formatDateYYYYMMDD(selectedDate);
+    // Warm odds using ALL to match the main games request contract.
+    const sportKey = "ALL";
+    const warmOddsUrl = buildPageDataGamesUrl({
+      date: dateStr,
+      sport: sportKey,
+      tab: "odds",
+    });
+    void fetchJsonCached<any>(warmOddsUrl, {
+      cacheKey: buildPageDataGamesCacheKey({
+        date: dateStr,
+        sport: sportKey,
+        tab: "odds",
+      }),
+      ttlMs: 8_000,
+      timeoutMs: 2_500,
+      init: { credentials: "include" },
+    }).catch(() => {});
+  }, [selectedDate]);
   
   // Pre-fetch adjacent dates after initial load completes
   useEffect(() => {
@@ -1022,7 +1375,7 @@ export function GamesPage() {
   // Transform raw API games to LiveGame-like format
   const hubGames = useMemo(() => {
     return rawGames.map((game: any) => {
-      const sportKey = (game.sport || 'NBA').toUpperCase();
+      const sportKey = normalizeSportForGamesPage(game.sport, game.league);
         const gameId = game.game_id || game.id || `gen_${sportKey}_${game.home_team_code}_${game.away_team_code}_${game.start_time}`;
         const idSummary = buildOddsLookupCandidates(gameId)
           .map((candidate) => oddsSummaryByGame[candidate])
@@ -1043,16 +1396,20 @@ export function GamesPage() {
           name: game.home_team_name || game.home_team_code || 'TBD',
           abbreviation: game.home_team_code || 'TBD',
           score: game.home_score ?? null,
+          logo: typeof game.home_logo_url === 'string' ? game.home_logo_url : undefined,
         },
         awayTeam: {
           name: game.away_team_name || game.away_team_code || 'TBD',
           abbreviation: game.away_team_code || 'TBD',
           score: game.away_score ?? null,
+          logo: typeof game.away_logo_url === 'string' ? game.away_logo_url : undefined,
         },
         status: game.status || 'SCHEDULED',
         period: game.period || null,
         clock: game.clock || null,
         startTime: game.start_time || null,
+        probableAwayPitcher: readProbablePitcherFromGame(game, "away"),
+        probableHomePitcher: readProbablePitcherFromGame(game, "home"),
         channel: game.channel || null,
         isOvertime: game.is_overtime || false,
         odds: {
@@ -1141,7 +1498,7 @@ export function GamesPage() {
           return {
             id: g.id || `game-${Math.random()}`,
             gameId: g.id || '',
-            sport: g.sport || 'NBA',
+            sport: normalizeSportForGamesPage(g.sport || 'NBA', (g as any).league),
             league: undefined,
             homeTeam: {
               abbr: homeAbbr,
@@ -1157,6 +1514,8 @@ export function GamesPage() {
             awayScore,
             status: normalizedStatus,
             startTime: g.startTime || undefined,
+            probableAwayPitcher: g.probableAwayPitcher,
+            probableHomePitcher: g.probableHomePitcher,
             period: g.period || undefined,
             clock: g.clock || undefined,
             spread: g.odds?.spreadHome ?? undefined,
@@ -1207,6 +1566,7 @@ export function GamesPage() {
   }, [games]);
 
   useEffect(() => {
+    if (activeTab !== 'odds') return;
     if (hubLoading || refreshing) return;
     if (games.length === 0) return;
     if (realOddsGameCount > 0) return;
@@ -1231,6 +1591,8 @@ export function GamesPage() {
 
   const loading = hubLoading;
   const error = hubError;
+  const routeSportParam = readSportParamFromLocation();
+  const showGlobalFailure = Boolean(error) && (!routeSportParam || routeSportParam === 'ALL');
 
   // Update URL and state
   const setSelectedSport = useCallback((sport: ExtendedSportKey) => {
@@ -1245,7 +1607,7 @@ export function GamesPage() {
     const params = new URLSearchParams(searchParams);
     params.set('date', formatDateYYYYMMDD(date));
     setSearchParams(params, { replace: true });
-    setStatusFilter('live');
+    setStatusFilter('all');
     setHasAutoFallback(false);
   }, [searchParams, setSearchParams]);
 
@@ -1280,8 +1642,8 @@ export function GamesPage() {
       return { liveGames: [], scheduledGames: [], finalGames: [], filteredCount: 0 };
     }
     
-    // Performance optimization: limit total games processed
-    const gamesToProcess = games.slice(0, 200);
+    // Process full slate - no client-side caps.
+    const gamesToProcess = games;
     // API is already date-scoped, so avoid re-filtering by date on the client.
     let filtered = gamesToProcess;
 
@@ -1571,6 +1933,8 @@ export function GamesPage() {
             period: game.period,
             clock: game.clock,
             startTime: game.startTime,
+            probableAwayPitcher: game.probableAwayPitcher,
+            probableHomePitcher: game.probableHomePitcher,
             channel: game.channel,
             spread: game.spread ?? game.odds?.spread ?? null,
             overUnder: game.overUnder ?? game.odds?.total ?? null,
@@ -1986,18 +2350,8 @@ export function GamesPage() {
                   }
                 }
                 if (sport === 'GOLF') {
-                  try {
-                    const res = await fetch('/api/sports-data/sportsradar/golf/next');
-                    if (res.ok) {
-                      const data = await res.json();
-                      if (data.gameId) {
-                        navigate(toGameDetailPath('golf', data.gameId));
-                        return;
-                      }
-                    }
-                  } catch (err) {
-                    console.error('Failed to fetch next PGA tournament:', err);
-                  }
+                  navigate('/sports/golf');
+                  return;
                 }
                 setSelectedSport(sport);
                 setLeagueFilter('ALL');
@@ -2096,6 +2450,12 @@ export function GamesPage() {
             <p className="text-[11px] text-cyan-200">{staleNotice}</p>
           </div>
         )}
+        {loading && games.length > 0 && (
+          <div className="mb-4 inline-flex items-center gap-2 rounded-full border border-cyan-400/30 bg-cyan-500/10 px-3 py-1">
+            <RefreshCw className="h-3.5 w-3.5 animate-spin text-cyan-200" />
+            <p className="text-[11px] font-medium text-cyan-100">Updating games...</p>
+          </div>
+        )}
         {showDebugTelemetry && (
           <div className="mb-4">
             <OddsTelemetryDebugPanel
@@ -2128,7 +2488,7 @@ export function GamesPage() {
             )}
 
             {/* Error */}
-            {error && !loading && (
+            {showGlobalFailure && !loading && games.length === 0 && rawGames.length === 0 && (
               <div className="flex flex-col items-center justify-center rounded-2xl border border-red-500/30 bg-red-500/10 px-5 py-12 text-center">
                 <AlertCircle className="mb-3 h-6 w-6 text-red-300" />
                 <p className="mb-2 text-sm font-semibold text-red-100">Unable to load games</p>
@@ -2149,7 +2509,7 @@ export function GamesPage() {
             )}
 
             {/* Empty - No games for date - show helpful message */}
-            {!loading && !error && games.length === 0 && rawGames.length === 0 && (
+            {!loading && !showGlobalFailure && games.length === 0 && rawGames.length === 0 && (
               <div className="flex flex-col items-center justify-center rounded-2xl border border-slate-700/30 bg-[#121821] px-6 py-20 text-center">
                 <div className="mb-5 flex h-16 w-16 items-center justify-center rounded-2xl border border-slate-700/30 bg-slate-800/50 text-sm font-semibold tracking-wide text-slate-300">
                   {String(sportConfig?.label || selectedSport || "ALL").slice(0, 3).toUpperCase()}
@@ -2183,7 +2543,7 @@ export function GamesPage() {
             )}
 
             {/* Games - List View */}
-            {!error && filteredCount > 0 && (
+            {filteredCount > 0 && (
               <div>
                 {statusFilter === 'all' ? (
                   <>
@@ -2243,6 +2603,8 @@ export function GamesPage() {
                                     period: game.period,
                                     clock: game.clock,
                                     startTime: game.startTime,
+                                    probableAwayPitcher: game.probableAwayPitcher,
+                                    probableHomePitcher: game.probableHomePitcher,
                                     channel: game.channel,
                                     spread: game.spread ?? game.odds?.spread ?? null,
                                     overUnder: game.overUnder ?? game.odds?.total ?? null,
@@ -2280,7 +2642,7 @@ export function GamesPage() {
             )}
 
         {/* No games in filtered view */}
-        {!error && games.length > 0 && filteredCount === 0 && (
+        {games.length > 0 && filteredCount === 0 && (
           <div className="flex flex-col items-center justify-center rounded-2xl border border-slate-700/30 bg-[#121821] px-6 py-16 text-center">
             <div className="mb-4 flex h-14 w-14 items-center justify-center rounded-xl border border-slate-700/30 bg-slate-800/40">
               <AlertCircle className="w-6 h-6 text-slate-500" />

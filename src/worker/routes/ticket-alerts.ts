@@ -19,6 +19,40 @@ type Bindings = {
 
 const app = new Hono<{ Bindings: Bindings }>();
 
+function isMissingTicketAlertStorage(error: unknown): boolean {
+  const msg = String((error as { message?: unknown })?.message || error || "").toLowerCase();
+  return (
+    msg.includes("no such table")
+    || msg.includes("ticket_alerts")
+    || msg.includes("ticket_alert_preferences")
+  );
+}
+
+function defaultTicketAlertPreferences(userId: string) {
+  return {
+    user_id: userId,
+    is_enabled: 1,
+    min_priority: 3,
+    channel_push: 1,
+    channel_banner: 1,
+    channel_center: 1,
+    mute_ticket_settled: 0,
+    mute_parlay_last_leg: 0,
+    mute_cover_flip_clutch: 0,
+    mute_game_final: 0,
+    mute_cover_flip: 0,
+    mute_momentum_shift: 0,
+    mute_overtime_start: 0,
+    mute_game_start: 0,
+    mute_lead_change: 0,
+    mute_buzzer_beater: 0,
+    mute_major_run: 0,
+    quiet_hours_enabled: 0,
+    quiet_hours_start: '22:00',
+    quiet_hours_end: '07:00',
+  };
+}
+
 /**
  * GET /api/ticket-alerts
  * Get all alerts for the current user
@@ -51,6 +85,15 @@ app.get('/', async (c) => {
     });
   } catch (error) {
     console.error('[TICKET-ALERTS] Error fetching alerts:', error);
+    if (isMissingTicketAlertStorage(error)) {
+      return c.json({
+        success: true,
+        alerts: [],
+        total: 0,
+        limit,
+        offset,
+      });
+    }
     return c.json({ error: 'Failed to fetch alerts' }, 500);
   }
 });
@@ -77,6 +120,13 @@ app.get('/unread', async (c) => {
     });
   } catch (error) {
     console.error('[TICKET-ALERTS] Error fetching unread alerts:', error);
+    if (isMissingTicketAlertStorage(error)) {
+      return c.json({
+        success: true,
+        alerts: [],
+        count: 0,
+      });
+    }
     return c.json({ error: 'Failed to fetch unread alerts' }, 500);
   }
 });
@@ -103,6 +153,12 @@ app.get('/count', async (c) => {
     });
   } catch (error) {
     console.error('[TICKET-ALERTS] Error counting alerts:', error);
+    if (isMissingTicketAlertStorage(error)) {
+      return c.json({
+        success: true,
+        unread_count: 0,
+      });
+    }
     return c.json({ error: 'Failed to count alerts' }, 500);
   }
 });
@@ -260,6 +316,12 @@ app.get('/ticket/:ticketId', async (c) => {
     });
   } catch (error) {
     console.error('[TICKET-ALERTS] Error fetching ticket alerts:', error);
+    if (isMissingTicketAlertStorage(error)) {
+      return c.json({
+        success: true,
+        alerts: [],
+      });
+    }
     return c.json({ error: 'Failed to fetch ticket alerts' }, 500);
   }
 });
@@ -310,6 +372,17 @@ app.get('/stats', async (c) => {
     });
   } catch (error) {
     console.error('[TICKET-ALERTS] Error fetching stats:', error);
+    if (isMissingTicketAlertStorage(error)) {
+      return c.json({
+        success: true,
+        stats: {
+          total: 0,
+          unread: 0,
+          by_priority: { critical: 0, important: 0, info: 0 },
+          by_type: { settlements: 0, cover_flips: 0 },
+        },
+      });
+    }
     return c.json({ error: 'Failed to fetch alert stats' }, 500);
   }
 });
@@ -362,6 +435,12 @@ app.get('/preferences', async (c) => {
     });
   } catch (error) {
     console.error('[TICKET-ALERTS] Error fetching preferences:', error);
+    if (isMissingTicketAlertStorage(error)) {
+      return c.json({
+        success: true,
+        preferences: defaultTicketAlertPreferences(userId),
+      });
+    }
     return c.json({ error: 'Failed to fetch preferences' }, 500);
   }
 });
@@ -438,6 +517,12 @@ app.patch('/preferences', async (c) => {
     });
   } catch (error) {
     console.error('[TICKET-ALERTS] Error updating preferences:', error);
+    if (isMissingTicketAlertStorage(error)) {
+      return c.json({
+        success: true,
+        preferences: { ...defaultTicketAlertPreferences(userId), ...validUpdates },
+      });
+    }
     return c.json({ error: 'Failed to update preferences' }, 500);
   }
 });

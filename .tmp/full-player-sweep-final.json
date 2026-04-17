@@ -1,0 +1,38 @@
+{
+  "ts": "2026-04-12T05:34:38.643Z",
+  "base": "http://localhost:5173",
+  "total": 226,
+  "counts": {
+    "pass_usable": 31,
+    "pass_pending": 192,
+    "fail_identity": 1,
+    "timeout": 1,
+    "fail_http": 1
+  },
+  "failures": [
+    {
+      "sport": "NBA",
+      "name": "donovan mitchell",
+      "expectedId": "4066421",
+      "verdict": "fail_identity",
+      "pageDataId": "3908809",
+      "partialReason": "profile_incomplete"
+    },
+    {
+      "sport": "NBA",
+      "name": "chris paul",
+      "expectedId": "2779",
+      "verdict": "timeout",
+      "pageDataId": null,
+      "partialReason": null
+    },
+    {
+      "sport": "GOLF",
+      "name": "tiger woods",
+      "expectedId": "462",
+      "verdict": "fail_http",
+      "pageDataId": null,
+      "partialReason": null
+    }
+  ]
+}

@@ -16,6 +16,7 @@ import { ParlaySlip, ParlayFloatingButton } from "@/react-app/components/ParlayS
 import { LazyRoute, lazyLoad } from "@/react-app/components/LazyRoute";
 import { ErrorProvider, ErrorBoundary } from "@/react-app/components/ErrorBoundary";
 import { Loader2 } from "lucide-react";
+import SportsPlayerRouteRedirect from "@/react-app/components/SportsPlayerRouteRedirect";
 import { Toaster } from "sonner";
 
 // Eager load - needed immediately for app shell
@@ -215,21 +216,11 @@ function AdminLayoutFallback() {
   );
 }
 
-function SportsPlayerRouteRedirect() {
-  const { sportKey, playerId } = useParams<{ sportKey: string; playerId: string }>();
-  const sport = String(sportKey || "").trim();
-  const player = String(playerId || "").trim();
-  if (!sport || !player) {
-    return <Navigate to="/props" replace />;
-  }
-  return <Navigate to={`/props/player/${encodeURIComponent(sport)}/${encodeURIComponent(decodeURIComponent(player))}`} replace />;
-}
-
 function LegacyPlayerRouteRedirect() {
-  const { sport, playerName } = useParams<{ sport: string; playerName: string }>();
+  const { sport, playerId } = useParams<{ sport: string; playerId: string }>();
   const sportKey = String(sport || "").trim();
-  const playerId = String(playerName || "").trim();
-  if (!sportKey || !playerId) {
+  const id = String(playerId || "").trim();
+  if (!sportKey || !id) {
     return <Navigate to="/props" replace />;
   }
   return (
@@ -624,7 +615,7 @@ function AppRoutes() {
         }
       />
       <Route
-        path="/props/player/:sport/:playerName"
+        path="/props/player/:sport/:playerId"
         element={
           <ProtectedRoute>
             <LegacyPlayerRouteRedirect />

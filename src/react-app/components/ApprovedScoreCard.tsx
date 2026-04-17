@@ -88,6 +88,8 @@ export interface ApprovedScoreCardGame {
   overUnder?: number;
   moneylineHome?: number;
   moneylineAway?: number;
+  homeLogoUrl?: string | null;
+  awayLogoUrl?: string | null;
   // Line movement (stored but not displayed in simplified card)
   spreadOpen?: number;
   totalOpen?: number;
@@ -117,6 +119,8 @@ export interface ApprovedScoreCardGame {
   channel?: string | null;
   // Overtime indicator
   isOvertime?: boolean;
+  probableAwayPitcher?: { name: string; record?: string };
+  probableHomePitcher?: { name: string; record?: string };
 }
 
 interface ApprovedScoreCardProps {
@@ -258,8 +262,8 @@ export function transformLiveGameToCard(game: {
   id: string;
   sport: string;
   league?: string | null;
-  homeTeam: { name: string; abbreviation: string; score: number };
-  awayTeam: { name: string; abbreviation: string; score: number };
+  homeTeam: { name: string; abbreviation: string; score: number; logo?: string };
+  awayTeam: { name: string; abbreviation: string; score: number; logo?: string };
   period: string;
   clock: string;
   status: string;
@@ -291,6 +295,8 @@ export function transformLiveGameToCard(game: {
     overUnder: game.odds?.total ?? undefined,
     moneylineHome: game.odds?.moneylineHome ?? undefined,
     moneylineAway: game.odds?.moneylineAway ?? undefined,
+    homeLogoUrl: game.homeTeam.logo || null,
+    awayLogoUrl: game.awayTeam.logo || null,
     coachSignal: game.hasCoachInsight ? 'edge' : undefined,
     publicBetHome: game.community?.homePercent,
     publicBetAway: game.community?.awayPercent,
@@ -371,6 +377,16 @@ function parseMlbInningDisplay(period?: string, clock?: string): string | null {
   if (inningOnly) {
     const inning = Number(inningOnly[1]);
     return `${ordinalSuffix(inning)} Inning`;
+  }
+
+  // Provider fallback: many MLB feeds expose bare inning number ("2") plus
+  // a meaningless clock ("0:00"). Never show basketball-style clocks for MLB.
+  const numericPeriod = String(period || '').trim().match(/^(\d{1,2})$/);
+  if (numericPeriod) {
+    const inning = Number(numericPeriod[1]);
+    if (Number.isFinite(inning) && inning > 0) {
+      return `${ordinalSuffix(inning)} Inning`;
+    }
   }
 
   return null;
@@ -521,6 +537,7 @@ const TeamIcon = memo(function TeamIcon({
   teamName,
   sport,
   league,
+  directLogoUrl,
   hasPossession,
   isFinalWinner,
   sizePreset = 'default',
@@ -529,13 +546,15 @@ const TeamIcon = memo(function TeamIcon({
   teamName?: string;
   sport?: string;
   league?: string | null;
+  directLogoUrl?: string | null;
   hasPossession?: boolean;
   isFinalWinner?: boolean;
   sizePreset?: 'default' | 'hub';
 }) {
   const isGolf = (sport || '').toUpperCase() === 'GOLF';
   const [imgError, setImgError] = useState(false);
-  const logoUrl = sport ? getTeamOrCountryLogoUrl(abbr, sport, league) : null;
+  const inlineLogo = String(directLogoUrl || '').trim() || null;
+  const logoUrl = inlineLogo || (sport ? getTeamOrCountryLogoUrl(abbr, sport, league) : null);
   const showLogo = logoUrl && !imgError;
   const usesHubSizing = sizePreset === 'hub';
   const iconWrap = usesHubSizing ? "w-16 h-16 sm:w-20 sm:h-20" : "w-14 h-14 sm:w-16 sm:h-16";
@@ -599,6 +618,7 @@ const TeamBlock = memo(function TeamBlock({
   hasPossession,
   sport,
   league,
+  logoUrl,
   rank,
   sizePreset = 'default',
 }: { 
@@ -612,6 +632,7 @@ const TeamBlock = memo(function TeamBlock({
   hasPossession?: boolean;
   sport?: string;
   league?: string | null;
+  logoUrl?: string | null;
   rank?: number | null; // NCAAB Top 25 ranking
   sizePreset?: 'default' | 'hub';
 }) {
@@ -688,6 +709,7 @@ const TeamBlock = memo(function TeamBlock({
         teamName={teamName}
         sport={sport}
         league={league}
+        directLogoUrl={logoUrl}
         hasPossession={hasPossession}
         isFinalWinner={isFinal && isWinner}
         sizePreset={sizePreset}
@@ -1316,6 +1338,7 @@ export const ApprovedScoreCard = memo(function ApprovedScoreCard({
           <TeamBlock 
             abbr={awayTeam} 
             teamName={awayTeamName}
+            logoUrl={game.awayLogoUrl}
             score={game.awayScore} 
             gameState={gameState}
             isWinner={awayIsWinner}
@@ -1335,6 +1358,7 @@ export const ApprovedScoreCard = memo(function ApprovedScoreCard({
           <TeamBlock 
             abbr={homeTeam} 
             teamName={homeTeamName}
+            logoUrl={game.homeLogoUrl}
             score={game.homeScore} 
             gameState={gameState}
             isWinner={homeIsWinner}

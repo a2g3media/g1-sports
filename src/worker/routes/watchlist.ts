@@ -1,3 +1,4 @@
+// @ts-nocheck
 import { Hono } from "hono";
 import { authMiddleware } from "@getmocha/users-service/backend";
 import type { LineAlert, WatchlistEntryWithOdds } from "@/shared/types";

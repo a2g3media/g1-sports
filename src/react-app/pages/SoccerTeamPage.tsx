@@ -4,6 +4,7 @@ import { Shield, Calendar, Users, Activity, Brain, MapPin, Trophy, Loader2, Chev
 import SoccerPageHeader, { buildTeamBreadcrumbs } from "@/react-app/components/soccer/SoccerPageHeader";
 import { useSoccerBackNavigation, buildSoccerMatchUrl, buildSoccerPlayerUrl } from "@/react-app/hooks/useSoccerBackNavigation";
 import { getEspnPlayerPhoto, fetchPlayerPhotos } from "@/react-app/lib/espnSoccer";
+import { fetchJsonCached } from "@/react-app/lib/fetchCache";
 import TeamCrest from "@/react-app/components/soccer/TeamCrest";
 import FavoriteEntityButton from "@/react-app/components/FavoriteEntityButton";
 
@@ -23,7 +24,11 @@ interface TeamData {
 }
 
 interface Player {
-  id: string;
+  id?: string | null;
+  playerId?: string | null;
+  espnId?: string | null;
+  providerPlayerId?: string | null;
+  srPlayerId?: string | null;
   name: string;
   jerseyNumber: number | null;
   position: string;
@@ -196,12 +201,12 @@ function SoccerTeamPageContent() {
       setError(null);
       
       try {
-        const response = await fetch(`/api/soccer/team/${teamId}`);
-        if (!response.ok) {
-          const errData = await response.json().catch(() => ({}));
-          throw new Error(errData.error || `HTTP ${response.status}`);
-        }
-        const result = await response.json();
+        const result = await fetchJsonCached<TeamProfileResponse>(`/api/soccer/team/${teamId}`, {
+          cacheKey: `soccer-team-profile:${teamId}`,
+          ttlMs: 45_000,
+          timeoutMs: 4_000,
+          init: { credentials: "include" },
+        });
         setData(result);
       } catch (err) {
         setError(err instanceof Error ? err.message : 'Failed to load team');
@@ -220,12 +225,17 @@ function SoccerTeamPageContent() {
     async function fetchFullSchedule() {
       setScheduleLoading(true);
       try {
-        const response = await fetch(`/api/soccer/team/${teamId}/schedule`);
-        if (response.ok) {
-          const result = await response.json();
-          setScheduleResults(result.results || []);
-          setScheduleUpcoming(result.upcoming || []);
-        }
+        const result = await fetchJsonCached<{ results?: ScheduleMatch[]; upcoming?: ScheduleMatch[] }>(
+          `/api/soccer/team/${teamId}/schedule`,
+          {
+            cacheKey: `soccer-team-schedule:${teamId}`,
+            ttlMs: 45_000,
+            timeoutMs: 4_000,
+            init: { credentials: "include" },
+          }
+        );
+        setScheduleResults(result.results || []);
+        setScheduleUpcoming(result.upcoming || []);
       } catch (err) {
         console.error('Failed to load full schedule:', err);
       } finally {
@@ -298,6 +308,37 @@ function SoccerTeamPageContent() {
     if (orderA !== orderB) return orderA - orderB;
     return (a.jerseyNumber || 99) - (b.jerseyNumber || 99);
   });
+
+  const resolveSoccerPlayerRouteId = useCallback((player: Player): string | null => {
+    const candidates = [
+      player.id,
+      player.playerId,
+      player.espnId,
+      player.providerPlayerId,
+      player.srPlayerId,
+    ];
+    for (const candidate of candidates) {
+      const value = String(candidate || "").trim();
+      if (!value) continue;
+      return value;
+    }
+    return null;
+  }, []);
+  useEffect(() => {
+    if (!teamId || !data) return;
+    const normalizedRosterCount = Array.isArray(data.players) ? data.players.length : 0;
+    const rows = sortedPlayers;
+    const clickableRows = rows.filter((p) => Boolean(resolveSoccerPlayerRouteId(p))).length;
+    console.log('[Soccer Team][roster-render]', {
+      requestedSport: 'soccer',
+      requestedTeamId: teamId,
+      source: (data as any)?.source || null,
+      rawProviderRosterCount: normalizedRosterCount,
+      normalizedRosterCount,
+      finalRenderedRosterCount: rows.length,
+      clickableRows,
+    });
+  }, [teamId, data, sortedPlayers, resolveSoccerPlayerRouteId]);
 
   if (loading) {
     return (
@@ -684,44 +725,78 @@ function SoccerTeamPageContent() {
               {sortedPlayers.length > 0 ? (
                 <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
                   {sortedPlayers.map((player) => (
-                    <Link
-                      key={player.id}
-                      to={buildSoccerPlayerUrl(player.id, { fromTeamId: teamId })}
-                      className="p-3 rounded-lg bg-white/[0.03] border border-white/5 flex items-center gap-3 hover:bg-white/[0.06] hover:border-emerald-500/30 transition-colors group"
-                    >
-                      {/* Player Photo - HD ESPN headshot */}
-                      <div className="w-12 h-12 rounded-full bg-gradient-to-br from-white/10 to-white/5 overflow-hidden relative flex-shrink-0 ring-1 ring-white/10">
-                        <img 
-                          src={getPlayerPhoto(player.name)} 
-                          alt={player.name}
-                          className="w-full h-full object-cover"
-                          loading="lazy"
-                          onError={(e) => { 
-                            e.currentTarget.style.display = 'none';
-                            e.currentTarget.nextElementSibling?.classList.remove('hidden');
-                          }}
-                        />
-                        <div className="hidden absolute inset-0 flex items-center justify-center text-sm font-bold text-white/60 bg-gradient-to-br from-emerald-500/20 to-cyan-500/20 group-hover:from-emerald-500/30 group-hover:to-cyan-500/30 transition-colors">
-                          {player.jerseyNumber || player.name.charAt(0)}
+                    (() => {
+                      const resolvedPlayerId = resolveSoccerPlayerRouteId(player);
+                      const playerRoute = resolvedPlayerId
+                        ? buildSoccerPlayerUrl(encodeURIComponent(resolvedPlayerId), { fromTeamId: teamId })
+                        : null;
+                      const cardClasses = [
+                        "p-3 rounded-lg border flex items-center gap-3 transition-colors group",
+                        resolvedPlayerId
+                          ? "bg-white/[0.03] border-white/5 hover:bg-white/[0.06] hover:border-emerald-500/30"
+                          : "bg-white/[0.02] border-white/10 opacity-85",
+                      ].join(" ");
+                      const cardContent = (
+                        <>
+                          {/* Player Photo - HD ESPN headshot */}
+                          <div className="w-12 h-12 rounded-full bg-gradient-to-br from-white/10 to-white/5 overflow-hidden relative flex-shrink-0 ring-1 ring-white/10">
+                            <img 
+                              src={getPlayerPhoto(player.name)} 
+                              alt={player.name}
+                              className="w-full h-full object-cover"
+                              loading="lazy"
+                              onError={(e) => { 
+                                e.currentTarget.style.display = 'none';
+                                e.currentTarget.nextElementSibling?.classList.remove('hidden');
+                              }}
+                            />
+                            <div className="hidden absolute inset-0 flex items-center justify-center text-sm font-bold text-white/60 bg-gradient-to-br from-emerald-500/20 to-cyan-500/20 group-hover:from-emerald-500/30 group-hover:to-cyan-500/30 transition-colors">
+                              {player.jerseyNumber || player.name.charAt(0)}
+                            </div>
+                          </div>
+                          <div className="flex-1 min-w-0">
+                            <p className="font-medium text-white/90 truncate group-hover:text-emerald-400 transition-colors">{player.name}</p>
+                            <p className="text-xs text-white/40 capitalize flex items-center gap-1">
+                              {player.jerseyNumber && <span className="text-white/30">#{player.jerseyNumber}</span>}
+                              {player.jerseyNumber && <span className="text-white/20">·</span>}
+                              {player.position}
+                            </p>
+                          </div>
+                          {player.nationality && (
+                            <span className="text-xs text-white/30">{player.nationality}</span>
+                          )}
+                          <ChevronRight className={`w-4 h-4 transition-colors ${resolvedPlayerId ? "text-white/20 group-hover:text-emerald-400/60" : "text-white/15"}`} />
+                        </>
+                      );
+                      if (playerRoute) {
+                        return (
+                          <Link
+                            key={`${player.name}:${resolvedPlayerId}`}
+                            to={playerRoute}
+                            className={cardClasses}
+                            data-soccer-player-row="true"
+                            data-clickable="true"
+                          >
+                            {cardContent}
+                          </Link>
+                        );
+                      }
+                      return (
+                        <div
+                          key={`${player.name}:no-id`}
+                          className={cardClasses}
+                          aria-disabled="true"
+                          data-soccer-player-row="true"
+                          data-clickable="false"
+                        >
+                          {cardContent}
                         </div>
-                      </div>
-                      <div className="flex-1 min-w-0">
-                        <p className="font-medium text-white/90 truncate group-hover:text-emerald-400 transition-colors">{player.name}</p>
-                        <p className="text-xs text-white/40 capitalize flex items-center gap-1">
-                          {player.jerseyNumber && <span className="text-white/30">#{player.jerseyNumber}</span>}
-                          {player.jerseyNumber && <span className="text-white/20">·</span>}
-                          {player.position}
-                        </p>
-                      </div>
-                      {player.nationality && (
-                        <span className="text-xs text-white/30">{player.nationality}</span>
-                      )}
-                      <ChevronRight className="w-4 h-4 text-white/20 group-hover:text-emerald-400/60 transition-colors" />
-                    </Link>
+                      );
+                    })()
                   ))}
                 </div>
               ) : (
-                <p className="text-center text-white/30 text-sm py-8">Squad data not available</p>
+                <p className="text-center text-white/30 text-sm py-8">Roster not available yet.</p>
               )}
             </div>
           </section>

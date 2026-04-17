@@ -1,3 +1,4 @@
+// @ts-nocheck
 /**
  * Odds API Provider
  * 

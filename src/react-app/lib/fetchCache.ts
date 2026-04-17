@@ -24,6 +24,32 @@ const fetchCacheStats = {
 
 const now = () => Date.now();
 
+function isDegradedPayload(value: unknown): boolean {
+  if (
+    value
+    && typeof value === "object"
+    && Object.prototype.hasOwnProperty.call(value as Record<string, unknown>, "pending_refresh")
+    && (value as { pending_refresh?: unknown }).pending_refresh === true
+  ) {
+    return true;
+  }
+  if (
+    !value
+    || typeof value !== "object"
+    || !Object.prototype.hasOwnProperty.call(value as Record<string, unknown>, "degraded")
+    || (value as { degraded?: unknown }).degraded !== true
+  ) {
+    return false;
+  }
+  // Only treat degraded player-profile payloads as hard failures.
+  // Games/team/sport-hub degraded payloads can still be usable and should render.
+  const route = String((value as { route?: unknown }).route || "").trim().toLowerCase();
+  if (route && route !== "player-profile") {
+    return false;
+  }
+  return route === "player-profile";
+}
+
 export async function fetchJsonCached<T = unknown>(url: string, options: JsonFetchOptions = {}): Promise<T> {
   fetchCacheStats.requests += 1;
 
@@ -53,8 +79,12 @@ export async function fetchJsonCached<T = unknown>(url: string, options: JsonFet
   const cached = jsonCache.get(cacheKey);
   if (!bypassCache && ttlMs > 0) {
     if (cached && cached.expiresAt > now()) {
+      if (isDegradedPayload(cached.value)) {
+        jsonCache.delete(cacheKey);
+      } else {
       fetchCacheStats.cacheHits += 1;
       return cached.value as T;
+      }
     }
   }
 
@@ -78,10 +108,16 @@ export async function fetchJsonCached<T = unknown>(url: string, options: JsonFet
     try {
       const response = await fetch(url, { ...init });
       if (!response.ok) {
-        throw new Error(`HTTP ${response.status}`);
+        const err = new Error(`HTTP ${response.status}`) as Error & {
+          status?: number;
+          responseBody?: unknown;
+        };
+        err.status = response.status;
+        err.responseBody = await response.json().catch(() => null);
+        throw err;
       }
       const payload = (await response.json()) as T;
-      if (ttlMs > 0) {
+      if (ttlMs > 0 && !isDegradedPayload(payload)) {
         jsonCache.set(cacheKey, { value: payload, expiresAt: now() + ttlMs });
       }
       return payload;

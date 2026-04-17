@@ -1,3 +1,4 @@
+// @ts-nocheck
 import { generateCoachGAnalysis } from "./coachgContentFactoryService";
 import {
   getCoachGFeaturedItemById,

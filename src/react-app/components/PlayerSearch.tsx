@@ -6,7 +6,10 @@ import { useState, useEffect, useRef } from "react";
 import { useNavigate } from "react-router-dom";
 import { Search, X, User, Loader2 } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
-import { buildPlayerRoute, logPlayerNavigation } from "@/react-app/lib/navigationRoutes";
+import { canonicalPlayerIdQueryParam, logPlayerNavigation } from "@/react-app/lib/navigationRoutes";
+import { navigateToPlayerProfile } from "@/react-app/lib/playerProfileNavigation";
+import { prefetchFullPlayerProfileSnapshot } from "@/react-app/lib/playerProfileSnapshotPrewarm";
+import { resolvePlayerIdForNavigation } from "@/react-app/lib/resolvePlayerIdForNavigation";
 
 interface SearchResult {
   espnId: string;
@@ -68,7 +71,27 @@ export function PlayerSearch({
         const res = await fetch(`/api/player/search?q=${encodeURIComponent(query)}${sportParam}`);
         if (res.ok) {
           const data = await res.json();
-          setResults(data.results || []);
+          const rows = Array.isArray(data?.results) ? data.results : [];
+          const normalized: SearchResult[] = rows.map((row: Record<string, unknown>) => {
+            const displayName = String(row?.displayName || row?.name || "").trim();
+            const sportKey = String(row?.sport || sport || "").trim();
+            const rawCandidateId = row?.espnId ?? row?.playerId ?? row?.id ?? "";
+            const espnId = String(
+              canonicalPlayerIdQueryParam(rawCandidateId)
+              || resolvePlayerIdForNavigation(rawCandidateId, displayName, sportKey.toLowerCase())
+              || ""
+            );
+            return {
+              espnId,
+              displayName,
+              position: row?.position ? String(row.position) : undefined,
+              teamName: row?.teamName ? String(row.teamName) : undefined,
+              teamAbbr: row?.teamAbbr ? String(row.teamAbbr) : undefined,
+              sport: sportKey,
+              headshotUrl: row?.headshotUrl ? String(row.headshotUrl) : undefined,
+            };
+          }).filter((row: SearchResult) => Boolean(row.displayName));
+          setResults(normalized);
         }
       } catch (err) {
         console.error("Player search error:", err);
@@ -86,10 +109,13 @@ export function PlayerSearch({
     if (onSelect) {
       onSelect(player);
     } else {
-      // Default navigation
       const sportKey = player.sport?.toLowerCase() || sport?.toLowerCase() || "nba";
-      logPlayerNavigation(player.displayName, sportKey);
-      navigate(buildPlayerRoute(sportKey, player.displayName));
+      const sid = String(player.espnId || "").trim();
+      logPlayerNavigation(sid || player.displayName, sportKey);
+      void navigateToPlayerProfile(navigate, sportKey, player.espnId, {
+        displayName: player.displayName,
+        source: "PlayerSearch",
+      });
     }
     setQuery("");
     setResults([]);
@@ -154,41 +180,78 @@ export function PlayerSearch({
               </div>
             ) : (
               <div className="py-1">
-                {results.map((player) => (
-                  <button
-                    key={player.espnId}
-                    onClick={() => handleSelect(player)}
-                    className="w-full flex items-center gap-3 px-4 py-3 hover:bg-white/10 transition-colors text-left"
-                  >
-                    {/* Player Photo */}
-                    <div className="w-10 h-10 rounded-full bg-white/10 overflow-hidden flex-shrink-0">
-                      {player.headshotUrl ? (
-                        <img 
-                          src={player.headshotUrl} 
-                          alt={player.displayName}
-                          className="w-full h-full object-cover"
-                          onError={(e) => {
-                            (e.target as HTMLImageElement).style.display = 'none';
-                          }}
-                        />
-                      ) : (
-                        <div className="w-full h-full flex items-center justify-center">
-                          <User className="w-5 h-5 text-white/30" />
-                        </div>
-                      )}
-                    </div>
-
-                    {/* Player Info */}
-                    <div className="flex-1 min-w-0">
-                      <div className="text-white font-medium truncate">{player.displayName}</div>
-                      <div className="text-xs text-white/50 truncate">
-                        {player.position && <span>{player.position} • </span>}
-                        {player.teamName || player.teamAbbr}
-                        {!sport && player.sport && <span className="ml-2 text-cyan-400">{player.sport}</span>}
+                {results.map((player, idx) => {
+                  const resolvedPlayerId = canonicalPlayerIdQueryParam(player.espnId) || "";
+                  const isNavigable = Boolean(resolvedPlayerId);
+                  const itemKey = `${String(player.espnId || "").trim() || "missing-id"}:${player.displayName}:${idx}`;
+                  const content = (
+                    <>
+                      {/* Player Photo */}
+                      <div className="w-10 h-10 rounded-full bg-white/10 overflow-hidden flex-shrink-0">
+                        {player.headshotUrl ? (
+                          <img 
+                            src={player.headshotUrl} 
+                            alt={player.displayName}
+                            className="w-full h-full object-cover"
+                            onError={(e) => {
+                              (e.target as HTMLImageElement).style.display = 'none';
+                            }}
+                          />
+                        ) : (
+                          <div className="w-full h-full flex items-center justify-center">
+                            <User className="w-5 h-5 text-white/30" />
+                          </div>
+                        )}
                       </div>
-                    </div>
-                  </button>
-                ))}
+
+                      {/* Player Info */}
+                      <div className="flex-1 min-w-0">
+                        <div className="text-white font-medium truncate">{player.displayName}</div>
+                        <div className="text-xs text-white/50 truncate">
+                          {player.position && <span>{player.position} • </span>}
+                          {player.teamName || player.teamAbbr}
+                          {!sport && player.sport && <span className="ml-2 text-cyan-400">{player.sport}</span>}
+                        </div>
+                      </div>
+                    </>
+                  );
+                  if (!isNavigable) {
+                    return (
+                      <div
+                        key={itemKey}
+                        className="w-full flex items-center gap-3 px-4 py-3 text-left opacity-70 cursor-default"
+                        title="Unavailable profile"
+                      >
+                        {content}
+                      </div>
+                    );
+                  }
+                  return (
+                    <button
+                      key={itemKey}
+                      onClick={() => handleSelect(player)}
+                      onMouseEnter={() => {
+                        const sk = (player.sport || sport || "nba").toUpperCase();
+                        void prefetchFullPlayerProfileSnapshot({
+                          sport: sk,
+                          playerId: resolvedPlayerId,
+                          timeoutMs: 8_000,
+                        });
+                      }}
+                      onTouchStart={() => {
+                        const sk = (player.sport || sport || "nba").toUpperCase();
+                        void prefetchFullPlayerProfileSnapshot({
+                          sport: sk,
+                          playerId: resolvedPlayerId,
+                          timeoutMs: 8_000,
+                        });
+                      }}
+                      className="w-full flex items-center gap-3 px-4 py-3 hover:bg-white/10 transition-colors text-left"
+                    >
+                      {content}
+                    </button>
+                  );
+                })}
               </div>
             )}
           </motion.div>

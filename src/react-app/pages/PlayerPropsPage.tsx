@@ -23,7 +23,15 @@ import { useFavoriteSports } from "@/react-app/components/FavoriteSportsSelector
 import { fetchJsonCached, getFetchCacheStats } from "@/react-app/lib/fetchCache";
 import { getRouteCache, setRouteCache } from "@/react-app/lib/routeDataCache";
 import { incrementPerfCounter, logPerfSnapshot, startPerfTimer } from "@/react-app/lib/perfTelemetry";
-import { buildPlayerRoute, logPlayerNavigation } from "@/react-app/lib/navigationRoutes";
+import { canonicalPlayerIdQueryParam, logPlayerNavigation } from "@/react-app/lib/navigationRoutes";
+import { navigateToPlayerProfile } from "@/react-app/lib/playerProfileNavigation";
+import {
+  dispatchWorkerPrewarmForPropsFeed,
+  prewarmPropsFeedSnapshots,
+} from "@/react-app/lib/propsPageSnapshotGate";
+import { prefetchFullPlayerProfileSnapshot } from "@/react-app/lib/playerProfileSnapshotPrewarm";
+import { usePlayerProfileInViewPrewarm } from "@/react-app/hooks/usePlayerProfileInViewPrewarm";
+import { resolvePlayerIdForNavigation } from "@/react-app/lib/resolvePlayerIdForNavigation";
 
 // ============================================
 // TYPES
@@ -168,6 +176,35 @@ function normalizeToken(value: string): string {
   return String(value || '').toLowerCase().replace(/[^a-z0-9]/g, '');
 }
 
+function resolvedPlayerIdForGroup(
+  rawId: unknown,
+  displayName: string,
+  sport: string
+): string {
+  return (
+    canonicalPlayerIdQueryParam(rawId)
+    || resolvePlayerIdForNavigation(rawId, displayName, String(sport || "").toLowerCase())
+    || ""
+  );
+}
+
+function strictPlayerIdFromPropSource(prop: PlayerProp & Record<string, unknown>): string {
+  const candidates: unknown[] = [
+    prop.player_id,
+    prop.playerId,
+    prop.espn_id,
+    prop.espnId,
+    prop.athlete_id,
+    prop.athleteId,
+    prop.player,
+  ];
+  for (const candidate of candidates) {
+    const parsed = canonicalPlayerIdQueryParam(candidate);
+    if (parsed) return parsed;
+  }
+  return "";
+}
+
 function normalizePlayerToken(name: string): string {
   const normalized = normalizePlayerName(name)
     .normalize("NFD")
@@ -178,6 +215,35 @@ function normalizePlayerToken(name: string): string {
     .replace(/\s+/g, " ")
     .trim();
   return normalized;
+}
+
+function buildPlayerProfileRouteCacheKey(sport: string, playerId?: string): string {
+  const sportUpper = String(sport || "").toUpperCase();
+  const id = String(playerId || "").trim();
+  if (!/^\d{4,}$/.test(id)) return "";
+  return `player-profile:v2:${sportUpper}:${id}`;
+}
+
+function extractProfileFromEnvelope(payload: any): any {
+  if (payload && typeof payload === "object" && payload.data && typeof payload.data === "object") {
+    return payload.data.profile ?? null;
+  }
+  return payload;
+}
+
+function hasCoreProfileDataLite(payload: any): boolean {
+  if (!payload || !payload.player) return false;
+  const gameLog = Array.isArray(payload.gameLog) ? payload.gameLog : [];
+  const seasonAverages = payload.seasonAverages && typeof payload.seasonAverages === "object" ? payload.seasonAverages : {};
+  const currentProps = Array.isArray(payload.currentProps) ? payload.currentProps : [];
+  const recentPerformance = Array.isArray(payload.recentPerformance) ? payload.recentPerformance : [];
+  return (
+    gameLog.length > 0
+    || Object.keys(seasonAverages).length > 0
+    || currentProps.length > 0
+    || recentPerformance.length > 0
+    || Boolean(payload?.matchup?.opponent)
+  );
 }
 
 function getStatKeysForPropType(propType: string): string[] {
@@ -293,7 +359,8 @@ function PlayerPropCard({
   onChooseBoard,
   isFollowed,
   onToggleFollow,
-  intel
+  intel,
+  snapshotsReady = true,
 }: { 
   group: GroupedProp;
   onQuickAdd?: (prop: PlayerProp) => void;
@@ -301,6 +368,8 @@ function PlayerPropCard({
   isFollowed?: boolean;
   onToggleFollow?: (playerName: string) => void;
   intel?: PropIntelSnapshot | null;
+  /** When false, snapshot warming is still in progress (navigation remains enabled when ID is valid). */
+  snapshotsReady?: boolean;
 }) {
   const navigate = useNavigate();
   const [expanded, setExpanded] = useState(false);
@@ -308,29 +377,54 @@ function PlayerPropCard({
   const [recentlyAdded, setRecentlyAdded] = useState(false);
   const teamColor = getTeamColor(group.team);
   const displayName = normalizePlayerName(group.playerName);
+  const exactPlayerId = resolvedPlayerIdForGroup(group.playerId, displayName, group.sport);
+  const canNavigate = Boolean(exactPlayerId);
   const hasPrefetchedRef = useRef(false);
+  const inViewPrewarmRef = usePlayerProfileInViewPrewarm({
+    sport: String(group.sport || "").toUpperCase(),
+    playerId: exactPlayerId,
+    displayName: normalizePlayerName(group.playerName),
+  });
 
   const prefetchPlayerProfile = useCallback(() => {
     if (hasPrefetchedRef.current) return;
+    if (!canNavigate) return;
+    if (!snapshotsReady) return;
+    const sportUpper = String(group.sport || "").toUpperCase();
+    const playerId = exactPlayerId;
+    if (!playerId) return;
     hasPrefetchedRef.current = true;
-    const encodedName = encodeURIComponent(displayName);
-    const sportKey = String(group.sport || '').toUpperCase();
-    const url = `/api/player/${group.sport.toLowerCase()}/${encodedName}`;
-    void fetchJsonCached<any>(url, {
-      cacheKey: `player-api:${sportKey}:${displayName}`,
-      ttlMs: 45_000,
-      timeoutMs: 3_500,
-      init: { credentials: 'include' },
+    void prefetchFullPlayerProfileSnapshot({
+      sport: sportUpper,
+      playerId,
+      timeoutMs: 22_000,
+    }).then((envelope) => {
+      const profile = extractProfileFromEnvelope(envelope);
+      if (!hasCoreProfileDataLite(profile)) return;
+      const rk = buildPlayerProfileRouteCacheKey(sportUpper, playerId);
+      if (rk) setRouteCache(rk, profile, 180_000);
     }).catch(() => {
       hasPrefetchedRef.current = false;
     });
-  }, [displayName, group.sport]);
+  }, [canNavigate, exactPlayerId, group.sport, snapshotsReady]);
   
   // Navigate to player profile
   const handlePlayerClick = (e: React.MouseEvent) => {
     e.stopPropagation();
-    logPlayerNavigation(displayName, group.sport);
-    navigate(buildPlayerRoute(group.sport, displayName));
+    if (!canNavigate) {
+      e.preventDefault();
+      return;
+    }
+    const pid = exactPlayerId;
+    if (!pid) {
+      console.error("PROPS_NAV_MISSING_PLAYER_ID", { displayName, sport: group.sport });
+      return;
+    }
+    logPlayerNavigation(pid, group.sport);
+    void navigateToPlayerProfile(navigate, String(group.sport || ""), pid, {
+      displayName,
+      source: "PlayerPropsCard",
+    });
   };
   
   // Get the primary prop (first one, usually points for basketball)
@@ -351,7 +445,10 @@ function PlayerPropCard({
   const uniqueSportsbooks = Object.keys(sportsbookLines);
   
   return (
-    <div className="bg-white/[0.03] backdrop-blur-md border border-white/[0.06] rounded-xl overflow-hidden hover:border-white/[0.12] transition-all group">
+    <div
+      ref={inViewPrewarmRef}
+      className="bg-white/[0.03] backdrop-blur-md border border-white/[0.06] rounded-xl overflow-hidden hover:border-white/[0.12] transition-all group"
+    >
       {/* Team Color Accent Bar */}
       <div 
         className="h-1"
@@ -363,11 +460,12 @@ function PlayerPropCard({
         <div className="flex gap-4">
           {/* Player Photo - Clickable */}
           <div
-            className="shrink-0 cursor-pointer"
-            onClick={handlePlayerClick}
-            onMouseEnter={prefetchPlayerProfile}
-            onFocus={prefetchPlayerProfile}
-            onTouchStart={prefetchPlayerProfile}
+            className={cn("shrink-0", canNavigate ? "cursor-pointer" : "cursor-not-allowed opacity-60")}
+            onClick={canNavigate ? handlePlayerClick : undefined}
+            onMouseEnter={canNavigate ? prefetchPlayerProfile : undefined}
+            onMouseDown={canNavigate ? prefetchPlayerProfile : undefined}
+            onFocus={canNavigate ? prefetchPlayerProfile : undefined}
+            onTouchStart={canNavigate ? prefetchPlayerProfile : undefined}
           >
             <div className="w-16 h-16 rounded-lg bg-gradient-to-br from-slate-700 to-slate-800 overflow-hidden shadow-lg hover:ring-2 hover:ring-blue-500/50 transition-all">
               <PlayerPhoto
@@ -383,11 +481,12 @@ function PlayerPropCard({
           <div className="flex-1 min-w-0">
             <div className="flex items-start justify-between gap-2">
               <div 
-                className="cursor-pointer group/name" 
-                onClick={handlePlayerClick}
-                onMouseEnter={prefetchPlayerProfile}
-                onFocus={prefetchPlayerProfile}
-                onTouchStart={prefetchPlayerProfile}
+                className={cn("group/name", canNavigate ? "cursor-pointer" : "cursor-not-allowed opacity-60")}
+                onClick={canNavigate ? handlePlayerClick : undefined}
+                onMouseEnter={canNavigate ? prefetchPlayerProfile : undefined}
+                onMouseDown={canNavigate ? prefetchPlayerProfile : undefined}
+                onFocus={canNavigate ? prefetchPlayerProfile : undefined}
+                onTouchStart={canNavigate ? prefetchPlayerProfile : undefined}
               >
                 <h3 className="text-base font-bold text-white truncate group-hover/name:text-blue-400 transition-colors">
                   {displayName}
@@ -926,6 +1025,8 @@ export function PlayerPropsPage() {
   const propsFetchSeqRef = useRef(0);
   const propsAbortRef = useRef<AbortController | null>(null);
   const autoRecoveredEmptySportRef = useRef(false);
+  const [propsSnapshotGate, setPropsSnapshotGate] = useState<"idle" | "warming" | "ready">("idle");
+  const propsWarmedKeysRef = useRef<Set<string>>(new Set());
 
   useEffect(() => {
     try {
@@ -990,6 +1091,42 @@ export function PlayerPropsPage() {
     if (!mapped) return;
     setSelectedSport((prev) => (prev === 'NBA' ? mapped : prev));
   }, [favoriteSports]);
+
+  const propsStableKey = useMemo(() => {
+    if (props.length === 0) return "0";
+    return `${props.length}:${props.reduce((acc, p) => acc + Number(p.id || 0), 0)}`;
+  }, [props]);
+
+  useEffect(() => {
+    propsWarmedKeysRef.current.clear();
+  }, [selectedSport]);
+
+  useEffect(() => {
+    if (loading) {
+      setPropsSnapshotGate("idle");
+      return;
+    }
+    if (props.length === 0) {
+      setPropsSnapshotGate("ready");
+      return;
+    }
+    let cancelled = false;
+    const ac = new AbortController();
+    setPropsSnapshotGate("warming");
+    dispatchWorkerPrewarmForPropsFeed(props);
+    void (async () => {
+      await prewarmPropsFeedSnapshots(props, {
+        concurrency: 16,
+        warmedKeysRef: propsWarmedKeysRef,
+        signal: ac.signal,
+      });
+      if (!cancelled) setPropsSnapshotGate("ready");
+    })();
+    return () => {
+      cancelled = true;
+      ac.abort();
+    };
+  }, [loading, propsStableKey, selectedSport]);
 
   const fetchPropsPage = useCallback(async (reset: boolean) => {
     if (capabilitiesLoading) return;
@@ -1131,7 +1268,7 @@ export function PlayerPropsPage() {
   useEffect(() => {
     void fetchPropsPage(true);
   }, [fetchPropsPage]);
-  
+
   // Show stub if props not available
   if (!capabilitiesLoading && !hasProps) {
     return <PropsUnavailableStub onBack={() => navigate('/games')} />;
@@ -1233,21 +1370,28 @@ export function PlayerPropsPage() {
     // Group by player
     const grouped: Record<string, GroupedProp> = {};
     filtered.forEach(prop => {
-      const key = `${prop.player_name}-${prop.team}-${prop.sport}`;
+      const strictSourceId = strictPlayerIdFromPropSource(prop as PlayerProp & Record<string, unknown>);
+      const key = `${prop.player_name}-${prop.team}-${prop.sport}-${strictSourceId || `unresolved:${prop.id}`}`;
       if (!grouped[key]) {
         grouped[key] = {
           playerName: prop.player_name,
-          playerId: prop.player_id,
+          playerId: strictSourceId,
           team: prop.team || 'Unknown',
           sport: prop.sport,
-          props: []
+          props: [],
         };
       }
       grouped[key].props.push(prop);
     });
     
     // Sort players by first prop's line value (descending - bigger stars first)
-    return Object.values(grouped).sort((a, b) => {
+    return Object.values(grouped).map((row) => ({
+      playerName: row.playerName,
+      playerId: row.playerId,
+      team: row.team,
+      sport: row.sport,
+      props: row.props,
+    })).sort((a, b) => {
       // Prioritize players with more props (usually bigger names)
       if (a.props.length !== b.props.length) {
         return b.props.length - a.props.length;
@@ -1259,7 +1403,7 @@ export function PlayerPropsPage() {
 
   useEffect(() => {
     let cancelled = false;
-    const visibleGroups = groupedProps.slice(0, 24);
+    const visibleGroups = groupedProps;
     const uniquePlayers = Array.from(new Set(visibleGroups.map((g) => normalizePlayerToken(g.playerName)).filter(Boolean)));
     const missingPlayers = visibleGroups
       .map((g) => ({ token: normalizePlayerToken(g.playerName), name: normalizePlayerName(g.playerName), team: g.team, sport: g.sport }))
@@ -1342,7 +1486,7 @@ export function PlayerPropsPage() {
     return () => {
       cancelled = true;
     };
-  }, [groupedProps, h2hByMatchupKey, playerLogsByToken]);
+  }, [groupedProps, props, h2hByMatchupKey, playerLogsByToken, selectedSport]);
 
   const intelByGroupKey = useMemo(() => {
     const out: Record<string, PropIntelSnapshot> = {};
@@ -1803,18 +1947,39 @@ export function PlayerPropsPage() {
 
         {/* Props Grid */}
         {!loading && !error && groupedProps.length > 0 && (
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            {groupedProps.map((group) => (
-              <PlayerPropCard
-                key={`${group.playerName}-${group.team}-${group.sport}`}
-                group={group}
-                intel={intelByGroupKey[`${group.playerName}-${group.team}-${group.sport}`] || null}
-                onQuickAdd={handleQuickAdd}
-                onChooseBoard={handleChooseBoard}
-                isFollowed={followedPlayerKeys.has(normalizeFollowedPlayerKey(group.playerName))}
-                onToggleFollow={handleToggleFollowPlayer}
-              />
-            ))}
+          <div className="relative min-h-[120px]">
+            {propsSnapshotGate === "warming" && (
+              <div
+                className="pointer-events-none absolute inset-0 z-30 flex items-center justify-center rounded-xl bg-slate-950/75 backdrop-blur-[2px] border border-white/10"
+                aria-live="polite"
+              >
+                <div className="text-center px-4 max-w-sm">
+                  <p className="text-sm font-medium text-white/95">Preparing player profiles…</p>
+                  <p className="text-[11px] text-white/45 mt-1.5">
+                    Warming snapshots for every player on this feed so navigation is instant.
+                  </p>
+                </div>
+              </div>
+            )}
+        <div
+          className={cn(
+            "grid grid-cols-1 md:grid-cols-2 gap-4 transition-opacity duration-200",
+            propsSnapshotGate === "warming" && "opacity-80"
+          )}
+        >
+              {groupedProps.map((group) => (
+                <PlayerPropCard
+                  key={`${group.playerName}-${group.team}-${group.sport}`}
+                  group={group}
+                  snapshotsReady={propsSnapshotGate === "ready"}
+                  intel={intelByGroupKey[`${group.playerName}-${group.team}-${group.sport}`] || null}
+                  onQuickAdd={handleQuickAdd}
+                  onChooseBoard={handleChooseBoard}
+                  isFollowed={followedPlayerKeys.has(normalizeFollowedPlayerKey(group.playerName))}
+                  onToggleFollow={handleToggleFollowPlayer}
+                />
+              ))}
+            </div>
           </div>
         )}
 
@@ -1830,7 +1995,7 @@ export function PlayerPropsPage() {
                   : "bg-white/[0.06] border-white/[0.14] text-white/80 hover:bg-white/[0.1]"
               )}
             >
-              {loadingMore ? 'Loading more...' : 'Load more props'}
+              {loadingMore ? 'Loading more...' : propsSnapshotGate === "warming" ? 'Preparing profiles in background…' : 'Load more props'}
             </button>
           </div>
         )}

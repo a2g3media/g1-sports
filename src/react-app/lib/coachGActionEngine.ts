@@ -4,6 +4,8 @@
  * Transforms Coach G from a chat assistant into an intelligent control layer
  * that can detect command intents and trigger actions across the app.
  */
+import { buildPlayerRoute, normalizeSportKeyForRoute } from "@/react-app/lib/navigationRoutes";
+import { resolvePlayerIdForNavigation } from "@/react-app/lib/resolvePlayerIdForNavigation";
 
 // ============ Intent Types ============
 
@@ -421,6 +423,14 @@ function getActionDetails(
   intent: ActionIntent,
   entities: DetectedAction['entities']
 ): { route?: string; confirmation?: string } {
+  const resolvePlayerRoute = (): string | undefined => {
+    const sport = normalizeSportKeyForRoute(String(entities.sport || ""));
+    const player = String(entities.player || "").trim();
+    if (!sport || !player) return undefined;
+    const playerId = resolvePlayerIdForNavigation("", player, sport);
+    if (!playerId) return undefined;
+    return buildPlayerRoute(sport, playerId);
+  };
   switch (intent) {
     case 'watch_game':
       return {
@@ -441,9 +451,7 @@ function getActionDetails(
     case 'follow_player':
     case 'track_player':
       return {
-        route: entities.sport && entities.player 
-          ? `/sports/${entities.sport}/player/${encodeURIComponent(entities.player)}`
-          : undefined,
+        route: resolvePlayerRoute(),
         confirmation: entities.player
           ? `${entities.player} added to your tracked players.`
           : 'Player tracking enabled.',
@@ -523,13 +531,16 @@ export function generateActionButtons(
   }
   
   if (entities.player) {
+    const sport = normalizeSportKeyForRoute(String(entities.sport || ""));
+    const playerRoute = (() => {
+      const playerId = resolvePlayerIdForNavigation("", entities.player, sport);
+      return playerId ? buildPlayerRoute(sport, playerId) : undefined;
+    })();
     if (!buttons.some(b => b.action === 'track_player' || b.action === 'follow_player')) {
       buttons.push({
         label: 'Track Player',
         action: 'track_player',
-        route: entities.sport 
-          ? `/sports/${entities.sport}/player/${encodeURIComponent(entities.player)}`
-          : undefined,
+        route: playerRoute,
         data: { player: entities.player, sport: entities.sport || '' },
         variant: 'secondary',
       });
@@ -695,7 +706,7 @@ export async function executeAction(
       return {
         success: true,
         message: 'Opening player page.',
-        navigateTo: action.route || '/games',
+        navigateTo: action.route || '/props',
       };
       
     case 'build_parlay':

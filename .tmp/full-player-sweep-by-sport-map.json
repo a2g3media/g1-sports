@@ -1,0 +1,306 @@
+{
+  "ts": "2026-04-12T05:24:15.050Z",
+  "base": "http://localhost:5173",
+  "total": 219,
+  "counts": {
+    "pass_pending": 167,
+    "pass_usable": 26,
+    "timeout": 1,
+    "fail_identity": 24,
+    "fail_http": 1
+  },
+  "failuresBySport": {
+    "NBA": 1,
+    "NFL": 25
+  },
+  "failures": [
+    {
+      "sport": "NBA",
+      "name": "bam adebayo",
+      "expectedId": "4066261",
+      "verdict": "timeout",
+      "pageDataId": null,
+      "partialReason": null,
+      "gameLog": 0,
+      "seasonKeys": 0,
+      "props": 0,
+      "err": "This operation was aborted"
+    },
+    {
+      "sport": "NFL",
+      "name": "amon-ra st. brown",
+      "expectedId": "4360939",
+      "verdict": "fail_identity",
+      "pageDataId": "4374302",
+      "partialReason": "profile_incomplete",
+      "gameLog": 17,
+      "seasonKeys": 0,
+      "props": 0
+    },
+    {
+      "sport": "NFL",
+      "name": "davante adams",
+      "expectedId": "2976212",
+      "verdict": "fail_identity",
+      "pageDataId": "16800",
+      "partialReason": "profile_incomplete",
+      "gameLog": 17,
+      "seasonKeys": 0,
+      "props": 0
+    },
+    {
+      "sport": "NFL",
+      "name": "puka nacua",
+      "expectedId": "4428331",
+      "verdict": "fail_identity",
+      "pageDataId": "4426515",
+      "partialReason": "profile_incomplete",
+      "gameLog": 19,
+      "seasonKeys": 0,
+      "props": 0
+    },
+    {
+      "sport": "NFL",
+      "name": "bijan robinson",
+      "expectedId": "4426348",
+      "verdict": "fail_identity",
+      "pageDataId": "4430807",
+      "partialReason": "profile_incomplete",
+      "gameLog": 17,
+      "seasonKeys": 0,
+      "props": 0
+    },
+    {
+      "sport": "NFL",
+      "name": "igor shesterkin",
+      "expectedId": "3899932",
+      "verdict": "fail_identity",
+      "pageDataId": "3151297",
+      "partialReason": "document_pending",
+      "gameLog": 0,
+      "seasonKeys": 0,
+      "props": 0
+    },
+    {
+      "sport": "NFL",
+      "name": "thatcher demko",
+      "expectedId": "3114720",
+      "verdict": "fail_identity",
+      "pageDataId": "3096217",
+      "partialReason": "document_pending",
+      "gameLog": 0,
+      "seasonKeys": 0,
+      "props": 0
+    },
+    {
+      "sport": "NFL",
+      "name": "ilya sorokin",
+      "expectedId": "3899934",
+      "verdict": "fail_identity",
+      "pageDataId": "3151981",
+      "partialReason": "document_pending",
+      "gameLog": 0,
+      "seasonKeys": 0,
+      "props": 0
+    },
+    {
+      "sport": "NFL",
+      "name": "andrei vasilevskiy",
+      "expectedId": "3114725",
+      "verdict": "fail_identity",
+      "pageDataId": "2976847",
+      "partialReason": "document_pending",
+      "gameLog": 0,
+      "seasonKeys": 0,
+      "props": 0
+    },
+    {
+      "sport": "NFL",
+      "name": "jake oettinger",
+      "expectedId": "4565234",
+      "verdict": "fail_identity",
+      "pageDataId": "4196914",
+      "partialReason": "document_pending",
+      "gameLog": 0,
+      "seasonKeys": 0,
+      "props": 0
+    },
+    {
+      "sport": "NFL",
+      "name": "connor hellebuyck",
+      "expectedId": "3042109",
+      "verdict": "fail_identity",
+      "pageDataId": "3020225",
+      "partialReason": "document_pending",
+      "gameLog": 0,
+      "seasonKeys": 0,
+      "props": 0
+    },
+    {
+      "sport": "NFL",
+      "name": "dug mcdaniel",
+      "expectedId": "4432183",
+      "verdict": "fail_identity",
+      "pageDataId": "5105805",
+      "partialReason": "document_pending",
+      "gameLog": 0,
+      "seasonKeys": 0,
+      "props": 0
+    },
+    {
+      "sport": "NFL",
+      "name": "trey alexander",
+      "expectedId": "4701234",
+      "verdict": "fail_identity",
+      "pageDataId": "4433268",
+      "partialReason": "document_pending",
+      "gameLog": 0,
+      "seasonKeys": 0,
+      "props": 0
+    },
+    {
+      "sport": "NFL",
+      "name": "tristen newton",
+      "expectedId": "4432185",
+      "verdict": "fail_identity",
+      "pageDataId": "4592965",
+      "partialReason": "document_pending",
+      "gameLog": 0,
+      "seasonKeys": 0,
+      "props": 0
+    },
+    {
+      "sport": "NFL",
+      "name": "ryan kalkbrenner",
+      "expectedId": "4432186",
+      "verdict": "fail_identity",
+      "pageDataId": "4576060",
+      "partialReason": "document_pending",
+      "gameLog": 0,
+      "seasonKeys": 0,
+      "props": 0
+    },
+    {
+      "sport": "NFL",
+      "name": "jamarion sharp",
+      "expectedId": "4701845",
+      "verdict": "fail_identity",
+      "pageDataId": "4897696",
+      "partialReason": "document_pending",
+      "gameLog": 0,
+      "seasonKeys": 0,
+      "props": 0
+    },
+    {
+      "sport": "NFL",
+      "name": "donovan clingan",
+      "expectedId": "4433138",
+      "verdict": "fail_identity",
+      "pageDataId": "5105565",
+      "partialReason": "document_pending",
+      "gameLog": 0,
+      "seasonKeys": 0,
+      "props": 0
+    },
+    {
+      "sport": "NFL",
+      "name": "ugonna onyenso",
+      "expectedId": "4701846",
+      "verdict": "fail_identity",
+      "pageDataId": "5037878",
+      "partialReason": "document_pending",
+      "gameLog": 0,
+      "seasonKeys": 0,
+      "props": 0
+    },
+    {
+      "sport": "NFL",
+      "name": "terrence shannon jr.",
+      "expectedId": "4395625",
+      "verdict": "fail_identity",
+      "pageDataId": "4432847",
+      "partialReason": "document_pending",
+      "gameLog": 0,
+      "seasonKeys": 0,
+      "props": 0
+    },
+    {
+      "sport": "NFL",
+      "name": "cam spencer",
+      "expectedId": "4432816",
+      "verdict": "fail_identity",
+      "pageDataId": "4433083",
+      "partialReason": "document_pending",
+      "gameLog": 0,
+      "seasonKeys": 0,
+      "props": 0
+    },
+    {
+      "sport": "NFL",
+      "name": "gradey dick",
+      "expectedId": "4432573",
+      "verdict": "fail_identity",
+      "pageDataId": "5106258",
+      "partialReason": "document_pending",
+      "gameLog": 0,
+      "seasonKeys": 0,
+      "props": 0
+    },
+    {
+      "sport": "NFL",
+      "name": "marcus sasser",
+      "expectedId": "4432187",
+      "verdict": "fail_identity",
+      "pageDataId": "4432107",
+      "partialReason": "document_pending",
+      "gameLog": 0,
+      "seasonKeys": 0,
+      "props": 0
+    },
+    {
+      "sport": "NFL",
+      "name": "jarace walker",
+      "expectedId": "4432188",
+      "verdict": "fail_identity",
+      "pageDataId": "5106060",
+      "partialReason": "document_pending",
+      "gameLog": 0,
+      "seasonKeys": 0,
+      "props": 0
+    },
+    {
+      "sport": "NFL",
+      "name": "stephon castle",
+      "expectedId": "4432189",
+      "verdict": "fail_identity",
+      "pageDataId": "4845367",
+      "partialReason": "document_pending",
+      "gameLog": 0,
+      "seasonKeys": 0,
+      "props": 0
+    },
+    {
+      "sport": "NFL",
+      "name": "viktor hovland",
+      "expectedId": "10592",
+      "verdict": "fail_identity",
+      "pageDataId": "4364873",
+      "partialReason": "document_pending",
+      "gameLog": 0,
+      "seasonKeys": 0,
+      "props": 0
+    },
+    {
+      "sport": "NFL",
+      "name": "tiger woods",
+      "expectedId": "462",
+      "verdict": "fail_http",
+      "pageDataId": null,
+      "partialReason": null,
+      "gameLog": 0,
+      "seasonKeys": 0,
+      "props": 0,
+      "err": "status=400"
+    }
+  ]
+}

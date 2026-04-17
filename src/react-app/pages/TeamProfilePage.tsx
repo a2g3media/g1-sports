@@ -6,7 +6,7 @@
  */
 
 import { useState, useEffect, useMemo, useRef } from "react";
-import { useParams, useNavigate, Link } from "react-router-dom";
+import { useParams, useNavigate } from "react-router-dom";
 import { 
   ArrowLeft, Trophy, Users, Calendar,
   MapPin, ChevronRight, Target, BarChart3
@@ -16,10 +16,32 @@ import { getTeamColors } from "@/react-app/lib/teamColors";
 import { motion, AnimatePresence } from "framer-motion";
 import FavoriteEntityButton from "@/react-app/components/FavoriteEntityButton";
 import { fetchJsonCached } from "@/react-app/lib/fetchCache";
+import { prefetchFullPlayerProfileSnapshot } from "@/react-app/lib/playerProfileSnapshotPrewarm";
 import { getRouteCache, setRouteCache } from "@/react-app/lib/routeDataCache";
 import { useFeatureFlags } from "@/react-app/hooks/useFeatureFlags";
 import PremiumScoutFlowBar, { type ScoutFlowItem } from "@/react-app/components/PremiumScoutFlowBar";
-import { buildPlayerRoute, buildTeamRoute, logPlayerNavigation, logTeamNavigation } from "@/react-app/lib/navigationRoutes";
+import {
+  buildPlayerRoute,
+  buildTeamRoute,
+  logPlayerNavigation,
+  logTeamNavigation,
+} from "@/react-app/lib/navigationRoutes";
+import { resolvePlayerIdForNavigation } from "@/react-app/lib/resolvePlayerIdForNavigation";
+import {
+  readAndRepairScoutRecentStorage,
+  sanitizeScoutRecentList,
+  SCOUT_FLOW_STORAGE_KEY,
+  fetchScoutFlowPlayersAndTeams,
+  isLikelyUuid,
+  navigateToScoutRecentPlayer,
+  navigateToScoutRecentTeam,
+  parsePlayerProfilePath,
+  parseTeamProfilePath,
+  validateScoutRecentEntry,
+  type ScoutRecentEntry,
+  type ScoutFlowPlayerRow,
+  type ScoutFlowTeamRow,
+} from "@/react-app/lib/scoutFlowRail";
 
 // ============================================
 // TYPES
@@ -62,11 +84,14 @@ interface TeamRecord {
 
 interface RosterPlayer {
   id: string;
+  playerId?: string;
   name: string;
   position: string;
   jersey: string;
   status?: string;
   headshot?: string;
+  routeTarget?: string;
+  clickable?: boolean;
   stats?: Record<string, number>;
 }
 
@@ -143,20 +168,211 @@ interface TeamH2HData {
 const FALLBACK_AVATAR_SVG =
   "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='32' fill='%23101724'/%3E%3Ccircle cx='32' cy='24' r='12' fill='%234b5563'/%3E%3Cpath d='M12 56c3-10 11-16 20-16s17 6 20 16' fill='%234b5563'/%3E%3C/svg%3E";
 
-interface ScoutRecentEntry {
-  type: "player" | "team";
-  label: string;
-  subtitle?: string;
-  sport: string;
-  path: string;
-  ts: number;
-}
-
 function safeNum(value: unknown): number | undefined {
   if (value === null || value === undefined) return undefined;
   if (typeof value === 'string' && value.trim() === '') return undefined;
   const n = Number(value);
   return Number.isFinite(n) ? n : undefined;
+}
+
+function extractEspnPlayerIdFromHeadshot(headshotUrl: unknown): string {
+  const raw = String(headshotUrl || "").trim();
+  if (!raw) return "";
+  let decoded = raw;
+  try {
+    decoded = decodeURIComponent(raw);
+  } catch {
+    decoded = raw;
+  }
+  const fullMatch = decoded.match(/\/players\/full\/(\d{4,})\.png/i);
+  if (fullMatch?.[1]) return fullMatch[1];
+  const genericMatch = decoded.match(/\/players\/(?:full\/)?(\d{4,})(?:\.png)?/i);
+  return genericMatch?.[1] || "";
+}
+
+function pickFirstString(...values: unknown[]): string {
+  for (const value of values) {
+    const normalized = String(value ?? "").trim();
+    if (normalized) return normalized;
+  }
+  return "";
+}
+
+const NBA_ALIAS_TO_FULL_NAME: Record<string, string> = {
+  ATL: "Atlanta Hawks",
+  BOS: "Boston Celtics",
+  BKN: "Brooklyn Nets",
+  CHA: "Charlotte Hornets",
+  CHI: "Chicago Bulls",
+  CLE: "Cleveland Cavaliers",
+  DAL: "Dallas Mavericks",
+  DEN: "Denver Nuggets",
+  DET: "Detroit Pistons",
+  GS: "Golden State Warriors",
+  GSW: "Golden State Warriors",
+  HOU: "Houston Rockets",
+  IND: "Indiana Pacers",
+  LAC: "Los Angeles Clippers",
+  LAL: "Los Angeles Lakers",
+  MEM: "Memphis Grizzlies",
+  MIA: "Miami Heat",
+  MIL: "Milwaukee Bucks",
+  MIN: "Minnesota Timberwolves",
+  NO: "New Orleans Pelicans",
+  NOP: "New Orleans Pelicans",
+  NY: "New York Knicks",
+  NYK: "New York Knicks",
+  OKC: "Oklahoma City Thunder",
+  ORL: "Orlando Magic",
+  PHI: "Philadelphia 76ers",
+  PHO: "Phoenix Suns",
+  PHX: "Phoenix Suns",
+  POR: "Portland Trail Blazers",
+  SA: "San Antonio Spurs",
+  SAS: "San Antonio Spurs",
+  SAC: "Sacramento Kings",
+  TOR: "Toronto Raptors",
+  UTA: "Utah Jazz",
+  UTAH: "Utah Jazz",
+  WAS: "Washington Wizards",
+};
+
+const NBA_ALIAS_TO_LEGACY_TEAM_ID: Record<string, string> = {
+  ATL: "1",
+  BOS: "2",
+  BKN: "17",
+  CHA: "30",
+  CHI: "4",
+  CLE: "5",
+  DAL: "6",
+  DEN: "7",
+  DET: "8",
+  GS: "9",
+  GSW: "9",
+  HOU: "10",
+  IND: "11",
+  LAC: "12",
+  LAL: "13",
+  MEM: "29",
+  MIA: "14",
+  MIL: "15",
+  MIN: "16",
+  NOP: "3",
+  NO: "3",
+  NYK: "18",
+  NY: "18",
+  OKC: "25",
+  ORL: "19",
+  PHI: "20",
+  PHX: "21",
+  PHO: "21",
+  POR: "22",
+  SAC: "23",
+  SAS: "24",
+  SA: "24",
+  TOR: "28",
+  UTA: "26",
+  UTAH: "26",
+  WAS: "27",
+};
+
+function isAbbreviationLikeTeamName(value: string): boolean {
+  const normalized = String(value || "").trim();
+  if (!normalized) return true;
+  if (normalized.length <= 4 && normalized === normalized.toUpperCase()) return true;
+  return false;
+}
+
+function collectRosterCandidates(profileJson: any): any[] {
+  const out: any[] = [];
+  const pushRows = (rows: any[]) => {
+    for (const row of rows) out.push(row);
+  };
+  if (Array.isArray(profileJson?.roster)) pushRows(profileJson.roster);
+  if (Array.isArray(profileJson?.players)) pushRows(profileJson.players);
+  if (Array.isArray(profileJson?.athletes)) pushRows(profileJson.athletes);
+  if (Array.isArray(profileJson?.entries)) pushRows(profileJson.entries);
+  const grouped = [
+    ...(Array.isArray(profileJson?.groups) ? profileJson.groups : []),
+    ...(Array.isArray(profileJson?.positions) ? profileJson.positions : []),
+    ...(Array.isArray(profileJson?.athletesByPosition) ? profileJson.athletesByPosition : []),
+  ];
+  for (const bucket of grouped) {
+    const athletes = Array.isArray(bucket?.athletes) ? bucket.athletes : [];
+    pushRows(athletes);
+  }
+  return out;
+}
+
+function normalizeTeamRosterForRender(profileJson: any, sportKey: string): RosterPlayer[] {
+  const rows = collectRosterCandidates(profileJson);
+  const sportLower = String(sportKey || "").toLowerCase();
+  const dedup = new Map<string, RosterPlayer>();
+  for (const raw of rows) {
+    const athlete = raw?.athlete || raw?.person || raw?.player || null;
+    const rawId = pickFirstString(
+      raw?.id,
+      raw?.playerId,
+      raw?.athleteId,
+      raw?.espnId,
+      athlete?.id,
+      extractEspnPlayerIdFromHeadshot(raw?.headshot),
+      extractEspnPlayerIdFromHeadshot(raw?.photoUrl),
+      extractEspnPlayerIdFromHeadshot(athlete?.headshot?.href),
+    );
+    const rawName = pickFirstString(
+      raw?.name,
+      raw?.displayName,
+      raw?.fullName,
+      athlete?.displayName,
+      athlete?.fullName,
+      athlete?.name,
+    );
+    if (!rawName) continue;
+    const normalizedPlayerId =
+      resolvePlayerIdForNavigation(rawId, rawName, sportLower)
+      || (/^\d{4,}$/.test(rawId) ? rawId : "");
+    const playerId = normalizedPlayerId || rawId;
+    const position = pickFirstString(
+      raw?.position?.abbreviation,
+      raw?.position?.name,
+      raw?.position,
+      athlete?.position?.abbreviation,
+      athlete?.position?.name,
+      "N/A",
+    );
+    const jersey = pickFirstString(
+      raw?.jersey,
+      raw?.jerseyNumber,
+      raw?.shirtNumber,
+      athlete?.jersey,
+      athlete?.jerseyNumber,
+      "-",
+    );
+    const headshot = pickFirstString(
+      raw?.headshot,
+      raw?.photoUrl,
+      raw?.image,
+      athlete?.headshot?.href,
+      /^\d{4,}$/.test(String(playerId || ""))
+        ? `https://a.espncdn.com/combiner/i?img=/i/headshots/${sportLower}/players/full/${playerId}.png&w=96&h=70&cb=1`
+        : "",
+    );
+    const key = `${String(playerId || rawId || "").trim()}::${rawName.toLowerCase()}`;
+    dedup.set(key, {
+      id: String(rawId || playerId || "").trim() || rawName.toLowerCase().replace(/\s+/g, "-"),
+      playerId: String(playerId || "").trim() || undefined,
+      name: rawName,
+      position,
+      jersey,
+      status: pickFirstString(raw?.status, athlete?.status) || undefined,
+      headshot: headshot || undefined,
+      routeTarget: /^\d{4,}$/.test(String(playerId || "")) ? String(playerId) : undefined,
+      clickable: /^\d{4,}$/.test(String(playerId || "")),
+      stats: {},
+    });
+  }
+  return Array.from(dedup.values());
 }
 
 function normalizePct(value: unknown): number | undefined {
@@ -431,8 +647,21 @@ function TeamStatsGrid({ stats, sportKey }: { stats: TeamStats; sportKey: string
   );
 }
 
-function RosterPreview({ roster, sportKey }: { roster: RosterPlayer[]; sportKey: string; teamAbbr?: string }) {
+function RosterPreview({
+  roster,
+  sportKey,
+  teamId,
+  isLoading = false,
+}: {
+  roster: RosterPlayer[];
+  sportKey: string;
+  teamAbbr?: string;
+  teamId?: string;
+  isLoading?: boolean;
+}) {
   void sportKey;
+  const navigate = useNavigate();
+  const rosterPrefetchSignatureRef = useRef("");
   const normalizeStatus = (value: string | undefined) => String(value || '').trim().toUpperCase();
   const statusRank = (value: string | undefined) => {
     const s = normalizeStatus(value);
@@ -492,16 +721,46 @@ function RosterPreview({ roster, sportKey }: { roster: RosterPlayer[]; sportKey:
     used.add(player.id);
   }
   const depth = byRelevance.filter((p) => !used.has(p.id));
-  const prefetchPlayer = (playerName: string) => {
+  const resolveRosterPlayerId = (player: Pick<RosterPlayer, "id" | "name" | "headshot">): string => {
+    const sportLower = String(sportKey || "").toLowerCase();
+    const routeTarget = String((player as any)?.routeTarget || "").trim();
+    if (/^\d{4,}$/.test(routeTarget)) return routeTarget;
+    const preferredId = String((player as any)?.playerId || "").trim();
+    if (/^\d{4,}$/.test(preferredId)) return preferredId;
+    const headshotId = extractEspnPlayerIdFromHeadshot(player.headshot);
+    if (/^\d{4,}$/.test(headshotId)) {
+      return resolvePlayerIdForNavigation(headshotId, player.name, sportLower) || headshotId;
+    }
+    const directId = String(player.id || "").trim();
+    if (/^\d{4,}$/.test(directId)) return directId;
+    const mappedFromRaw = resolvePlayerIdForNavigation(directId, player.name, sportLower);
+    if (mappedFromRaw) return mappedFromRaw;
+    return "";
+  };
+  const prefetchPlayer = (resolvedPid?: string) => {
     const sportUpper = String(sportKey || '').toUpperCase();
-    if (!sportUpper || !playerName) return;
-    void fetchJsonCached(`/api/player/${sportUpper}/${encodeURIComponent(playerName)}`, {
-      cacheKey: `player-api:${sportUpper}:${playerName}`,
-      ttlMs: 45_000,
-      timeoutMs: 4_000,
-      init: { credentials: 'include' },
+    if (!sportUpper) return;
+    const pid = String(resolvedPid || "").trim();
+    if (!pid) return;
+    void prefetchFullPlayerProfileSnapshot({
+      sport: sportUpper,
+      playerId: pid,
+      timeoutMs: 22_000,
     }).catch(() => null);
   };
+  useEffect(() => {
+    const sportUpper = String(sportKey || "").toUpperCase();
+    if (!sportUpper || roster.length === 0) return;
+    const previewTargets = starters
+      .map((p) => resolveRosterPlayerId(p))
+      .filter((id, idx, arr) => Boolean(id) && arr.indexOf(id) === idx)
+      .slice(0, 2);
+    if (previewTargets.length === 0) return;
+    const signature = `${sportUpper}:${String(teamId || "")}:${previewTargets.join(",")}`;
+    if (rosterPrefetchSignatureRef.current === signature) return;
+    rosterPrefetchSignatureRef.current = signature;
+    for (const playerId of previewTargets) prefetchPlayer(playerId);
+  }, [roster.length, sportKey, starters, teamId]);
   
   if (roster.length === 0) {
     return (
@@ -510,9 +769,18 @@ function RosterPreview({ roster, sportKey }: { roster: RosterPlayer[]; sportKey:
           <Users className="w-4 h-4" />
           Roster
         </h3>
-        <p className="text-sm text-muted-foreground text-center py-4">
-          Roster data unavailable
-        </p>
+        {isLoading ? (
+          <div className="space-y-2 py-1">
+            {Array.from({ length: 4 }).map((_, idx) => (
+              <div key={`roster-skeleton-${idx}`} className="h-9 animate-pulse rounded-lg border border-white/10 bg-white/[0.03]" />
+            ))}
+            <p className="text-xs text-muted-foreground text-center pt-1">Loading roster...</p>
+          </div>
+        ) : (
+          <p className="text-sm text-muted-foreground text-center py-4">
+            Roster not available yet.
+          </p>
+        )}
       </div>
     );
   }
@@ -533,14 +801,42 @@ function RosterPreview({ roster, sportKey }: { roster: RosterPlayer[]; sportKey:
               Likely Starters / Core
             </div>
             <div className="space-y-1.5">
-              {starters.map((player) => (
-                <Link
+              {starters.map((player) => {
+                const pid = resolveRosterPlayerId(player);
+                const isClickable = Boolean(pid);
+                return (
+                <button
                   key={player.id}
-                  to={buildPlayerRoute(String(sportKey || ""), player.name)}
-                  onClick={() => logPlayerNavigation(player.name, String(sportKey || ""))}
-                  className="flex items-center gap-3 p-2 rounded-lg border border-emerald-300/20 bg-emerald-500/5 hover:bg-emerald-500/10 transition-colors group"
-                  onMouseEnter={() => prefetchPlayer(player.name)}
-                  onFocus={() => prefetchPlayer(player.name)}
+                  type="button"
+                  data-team-roster-row="true"
+                  data-clickable={isClickable ? "true" : "false"}
+                  disabled={!isClickable}
+                  onClick={() => {
+                    if (!pid) return;
+                    logPlayerNavigation(pid, String(sportKey || ""));
+                    const hintedName = String(player.name || "").trim();
+                    const routeBase = buildPlayerRoute(String(sportKey || ""), pid);
+                    const route = hintedName
+                      ? `${routeBase}?playerName=${encodeURIComponent(hintedName)}`
+                      : routeBase;
+                    navigate(route, {
+                      state: { playerNameHint: String(player.name || "").trim() },
+                    });
+                  }}
+                  className={cn(
+                    "w-full text-left flex items-center gap-3 p-2 rounded-lg border transition-colors group",
+                    isClickable
+                      ? "border-emerald-300/20 bg-emerald-500/5 hover:bg-emerald-500/10"
+                      : "border-white/10 bg-white/[0.02] opacity-70 cursor-default"
+                  )}
+                  onMouseEnter={() => {
+                    if (!pid) return;
+                    prefetchPlayer(pid);
+                  }}
+                  onFocus={() => {
+                    if (!pid) return;
+                    prefetchPlayer(pid);
+                  }}
                 >
                   <div className="relative w-10 h-10 rounded-full bg-muted overflow-hidden flex-shrink-0">
                     {player.headshot ? (
@@ -562,16 +858,21 @@ function RosterPreview({ roster, sportKey }: { roster: RosterPlayer[]; sportKey:
                     )}
                   </div>
                   <div className="flex-1 min-w-0">
-                    <div className="font-medium text-sm truncate group-hover:text-primary transition-colors">
+                    <div className={cn(
+                      "font-medium text-sm truncate transition-colors",
+                      isClickable && "group-hover:text-primary"
+                    )}>
                       {player.name}
                     </div>
                     <div className="text-xs text-muted-foreground">
                       #{player.jersey} · {player.position}
                     </div>
                   </div>
-                  <ChevronRight className="w-4 h-4 text-muted-foreground opacity-0 group-hover:opacity-100 transition-opacity" />
-                </Link>
-              ))}
+                  {isClickable ? (
+                    <ChevronRight className="w-4 h-4 text-muted-foreground opacity-0 group-hover:opacity-100 transition-opacity" />
+                  ) : null}
+                </button>
+              )})}
             </div>
           </div>
         )}
@@ -582,14 +883,40 @@ function RosterPreview({ roster, sportKey }: { roster: RosterPlayer[]; sportKey:
               Bench / Depth
             </div>
             <div className="space-y-1.5">
-              {depth.map((player) => (
-                <Link
+              {depth.map((player) => {
+                const pid = resolveRosterPlayerId(player);
+                const isClickable = Boolean(pid);
+                return (
+                <button
                   key={player.id}
-                  to={buildPlayerRoute(String(sportKey || ""), player.name)}
-                  onClick={() => logPlayerNavigation(player.name, String(sportKey || ""))}
-                  className="flex items-center gap-3 p-2 rounded-lg hover:bg-white/5 transition-colors group"
-                  onMouseEnter={() => prefetchPlayer(player.name)}
-                  onFocus={() => prefetchPlayer(player.name)}
+                  type="button"
+                  data-team-roster-row="true"
+                  data-clickable={isClickable ? "true" : "false"}
+                  disabled={!isClickable}
+                  onClick={() => {
+                    if (!pid) return;
+                    logPlayerNavigation(pid, String(sportKey || ""));
+                    const hintedName = String(player.name || "").trim();
+                    const routeBase = buildPlayerRoute(String(sportKey || ""), pid);
+                    const route = hintedName
+                      ? `${routeBase}?playerName=${encodeURIComponent(hintedName)}`
+                      : routeBase;
+                    navigate(route, {
+                      state: { playerNameHint: String(player.name || "").trim() },
+                    });
+                  }}
+                  className={cn(
+                    "w-full text-left flex items-center gap-3 p-2 rounded-lg transition-colors group",
+                    isClickable ? "hover:bg-white/5" : "opacity-70 cursor-default"
+                  )}
+                  onMouseEnter={() => {
+                    if (!pid) return;
+                    prefetchPlayer(pid);
+                  }}
+                  onFocus={() => {
+                    if (!pid) return;
+                    prefetchPlayer(pid);
+                  }}
                 >
                   <div className="relative w-10 h-10 rounded-full bg-muted overflow-hidden flex-shrink-0">
                     {player.headshot ? (
@@ -611,16 +938,21 @@ function RosterPreview({ roster, sportKey }: { roster: RosterPlayer[]; sportKey:
                     )}
                   </div>
                   <div className="flex-1 min-w-0">
-                    <div className="font-medium text-sm truncate group-hover:text-primary transition-colors">
+                    <div className={cn(
+                      "font-medium text-sm truncate transition-colors",
+                      isClickable && "group-hover:text-primary"
+                    )}>
                       {player.name}
                     </div>
                     <div className="text-xs text-muted-foreground">
                       #{player.jersey} · {player.position}
                     </div>
                   </div>
-                  <ChevronRight className="w-4 h-4 text-muted-foreground opacity-0 group-hover:opacity-100 transition-opacity" />
-                </Link>
-              ))}
+                  {isClickable ? (
+                    <ChevronRight className="w-4 h-4 text-muted-foreground opacity-0 group-hover:opacity-100 transition-opacity" />
+                  ) : null}
+                </button>
+              )})}
             </div>
           </div>
         )}
@@ -814,30 +1146,204 @@ function TeamMatchupEdgeSection({
   teamName,
   schedule,
   initialH2H,
+  isLoading = false,
 }: {
   sportKey: string;
   teamAbbr: string;
   teamName: string;
   schedule: GameResult[];
   initialH2H: TeamH2HData | null;
+  isLoading?: boolean;
 }) {
+  const fallbackScheduleAttemptedRef = useRef(false);
+  const [fallbackScheduleRows, setFallbackScheduleRows] = useState<GameResult[]>([]);
+  const scheduleForEdge = useMemo(() => {
+    const hasFinals = schedule.some((g) => g.status === "final");
+    if (hasFinals) return schedule;
+    return fallbackScheduleRows.length > 0 ? fallbackScheduleRows : schedule;
+  }, [schedule, fallbackScheduleRows]);
+
+  useEffect(() => {
+    const sportUpper = String(sportKey || "").toUpperCase();
+    if (sportUpper !== "NBA") return;
+    const hasFinals = schedule.some((g) => g.status === "final");
+    if (hasFinals) {
+      setFallbackScheduleRows([]);
+      fallbackScheduleAttemptedRef.current = false;
+      return;
+    }
+    if (fallbackScheduleAttemptedRef.current) return;
+    const alias = String(teamAbbr || "").trim().toUpperCase();
+    if (!alias) return;
+    fallbackScheduleAttemptedRef.current = true;
+    let cancelled = false;
+    const toStatus = (raw: unknown): "final" | "live" | "scheduled" => {
+      const statusRaw = String((raw as any)?.name || raw || "").toUpperCase();
+      if (
+        statusRaw.includes("FINAL")
+        || statusRaw.includes("STATUS_FINAL")
+        || statusRaw.includes("COMPLETED")
+        || statusRaw.includes("CLOSED")
+      ) return "final";
+      if (statusRaw.includes("LIVE") || statusRaw.includes("IN_PROGRESS")) return "live";
+      return "scheduled";
+    };
+    const toNum = (value: unknown): number | undefined => {
+      const n = Number(value);
+      return Number.isFinite(n) ? n : undefined;
+    };
+    const normalizeRows = (rows: any[]): GameResult[] => {
+      return rows.map((g: any) => {
+        const homeAlias = String(g?.homeTeamAlias || g?.homeTeam?.alias || "").trim().toUpperCase();
+        const awayAlias = String(g?.awayTeamAlias || g?.awayTeam?.alias || "").trim().toUpperCase();
+        const isHome = homeAlias === alias;
+        const status = toStatus(g?.status);
+        const oppAlias = isHome ? awayAlias : homeAlias;
+        const oppName = String(
+          isHome
+            ? (g?.awayTeamName || g?.awayTeam?.name || oppAlias)
+            : (g?.homeTeamName || g?.homeTeam?.name || oppAlias)
+        ).trim() || oppAlias || "Opponent";
+        const homeScore = toNum(g?.homeScore);
+        const awayScore = toNum(g?.awayScore);
+        const teamScore = isHome ? homeScore : awayScore;
+        const oppScore = isHome ? awayScore : homeScore;
+        const result = status === "final" && teamScore !== undefined && oppScore !== undefined
+          ? (teamScore > oppScore ? "W" : teamScore < oppScore ? "L" : "T")
+          : undefined;
+        return {
+          id: String(g?.id || ""),
+          date: String(g?.scheduledTime || g?.start_time || ""),
+          opponent: {
+            name: oppName,
+            abbreviation: oppAlias,
+            logo: `https://a.espncdn.com/i/teamlogos/nba/500/${oppAlias.toLowerCase()}.png`,
+          },
+          homeAway: isHome ? "home" : "away",
+          result,
+          teamScore,
+          oppScore,
+          spread: toNum(g?.spreadHome) !== undefined ? (isHome ? Number(g.spreadHome) : -Number(g.spreadHome)) : null,
+          total: toNum(g?.totalLine) ?? null,
+          status,
+          time: g?.scheduledTime
+            ? new Date(g.scheduledTime).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" })
+            : undefined,
+        } as GameResult;
+      }).filter((row) => Boolean(row.date));
+    };
+    const loadFallbackSchedule = async () => {
+      const startedAt = performance.now();
+      const preferredId = NBA_ALIAS_TO_LEGACY_TEAM_ID[alias] || "";
+      const candidates = [preferredId, alias].filter(Boolean);
+      for (const candidate of candidates) {
+        const pageDataController = new AbortController();
+        const pageDataTimer = setTimeout(() => pageDataController.abort(), 2_800);
+        try {
+          const pageDataRes = await fetch(
+            `/api/page-data/team-profile?sport=NBA&teamId=${encodeURIComponent(candidate)}&fresh=1`,
+            {
+              credentials: "include",
+              signal: pageDataController.signal,
+            }
+          );
+          if (pageDataRes.ok) {
+            const pageDataJson = await pageDataRes.json().catch(() => null);
+            const scheduleJson = pageDataJson?.data?.scheduleJson || {};
+            const rows = Array.isArray(scheduleJson?.allGames) && scheduleJson.allGames.length > 0
+              ? scheduleJson.allGames
+              : [
+                  ...(Array.isArray(scheduleJson?.pastGames) ? scheduleJson.pastGames : []),
+                  ...(Array.isArray(scheduleJson?.upcomingGames) ? scheduleJson.upcomingGames : []),
+                ];
+            if (rows.length > 0) {
+              const normalized = normalizeRows(rows);
+              const withFinals = normalized.filter((row) => row.status === "final");
+              if (withFinals.length > 0) {
+                if (!cancelled) setFallbackScheduleRows(normalized);
+                console.info("TEAM_MATCHUP_EDGE_FALLBACK", {
+                  sport: "NBA",
+                  teamAbbr: alias,
+                  candidate,
+                  source: "page-data-team-profile",
+                  rows: normalized.length,
+                  finals: withFinals.length,
+                  elapsedMs: Math.max(0, Math.round(performance.now() - startedAt)),
+                });
+                return;
+              }
+            }
+          }
+        } catch {
+          // Fall through to team schedule endpoint.
+        } finally {
+          clearTimeout(pageDataTimer);
+        }
+
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 2_800);
+        try {
+          const res = await fetch(`/api/teams/NBA/${encodeURIComponent(candidate)}/schedule?fresh=1`, {
+            credentials: "include",
+            signal: controller.signal,
+          });
+          if (!res.ok) continue;
+          const payload = await res.json().catch(() => null);
+          const rows = Array.isArray(payload?.allGames) ? payload.allGames : [];
+          if (rows.length === 0) continue;
+          const normalized = normalizeRows(rows);
+          const withFinals = normalized.filter((row) => row.status === "final");
+          if (withFinals.length === 0) continue;
+          if (!cancelled) setFallbackScheduleRows(normalized);
+          console.info("TEAM_MATCHUP_EDGE_FALLBACK", {
+            sport: "NBA",
+            teamAbbr: alias,
+            candidate,
+            source: "teams-schedule",
+            rows: normalized.length,
+            finals: withFinals.length,
+            elapsedMs: Math.max(0, Math.round(performance.now() - startedAt)),
+          });
+          return;
+        } catch {
+          // Keep trying candidates.
+        } finally {
+          clearTimeout(timer);
+        }
+      }
+      console.info("TEAM_MATCHUP_EDGE_FALLBACK", {
+        sport: "NBA",
+        teamAbbr: alias,
+        source: "none",
+        rows: 0,
+        finals: 0,
+        elapsedMs: Math.max(0, Math.round(performance.now() - startedAt)),
+      });
+    };
+    void loadFallbackSchedule();
+    return () => {
+      cancelled = true;
+    };
+  }, [schedule, sportKey, teamAbbr]);
+
   const recentGames = useMemo(
     () =>
-      [...schedule]
+      [...scheduleForEdge]
         .filter((g) => g.status === 'final')
         .sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime())
         .slice(0, 5),
-    [schedule]
+    [scheduleForEdge]
   );
 
   const opponents = useMemo(() => {
-    const upcoming = schedule
-      .filter((g) => g.status === 'scheduled' || g.status === 'live')
-      .map((g) => g.opponent);
-    const fallback = schedule
+    const finals = scheduleForEdge
       .filter((g) => g.status === 'final')
       .map((g) => g.opponent);
-    const merged = [...upcoming, ...fallback];
+    const upcoming = scheduleForEdge
+      .filter((g) => g.status === 'scheduled' || g.status === 'live')
+      .map((g) => g.opponent);
+    // Prefer finalized opponents first so H2H cards default to meaningful matchups.
+    const merged = [...finals, ...upcoming];
     const seen = new Set<string>();
     const out: Array<{ name: string; abbreviation: string; logo?: string }> = [];
     for (const opp of merged) {
@@ -847,20 +1353,23 @@ function TeamMatchupEdgeSection({
       out.push({ name: opp.name, abbreviation: opp.abbreviation, logo: opp.logo });
     }
     return out.slice(0, 12);
-  }, [schedule]);
+  }, [scheduleForEdge]);
 
   const [oppIdx, setOppIdx] = useState(0);
   const [h2h, setH2h] = useState<TeamH2HData | null>(initialH2H);
 
   useEffect(() => {
     if (opponents.length === 0) return;
-    if (oppIdx >= opponents.length) setOppIdx(0);
+    if (oppIdx >= opponents.length) {
+      setOppIdx(0);
+    }
   }, [oppIdx, opponents.length]);
 
   useEffect(() => {
     const selected = opponents[oppIdx];
     const teamA = String(teamAbbr || '').trim();
     const sportUpper = String(sportKey || '').toUpperCase();
+    const supportsTeamH2H = new Set(['NBA', 'NFL', 'MLB', 'NCAAB', 'NCAAF']).has(sportUpper);
     if (!selected || !teamA || !sportUpper) return;
     const teamB = String(selected.abbreviation || selected.name || '').trim();
     if (!teamB) return;
@@ -869,6 +1378,10 @@ function TeamMatchupEdgeSection({
       && String(initialH2H.teamB?.alias || '').toUpperCase() === String(selected.abbreviation || '').toUpperCase();
     if (initialMatches) {
       setH2h(initialH2H);
+      return;
+    }
+    if (!supportsTeamH2H) {
+      setH2h(null);
       return;
     }
     let cancelled = false;
@@ -936,17 +1449,34 @@ function TeamMatchupEdgeSection({
     { cover: 0, noCover: 0, push: 0 }
   );
   const atsSampleWithLine = lineOutcomes.filter((row) => row.ats !== 'No Line').length;
+  const straightSummary = lineOutcomes.reduce(
+    (acc, row) => {
+      if (row.game.result === 'W') acc.wins += 1;
+      if (row.game.result === 'L') acc.losses += 1;
+      if (row.game.result === 'T') acc.ties += 1;
+      return acc;
+    },
+    { wins: 0, losses: 0, ties: 0 }
+  );
   const l5AtsLabel = atsSampleWithLine > 0
     ? `${atsSummary.cover}-${atsSummary.noCover}-${atsSummary.push}`
-    : 'No Line';
+    : (lineOutcomes.length > 0
+      ? `W-L ${straightSummary.wins}-${straightSummary.losses}${straightSummary.ties > 0 ? `-${straightSummary.ties}` : ''}`
+      : 'No Recent Games');
 
   const selectedOpponent = opponents[oppIdx] || null;
+  const selectedOrRecentOpponent = selectedOpponent || recentGames[0]?.opponent || null;
   const fallbackH2H = useMemo(() => {
-    if (!selectedOpponent) return null;
-    const oppKey = String(selectedOpponent.abbreviation || selectedOpponent.name || '').toUpperCase();
+    if (!selectedOrRecentOpponent) return null;
+    const oppKey = String(selectedOrRecentOpponent.abbreviation || selectedOrRecentOpponent.name || '').toUpperCase();
     if (!oppKey) return null;
-    const meetings = [...schedule]
-      .filter((g) => g.status === 'final' && String(g.opponent.abbreviation || '').toUpperCase() === oppKey)
+    const meetings = [...scheduleForEdge]
+      .filter((g) => {
+        if (g.status !== 'final') return false;
+        const gameOppAbbr = String(g.opponent.abbreviation || '').toUpperCase();
+        const gameOppName = String(g.opponent.name || '').toUpperCase();
+        return gameOppAbbr === oppKey || gameOppName === oppKey;
+      })
       .sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime())
       .slice(0, 10);
     if (meetings.length === 0) return null;
@@ -978,17 +1508,26 @@ function TeamMatchupEdgeSection({
     }
 
     return {
-      seriesLabel: `${teamAbbr} ${teamAWins}-${teamBWins}${ties > 0 ? `-${ties}` : ''} ${selectedOpponent.abbreviation}`,
-      atsLabel: atsSample > 0 ? `${covers}-${noCovers}-${pushes}` : 'No Line',
+      seriesLabel: `${teamAbbr} ${teamAWins}-${teamBWins}${ties > 0 ? `-${ties}` : ''} ${String(selectedOrRecentOpponent.abbreviation || selectedOrRecentOpponent.name || "OPP").toUpperCase()}`,
+      atsLabel: atsSample > 0
+        ? `${covers}-${noCovers}-${pushes}`
+        : `${teamAWins}-${teamBWins}${ties > 0 ? `-${ties}` : ''}`,
     };
-  }, [schedule, selectedOpponent, teamAbbr]);
+  }, [scheduleForEdge, selectedOrRecentOpponent, teamAbbr]);
+
+  const recentSeriesLabel = recentGames.length > 0
+    ? `${teamAbbr} ${straightSummary.wins}-${straightSummary.losses}${straightSummary.ties > 0 ? `-${straightSummary.ties}` : ''}`
+    : "No Matchups Yet";
 
   const h2hSeriesLabel = h2h
     ? `${h2h.teamA.alias} ${h2h.series.teamAWins}-${h2h.series.teamBWins} ${h2h.teamB.alias}`
-    : (fallbackH2H?.seriesLabel || 'No Matchups Yet');
+    : (fallbackH2H?.seriesLabel || recentSeriesLabel);
   const h2hAtsLabel = h2h && h2h.ats.sampleWithLine > 0
     ? `${h2h.ats.teamACovers}-${h2h.ats.teamBCovers}-${h2h.ats.pushes}`
-    : (fallbackH2H?.atsLabel || 'No Line');
+    : (h2h
+      ? `${h2h.series.teamAWins}-${h2h.series.teamBWins}${h2h.series.ties > 0 ? `-${h2h.series.ties}` : ''}`
+      : (fallbackH2H?.atsLabel
+        || "No Matchups Yet"));
 
   return (
     <div className="rounded-xl border border-cyan-400/15 bg-gradient-to-br from-[#0d1628]/90 via-[#0b1323]/90 to-[#111827]/90 overflow-hidden shadow-[0_0_30px_rgba(34,211,238,0.08)]">
@@ -1017,7 +1556,7 @@ function TeamMatchupEdgeSection({
       <div className="p-4 space-y-3">
         <div className="flex items-center gap-2 text-[11px]">
           <span className="inline-flex items-center rounded-full border border-cyan-300/30 bg-cyan-500/10 px-2 py-0.5 font-medium text-cyan-100">
-            Upcoming: {selectedOpponent ? `${selectedOpponent.name} (${selectedOpponent.abbreviation})` : 'TBD'}
+            Upcoming: {selectedOrRecentOpponent ? `${selectedOrRecentOpponent.name} (${selectedOrRecentOpponent.abbreviation})` : 'TBD'}
           </span>
           <span className="inline-flex items-center rounded-full border border-white/15 bg-white/[0.03] px-2 py-0.5 font-medium text-white/65">
             Game-by-Game + Cover Checks
@@ -1046,7 +1585,7 @@ function TeamMatchupEdgeSection({
         <div className="space-y-2">
           {lineOutcomes.length === 0 ? (
             <div className="rounded-md bg-white/[0.02] border border-white/[0.05] px-3 py-3 text-xs text-white/60">
-              No final games available.
+              {isLoading ? 'Loading matchup edge...' : 'No completed games yet for matchup analysis.'}
             </div>
           ) : (
             lineOutcomes.map((row, idx) => (
@@ -1132,7 +1671,7 @@ function TeamMatchupEdgeSection({
   );
 }
 
-function InjuriesPreview({ injuries }: { injuries: TeamInjury[] }) {
+function InjuriesPreview({ injuries, isLoading = false }: { injuries: TeamInjury[]; isLoading?: boolean }) {
   const rows = injuries.slice(0, 8);
   return (
     <div className="bg-card/50 backdrop-blur-sm rounded-xl border border-border/50 p-4">
@@ -1144,7 +1683,16 @@ function InjuriesPreview({ injuries }: { injuries: TeamInjury[] }) {
         <span className="text-xs text-muted-foreground">{injuries.length} listed</span>
       </div>
       {rows.length === 0 ? (
-        <p className="text-sm text-muted-foreground text-center py-4">No reported injuries</p>
+        isLoading ? (
+          <div className="space-y-2 py-1">
+            {Array.from({ length: 3 }).map((_, idx) => (
+              <div key={`injury-skeleton-${idx}`} className="h-11 animate-pulse rounded-lg border border-white/10 bg-white/[0.03]" />
+            ))}
+            <p className="text-xs text-muted-foreground text-center pt-1">Loading injuries...</p>
+          </div>
+        ) : (
+          <p className="text-sm text-muted-foreground text-center py-4">No reported injuries</p>
+        )
       ) : (
         <div className="space-y-2">
           {rows.map((injury) => (
@@ -1190,50 +1738,6 @@ function InjuriesPreview({ injuries }: { injuries: TeamInjury[] }) {
   );
 }
 
-function LoadingState() {
-  return (
-    <div className="min-h-screen bg-background">
-      <div className="animate-pulse p-6 space-y-6">
-        <div className="flex items-center gap-6">
-          <div className="w-28 h-28 rounded-full bg-muted" />
-          <div className="space-y-3">
-            <div className="h-4 w-24 bg-muted rounded" />
-            <div className="h-8 w-48 bg-muted rounded" />
-            <div className="h-6 w-32 bg-muted rounded" />
-          </div>
-        </div>
-        <div className="grid grid-cols-3 gap-4">
-          {[1, 2, 3].map(i => (
-            <div key={i} className="h-20 bg-muted rounded-lg" />
-          ))}
-        </div>
-        <div className="h-48 bg-muted rounded-xl" />
-        <div className="h-48 bg-muted rounded-xl" />
-      </div>
-    </div>
-  );
-}
-
-function ErrorState({ message, onRetry }: { message: string; onRetry: () => void }) {
-  return (
-    <div className="min-h-screen bg-background flex items-center justify-center p-6">
-      <div className="text-center space-y-4 max-w-sm">
-        <div className="w-16 h-16 rounded-full bg-red-500/10 flex items-center justify-center mx-auto">
-          <Target className="w-8 h-8 text-red-400" />
-        </div>
-        <h2 className="text-xl font-bold">Team Not Found</h2>
-        <p className="text-muted-foreground text-sm">{message}</p>
-        <button
-          onClick={onRetry}
-          className="px-4 py-2 bg-primary text-primary-foreground rounded-lg text-sm font-medium"
-        >
-          Try Again
-        </button>
-      </div>
-    </div>
-  );
-}
-
 // ============================================
 // MAIN COMPONENT
 // ============================================
@@ -1243,24 +1747,66 @@ export function TeamProfilePage() {
   const navigate = useNavigate();
   const { flags } = useFeatureFlags();
   const scoutEnabled = Boolean(flags.PREMIUM_SCOUT_FLOW_ENABLED);
-  
+
+  useEffect(() => {
+    if (!scoutEnabled) return;
+    const cleaned = readAndRepairScoutRecentStorage((reason, row) => {
+      if (import.meta.env.DEV) {
+        console.info("[scoutFlowRail] dropped invalid recent entry", { reason, row });
+      }
+    });
+    setScoutRecent(cleaned);
+  }, [scoutEnabled]);
+
   const [data, setData] = useState<TeamProfileData | null>(null);
   const [loading, setLoading] = useState(true);
   const [loadStatus, setLoadStatus] = useState<'loading' | 'partial' | 'complete'>('loading');
   const [error, setError] = useState<string | null>(null);
   const [scoutRecent, setScoutRecent] = useState<ScoutRecentEntry[]>([]);
-  const [scoutPlayers, setScoutPlayers] = useState<Array<{ name: string; team: string; sport: string }>>([]);
-  const [scoutTeams, setScoutTeams] = useState<Array<{ id: string; alias: string; name: string }>>([]);
+  const [scoutPlayers, setScoutPlayers] = useState<ScoutFlowPlayerRow[]>([]);
+  const [scoutTeams, setScoutTeams] = useState<ScoutFlowTeamRow[]>([]);
   const backgroundRetryTimerRef = useRef<number | null>(null);
   const backgroundRetryCountRef = useRef(0);
   const partialHydrationAttemptedRef = useRef(false);
   const finalHydrationAttemptedRef = useRef(false);
   const activeLoadRequestRef = useRef(0);
+  const routeStartMsRef = useRef<number>(0);
+  const firstPaintLoggedRef = useRef(false);
+  const fullHydrationLoggedRef = useRef(false);
+  const lastRosterPrebuildKeyRef = useRef("");
+  const routeProvisionalData = useMemo<TeamProfileData>(() => {
+    const effectiveTeamId = String(teamId || "").trim();
+    const sportLower = String(sportKey || "nba").toLowerCase();
+    return {
+      team: {
+        id: effectiveTeamId || teamId || "team",
+        name: String(teamId || "Team"),
+        nickname: String(teamId || "Team"),
+        abbreviation: String(teamId || "").toUpperCase(),
+        city: "",
+        logo: "",
+        color: "#3b82f6",
+      },
+      record: { wins: 0, losses: 0, pct: 0 },
+      roster: [],
+      schedule: [],
+      stats: {},
+      injuries: [],
+      teamH2H: null,
+      sport: sportLower,
+    };
+  }, [sportKey, teamId]);
 
   const isTeamPayloadIncomplete = (payload: TeamProfileData | null): boolean => {
     if (!payload?.team?.id) return true;
     const hasRoster = Array.isArray(payload.roster) && payload.roster.length > 0;
     const hasSchedule = Array.isArray(payload.schedule) && payload.schedule.length > 0;
+    const hasFinalScheduleGame = Array.isArray(payload.schedule)
+      && payload.schedule.some((game) => game?.status === "final");
+    const wins = Number(payload?.record?.wins ?? 0);
+    const losses = Number(payload?.record?.losses ?? 0);
+    const ties = Number(payload?.record?.ties ?? 0);
+    const hasRecord = Number.isFinite(wins) && Number.isFinite(losses) && (wins + losses + ties) > 0;
     const stats = payload.stats || {};
     const hasStats = [
       stats.ppg,
@@ -1272,75 +1818,15 @@ export function TeamProfilePage() {
       stats.offRank,
       stats.defRank,
     ].some((value) => Number.isFinite(Number(value)));
+    // Team pages need real schedule context. Without schedule we cannot render matchup reliably.
+    if (!hasSchedule) return true;
+    const teamAlias = String(payload?.team?.abbreviation || "").trim().toUpperCase();
+    const isNbaTeam = Boolean(teamAlias && NBA_ALIAS_TO_FULL_NAME[teamAlias]);
+    // NBA degraded payloads often include roster/stats + record but no finals; force hydration until finals exist.
+    if (isNbaTeam && !hasFinalScheduleGame && hasRecord) return true;
     const completedSlices = [hasRoster, hasSchedule, hasStats].filter(Boolean).length;
     return completedSlices < 2;
   };
-
-  useEffect(() => {
-    if (!sportKey || !teamId) return;
-    const sportUpper = sportKey.toUpperCase();
-    const raw = String(teamId).trim();
-    if (!raw) return;
-    if (/^[0-9a-f]{8}-[0-9a-f-]{27}$/i.test(raw) || raw.startsWith("sr:")) return;
-    const controller = new AbortController();
-
-    const resolveCanonicalRoute = async () => {
-      try {
-        const timeout = setTimeout(() => controller.abort(), 1800);
-        try {
-          const res = await fetch(`/api/teams/${encodeURIComponent(sportUpper)}/standings`, {
-            credentials: "include",
-            signal: controller.signal,
-          });
-          if (!res.ok) return;
-          const json = await res.json().catch(() => null) as any;
-          const teams = Array.isArray(json?.teams) ? json.teams : [];
-          const alias = raw.toUpperCase();
-          const aliasMap: Record<string, string[]> = {
-            GSW: ["GS"],
-            GS: ["GSW"],
-            NYK: ["NY"],
-            NY: ["NYK"],
-            SAS: ["SA"],
-            SA: ["SAS"],
-            NOP: ["NO"],
-            NO: ["NOP"],
-            PHX: ["PHO"],
-            PHO: ["PHX"],
-            CHA: ["CHO"],
-            CHO: ["CHA"],
-            BKN: ["BRK"],
-            BRK: ["BKN"],
-          };
-          const candidates = new Set<string>([alias, ...(aliasMap[alias] || [])]);
-          const normalizedRaw = alias.replace(/[^A-Z0-9]/g, "");
-          const row = teams.find((t: any) => {
-            const id = String(t?.id || "").trim();
-            const rowAlias = String(t?.alias || t?.abbreviation || "").trim().toUpperCase();
-            const rowName = String(t?.name || "").trim().toUpperCase();
-            const rowMarket = String(t?.market || "").trim().toUpperCase();
-            const rowFull = `${rowMarket} ${rowName}`.trim();
-            const normalizedFull = rowFull.replace(/[^A-Z0-9]/g, "");
-            return id === raw
-              || candidates.has(rowAlias)
-              || normalizedFull === normalizedRaw
-              || normalizedRaw.includes(normalizedFull)
-              || normalizedFull.includes(normalizedRaw);
-          });
-          const canonical = String(row?.id || "").trim();
-          if (canonical && canonical !== raw) {
-            navigate(`/sports/${sportKey.toLowerCase()}/team/${encodeURIComponent(canonical)}`, { replace: true });
-          }
-        } finally {
-          clearTimeout(timeout);
-        }
-      } catch (err) {
-        if (err instanceof DOMException && err.name === "AbortError") return;
-      }
-    };
-    void resolveCanonicalRoute();
-    return () => controller.abort();
-  }, [sportKey, teamId, navigate]);
 
   const fetchTeamData = async (stage: 'primary' | 'second' | 'final' = 'primary', requestId = activeLoadRequestRef.current) => {
     const isActiveRequest = () => activeLoadRequestRef.current === requestId;
@@ -1349,61 +1835,8 @@ export function TeamProfilePage() {
     let apiCalls = 0;
     let keepLoading = false;
     const sportUpper = sportKey.toUpperCase();
-    let effectiveTeamId = String(teamId || "").trim();
-    if (effectiveTeamId && !/^[0-9a-f]{8}-[0-9a-f-]{27}$/i.test(effectiveTeamId) && !effectiveTeamId.startsWith("sr:")) {
-      try {
-        apiCalls += 1;
-        const standings = await fetchJsonCached<{ teams?: Array<{ id?: string; alias?: string; abbreviation?: string; name?: string; market?: string }> }>(
-          `/api/teams/${encodeURIComponent(sportUpper)}/standings`,
-          {
-            cacheKey: `team-canonical-standings:${sportUpper}:v1`,
-            ttlMs: 90_000,
-            timeoutMs: 1_500,
-            init: { credentials: "include" },
-          }
-        ).catch(() => ({ teams: [] }));
-        const teams = Array.isArray(standings?.teams) ? standings.teams : [];
-        const alias = effectiveTeamId.toUpperCase();
-        const aliasMap: Record<string, string[]> = {
-          GSW: ["GS"],
-          GS: ["GSW"],
-          NYK: ["NY"],
-          NY: ["NYK"],
-          SAS: ["SA"],
-          SA: ["SAS"],
-          NOP: ["NO"],
-          NO: ["NOP"],
-          PHX: ["PHO"],
-          PHO: ["PHX"],
-          CHA: ["CHO"],
-          CHO: ["CHA"],
-          BKN: ["BRK"],
-          BRK: ["BKN"],
-        };
-        const candidates = new Set<string>([alias, ...(aliasMap[alias] || [])]);
-        const normalizedRaw = alias.replace(/[^A-Z0-9]/g, "");
-        const hit = teams.find((row) => {
-          const id = String(row?.id || "").trim();
-          const rowAlias = String(row?.alias || row?.abbreviation || "").trim().toUpperCase();
-          const rowName = String(row?.name || "").trim().toUpperCase();
-          const rowMarket = String(row?.market || "").trim().toUpperCase();
-          const rowFull = `${rowMarket} ${rowName}`.trim();
-          const normalizedFull = rowFull.replace(/[^A-Z0-9]/g, "");
-          return id === effectiveTeamId
-            || candidates.has(rowAlias)
-            || normalizedFull === normalizedRaw
-            || normalizedRaw.includes(normalizedFull)
-            || normalizedFull.includes(normalizedRaw);
-        });
-        const canonical = String(hit?.id || "").trim();
-        if (canonical) {
-          effectiveTeamId = canonical;
-        }
-      } catch {
-        // keep original teamId when canonical lookup fails
-      }
-    }
-    const cacheKey = `team-profile:v12:${sportUpper}:${effectiveTeamId}`;
+    const effectiveTeamId = String(teamId || "").trim();
+    const cacheKey = `team-profile:v18:${sportUpper}:${effectiveTeamId}`;
     const cached = getRouteCache<TeamProfileData>(cacheKey, 180_000);
     const lastGood = cached || null;
     if (cached) {
@@ -1411,13 +1844,23 @@ export function TeamProfilePage() {
       setData(cached);
       setLoading(false);
       setLoadStatus(isTeamPayloadIncomplete(cached) ? 'partial' : 'complete');
+      if (!firstPaintLoggedRef.current) {
+        firstPaintLoggedRef.current = true;
+        const elapsed = Math.max(0, Math.round(performance.now() - (routeStartMsRef.current || performance.now())));
+        console.info("FIRST_PAINT", { route: "team-profile", source: "cache", first_paint_time_ms: elapsed });
+      }
     }
     
     if (!cached) {
       if (!isActiveRequest()) return;
-      setData(null);
-      setLoading(true);
-      setLoadStatus('loading');
+      setData(routeProvisionalData);
+      setLoading(false);
+      setLoadStatus('partial');
+      if (!firstPaintLoggedRef.current) {
+        firstPaintLoggedRef.current = true;
+        const elapsed = Math.max(0, Math.round(performance.now() - (routeStartMsRef.current || performance.now())));
+        console.info("FIRST_PAINT", { route: "team-profile", source: "provisional", first_paint_time_ms: elapsed });
+      }
     }
     setError(null);
     
@@ -1438,7 +1881,7 @@ export function TeamProfilePage() {
 
       apiCalls += 1;
       console.info("PAGE_DATA_START", { route: "team-profile", sport: sportUpper, teamId: effectiveTeamId, requestedTeamId: teamId });
-      const baseCacheKey = `page-data-team-profile:v1:${sportUpper}:${effectiveTeamId}`;
+      const baseCacheKey = `page-data-team-profile:v2:${sportUpper}:${effectiveTeamId}`;
       let pageData: any = null;
       let lastErr: unknown = null;
       for (let attempt = 0; attempt < 2; attempt += 1) {
@@ -1451,14 +1894,11 @@ export function TeamProfilePage() {
                 ? `${baseCacheKey}:hydrate`
                 : (attempt > 0 ? `${baseCacheKey}:retry` : baseCacheKey),
               ttlMs: 60_000,
-              timeoutMs: 8_000,
+              timeoutMs: stage === "primary" ? 3_500 : 8_000,
               bypassCache: stage !== 'primary' || attempt > 0,
               init: { credentials: "include" },
             }
           );
-          if (!pageData?.data?.profileJson?.team && attempt === 0) {
-            throw new Error("Team profile payload is partial");
-          }
           break;
         } catch (attemptErr) {
           lastErr = attemptErr;
@@ -1473,6 +1913,14 @@ export function TeamProfilePage() {
           if (attempt === 0) continue;
           throw attemptErr;
         }
+      }
+      const explicitPayloadError = String(pageData?.error || "").trim();
+      if (pageData?.ok === false || explicitPayloadError) {
+        if (!isActiveRequest()) return;
+        setError(explicitPayloadError || "Unable to load team data right now.");
+        setData(lastGood || routeProvisionalData);
+        setLoadStatus(lastGood ? (isTeamPayloadIncomplete(lastGood) ? 'partial' : 'complete') : 'partial');
+        return;
       }
 
       if (pageData?.data?.profileJson?.team) {
@@ -1503,13 +1951,13 @@ export function TeamProfilePage() {
       }
       
       // Transform SportsRadar data to our format
-      const teamAlias = profileJson.team?.alias || '';
+      const teamAlias = String(profileJson.team?.alias || '').trim();
       const teamColors = getTeamColors(sportKey || 'nba', teamAlias);
       
-      const team: TeamInfo = {
+      let team: TeamInfo = {
         id: profileJson.team?.id || effectiveTeamId || teamId,
-        name: profileJson.team?.name || 'Unknown',
-        nickname: profileJson.team?.name || 'Unknown',
+        name: String(profileJson.team?.name || '').trim() || String(effectiveTeamId || teamId || "Unknown"),
+        nickname: String(profileJson.team?.name || '').trim() || String(effectiveTeamId || teamId || "Unknown"),
         abbreviation: teamAlias,
         city: profileJson.team?.market || '',
         logo: profileJson.team?.logo || `https://a.espncdn.com/i/teamlogos/${sportKey}/500/${teamAlias.toLowerCase()}.png`,
@@ -1569,6 +2017,57 @@ export function TeamProfilePage() {
           ));
       });
 
+      const gamesRows = Array.isArray(gamesJson?.games) ? gamesJson.games : [];
+      const gameTeamMatch = gamesRows.find((g: any) => {
+        const ids = [
+          String(g?.home_team_id || g?.homeTeamId || "").trim(),
+          String(g?.away_team_id || g?.awayTeamId || "").trim(),
+        ].filter(Boolean);
+        const aliases = [
+          String(g?.home_team_code || g?.homeTeam || "").trim().toLowerCase(),
+          String(g?.away_team_code || g?.awayTeam || "").trim().toLowerCase(),
+        ].filter(Boolean);
+        return ids.includes(profileTeamId) || (profileAlias && aliases.includes(profileAlias));
+      });
+      const gameAlias = String(
+        gameTeamMatch?.home_team_id === profileTeamId || String(gameTeamMatch?.home_team_code || "").trim().toLowerCase() === profileAlias
+          ? (gameTeamMatch?.home_team_code || gameTeamMatch?.homeTeam || "")
+          : (gameTeamMatch?.away_team_code || gameTeamMatch?.awayTeam || "")
+      ).trim().toUpperCase();
+      const gameName = String(
+        gameTeamMatch?.home_team_id === profileTeamId || String(gameTeamMatch?.home_team_code || "").trim().toLowerCase() === profileAlias
+          ? (gameTeamMatch?.home_team_name || gameTeamMatch?.homeTeamFull || "")
+          : (gameTeamMatch?.away_team_name || gameTeamMatch?.awayTeamFull || "")
+      ).trim();
+
+      const resolvedAlias = String(team.abbreviation || standingsMatch?.alias || gameAlias || profileAlias || "").trim().toUpperCase();
+      const standingsDisplayName = [String(standingsMatch?.market || "").trim(), String(standingsMatch?.name || "").trim()]
+        .filter(Boolean)
+        .join(" ")
+        .trim();
+      const rawTeamName = String(team.name || "").trim();
+      const nbaNameFromAlias = sportUpper === "NBA"
+        ? (NBA_ALIAS_TO_FULL_NAME[resolvedAlias] || "")
+        : "";
+      const resolvedName = (isAbbreviationLikeTeamName(rawTeamName) ? "" : rawTeamName)
+        || nbaNameFromAlias
+        || standingsDisplayName
+        || gameName
+        || resolvedAlias
+        || String(effectiveTeamId || teamId || "Unknown");
+      const resolvedId = String(team.id || standingsMatch?.id || "").trim() || String(effectiveTeamId || teamId || "");
+      const resolvedCity = String(team.city || standingsMatch?.market || "").trim();
+
+      team = {
+        ...team,
+        id: resolvedId,
+        name: resolvedName,
+        nickname: resolvedName,
+        abbreviation: resolvedAlias,
+        city: resolvedCity,
+        logo: team.logo || (resolvedAlias ? `https://a.espncdn.com/i/teamlogos/${sportKey}/500/${resolvedAlias.toLowerCase()}.png` : team.logo),
+      };
+
       const teamRecord = profileJson.team?.record || {};
       const wins = Number(teamRecord.wins ?? standingsMatch?.wins ?? 0);
       const losses = Number(teamRecord.losses ?? standingsMatch?.losses ?? 0);
@@ -1624,17 +2123,68 @@ export function TeamProfilePage() {
           awayWins: parseSplitNum(splitOverride.awayWins) ?? record.awayWins,
           awayLosses: parseSplitNum(splitOverride.awayLosses) ?? record.awayLosses,
         };
+        const winsMissing = Number(record.wins || 0) <= 0 && Number(record.losses || 0) <= 0;
+        const derivedWins = Number(record.homeWins ?? 0) + Number(record.awayWins ?? 0);
+        const derivedLosses = Number(record.homeLosses ?? 0) + Number(record.awayLosses ?? 0);
+        if (winsMissing && (derivedWins + derivedLosses) > 0) {
+          record = {
+            ...record,
+            wins: derivedWins,
+            losses: derivedLosses,
+            pct: derivedWins / Math.max(1, derivedWins + derivedLosses),
+          };
+        }
       }
       
       // Transform roster
-      const roster: RosterPlayer[] = (profileJson.roster || []).map((p: any) => ({
-        id: p.id,
-        name: p.name,
-        position: p.position || 'N/A',
-        jersey: p.jerseyNumber || '-',
-        headshot: p.headshot || `https://a.espncdn.com/combiner/i?img=/i/headshots/${sportKey}/players/full/${p.id}.png&w=96&h=70&cb=1`,
-        stats: {}
-      }));
+      const roster: RosterPlayer[] = normalizeTeamRosterForRender(profileJson, sportKey || "");
+      const rosterBuildTargets = roster
+        .map((p) => ({
+          playerId: String(p.id || "").trim(),
+          playerName: String(p.name || "").trim(),
+        }))
+        .filter((row) => /^\d{3,}$/.test(row.playerId) && row.playerName.length > 0);
+      if (stage === 'primary' && rosterBuildTargets.length > 0) {
+        const prebuildKey = `${sportUpper}:${effectiveTeamId}:${rosterBuildTargets.map((row) => row.playerId).sort().join(",")}`;
+        if (lastRosterPrebuildKeyRef.current !== prebuildKey) {
+          lastRosterPrebuildKeyRef.current = prebuildKey;
+          // Fire-and-forget prebuild so team page first paint is never blocked.
+          const schedulePrebuild = () => {
+            void (async () => {
+              const prebuildRes = await fetch("/api/page-data/player-profile/build-bulk", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                credentials: "include",
+                body: JSON.stringify({
+                  sport: sportUpper,
+                  teamId: effectiveTeamId,
+                  players: rosterBuildTargets,
+                  concurrency: 6,
+                  maxAttempts: 3,
+                  waitForCompletion: false,
+                }),
+              }).catch(() => null);
+              const prebuildBody = prebuildRes ? await prebuildRes.json().catch(() => null) : null;
+              const totalBuilt = Number(prebuildBody?.summary?.total || 0);
+              const readyBuilt = Number(prebuildBody?.summary?.ready || 0);
+              const failedBuilt = Number(prebuildBody?.summary?.failed || 0);
+              console.info("TEAM_ROSTER_PREBUILD_BG", {
+                sport: sportUpper,
+                teamId: effectiveTeamId,
+                totalBuilt,
+                readyBuilt,
+                failedBuilt,
+              });
+            })();
+          };
+          if (typeof window !== "undefined" && "requestIdleCallback" in window) {
+            (window as Window & { requestIdleCallback?: (callback: () => void, options?: { timeout?: number }) => number })
+              .requestIdleCallback?.(schedulePrebuild, { timeout: 1200 });
+          } else {
+            globalThis.setTimeout(schedulePrebuild, 0);
+          }
+        }
+      }
       
       // Transform schedule - prefer team endpoint; fallback to sport games feed if unavailable.
       const teamAliasUpper = String(team.abbreviation || '').toUpperCase();
@@ -1979,30 +2529,47 @@ export function TeamProfilePage() {
           };
         });
       };
-      let scheduleFromTeamEndpoint = await enrichMissingLinesByDate(scheduleFromTeamEndpointRaw.map(enrichWithGamesFeed));
+      const safeEnrichSchedule = async (rows: GameResult[]): Promise<GameResult[]> => {
+        const baseRows = rows.map(enrichWithGamesFeed);
+        try {
+          return await enrichMissingLinesByDate(baseRows);
+        } catch {
+          // Never drop finalized schedule context when line enrichment fails.
+          return baseRows;
+        }
+      };
+      let scheduleFromTeamEndpoint = await safeEnrichSchedule(scheduleFromTeamEndpointRaw);
       // Self-heal for degraded fast-timeout payloads: one quick fresh retry only.
       if (!pageDataOnlyMode && sportUpper === 'NBA' && scheduleFromTeamEndpoint.filter((g) => g.status === 'final').length === 0) {
         try {
-          const controller = new AbortController();
-          const timer = setTimeout(() => controller.abort(), 3_500);
-          try {
-            const res = await fetch(`/api/teams/${sportUpper}/${teamId}/schedule?fresh=1`, {
-              credentials: 'include',
-              signal: controller.signal,
-            });
-            if (res.ok) {
+          const aliasUpper = String(team.abbreviation || '').trim().toUpperCase();
+          const preferredNbaId = NBA_ALIAS_TO_LEGACY_TEAM_ID[aliasUpper] || '';
+          const scheduleFetchCandidates = [
+            preferredNbaId,
+            String(teamId || '').trim(),
+            String(team.id || '').trim(),
+          ].filter((candidate, idx, arr) => Boolean(candidate) && arr.indexOf(candidate) === idx);
+          for (const candidateId of scheduleFetchCandidates) {
+            const controller = new AbortController();
+            const timer = setTimeout(() => controller.abort(), 5_500);
+            try {
+              const res = await fetch(`/api/teams/${sportUpper}/${encodeURIComponent(candidateId)}/schedule?fresh=1`, {
+                credentials: 'include',
+                signal: controller.signal,
+              });
+              if (!res.ok) continue;
               const freshScheduleJson = await res.json().catch(() => null);
-              if (freshScheduleJson) {
-                const freshRaw = mapSchedulePayloadRows(freshScheduleJson);
-                const freshMapped = await enrichMissingLinesByDate(freshRaw.map(enrichWithGamesFeed));
-                if (freshMapped.filter((g) => g.status === 'final').length > 0) {
-                  scheduleFromTeamEndpointRaw = freshRaw;
-                  scheduleFromTeamEndpoint = freshMapped;
-                }
+              if (!freshScheduleJson) continue;
+              const freshRaw = mapSchedulePayloadRows(freshScheduleJson);
+              const freshMapped = await safeEnrichSchedule(freshRaw);
+              if (freshMapped.filter((g) => g.status === 'final').length > 0) {
+                scheduleFromTeamEndpointRaw = freshRaw;
+                scheduleFromTeamEndpoint = freshMapped;
+                break;
               }
+            } finally {
+              clearTimeout(timer);
             }
-          } finally {
-            clearTimeout(timer);
           }
         } catch {
           // Keep initial schedule; stability fallback paths still apply below.
@@ -2134,7 +2701,8 @@ export function TeamProfilePage() {
         || schedule.find((g) => g.status === 'final')?.opponent
         || null;
       let teamH2H: TeamH2HData | null = null;
-      if (!pageDataOnlyMode && h2hOpponent?.abbreviation) {
+      const supportsTeamH2H = new Set(["NBA", "NFL", "MLB", "NCAAB", "NCAAF"]).has(sportUpper);
+      if (!pageDataOnlyMode && supportsTeamH2H && h2hOpponent?.abbreviation) {
         try {
           const h2hUrl = `/api/teams/${sportKey.toUpperCase()}/h2h?teamA=${encodeURIComponent(String(team.id || team.abbreviation || team.name || ''))}&teamB=${encodeURIComponent(String(h2hOpponent.abbreviation || h2hOpponent.name || ''))}&window=10`;
           const h2hJson = await fetchJsonCached<TeamH2HData>(h2hUrl, {
@@ -2211,6 +2779,35 @@ export function TeamProfilePage() {
         returnDate: String(row?.returnDate || ''),
         headshot: String(row?.headshot || ''),
       }));
+      const normalizePersonForTeamMatch = (value: unknown): string =>
+        String(value || "")
+          .normalize("NFD")
+          .replace(/[\u0300-\u036f]/g, "")
+          .toLowerCase()
+          .replace(/[^a-z0-9 ]/g, " ")
+          .replace(/\b(jr|sr|ii|iii|iv|v)\b/g, "")
+          .replace(/\s+/g, " ")
+          .trim();
+      const rosterNameSet = new Set(
+        roster
+          .map((row) => normalizePersonForTeamMatch(row.name))
+          .filter(Boolean)
+      );
+      const rosterIdSet = new Set(
+        roster
+          .map((row) => String(row.playerId || row.id || "").trim())
+          .filter(Boolean)
+      );
+      const teamAliasSet = new Set(expandAliasCandidates(String(team.abbreviation || "").toUpperCase()));
+      injuries = injuries.filter((row: any) => {
+        const playerNameKey = normalizePersonForTeamMatch(row.playerName);
+        const playerId = String((row as any)?.playerId || "").trim();
+        const injuryAlias = String((row as any)?.teamAlias || "").trim().toUpperCase();
+        if (playerId && rosterIdSet.has(playerId)) return true;
+        if (playerNameKey && rosterNameSet.has(playerNameKey)) return true;
+        if (injuryAlias && teamAliasSet.has(injuryAlias)) return true;
+        return false;
+      });
       const hasLastGoodInjuries = Array.isArray(lastGood?.injuries) && lastGood!.injuries.length > 0;
       if (injuries.length === 0 && hasLastGoodInjuries) {
         injuries = lastGood!.injuries;
@@ -2255,7 +2852,14 @@ export function TeamProfilePage() {
         teamId,
         hasTeam: Boolean(nextData?.team?.id),
         scheduleGames: Array.isArray(nextData?.schedule) ? nextData.schedule.length : 0,
+        cache: pageData?.freshness?.source || "cold",
+        cache_hit: pageData?.freshness?.source === "l1" || pageData?.freshness?.source === "l2",
       });
+      if (!firstPaintLoggedRef.current) {
+        firstPaintLoggedRef.current = true;
+        const elapsed = Math.max(0, Math.round(performance.now() - (routeStartMsRef.current || performance.now())));
+        console.info("FIRST_PAINT", { route: "team-profile", source: "network", first_paint_time_ms: elapsed });
+      }
       const incomplete = isTeamPayloadIncomplete(nextData);
       if (stage === 'primary' && incomplete && !partialHydrationAttemptedRef.current) {
         partialHydrationAttemptedRef.current = true;
@@ -2308,7 +2912,7 @@ export function TeamProfilePage() {
       console.warn("PAGE_DATA_FALLBACK_USED", { route: "team-profile", reason: "request_failed", sport: String(sportKey || "").toUpperCase(), teamId });
       if (lastGood) {
         if (!isActiveRequest()) return;
-        setError(null);
+        setError(msg ? `Unable to refresh team data (${msg.slice(0, 120)}).` : "Unable to refresh team data right now.");
         setLoadStatus(lastGood ? (isTeamPayloadIncomplete(lastGood) ? 'partial' : 'complete') : 'partial');
       } else {
         const lowered = msg.toLowerCase();
@@ -2327,7 +2931,9 @@ export function TeamProfilePage() {
           return;
         }
         if (!isActiveRequest()) return;
-        setError(msg.includes('404') ? 'Team not found' : 'Team data is currently unavailable');
+        setError(msg.includes('404') ? 'Team not found' : (msg ? `Unable to load team data (${msg.slice(0, 120)}).` : 'Unable to load team data right now.'));
+        setData(lastGood || routeProvisionalData);
+        setLoadStatus('partial');
       }
     } finally {
       if (!isActiveRequest()) return;
@@ -2349,6 +2955,9 @@ export function TeamProfilePage() {
   useEffect(() => {
     const requestId = activeLoadRequestRef.current + 1;
     activeLoadRequestRef.current = requestId;
+    routeStartMsRef.current = performance.now();
+    firstPaintLoggedRef.current = false;
+    fullHydrationLoggedRef.current = false;
     backgroundRetryCountRef.current = 0;
     partialHydrationAttemptedRef.current = false;
     finalHydrationAttemptedRef.current = false;
@@ -2365,22 +2974,34 @@ export function TeamProfilePage() {
   }, [sportKey, teamId]);
 
   useEffect(() => {
+    if (loadStatus !== "complete") return;
+    if (fullHydrationLoggedRef.current) return;
+    fullHydrationLoggedRef.current = true;
+    const elapsed = Math.max(0, Math.round(performance.now() - (routeStartMsRef.current || performance.now())));
+    console.info("FULL_HYDRATION", { route: "team-profile", full_hydration_time_ms: elapsed });
+  }, [loadStatus]);
+
+  useEffect(() => {
     if (!sportKey || !teamId || !data?.team || !scoutEnabled || loading) return;
-    const key = "scout-flow:recent:v1";
+    if (isLikelyUuid(String(teamId))) return;
     try {
-      const raw = window.localStorage.getItem(key);
-      const parsed = raw ? (JSON.parse(raw) as ScoutRecentEntry[]) : [];
+      const raw = window.localStorage.getItem(SCOUT_FLOW_STORAGE_KEY);
+      const parsed = raw ? JSON.parse(raw) : [];
       const next: ScoutRecentEntry = {
         type: "team",
         label: data.team.name,
         subtitle: data.team.abbreviation || undefined,
         sport: sportKey.toUpperCase(),
-        path: `/sports/${sportKey.toLowerCase()}/team/${encodeURIComponent(teamId)}`,
+        path: buildTeamRoute(sportKey, teamId),
         ts: Date.now(),
       };
-      const merged = [next, ...parsed.filter((row) => row.path !== next.path)].slice(0, 12);
-      window.localStorage.setItem(key, JSON.stringify(merged));
-      setScoutRecent(merged);
+      const validated = validateScoutRecentEntry(next);
+      if (!validated) return;
+      const prev = sanitizeScoutRecentList(Array.isArray(parsed) ? parsed : []);
+      const merged = [validated, ...prev.filter((row) => row.path !== validated.path)];
+      const cleaned = sanitizeScoutRecentList(merged);
+      window.localStorage.setItem(SCOUT_FLOW_STORAGE_KEY, JSON.stringify(cleaned.slice(0, 12)));
+      setScoutRecent(cleaned.slice(0, 12));
     } catch {
       // Ignore localStorage failures.
     }
@@ -2391,50 +3012,10 @@ export function TeamProfilePage() {
     let cancelled = false;
     (async () => {
       const sportUpper = sportKey.toUpperCase();
-      const players = await fetchJsonCached<{ props?: Array<{ player_name?: string; team?: string; sport?: string }> }>(
-        `/api/sports-data/props/today?sport=${encodeURIComponent(sportUpper)}&limit=220&offset=0`,
-        {
-          cacheKey: `scout-flow:players:${sportUpper}:v1`,
-          ttlMs: 45_000,
-          timeoutMs: 4_500,
-          init: { credentials: "include" },
-        }
-      ).catch(() => ({ props: [] }));
-      const standings = await fetchJsonCached<{ teams?: Array<{ id?: string; alias?: string; name?: string }> }>(
-        `/api/teams/${encodeURIComponent(sportUpper)}/standings`,
-        {
-          cacheKey: `scout-flow:teams:${sportUpper}:v1`,
-          ttlMs: 90_000,
-          timeoutMs: 4_500,
-          init: { credentials: "include" },
-        }
-      ).catch(() => ({ teams: [] }));
+      const { players, teams } = await fetchScoutFlowPlayersAndTeams(sportUpper);
       if (cancelled) return;
-
-      const playerMap = new Map<string, { name: string; team: string; sport: string }>();
-      for (const row of Array.isArray(players?.props) ? players.props : []) {
-        const name = String(row?.player_name || "").trim();
-        if (!name) continue;
-        const mapKey = name.toLowerCase();
-        if (!playerMap.has(mapKey)) {
-          playerMap.set(mapKey, {
-            name,
-            team: String(row?.team || "").trim(),
-            sport: String(row?.sport || sportUpper).toUpperCase(),
-          });
-        }
-      }
-      setScoutPlayers(Array.from(playerMap.values()).slice(0, 150));
-      setScoutTeams(
-        (Array.isArray(standings?.teams) ? standings.teams : [])
-          .map((row) => ({
-            id: String(row?.id || "").trim(),
-            alias: String(row?.alias || "").trim().toUpperCase(),
-            name: String(row?.name || "").trim(),
-          }))
-          .filter((row) => row.id && row.alias)
-          .slice(0, 40)
-      );
+      setScoutPlayers(players);
+      setScoutTeams(teams);
     })();
     return () => {
       cancelled = true;
@@ -2448,32 +3029,56 @@ export function TeamProfilePage() {
       .filter((row) => row.sport === sportUpper)
       .slice(0, 6)
       .map((row) => ({
-        id: `recent:${row.path}`,
+        id: `recent:${row.type}:${row.path}`,
         label: row.label,
-        subtitle: row.subtitle || "Recent view",
-        kind: "recent",
-        onSelect: () => navigate(row.path),
+        subtitle: row.subtitle || (row.type === "team" ? "team" : "player"),
+        kind: row.type === "team" ? "team" : "player",
+        onSelect: () => {
+          if (row.type === "team") {
+            const p = parseTeamProfilePath(row.path);
+            if (p) logTeamNavigation(p.teamId, p.sportKey);
+            navigateToScoutRecentTeam(row.path, navigate);
+            return;
+          }
+          const p = parsePlayerProfilePath(row.path);
+          if (p) logPlayerNavigation(p.playerId, p.sportKey);
+          navigateToScoutRecentPlayer(row.path, navigate);
+        },
       }));
     const playerItems: ScoutFlowItem[] = scoutPlayers
+      .map((row) => {
+        const pid =
+          resolvePlayerIdForNavigation(row.playerId, row.name, String(row.sport || sportUpper).toLowerCase())
+          || "";
+        return { row, pid };
+      })
+      .filter(({ pid }) => Boolean(pid))
       .slice(0, 12)
-      .map((row) => ({
-        id: `player:${row.name}`,
-        label: row.name,
+      .map(({ row, pid }) => ({
+        id: `player:${pid}`,
+        label: row.name || "Loading player profile...",
         subtitle: row.team || "Player",
-        kind: "player",
+        kind: "player" as const,
         onSelect: () => {
-          logPlayerNavigation(row.name, sportUpper);
-          navigate(buildPlayerRoute(sportUpper, row.name));
+          logPlayerNavigation(pid, sportUpper);
+          const hintedName = String(row.name || "").trim();
+          const routeBase = buildPlayerRoute(sportUpper, pid);
+          const route = hintedName
+            ? `${routeBase}?playerName=${encodeURIComponent(hintedName)}`
+            : routeBase;
+          navigate(route, {
+            state: { playerNameHint: String(row.name || "").trim() },
+          });
         },
       }));
     const teamItems: ScoutFlowItem[] = scoutTeams
-      .filter((row) => row.id !== teamId)
+      .filter((row) => row.id !== teamId && !isLikelyUuid(row.id))
       .slice(0, 12)
       .map((row) => ({
         id: `team:${row.id}`,
         label: row.name || row.alias,
         subtitle: row.alias,
-        kind: "team",
+        kind: "team" as const,
         onSelect: () => {
           logTeamNavigation(row.id, sportKey);
           navigate(buildTeamRoute(String(sportKey || ""), row.id));
@@ -2482,10 +3087,8 @@ export function TeamProfilePage() {
     return [...recentItems, ...playerItems, ...teamItems];
   }, [scoutEnabled, sportKey, scoutRecent, scoutPlayers, scoutTeams, navigate, teamId]);
 
-  if (loading && !data) return <LoadingState />;
-  if ((error && !data) || !data) return <ErrorState message={error || 'Unknown error'} onRetry={() => void fetchTeamData('primary')} />;
-
-  const { team, record, roster, schedule, stats, injuries, teamH2H } = data;
+  const renderData = data || routeProvisionalData;
+  const { team, record, roster, schedule, stats, injuries, teamH2H } = renderData;
 
   return (
     <div className="min-h-screen bg-background pb-24">
@@ -2510,9 +3113,20 @@ export function TeamProfilePage() {
 
       {/* Content */}
       <div className="px-4 space-y-4 -mt-4 relative z-10">
-        {loadStatus === 'partial' && (
+        {loadStatus === 'partial' && loading && (
           <div className="rounded-xl border border-amber-400/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-100">
             Loading remaining team sections...
+          </div>
+        )}
+        {error && (
+          <div className="rounded-xl border border-red-400/30 bg-red-500/10 px-3 py-2 text-xs text-red-100 flex items-center justify-between gap-3">
+            <span>{error}</span>
+            <button
+              onClick={() => void fetchTeamData('primary')}
+              className="shrink-0 rounded border border-red-300/40 bg-red-500/15 px-2 py-1 text-[11px] font-medium text-red-100 hover:bg-red-500/25"
+            >
+              Retry
+            </button>
           </div>
         )}
         {scoutEnabled && (
@@ -2536,6 +3150,7 @@ export function TeamProfilePage() {
           teamName={team.name}
           schedule={schedule}
           initialH2H={teamH2H}
+          isLoading={loading && schedule.length === 0}
         />
 
         {/* Roster Preview */}
@@ -2543,10 +3158,12 @@ export function TeamProfilePage() {
           roster={roster} 
           sportKey={sportKey || 'nba'} 
           teamAbbr={team.abbreviation}
+          teamId={team.id}
+          isLoading={loading && roster.length === 0}
         />
 
         {/* Injuries */}
-        <InjuriesPreview injuries={injuries} />
+        <InjuriesPreview injuries={injuries} isLoading={loading && injuries.length === 0} />
 
         {/* Venue Info */}
         {team.venue && (

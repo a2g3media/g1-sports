@@ -33,6 +33,8 @@ import { useImpersonation } from "@/react-app/contexts/ImpersonationContext";
 import { ThemeToggle } from "@/react-app/components/ThemeToggle";
 import { UnifiedNotificationCenter } from "@/react-app/components/UnifiedNotificationCenter";
 import { useFeatureFlags } from "@/react-app/hooks/useFeatureFlags";
+import { fetchJsonCached } from "@/react-app/lib/fetchCache";
+import { buildPageDataGamesCacheKey, buildPageDataGamesUrl } from "@/react-app/lib/pageDataKeys";
 
 import { useFirstSession } from "@/react-app/hooks/useFirstSession";
 import { cn } from "@/react-app/lib/utils";
@@ -96,6 +98,21 @@ export function Layout({ children, hideFooter: _hideFooter }: LayoutProps) {
       void import('@/react-app/pages/PlayerPropsPage');
       void import('@/react-app/pages/GameDetailPage');
       void import('@/react-app/pages/OddsGamePage');
+      const today = new Date().toISOString().slice(0, 10);
+      const prewarmGamesUrl = buildPageDataGamesUrl({ date: today, sport: "ALL", tab: "scores" });
+      const prewarmOddsUrl = buildPageDataGamesUrl({ date: today, sport: "ALL", tab: "odds" });
+      void fetchJsonCached(prewarmGamesUrl, {
+        cacheKey: buildPageDataGamesCacheKey({ date: today, sport: "ALL", tab: "scores" }),
+        ttlMs: 15_000,
+        timeoutMs: 2_000,
+        init: { credentials: "include" },
+      }).catch(() => {});
+      void fetchJsonCached(prewarmOddsUrl, {
+        cacheKey: buildPageDataGamesCacheKey({ date: today, sport: "ALL", tab: "odds" }),
+        ttlMs: 15_000,
+        timeoutMs: 2_000,
+        init: { credentials: "include" },
+      }).catch(() => {});
     });
 
     return () => {
@@ -162,6 +179,29 @@ export function Layout({ children, hideFooter: _hideFooter }: LayoutProps) {
     { name: "Pools", href: ROUTES.POOLS, icon: Trophy },
     { name: "Coach G", href: ROUTES.COACH, icon: null }, // Uses CoachGAvatarIcon
   ];
+  const prefetchNavData = (href: string) => {
+    const key = String(href || "").trim().toLowerCase();
+    const today = new Date().toISOString().slice(0, 10);
+    if (key === "/games" || key === "/odds") {
+      const tab = key === "/odds" ? "odds" : "scores";
+      const url = buildPageDataGamesUrl({ date: today, sport: "ALL", tab });
+      void fetchJsonCached(url, {
+        cacheKey: buildPageDataGamesCacheKey({ date: today, sport: "ALL", tab }),
+        ttlMs: 10_000,
+        timeoutMs: 2_500,
+        init: { credentials: "include" },
+      }).catch(() => {});
+      return;
+    }
+    if (key === "/props") {
+      void fetchJsonCached("/api/page-data/player-profile/coverage?sport=NBA", {
+        cacheKey: "prefetch:props:coverage:nba",
+        ttlMs: 30_000,
+        timeoutMs: 2_500,
+        init: { credentials: "include" },
+      }).catch(() => {});
+    }
+  };
 
   // Custom isActive that handles Games vs Odds tab distinction
   const isActive = (href: string) => {
@@ -577,6 +617,8 @@ export function Layout({ children, hideFooter: _hideFooter }: LayoutProps) {
                   <Link
                     key={item.name}
                     to={item.href}
+                    onMouseEnter={() => prefetchNavData(item.href)}
+                    onFocus={() => prefetchNavData(item.href)}
                     className={cn(
                       "flex flex-col items-center justify-center gap-1 py-1 px-2 sm:px-3 relative group",
                       "transition-all duration-200 ease-in-out",
@@ -610,6 +652,8 @@ export function Layout({ children, hideFooter: _hideFooter }: LayoutProps) {
                 <Link
                   key={item.name}
                   to={item.href}
+                  onMouseEnter={() => prefetchNavData(item.href)}
+                  onFocus={() => prefetchNavData(item.href)}
                   className={cn(
                     "flex flex-col items-center justify-center gap-1 py-1.5 px-3 sm:px-4 lg:px-5 xl:px-6 min-w-[56px] sm:min-w-[72px] lg:min-w-[80px] relative group",
                     "transition-all duration-200 ease-in-out",

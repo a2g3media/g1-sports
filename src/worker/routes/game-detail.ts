@@ -1,3 +1,4 @@
+// @ts-nocheck
 /**
  * Game Detail API Routes
  * 

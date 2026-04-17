@@ -51,6 +51,12 @@ interface UseCoachGPreviewReturn {
   refreshPreview: () => Promise<void>;
 }
 
+const PREVIEW_TTL_MS = 30_000;
+const PREVIEW_UNAVAILABLE_COOLDOWN_MS = 60_000;
+const previewCache = new Map<string, { preview: GamePreview | null; expiresAt: number }>();
+const previewInflight = new Map<string, Promise<GamePreview | null>>();
+const previewUnavailableUntil = new Map<string, number>();
+
 export function useCoachGPreview(gameId: string | undefined): UseCoachGPreviewReturn {
   const [preview, setPreview] = useState<GamePreview | null>(null);
   const [isLoading, setIsLoading] = useState(false);
@@ -60,33 +66,73 @@ export function useCoachGPreview(gameId: string | undefined): UseCoachGPreviewRe
   // Fetch existing preview
   const fetchPreview = useCallback(async () => {
     if (!gameId) return;
-    
+
+    const now = Date.now();
+    const unavailableUntil = previewUnavailableUntil.get(gameId) || 0;
+    if (unavailableUntil > now) {
+      setPreview(null);
+      setError(null);
+      return;
+    }
+
+    const cached = previewCache.get(gameId);
+    if (cached && cached.expiresAt > now) {
+      setPreview(cached.preview);
+      setError(null);
+      return;
+    }
+
     setIsLoading(true);
     setError(null);
-    
+
     try {
-      const response = await fetch(`/api/coach-g-preview/${gameId}`);
-      
-      if (response.status === 404) {
-        // Automatically enqueue generation on first miss so article content backfills.
-        const generateResponse = await fetch(`/api/coach-g-preview/${gameId}`, {
-          method: "POST",
+      let inflight = previewInflight.get(gameId);
+      if (!inflight) {
+        inflight = (async () => {
+          const response = await fetch(`/api/coach-g-preview/${gameId}`, { credentials: 'include' });
+
+          if (response.status === 404) {
+            // Automatically enqueue generation on first miss so article content backfills.
+            const generateResponse = await fetch(`/api/coach-g-preview/${gameId}`, {
+              method: "POST",
+              credentials: 'include',
+            });
+            if (generateResponse.status === 404) {
+              previewUnavailableUntil.set(gameId, Date.now() + PREVIEW_UNAVAILABLE_COOLDOWN_MS);
+              return null;
+            }
+            if (generateResponse.ok) {
+              const generated = await generateResponse.json();
+              return generated.preview || null;
+            }
+            return null;
+          }
+
+          if (!response.ok) {
+            throw new Error('Failed to load preview');
+          }
+
+          const data = await response.json();
+          return data.preview || null;
+        })().finally(() => {
+          previewInflight.delete(gameId);
         });
-        if (generateResponse.ok) {
-          const generated = await generateResponse.json();
-          setPreview(generated.preview || null);
-        } else {
-          setPreview(null);
+        previewInflight.set(gameId, inflight);
+      }
+
+      const resolved = await inflight;
+      previewCache.set(gameId, {
+        preview: resolved,
+        expiresAt: Date.now() + PREVIEW_TTL_MS,
+      });
+      setPreview(resolved);
+      if (!resolved) {
+        const blockedUntil = previewUnavailableUntil.get(gameId) || 0;
+        if (blockedUntil > Date.now()) {
+          setError(null);
+          return;
         }
-        return;
       }
-      
-      if (!response.ok) {
-        throw new Error('Failed to load preview');
-      }
-      
-      const data = await response.json();
-      setPreview(data.preview);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load preview');
     } finally {

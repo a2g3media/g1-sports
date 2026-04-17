@@ -48,9 +48,27 @@ import {
 import { getMarketPeriodLabels } from "@/react-app/lib/marketPeriodLabels";
 import { getAllSoccerLeagues, getSoccerLeagueMeta } from "@/react-app/lib/soccerLeagueMeta";
 import { toGameDetailPath } from "@/react-app/lib/gameRoutes";
+import { getEspnAthleteIdForPlayerName, resolveCanonicalPlayerIdFromPayload } from "@/shared/espnAthleteIdLookup";
+import { normalizeSoccerRouteId } from "@/shared/canonicalSoccerId";
+import { logPlayerNavigation, normalizeSportKeyForRoute } from "@/react-app/lib/navigationRoutes";
+import { navigateToPlayerProfile } from "@/react-app/lib/playerProfileNavigation";
 import { fetchJsonCached, getFetchCacheStats } from "@/react-app/lib/fetchCache";
+import { prefetchFullPlayerProfileSnapshot } from "@/react-app/lib/playerProfileSnapshotPrewarm";
 import { getRouteCache, setRouteCache, getRouteCacheStats } from "@/react-app/lib/routeDataCache";
 import { logPerfSnapshot, startPerfTimer } from "@/react-app/lib/perfTelemetry";
+
+function resolveGameDetailNavigationPlayerId(
+  rawId: unknown,
+  displayName: string,
+  sportKey: string
+): string | undefined {
+  const normalizedName = String(displayName || "").trim();
+  if (normalizedName) {
+    const mapped = getEspnAthleteIdForPlayerName(normalizedName, sportKey);
+    if (mapped) return mapped;
+  }
+  return resolveCanonicalPlayerIdFromPayload(rawId, normalizedName, sportKey);
+}
 
 // ====================
 // TYPES
@@ -124,6 +142,45 @@ interface PlayByPlayData {
   timestamp: string;
 }
 
+interface MlbPitcherState {
+  name: string | null;
+  handedness: string | null;
+  era: string | null;
+  last5: string | null;
+}
+
+interface MlbLiveState {
+  inningNumber: number | null;
+  inningHalf: "top" | "bottom" | null;
+  outs: number | null;
+  balls: number | null;
+  strikes: number | null;
+  runnersOnBase: {
+    first: boolean;
+    second: boolean;
+    third: boolean;
+  } | null;
+  currentBatter: {
+    name: string | null;
+    handedness: string | null;
+  } | null;
+  currentPitcher: {
+    name: string | null;
+    handedness: string | null;
+  } | null;
+  lastPlay: {
+    type: string | null;
+    player: string | null;
+    text: string | null;
+    timestamp: string | null;
+  } | null;
+}
+
+interface MlbPregameState {
+  probableHomePitcher: MlbPitcherState | null;
+  probableAwayPitcher: MlbPitcherState | null;
+}
+
 interface GameData {
   id: string;
   sport: string;
@@ -149,6 +206,11 @@ interface GameData {
   props?: PlayerProp[];
   propsSource?: 'event' | 'competition' | 'placeholder' | 'none';
   propsFallbackReason?: string | null;
+  probableAwayPitcher?: { name: string; record?: string; handedness?: string; era?: string; last5?: string };
+  probableHomePitcher?: { name: string; record?: string; handedness?: string; era?: string; last5?: string };
+  mlbLiveState?: MlbLiveState | null;
+  mlbPregameState?: MlbPregameState | null;
+  playByPlay?: PlayByPlayData | null;
 }
 
 // Box Score Types
@@ -655,14 +717,181 @@ const SectionHeader = memo(function SectionHeader({
   );
 });
 
+const MlbTopStatePanel = memo(function MlbTopStatePanel({
+  game,
+  lastPlayUpdated,
+}: {
+  game: GameData;
+  lastPlayUpdated?: Date | null;
+}) {
+  const isMlb = String(game.sport || "").toUpperCase() === "MLB";
+  if (!isMlb) return null;
+
+  const liveState = game.mlbLiveState ?? null;
+  const pregameState = game.mlbPregameState ?? null;
+  const hasStructuredLiveState = liveState !== null && liveState !== undefined;
+  const hasStructuredPregameState = pregameState !== null && pregameState !== undefined;
+  const isLive = game.status === "LIVE" || hasStructuredLiveState;
+
+  const getLatestPlay = (): (PlayByPlayEvent & {
+    balls?: number | null;
+    strikes?: number | null;
+    outs?: number | null;
+    text?: string | null;
+  }) | null => {
+    const plays = game.playByPlay?.plays;
+    if (!plays || plays.length === 0) return null;
+    const latest = plays[plays.length - 1];
+    return latest || null;
+  };
+  const latestPlay = getLatestPlay();
+
+  console.debug("MLB FALLBACK CHECK", {
+    mlbLiveState: game.mlbLiveState,
+    hasPlays: !!game.playByPlay?.plays?.length,
+    latestPlay,
+  });
+
+  // TEMP DEV LOG: verify structured MLB state presence in top section path.
+  console.debug("[MLB Top Section State]", {
+    gameId: game.id,
+    mlbLiveState: game.mlbLiveState,
+    mlbPregameState: game.mlbPregameState,
+  });
+
+  const inningHalfLabel = liveState?.inningHalf === "top" ? "Top" : liveState?.inningHalf === "bottom" ? "Bot" : null;
+  const inningLabel =
+    liveState?.inningNumber !== null && liveState?.inningNumber !== undefined
+      ? `${inningHalfLabel ? `${inningHalfLabel} ` : ""}${liveState.inningNumber}`.trim()
+      : null;
+  const outsLabel = liveState?.outs !== null && liveState?.outs !== undefined
+    ? `${liveState.outs} out${liveState.outs === 1 ? "" : "s"}`
+    : (() => {
+      if (latestPlay?.outs !== null && latestPlay?.outs !== undefined) {
+        return `${latestPlay.outs} out${latestPlay.outs === 1 ? "" : "s"}`;
+      }
+      const playText = String(latestPlay?.description || latestPlay?.text || "").toLowerCase();
+      const outsMatch = playText.match(/(\d)\s*out/);
+      if (outsMatch && outsMatch[1] !== undefined) {
+        const parsedOuts = Number(outsMatch[1]);
+        if (Number.isFinite(parsedOuts)) {
+          return `${parsedOuts} out${parsedOuts === 1 ? "" : "s"}`;
+        }
+      }
+      return null;
+    })();
+  const derivedBalls =
+    latestPlay?.balls !== null && latestPlay?.balls !== undefined
+      ? latestPlay.balls
+      : null;
+  const derivedStrikes =
+    latestPlay?.strikes !== null && latestPlay?.strikes !== undefined
+      ? latestPlay.strikes
+      : null;
+  const countLabel =
+    liveState?.balls !== null
+    && liveState?.balls !== undefined
+    && liveState?.strikes !== null
+    && liveState?.strikes !== undefined
+      ? `${liveState.balls}-${liveState.strikes} count`
+      : (derivedBalls !== null && derivedStrikes !== null
+        ? `${derivedBalls}-${derivedStrikes} count`
+        : (hasStructuredLiveState ? "Count unavailable" : null));
+  const baseState = liveState?.runnersOnBase ?? null;
+  const occupiedBases = [
+    baseState?.first ? "1st" : "",
+    baseState?.second ? "2nd" : "",
+    baseState?.third ? "3rd" : "",
+  ].filter(Boolean);
+  const baseLabel = baseState
+    ? (occupiedBases.length > 0 ? `Runners on ${occupiedBases.join(" and ")}` : "Bases empty")
+    : (hasStructuredLiveState ? "Base state unavailable" : null);
+  const batterName = liveState?.currentBatter?.name ?? latestPlay?.playerName ?? null;
+  const pitcherName = liveState?.currentPitcher?.name ?? null;
+  const matchupLabel = batterName && pitcherName
+    ? `${batterName} vs ${pitcherName}`
+    : (batterName || pitcherName || null);
+  const latestPlayText = liveState?.lastPlay?.text ?? latestPlay?.description ?? latestPlay?.text ?? null;
+  const latestPlayTs = liveState?.lastPlay?.timestamp ?? latestPlay?.timestamp ?? (lastPlayUpdated ? lastPlayUpdated.toISOString() : null);
+  const freshnessLabel = latestPlayTs
+    ? new Date(latestPlayTs).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })
+    : null;
+
+  const homeProbable = pregameState?.probableHomePitcher || null;
+  const awayProbable = pregameState?.probableAwayPitcher || null;
+  const hasPregamePitchers = Boolean(awayProbable?.name || homeProbable?.name);
+  const buildPregameLine = (pitcher: MlbPitcherState | null): string | null => {
+    if (!pitcher?.name) return null;
+    const meta = [pitcher.handedness, pitcher.era ? `${pitcher.era} ERA` : null, pitcher.last5 ? `Last 5: ${pitcher.last5}` : null]
+      .filter(Boolean)
+      .join(" • ");
+    return meta ? `${pitcher.name} (${meta})` : pitcher.name;
+  };
+  const awayPregameLine = buildPregameLine(awayProbable);
+  const homePregameLine = buildPregameLine(homeProbable);
+
+  return (
+    <GlassCard className="mb-5 border border-cyan-400/25 bg-[#121821] p-4 shadow-[0_0_28px_rgba(34,211,238,0.11)] md:mb-6">
+      {isLive ? (
+        <div className="space-y-3">
+          <div className="flex flex-wrap items-center gap-2 text-xs uppercase tracking-[0.08em] text-cyan-200/85">
+            <span className="inline-flex items-center gap-1 rounded-md border border-cyan-400/25 bg-cyan-500/10 px-2 py-1">
+              <span className="h-1.5 w-1.5 rounded-full bg-red-400 animate-pulse" />
+              Live MLB
+            </span>
+            {inningLabel ? <span className="text-sm font-semibold normal-case text-[#E5E7EB]">{inningLabel}</span> : null}
+            {outsLabel ? <span className="text-sm font-semibold normal-case text-[#E5E7EB]">{outsLabel}</span> : null}
+            {game.clock ? <span className="text-sm font-semibold normal-case text-[#E5E7EB]">{game.clock}</span> : null}
+          </div>
+          {(countLabel || baseLabel) && (
+            <div className="grid gap-2 md:grid-cols-2">
+              {countLabel ? <div className="rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-sm font-medium text-[#E5E7EB]">{countLabel}</div> : null}
+              {baseLabel ? <div className="rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-sm font-medium text-[#E5E7EB]">{baseLabel}</div> : null}
+            </div>
+          )}
+          {matchupLabel ? (
+            <div className="rounded-lg border border-emerald-400/20 bg-emerald-500/10 px-3 py-2 text-sm font-semibold text-emerald-100">{matchupLabel}</div>
+          ) : null}
+          {latestPlayText ? (
+            <div className="rounded-lg border border-violet-400/20 bg-violet-500/10 px-3 py-2 text-sm text-violet-100">
+              <span className="font-semibold">Last play:</span> {latestPlayText}
+              {freshnessLabel ? <span className="ml-2 text-xs text-violet-200/80">({freshnessLabel})</span> : null}
+            </div>
+          ) : null}
+        </div>
+      ) : (
+        <div className="space-y-3">
+          <div className="text-xs uppercase tracking-[0.08em] text-cyan-200/85">MLB Pitching Matchup</div>
+          {hasStructuredPregameState && hasPregamePitchers ? (
+            <div className="grid gap-2 md:grid-cols-2">
+              {awayPregameLine ? (
+                <div className="rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-sm font-medium text-[#E5E7EB]">{awayPregameLine}</div>
+              ) : null}
+              {homePregameLine ? (
+                <div className="rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-sm font-medium text-[#E5E7EB]">{homePregameLine}</div>
+              ) : null}
+            </div>
+          ) : (
+            <div className="rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-sm font-medium text-[#E5E7EB]">Pitching matchup pending</div>
+          )}
+        </div>
+      )}
+    </GlassCard>
+  );
+});
+
 const GameHeroPanel = memo(function GameHeroPanel({
   game,
   getTeamName,
+  getTeamLogoCode,
+  competitionLabel,
   onTeamNavigate,
   onTeamPrefetch,
 }: {
   game: GameData;
   getTeamName: (isHome: boolean) => string;
+  getTeamLogoCode: (isHome: boolean) => string;
+  competitionLabel?: string | null;
   onTeamNavigate?: (teamCode: string, teamName: string) => void;
   onTeamPrefetch?: (teamCode: string, teamName: string) => void;
 }) {
@@ -688,8 +917,24 @@ const GameHeroPanel = memo(function GameHeroPanel({
     });
   }, [game.clock, game.period, game.startTime, game.status]);
 
-  const spreadLabel = game.odds?.spread !== undefined ? `${game.homeTeam} ${formatSpread(game.odds.spread)}` : "-";
+  const spreadLabel = game.odds?.spread !== undefined ? `${homeName} ${formatSpread(game.odds.spread)}` : "-";
   const totalLabel = game.odds?.total !== undefined ? String(game.odds.total) : "-";
+  const isSoccer = String(game.sport || "").toUpperCase() === "SOCCER";
+  const isMlb = String(game.sport || "").toUpperCase() === "MLB";
+  const isScheduled = game.status === "SCHEDULED";
+  const awayMlbProbable = game.mlbPregameState?.probableAwayPitcher ?? null;
+  const homeMlbProbable = game.mlbPregameState?.probableHomePitcher ?? null;
+  const awayPitcherLabel = isMlb
+    ? (awayMlbProbable?.name || "")
+    : (game.probableAwayPitcher?.record
+      ? `${game.probableAwayPitcher.name} (${game.probableAwayPitcher.record})`
+      : (game.probableAwayPitcher?.name || ""));
+  const homePitcherLabel = isMlb
+    ? (homeMlbProbable?.name || "")
+    : (game.probableHomePitcher?.record
+      ? `${game.probableHomePitcher.name} (${game.probableHomePitcher.record})`
+      : (game.probableHomePitcher?.name || ""));
+  const showHeroPitcherMatchup = isMlb && isScheduled && Boolean(awayPitcherLabel || homePitcherLabel);
   const isFinalGame = game.status === "FINAL";
   const awayWon = isFinalGame && game.awayScore !== null && game.homeScore !== null && game.awayScore > game.homeScore;
   const homeWon = isFinalGame && game.awayScore !== null && game.homeScore !== null && game.homeScore > game.awayScore;
@@ -706,12 +951,19 @@ const GameHeroPanel = memo(function GameHeroPanel({
     const fallback = homeMl ?? awayMl;
     return fallback !== undefined ? formatMoneylineValue(fallback) : "-";
   }, [formatMoneylineValue, game.awayTeam, game.homeTeam, game.odds?.mlAway, game.odds?.mlHome]);
+  const marketRows = [
+    game.odds?.spread !== undefined ? { label: "Spread", value: spreadLabel } : null,
+    game.odds?.total !== undefined ? { label: "Total", value: totalLabel } : null,
+    (game.odds?.mlAway !== undefined || game.odds?.mlHome !== undefined) ? { label: "Moneyline", value: moneylineLabel } : null,
+  ].filter(Boolean) as Array<{ label: string; value: string }>;
+  const statusChip = game.status === "LIVE" ? "LIVE" : game.status === "FINAL" ? "FINAL" : "UPCOMING";
+  const heroLogoSize = isSoccer ? 84 : 96;
 
   return (
-    <div className="mb-5 md:mb-6 overflow-hidden rounded-[14px] border border-white/[0.05] bg-[#121821] shadow-[0_10px_24px_rgba(0,0,0,0.30)]">
+    <div className="mb-4 md:mb-5 overflow-hidden rounded-[14px] border border-white/[0.05] bg-[#121821] shadow-[0_10px_24px_rgba(0,0,0,0.30)]">
       <div className="grid grid-cols-12">
         <div
-          className="col-span-4 p-4 md:p-6"
+          className="col-span-4 p-3.5 md:p-5"
           style={{
             background: awayColors
               ? `linear-gradient(120deg, ${awayColors.primary}44 0%, ${awayColors.secondary}22 100%)`
@@ -728,35 +980,61 @@ const GameHeroPanel = memo(function GameHeroPanel({
             aria-label={`Open ${awayName} team page`}
           >
             <TeamLogo
-              teamCode={game.awayTeam || "AWY"}
+              teamCode={getTeamLogoCode(false)}
               teamName={awayName}
               sport={game.sport}
-              size={96}
+              size={heroLogoSize}
               winnerGlow={awayWon}
               className="drop-shadow-[0_0_22px_rgba(255,255,255,0.35)]"
             />
             <div className="min-w-0">
               <p className="truncate text-xs uppercase tracking-wide text-[#9CA3AF]">Away</p>
-              <p className="truncate text-base font-semibold text-[#E5E7EB] md:text-xl">{awayName}</p>
+              <p className="truncate text-base font-semibold text-[#E5E7EB] md:text-2xl">{awayName}</p>
               <p className="text-[10px] text-cyan-300/80 opacity-0 -translate-y-0.5 transition-all duration-150 group-hover:opacity-100 group-hover:translate-y-0">
                 View Team &rarr;
               </p>
             </div>
           </button>
         </div>
-        <div className="col-span-4 border-x border-white/[0.05] bg-[#16202B] p-4 text-center md:p-6">
-          <p className="text-xs uppercase tracking-wider text-[#9CA3AF]">{game.sport}</p>
-          <div className="mt-1 flex items-end justify-center gap-3">
-            <span className="text-4xl font-bold text-[#E5E7EB] transition-all duration-300 md:text-5xl">{game.awayScore ?? "-"}</span>
+        <div className="col-span-4 border-x border-white/[0.05] bg-[#16202B] p-3.5 text-center md:p-5">
+          <p className="text-[11px] uppercase tracking-[0.08em] text-[#9CA3AF]">{competitionLabel || game.sport}</p>
+          <div className="mt-1 flex items-end justify-center gap-2">
+            <span className="text-5xl font-black leading-none text-[#E5E7EB] transition-all duration-300 md:text-6xl">{game.awayScore ?? "-"}</span>
             <span className="pb-1 text-xl text-[#6B7280]">-</span>
-            <span className="text-4xl font-bold text-[#E5E7EB] transition-all duration-300 md:text-5xl">{game.homeScore ?? "-"}</span>
+            <span className="text-5xl font-black leading-none text-[#E5E7EB] transition-all duration-300 md:text-6xl">{game.homeScore ?? "-"}</span>
           </div>
-          <p className={cn("mt-2 text-sm font-medium md:text-base", game.status === "LIVE" ? "text-emerald-300" : "text-[#9CA3AF]")}>
+          <div className="mt-2 inline-flex items-center rounded-full border border-white/15 bg-white/[0.04] px-2.5 py-1">
+            <span className={cn("text-[10px] font-semibold tracking-[0.08em]", statusChip === "LIVE" ? "text-emerald-300" : "text-[#CBD5E1]")}>{statusChip}</span>
+          </div>
+          <p className={cn("mt-1 text-xs font-medium md:text-sm", game.status === "LIVE" ? "text-emerald-300" : "text-[#9CA3AF]")}>
             {statusLabel}
           </p>
+          {showHeroPitcherMatchup && (
+            <div className="mt-3 rounded-xl border border-cyan-400/35 bg-gradient-to-r from-cyan-500/16 via-sky-500/10 to-violet-500/14 px-3 py-2.5 text-left shadow-[0_0_26px_rgba(56,189,248,0.14)]">
+              <div className="mb-1.5 flex items-center gap-1.5 text-[10px] font-semibold uppercase tracking-[0.09em] text-cyan-100/95">
+                <span>⚾</span>
+                <span>Probable Pitcher Duel</span>
+                <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-cyan-300/80" />
+              </div>
+              <div className="grid grid-cols-1 gap-1.5 sm:grid-cols-2">
+                {awayPitcherLabel && (
+                  <div className="truncate rounded-md border border-cyan-300/20 bg-cyan-500/10 px-2 py-1 text-[11px] text-slate-100">
+                    <span className="mr-1 text-[9px] uppercase text-cyan-300">Away</span>
+                    {awayPitcherLabel}
+                  </div>
+                )}
+                {homePitcherLabel && (
+                  <div className="truncate rounded-md border border-violet-300/20 bg-violet-500/10 px-2 py-1 text-[11px] text-slate-100">
+                    <span className="mr-1 text-[9px] uppercase text-violet-300">Home</span>
+                    {homePitcherLabel}
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
         </div>
         <div
-          className="col-span-4 p-4 md:p-6"
+          className="col-span-4 p-3.5 md:p-5"
           style={{
             background: homeColors
               ? `linear-gradient(240deg, ${homeColors.primary}44 0%, ${homeColors.secondary}22 100%)`
@@ -774,36 +1052,36 @@ const GameHeroPanel = memo(function GameHeroPanel({
           >
             <div className="min-w-0 text-right">
               <p className="truncate text-xs uppercase tracking-wide text-[#9CA3AF]">Home</p>
-              <p className="truncate text-base font-semibold text-[#E5E7EB] md:text-xl">{homeName}</p>
+              <p className="truncate text-base font-semibold text-[#E5E7EB] md:text-2xl">{homeName}</p>
               <p className="text-[10px] text-cyan-300/80 opacity-0 -translate-y-0.5 transition-all duration-150 group-hover:opacity-100 group-hover:translate-y-0">
                 View Team &rarr;
               </p>
             </div>
             <TeamLogo
-              teamCode={game.homeTeam || "HOM"}
+              teamCode={getTeamLogoCode(true)}
               teamName={homeName}
               sport={game.sport}
-              size={96}
+              size={heroLogoSize}
               winnerGlow={homeWon}
               className="drop-shadow-[0_0_22px_rgba(255,255,255,0.35)]"
             />
           </button>
         </div>
       </div>
-      <div className="grid grid-cols-3 border-t border-white/[0.05] bg-[#0F141B]">
-        <div className="p-3 text-center">
-          <p className="text-xs font-semibold uppercase tracking-[0.08em] text-[#9CA3AF] md:text-[13px]">Spread</p>
-          <p className="mt-1 text-base font-extrabold tracking-tight text-[#E5E7EB] md:text-lg">{spreadLabel}</p>
+      {marketRows.length > 0 ? (
+        <div className={cn("border-t border-white/[0.05] bg-[#0F141B]", marketRows.length === 1 ? "grid grid-cols-1" : marketRows.length === 2 ? "grid grid-cols-2" : "grid grid-cols-3")}>
+          {marketRows.map((market, idx) => (
+            <div key={market.label} className={cn("p-3 text-center", idx > 0 && "border-l border-white/[0.05]")}>
+              <p className="text-xs font-semibold uppercase tracking-[0.08em] text-[#9CA3AF] md:text-[13px]">{market.label}</p>
+              <p className="mt-1 text-base font-extrabold tracking-tight text-[#E5E7EB] md:text-lg">{market.value}</p>
+            </div>
+          ))}
         </div>
-        <div className="border-x border-white/[0.05] p-3 text-center">
-          <p className="text-xs font-semibold uppercase tracking-[0.08em] text-[#9CA3AF] md:text-[13px]">Total</p>
-          <p className="mt-1 text-base font-extrabold tracking-tight text-[#E5E7EB] md:text-lg">{totalLabel}</p>
+      ) : (
+        <div className="border-t border-white/[0.05] bg-[#0F141B] px-4 py-2.5 text-center text-sm font-medium text-[#9CA3AF]">
+          Markets not offered
         </div>
-        <div className="p-3 text-center">
-          <p className="text-xs font-semibold uppercase tracking-[0.08em] text-[#9CA3AF] md:text-[13px]">Moneyline</p>
-          <p className="mt-1 text-base font-extrabold tracking-tight text-[#E5E7EB] md:text-lg">{moneylineLabel}</p>
-        </div>
-      </div>
+      )}
     </div>
   );
 });
@@ -1009,6 +1287,14 @@ const OverviewTab = memo(function OverviewTab({
   const { formatMoneylineValue, formatSpreadValue } = useOddsFormat();
   const isLive = game.status === 'LIVE';
   const isScheduled = game.status === 'SCHEDULED';
+  const isMlb = String(game.sport || '').toUpperCase() === 'MLB';
+  const awayPitcherLabel = game.probableAwayPitcher?.record
+    ? `${game.probableAwayPitcher.name} (${game.probableAwayPitcher.record})`
+    : (game.probableAwayPitcher?.name || "");
+  const homePitcherLabel = game.probableHomePitcher?.record
+    ? `${game.probableHomePitcher.name} (${game.probableHomePitcher.record})`
+    : (game.probableHomePitcher?.name || "");
+  const hasPitcherMatchup = isMlb && isScheduled && Boolean(awayPitcherLabel || homePitcherLabel);
   const periodLabels = getMarketPeriodLabels(game.sport);
   
   const formatSpread = (spread: number | null | undefined): string => {
@@ -1108,6 +1394,31 @@ const OverviewTab = memo(function OverviewTab({
         </div>
       </GlassCard>
 
+      {hasPitcherMatchup && (
+        <GlassCard className="p-4 border border-cyan-500/20 bg-[#121821]">
+          <SectionHeader
+            icon={Target}
+            title="Probable Pitching Matchup"
+            subtitle="Shown when provider pregame probables are available."
+            accent="blue"
+          />
+          <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+            {awayPitcherLabel && (
+              <div className="rounded-xl bg-white/[0.02] p-3">
+                <div className="mb-1 text-[10px] uppercase tracking-wide text-[#6B7280]">Away Starter</div>
+                <div className="truncate text-sm font-medium text-[#E5E7EB]">{awayPitcherLabel}</div>
+              </div>
+            )}
+            {homePitcherLabel && (
+              <div className="rounded-xl bg-white/[0.02] p-3">
+                <div className="mb-1 text-[10px] uppercase tracking-wide text-[#6B7280]">Home Starter</div>
+                <div className="truncate text-sm font-medium text-[#E5E7EB]">{homePitcherLabel}</div>
+              </div>
+            )}
+          </div>
+        </GlassCard>
+      )}
+
       {/* Quick Odds Summary */}
       {game.odds && (
         <GlassCard className="p-4 border border-violet-500/20 bg-[#121821]" glow="blue">
@@ -1201,7 +1512,7 @@ const LineMovementTab = memo(function LineMovementTab({ game }: { game: GameData
     return (
       <GlassCard className="p-8 text-center">
         <TrendingUp className="mx-auto mb-3 h-10 w-10 text-[#6B7280]" />
-        <p className="text-[#9CA3AF]">Line movement data not available</p>
+        <p className="text-[#9CA3AF]">No additional match data available yet</p>
         <p className="mt-1 text-sm text-[#6B7280]">Historical line data tracks changes over time</p>
       </GlassCard>
     );
@@ -1335,7 +1646,6 @@ const LineMovementTab = memo(function LineMovementTab({ game }: { game: GameData
 const SportsbooksTab = memo(function SportsbooksTab({ game, getTeamName }: { game: GameData; getTeamName: (isHome: boolean) => string }) {
   const { formatMoneylineValue } = useOddsFormat();
   const sportsbooks = game.sportsbooks || [];
-  console.log('[SportsbooksTab] Rendering with', sportsbooks.length, 'sportsbooks:', sportsbooks.map(s => s.sportsbook));
   
   const formatMoneyline = (ml: number | null | undefined): string => {
     if (ml === null || ml === undefined) return '-';
@@ -1361,7 +1671,7 @@ const SportsbooksTab = memo(function SportsbooksTab({ game, getTeamName }: { gam
     return (
       <GlassCard className="p-8 text-center">
         <Building2 className="mx-auto mb-3 h-10 w-10 text-[#6B7280]" />
-        <p className="text-[#9CA3AF]">Sportsbook lines not available</p>
+        <p className="text-[#9CA3AF]">No additional match data available yet</p>
         <p className="mt-1 text-sm text-[#6B7280]">Compare odds across multiple books when available</p>
       </GlassCard>
     );
@@ -1448,67 +1758,18 @@ const SportsbooksTab = memo(function SportsbooksTab({ game, getTeamName }: { gam
 const CoachGIntelligenceSections = memo(function CoachGIntelligenceSections({
   game,
   gameId,
+  videoJob,
 }: {
   game: GameData;
   gameId: string;
+  videoJob?: CoachGVideoJob | null;
 }) {
   const { preview, isLoading, isGenerating, error, refreshPreview } = useCoachGPreview(gameId);
   const previewRosterFreshness = preview?.rosterFreshness || preview?.content?.rosterFreshness;
   const lowFreshnessRisk = Boolean(previewRosterFreshness && previewRosterFreshness.score < 60);
   const criticalFreshnessRisk = Boolean(previewRosterFreshness && previewRosterFreshness.score < 50);
   const autoRefreshAttemptedGameRef = useRef<string | null>(null);
-  const [videoJobs, setVideoJobs] = useState<Array<{
-    id: string;
-    status: "queued" | "submitted" | "completed" | "failed";
-    videoUrl?: string;
-    errorMessage?: string | null;
-    createdAt: string;
-  }>>([]);
   const isPro = useIsPro();
-
-  useEffect(() => {
-    let cancelled = false;
-    const run = async () => {
-      try {
-        const viewerOffset = new Date().getTimezoneOffset();
-        const res = await fetch(
-          `/api/coachg/video/jobs?game_id=${encodeURIComponent(gameId)}&limit=8&window_hours=24&viewer_tz_offset_min=${encodeURIComponent(String(viewerOffset))}`,
-          { credentials: "include" }
-        );
-        if (!res.ok) return;
-        const data = await res.json() as {
-          jobs?: Array<{
-            id?: string;
-            status?: "queued" | "submitted" | "completed" | "failed";
-            videoUrl?: string;
-            errorMessage?: string | null;
-            createdAt?: string;
-          }>;
-        };
-        if (!cancelled) {
-          setVideoJobs(
-            (data.jobs || [])
-              .filter((j) => j.id)
-              .map((j) => ({
-                id: String(j.id),
-                status: j.status || "queued",
-                videoUrl: j.videoUrl,
-                errorMessage: j.errorMessage ?? null,
-                createdAt: j.createdAt || new Date().toISOString(),
-              }))
-          );
-        }
-      } catch {
-        // keep silent
-      }
-    };
-    void run();
-    const timer = setInterval(run, 20000);
-    return () => {
-      cancelled = true;
-      clearInterval(timer);
-    };
-  }, [gameId]);
 
   useEffect(() => {
     if (!criticalFreshnessRisk || isGenerating) return;
@@ -1517,14 +1778,8 @@ const CoachGIntelligenceSections = memo(function CoachGIntelligenceSections({
     void refreshPreview();
   }, [criticalFreshnessRisk, gameId, isGenerating, refreshPreview]);
 
-  const latestVideo = useMemo(
-    () => videoJobs.find((job) => job.status === "completed" && !!job.videoUrl) || null,
-    [videoJobs]
-  );
-  const latestVideoJob = useMemo(
-    () => videoJobs[0] || null,
-    [videoJobs]
-  );
+  const latestVideo = videoJob?.videoUrl ? videoJob : null;
+  const latestVideoJob = videoJob || null;
   const latestVideoError = useMemo(() => {
     const raw = latestVideoJob?.errorMessage || "";
     if (!raw) return "";
@@ -1892,7 +2147,7 @@ const BoxScoreTab = memo(function BoxScoreTab({
     return (
       <GlassCard className="p-8 text-center">
         <Users className="mx-auto mb-3 h-10 w-10 text-[#6B7280]" />
-        <p className="text-[#9CA3AF]">Box score not available yet</p>
+        <p className="text-[#9CA3AF]">No additional match data available yet</p>
         <p className="mt-1 text-sm text-[#6B7280]">Stats will appear once the game begins</p>
       </GlassCard>
     );
@@ -2083,7 +2338,7 @@ const H2HTab = memo(function H2HTab({
     return (
       <GlassCard className="p-8 text-center">
         <History className="mx-auto mb-3 h-10 w-10 text-[#6B7280]" />
-        <p className="text-[#9CA3AF]">No head-to-head history available</p>
+        <p className="text-[#9CA3AF]">No additional match data available yet</p>
         <p className="mt-1 text-sm text-[#6B7280]">Historical matchups between these teams</p>
       </GlassCard>
     );
@@ -2332,6 +2587,7 @@ const PlayerPropsTab = memo(function PlayerPropsTab({
   propsSource?: 'event' | 'competition' | 'placeholder' | 'none';
   propsFallbackReason?: string | null;
 }) {
+  const navigate = useNavigate();
   const { addProp, isPropInWatchboard, activeBoard } = useWatchboards();
   const [addedProps, setAddedProps] = useState<Set<string>>(new Set());
   const [marketFilter, setMarketFilter] = useState<string>('ALL');
@@ -2351,21 +2607,59 @@ const PlayerPropsTab = memo(function PlayerPropsTab({
         return;
       }
       try {
-        const res = await fetch(
-          `/api/teams/${encodeURIComponent(sportKey)}/h2h?teamA=${encodeURIComponent(teamA)}&teamB=${encodeURIComponent(teamB)}&window=10`,
-          { credentials: 'include', cache: 'no-store' }
-        );
-        if (!res.ok) {
+        const today = new Date().toISOString().slice(0, 10);
+        const payload = await fetchJsonCached<any>(
+          `/api/page-data/games?date=${encodeURIComponent(today)}&sport=${encodeURIComponent(sportKey)}&tab=scores`,
+          {
+            cacheKey: `h2h-snapshot:${sportKey}:${teamA}:${teamB}:${today}`,
+            ttlMs: 45_000,
+            timeoutMs: 2_500,
+            init: { credentials: "include" },
+          }
+        ).catch(() => null);
+        const games = Array.isArray(payload?.games) ? payload.games : [];
+        const normalize = (value: unknown): string =>
+          String(value || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+        const teamATokens = new Set([normalize(teamA), normalize(homeTeamName)]);
+        const teamBTokens = new Set([normalize(teamB), normalize(awayTeamName)]);
+        const matching = games.filter((g: any) => {
+          const homeCode = normalize(g?.home_team_code || g?.homeTeam);
+          const awayCode = normalize(g?.away_team_code || g?.awayTeam);
+          const homeName = normalize(g?.home_team_name || g?.homeTeamFull);
+          const awayName = normalize(g?.away_team_name || g?.awayTeamFull);
+          const homeMatchesA = teamATokens.has(homeCode) || teamATokens.has(homeName);
+          const awayMatchesA = teamATokens.has(awayCode) || teamATokens.has(awayName);
+          const homeMatchesB = teamBTokens.has(homeCode) || teamBTokens.has(homeName);
+          const awayMatchesB = teamBTokens.has(awayCode) || teamBTokens.has(awayName);
+          return (homeMatchesA && awayMatchesB) || (homeMatchesB && awayMatchesA);
+        });
+        if (matching.length === 0) {
           if (!cancelled) setTeamH2H(null);
           return;
         }
-        const json = await res.json();
-        if (!cancelled && Number(json?.sampleSize) > 0) {
+        let aWins = 0;
+        let bWins = 0;
+        for (const g of matching) {
+          const homeScore = Number(g?.home_score ?? g?.homeScore);
+          const awayScore = Number(g?.away_score ?? g?.awayScore);
+          if (!Number.isFinite(homeScore) || !Number.isFinite(awayScore)) continue;
+          const homeCode = normalize(g?.home_team_code || g?.homeTeam || g?.home_team_name);
+          const homeIsA = teamATokens.has(homeCode);
+          if (homeScore === awayScore) continue;
+          if (homeIsA) {
+            if (homeScore > awayScore) aWins += 1;
+            else bWins += 1;
+          } else {
+            if (homeScore > awayScore) bWins += 1;
+            else aWins += 1;
+          }
+        }
+        if (!cancelled && matching.length > 0) {
           setTeamH2H({
-            sampleSize: Number(json.sampleSize),
+            sampleSize: matching.length,
             series: {
-              teamAWins: Number(json?.series?.teamAWins || 0),
-              teamBWins: Number(json?.series?.teamBWins || 0),
+              teamAWins: aWins,
+              teamBWins: bWins,
             },
           });
         } else if (!cancelled) {
@@ -2646,6 +2940,30 @@ const PlayerPropsTab = memo(function PlayerPropsTab({
     };
   }, [normalizePlayerToken, playerGameLogs, props, sport]);
 
+  useEffect(() => {
+    const sportUpper = String(sport || "").toUpperCase();
+    const gameIdValue = String(gameId || "").trim();
+    if (!sportUpper || !gameIdValue) return;
+    const sk = normalizeSportKeyForRoute(String(sport || ""));
+    const rows = (props || [])
+      .map((p) => ({
+        name: String(p.player_name || "").trim(),
+        id: resolveGameDetailNavigationPlayerId(p.player_id, String(p.player_name || "").trim(), sk),
+      }))
+      .filter((row): row is { name: string; id: string } => Boolean(row.name && row.id));
+    const seen = new Set<string>();
+    for (const row of rows) {
+      const key = `${row.id}:${row.name}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      void prefetchFullPlayerProfileSnapshot({
+        sport: sportUpper,
+        playerId: row.id,
+        timeoutMs: 22_000,
+      }).catch(() => null);
+    }
+  }, [gameId, props, sport]);
+
   const teamPills = useMemo(() => {
     const homeLabel = homeTeamName || homeTeamCode || 'Home';
     const awayLabel = awayTeamName || awayTeamCode || 'Away';
@@ -2691,7 +3009,7 @@ const PlayerPropsTab = memo(function PlayerPropsTab({
     return (
       <GlassCard className="p-8 text-center">
         <Target className="w-10 h-10 text-blue-500/50 mx-auto mb-3" />
-        <p className="text-[#9CA3AF]">No player props available</p>
+        <p className="text-[#9CA3AF]">No additional match data available yet</p>
         <p className="mt-1 text-sm text-[#6B7280]">Props may not be posted for this game yet</p>
       </GlassCard>
     );
@@ -2894,7 +3212,23 @@ const PlayerPropsTab = memo(function PlayerPropsTab({
         </GlassCard>
       )}
       
-      {groupedEntries.map(([playerName, playerProps]) => (
+      {groupedEntries.map(([playerName, playerProps]) => {
+        const sportKey = normalizeSportKeyForRoute(String(sport || ""));
+        const resolvedPlayerId = resolveGameDetailNavigationPlayerId(
+          playerProps[0]?.player_id,
+          playerName,
+          sportKey
+        );
+        const canNavigatePlayer = Boolean(resolvedPlayerId);
+        const openPlayerProfile = () => {
+          if (!resolvedPlayerId) return;
+          logPlayerNavigation(resolvedPlayerId, sportKey);
+          void navigateToPlayerProfile(navigate, sportKey, resolvedPlayerId, {
+            displayName: playerName,
+            source: "GameDetailPlayerPropsCard",
+          });
+        };
+        return (
         <GlassCard key={playerName} className="border border-white/[0.05] bg-[#121821] p-4 shadow-[0_0_22px_rgba(255,255,255,0.06)] transition-all hover:-translate-y-0.5">
           {(() => {
             const groupedByMarket = playerProps.reduce((acc, prop) => {
@@ -2925,15 +3259,25 @@ const PlayerPropsTab = memo(function PlayerPropsTab({
             return (
               <>
                 <div className="flex items-center gap-3 mb-3">
-                  <PlayerPhoto
-                    playerName={playerName}
-                    sport={sport.toLowerCase()}
-                    size={42}
-                    showRing={true}
-                    ringColor="ring-white/15"
-                  />
-                  <div className="min-w-0">
-                    <h3 className="truncate text-sm font-semibold text-[#E5E7EB]">{playerName}</h3>
+                  <div
+                    className={cn(canNavigatePlayer && "cursor-pointer")}
+                    onClick={canNavigatePlayer ? openPlayerProfile : undefined}
+                  >
+                    <PlayerPhoto
+                      playerName={playerName}
+                      sport={sport.toLowerCase()}
+                      size={42}
+                      showRing={true}
+                      ringColor="ring-white/15"
+                    />
+                  </div>
+                  <div
+                    className={cn("min-w-0", canNavigatePlayer && "cursor-pointer")}
+                    onClick={canNavigatePlayer ? openPlayerProfile : undefined}
+                  >
+                    <h3 className={cn("truncate text-sm font-semibold text-[#E5E7EB]", canNavigatePlayer && "hover:text-cyan-300 transition-colors")}>
+                      {playerName}
+                    </h3>
                     {playerProps[0]?.team && (
                       <span className="text-xs text-slate-500">{playerProps[0].team}</span>
                     )}
@@ -3164,7 +3508,8 @@ const PlayerPropsTab = memo(function PlayerPropsTab({
             );
           })()}
         </GlassCard>
-      ))}
+        );
+      })}
     </div>
   );
 });
@@ -3939,28 +4284,30 @@ function deriveFinalOutcomes(game: GameData) {
   const homeScore = game.homeScore ?? 0;
   const awayScore = game.awayScore ?? 0;
   const totalScore = homeScore + awayScore;
-  const winner = homeScore === awayScore ? "Push/Tie" : homeScore > awayScore ? game.homeTeam : game.awayTeam;
+  const homeName = String(game.homeTeamFull || game.homeTeam || "Home").trim();
+  const awayName = String(game.awayTeamFull || game.awayTeam || "Away").trim();
+  const winner = homeScore === awayScore ? "Push/Tie" : homeScore > awayScore ? homeName : awayName;
 
   const spread = game.odds?.spread;
   const spreadResult = spread === undefined
-    ? "Spread unavailable"
-    : `${game.homeTeam} ${formatSpread(spread)} | Final margin ${homeScore - awayScore > 0 ? "+" : ""}${homeScore - awayScore}`;
+    ? null
+    : `${homeName} ${formatSpread(spread)} | Final margin ${homeScore - awayScore > 0 ? "+" : ""}${homeScore - awayScore}`;
 
   const coverResult = spread === undefined
-    ? "Cover unavailable"
+    ? null
     : homeScore + spread === awayScore
       ? "Push"
       : homeScore + spread > awayScore
-        ? `${game.homeTeam} covered`
-        : `${game.awayTeam} covered`;
+        ? `${homeName} covered`
+        : `${awayName} covered`;
 
   const totalLine = game.odds?.total;
   const totalResult = totalLine === undefined
-    ? "Total unavailable"
+    ? null
     : `${totalScore} vs ${totalLine}`;
 
   const overUnderResult = totalLine === undefined
-    ? "O/U unavailable"
+    ? null
     : totalScore === totalLine
       ? "Push"
       : totalScore > totalLine
@@ -3970,15 +4317,61 @@ function deriveFinalOutcomes(game: GameData) {
   return { winner, spreadResult, coverResult, totalResult, overUnderResult, totalScore };
 }
 
+function gameIdentityMatchesTarget(candidateId: unknown, fullGameId: string, marketGameId: string): boolean {
+  const normalize = (value: unknown): string => decodeURIComponent(String(value || "").trim());
+  const candidate = normalize(candidateId);
+  const full = normalize(fullGameId);
+  const market = normalize(marketGameId);
+  if (!candidate) return false;
+  if (candidate === full || candidate === market) return true;
+  const extractNumeric = (value: string): string =>
+    value.match(/(?:^|[_:])(\d{6,})$/)?.[1] || "";
+  const cNum = extractNumeric(candidate);
+  const fNum = extractNumeric(full) || extractNumeric(market);
+  return Boolean(cNum && fNum && cNum === fNum);
+}
+
+function stabilizeLiveScore(
+  prevGame: GameData | null | undefined,
+  incomingHomeScore: unknown,
+  incomingAwayScore: unknown,
+  incomingStatus: GameData["status"]
+): { homeScore: number | null; awayScore: number | null } {
+  const incomingHome = Number(incomingHomeScore);
+  const incomingAway = Number(incomingAwayScore);
+  const nextHome = Number.isFinite(incomingHome) ? incomingHome : null;
+  const nextAway = Number.isFinite(incomingAway) ? incomingAway : null;
+  if (!prevGame || incomingStatus !== "LIVE" || prevGame.status !== "LIVE") {
+    return { homeScore: nextHome, awayScore: nextAway };
+  }
+  const prevHome = Number(prevGame.homeScore);
+  const prevAway = Number(prevGame.awayScore);
+  if (!Number.isFinite(prevHome) || !Number.isFinite(prevAway)) {
+    return { homeScore: nextHome, awayScore: nextAway };
+  }
+  if (nextHome === null || nextAway === null) {
+    return { homeScore: prevHome, awayScore: prevAway };
+  }
+  // Guard against stale cache/poll regressions during live play.
+  if (nextHome + nextAway < prevHome + prevAway) {
+    return { homeScore: prevHome, awayScore: prevAway };
+  }
+  return { homeScore: nextHome, awayScore: nextAway };
+}
+
 const LiveHeroScoreboard = memo(function LiveHeroScoreboard({
   game,
   getTeamName,
+  getTeamLogoCode,
+  competitionLabel,
   lastPlay,
   onTeamNavigate,
   onTeamPrefetch,
 }: {
   game: GameData;
   getTeamName: (isHome: boolean) => string;
+  getTeamLogoCode: (isHome: boolean) => string;
+  competitionLabel?: string | null;
   lastPlay: PlayByPlayEvent | null;
   onTeamNavigate?: (teamCode: string, teamName: string) => void;
   onTeamPrefetch?: (teamCode: string, teamName: string) => void;
@@ -3987,14 +4380,24 @@ const LiveHeroScoreboard = memo(function LiveHeroScoreboard({
   const homeDisplay = getTeamName(true);
   const awayDisplay = getTeamName(false);
   const possession = derivePossessionSide(game, homeDisplay, awayDisplay, lastPlay);
-  const spreadLabel = game.odds?.spread !== undefined ? `${game.homeTeam} ${formatSpread(game.odds.spread)}` : "-";
+  const spreadLabel = game.odds?.spread !== undefined ? `${homeDisplay} ${formatSpread(game.odds.spread)}` : "-";
   const totalLabel = game.odds?.total !== undefined ? String(game.odds.total) : "-";
+  const isSoccer = String(game.sport || "").toUpperCase() === "SOCCER";
   const mlLabel = game.odds?.mlAway !== undefined || game.odds?.mlHome !== undefined
     ? `${game.odds?.mlAway !== undefined ? formatMoneylineValue(game.odds.mlAway) : "-"} / ${game.odds?.mlHome !== undefined ? formatMoneylineValue(game.odds.mlHome) : "-"}`
     : "-";
+  const isMlb = String(game.sport || "").toUpperCase() === "MLB";
+  const liveLastPlayText = isMlb
+    ? (game.mlbLiveState?.lastPlay?.text ?? "-")
+    : (lastPlay?.description || "No additional match data available yet");
+  const marketRows = [
+    game.odds?.spread !== undefined ? { label: "Live Spread", value: spreadLabel } : null,
+    game.odds?.total !== undefined ? { label: "Live Total", value: totalLabel } : null,
+    (game.odds?.mlAway !== undefined || game.odds?.mlHome !== undefined) ? { label: "Live Moneyline", value: mlLabel } : null,
+  ].filter(Boolean) as Array<{ label: string; value: string }>;
 
   return (
-    <GlassCard className="border border-emerald-500/30 bg-[#1B2633] p-4 md:p-5" glow="emerald">
+    <GlassCard className="border border-emerald-500/30 bg-[#1B2633] p-3.5 md:p-5" glow="emerald">
       <SectionHeader icon={Zap} title="Live Hero Scoreboard" subtitle="Real-time scoring, market state, and flow context." accent="green" />
       <div className="grid grid-cols-12 items-center gap-3">
         <div className="col-span-5 rounded-[14px] border border-white/[0.05] bg-[#121821] p-3">
@@ -4008,23 +4411,24 @@ const LiveHeroScoreboard = memo(function LiveHeroScoreboard({
             aria-label={`Open ${awayDisplay} team page`}
           >
             <TeamLogo
-              teamCode={game.awayTeam || "AWY"}
+              teamCode={getTeamLogoCode(false)}
               teamName={awayDisplay}
               sport={game.sport}
-              size={52}
+              size={56}
               className="drop-shadow-[0_10px_14px_rgba(0,0,0,0.45)]"
             />
             <div className="min-w-0">
-              <p className="truncate text-sm font-semibold tracking-wide text-[#E5E7EB]">{awayDisplay}</p>
+              <p className="truncate text-base font-semibold tracking-wide text-[#E5E7EB]">{awayDisplay}</p>
               <p className="text-[10px] text-cyan-300/80 opacity-0 -translate-y-0.5 transition-all duration-150 group-hover:opacity-100 group-hover:translate-y-0">
                 View Team &rarr;
               </p>
             </div>
           </button>
-          <p className="mt-1 text-3xl font-black text-[#E5E7EB] md:text-4xl">{game.awayScore ?? "-"}</p>
+          <p className="mt-1 text-4xl font-black text-[#E5E7EB] md:text-5xl">{game.awayScore ?? "-"}</p>
           {possession === "away" && <Badge className="mt-2 border border-cyan-400/30 bg-cyan-500/15 text-[10px] text-cyan-100">POSSESSION</Badge>}
         </div>
         <div className="col-span-2 text-center">
+          <p className="text-[10px] uppercase tracking-wide text-[#9CA3AF]">{competitionLabel || game.sport}</p>
           <p className="text-[10px] uppercase tracking-wide text-emerald-300">LIVE</p>
           <p className="mt-1 text-xs text-[#9CA3AF]">{game.period || "Live"}</p>
           <p className="text-sm font-semibold text-[#E5E7EB]">{game.clock || "--:--"}</p>
@@ -4046,24 +4450,33 @@ const LiveHeroScoreboard = memo(function LiveHeroScoreboard({
               </p>
             </div>
             <TeamLogo
-              teamCode={game.homeTeam || "HOM"}
+              teamCode={getTeamLogoCode(true)}
               teamName={homeDisplay}
               sport={game.sport}
-              size={52}
+              size={56}
               className="drop-shadow-[0_10px_14px_rgba(0,0,0,0.45)]"
             />
           </button>
-          <p className="mt-1 text-3xl font-black text-[#E5E7EB] md:text-4xl">{game.homeScore ?? "-"}</p>
+          <p className="mt-1 text-4xl font-black text-[#E5E7EB] md:text-5xl">{game.homeScore ?? "-"}</p>
           {possession === "home" && <Badge className="mt-2 border border-cyan-400/30 bg-cyan-500/15 text-[10px] text-cyan-100">POSSESSION</Badge>}
         </div>
       </div>
-      <div className="mt-3 grid grid-cols-3 gap-2">
-        <div className="rounded-xl border border-white/[0.05] bg-[#121821] p-2 text-center"><p className="text-[10px] uppercase text-[#6B7280]">Live Spread</p><p className="text-sm font-bold text-[#E5E7EB]">{spreadLabel}</p></div>
-        <div className="rounded-xl border border-white/[0.05] bg-[#121821] p-2 text-center"><p className="text-[10px] uppercase text-[#6B7280]">Live Total</p><p className="text-sm font-bold text-[#E5E7EB]">{totalLabel}</p></div>
-        <div className="rounded-xl border border-white/[0.05] bg-[#121821] p-2 text-center"><p className="text-[10px] uppercase text-[#6B7280]">Live Moneyline</p><p className="text-sm font-bold text-[#E5E7EB]">{mlLabel}</p></div>
-      </div>
+      {marketRows.length > 0 ? (
+        <div className={cn("mt-3 grid gap-2", marketRows.length === 1 ? "grid-cols-1" : marketRows.length === 2 ? "grid-cols-2" : "grid-cols-3")}>
+          {marketRows.map((market) => (
+            <div key={market.label} className="rounded-xl border border-white/[0.05] bg-[#121821] p-2 text-center">
+              <p className="text-[10px] uppercase text-[#6B7280]">{market.label}</p>
+              <p className="text-sm font-bold text-[#E5E7EB]">{market.value}</p>
+            </div>
+          ))}
+        </div>
+      ) : (
+        <div className="mt-3 rounded-xl border border-white/[0.05] bg-[#121821] px-3 py-2 text-center text-sm font-medium text-[#9CA3AF]">
+          Markets not offered
+        </div>
+      )}
       <div className="mt-3 rounded-xl border border-white/[0.05] bg-[#121821] px-3 py-2 text-sm text-[#9CA3AF]">
-        <span className="font-semibold text-cyan-200">Last Play:</span> {lastPlay?.description || "Awaiting latest event..."}
+        <span className="font-semibold text-cyan-200">Last Play:</span> {liveLastPlayText}
       </div>
     </GlassCard>
   );
@@ -4357,20 +4770,31 @@ const LiveBettingCards = memo(function LiveBettingCards({ game }: { game: GameDa
 const FinalHeroPanel = memo(function FinalHeroPanel({
   game,
   getTeamName,
+  getTeamLogoCode,
+  competitionLabel,
   onTeamNavigate,
   onTeamPrefetch,
 }: {
   game: GameData;
   getTeamName: (isHome: boolean) => string;
+  getTeamLogoCode: (isHome: boolean) => string;
+  competitionLabel?: string | null;
   onTeamNavigate?: (teamCode: string, teamName: string) => void;
   onTeamPrefetch?: (teamCode: string, teamName: string) => void;
 }) {
   const outcomes = deriveFinalOutcomes(game);
   const awayWon = game.awayScore !== null && game.homeScore !== null && game.awayScore > game.homeScore;
   const homeWon = game.awayScore !== null && game.homeScore !== null && game.homeScore > game.awayScore;
+  const isSoccer = String(game.sport || "").toUpperCase() === "SOCCER";
+  const marketRows = [
+    outcomes.spreadResult ? { label: "Final spread result", value: outcomes.spreadResult } : null,
+    outcomes.totalResult ? { label: "Final total result", value: outcomes.totalResult } : null,
+    outcomes.coverResult ? { label: "Cover / No Cover", value: outcomes.coverResult } : null,
+    outcomes.overUnderResult ? { label: "Over / Under", value: outcomes.overUnderResult } : null,
+  ].filter(Boolean) as Array<{ label: string; value: string }>;
   return (
     <GlassCard className="border border-violet-400/24 bg-[#1B2633] p-4 md:p-5">
-      <SectionHeader icon={Trophy} title="Final Hero" subtitle="Final result and market outcomes." accent="violet" />
+      <SectionHeader icon={Trophy} title="Final Hero" subtitle={isSoccer ? "Final score and winner." : "Final result and market outcomes."} accent="violet" />
       <div className="grid grid-cols-3 items-center gap-3">
         <div className="rounded-xl border border-white/[0.05] bg-[#121821] p-3 text-center">
           <div className="mb-2 flex justify-center">
@@ -4387,7 +4811,7 @@ const FinalHeroPanel = memo(function FinalHeroPanel({
               <div className="pointer-events-none absolute inset-0 rounded-full bg-gradient-to-b from-white/18 via-violet-300/12 to-transparent blur-[1px]" />
               <div className="pointer-events-none absolute inset-[-6px] rounded-full bg-violet-400/18 blur-md" />
               <TeamLogo
-                teamCode={game.awayTeam || "AWY"}
+                teamCode={getTeamLogoCode(false)}
                 teamName={getTeamName(false)}
                 sport={game.sport}
                 size={64}
@@ -4400,8 +4824,9 @@ const FinalHeroPanel = memo(function FinalHeroPanel({
           <p className="text-3xl font-black text-[#E5E7EB]">{game.awayScore ?? "-"}</p>
         </div>
         <div className="text-center">
+          <p className="text-[10px] uppercase tracking-[0.08em] text-[#9CA3AF]">{competitionLabel || game.sport}</p>
           <p className="text-[10px] uppercase tracking-wide text-violet-300">Final</p>
-          <p className="text-sm font-semibold text-[#E5E7EB]">{outcomes.winner}</p>
+          <p className="text-base font-semibold text-[#E5E7EB]">{outcomes.winner}</p>
         </div>
         <div className="rounded-xl border border-white/[0.05] bg-[#121821] p-3 text-center">
           <div className="mb-2 flex justify-center">
@@ -4418,7 +4843,7 @@ const FinalHeroPanel = memo(function FinalHeroPanel({
               <div className="pointer-events-none absolute inset-0 rounded-full bg-gradient-to-b from-white/18 via-violet-300/12 to-transparent blur-[1px]" />
               <div className="pointer-events-none absolute inset-[-6px] rounded-full bg-violet-400/18 blur-md" />
               <TeamLogo
-                teamCode={game.homeTeam || "HOM"}
+                teamCode={getTeamLogoCode(true)}
                 teamName={getTeamName(true)}
                 sport={game.sport}
                 size={64}
@@ -4431,12 +4856,21 @@ const FinalHeroPanel = memo(function FinalHeroPanel({
           <p className="text-3xl font-black text-[#E5E7EB]">{game.homeScore ?? "-"}</p>
         </div>
       </div>
-      <div className="mt-3 grid gap-2 md:grid-cols-2">
-        <div className="rounded-lg border border-white/[0.05] bg-[#121821] p-2 text-sm text-[#9CA3AF]">Final spread result: <span className="font-semibold text-[#E5E7EB]">{outcomes.spreadResult}</span></div>
-        <div className="rounded-lg border border-white/[0.05] bg-[#121821] p-2 text-sm text-[#9CA3AF]">Final total result: <span className="font-semibold text-[#E5E7EB]">{outcomes.totalResult}</span></div>
-        <div className="rounded-lg border border-white/[0.05] bg-[#121821] p-2 text-sm text-[#9CA3AF]">Cover / No Cover: <span className="font-semibold text-[#E5E7EB]">{outcomes.coverResult}</span></div>
-        <div className="rounded-lg border border-white/[0.05] bg-[#121821] p-2 text-sm text-[#9CA3AF]">Over / Under: <span className="font-semibold text-[#E5E7EB]">{outcomes.overUnderResult}</span></div>
-      </div>
+      {!isSoccer && (
+        marketRows.length > 0 ? (
+          <div className="mt-3 grid gap-2 md:grid-cols-2">
+            {marketRows.map((market) => (
+              <div key={market.label} className="rounded-lg border border-white/[0.05] bg-[#121821] p-2 text-sm text-[#9CA3AF]">
+                {market.label}: <span className="font-semibold text-[#E5E7EB]">{market.value}</span>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <div className="mt-3 rounded-lg border border-white/[0.05] bg-[#121821] px-3 py-2 text-sm text-[#9CA3AF]">
+            Markets not offered
+          </div>
+        )
+      )}
     </GlassCard>
   );
 });
@@ -4454,8 +4888,8 @@ const PostgameAnalysisPanel = memo(function PostgameAnalysisPanel({ game }: { ga
         <li>What changed during the game: momentum swings and live pace pressure drove late-game volatility.</li>
         <li>Key momentum shifts: play-by-play sequence and scoring runs determined separation windows.</li>
         <li>Best/worst prop outcomes: use prop tracker and box score to validate overperformers and misses.</li>
-        <li>Line close vs final: {spreadMove !== null ? `spread moved ${spreadMove > 0 ? "+" : ""}${spreadMove.toFixed(1)} from open before final.` : "closing spread comparison unavailable."}</li>
-        <li>Final market outcome: {outcomes.coverResult} • {outcomes.overUnderResult}.</li>
+        <li>Line close vs final: {spreadMove !== null ? `spread moved ${spreadMove > 0 ? "+" : ""}${spreadMove.toFixed(1)} from open before final.` : "closing spread comparison pending market data."}</li>
+        <li>Final market outcome: {outcomes.coverResult && outcomes.overUnderResult ? `${outcomes.coverResult} • ${outcomes.overUnderResult}.` : "Markets not offered."}</li>
       </ul>
     </GlassCard>
   );
@@ -4480,6 +4914,7 @@ export function GameDetailPage() {
   const [game, setGame] = useState<GameData | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [soccerDetailStatus, setSoccerDetailStatus] = useState<"ready" | "unavailable">("ready");
   const [searchParams, setSearchParams] = useSearchParams();
   
   // Detect ?view=odds (or other tab) from URL - used when coming from Odds Board
@@ -4502,14 +4937,31 @@ export function GameDetailPage() {
   // - legacy provider IDs are normalized upstream and not expected here
   const fullGameId = useMemo(() => {
     if (!gameId) return '';
+    const inferredSport = String(
+      params.sportKey
+      || params.league
+      || (location.pathname.includes('/sports/soccer/') ? 'soccer' : '')
+    ).toLowerCase();
+    if (inferredSport === "soccer") {
+      const normalizedSoccerId = normalizeSoccerRouteId(gameId);
+      return normalizedSoccerId || gameId;
+    }
     // Already has a recognized prefix - use as-is
     if (gameId.startsWith('espn_') || gameId.startsWith('sr_') || gameId.startsWith('sr:')) {
       return gameId;
     }
     // Raw game ID - try to construct ESPN format if we have league
-    // ESPN IDs are preferred since SportsRadar is primary for schedule but ESPN for individual games
-    return league ? `espn_${league.toLowerCase()}_${gameId}` : gameId;
-  }, [gameId, league]);
+    return inferredSport ? `espn_${inferredSport}_${gameId}` : gameId;
+  }, [gameId, params.sportKey, params.league, location.pathname]);
+
+  // Market endpoints are typically faster with canonical numeric ids.
+  const marketGameId = useMemo(() => {
+    const raw = decodeURIComponent(String(fullGameId || "").trim());
+    if (!raw) return "";
+    if (/^\d{6,}$/.test(raw)) return raw;
+    const suffix = raw.match(/(?:^|[_:])(\d{6,})$/);
+    return suffix?.[1] || raw;
+  }, [fullGameId]);
   
   // Determine if this is a SportsRadar game
   const isSportsRadarGame = useMemo(() => {
@@ -4544,20 +4996,36 @@ export function GameDetailPage() {
   const [playByPlay, setPlayByPlay] = useState<PlayByPlayData | null>(null);
   const [lastPlay, setLastPlay] = useState<PlayByPlayEvent | null>(null);
   const [lastPlayUpdated, setLastPlayUpdated] = useState<Date | null>(null);
+  const [isTabVisible, setIsTabVisible] = useState<boolean>(() => {
+    if (typeof document === "undefined") return true;
+    return document.visibilityState === "visible";
+  });
   const activeGameRequestRef = useRef(0);
 
   useEffect(() => {
     if (!fullGameId) return;
     const cached = getRouteCache<GameData>(`route:game-detail:${fullGameId}`, 45000);
-    if (!cached) return;
-    setGame((prev) => prev || cached);
-    setIsLoading(false);
-  }, [fullGameId]);
+    setGame((prev) => {
+      if (gameIdentityMatchesTarget(prev?.id, fullGameId, marketGameId)) {
+        return prev;
+      }
+      return cached || null;
+    });
+    setIsLoading(!Boolean(cached));
+  }, [fullGameId, marketGameId]);
 
   useEffect(() => {
     if (!fullGameId || !game) return;
     setRouteCache(`route:game-detail:${fullGameId}`, game, 90000);
   }, [fullGameId, game]);
+  useEffect(() => {
+    if (typeof document === "undefined") return;
+    const handleVisibility = () => {
+      setIsTabVisible(document.visibilityState === "visible");
+    };
+    document.addEventListener("visibilitychange", handleVisibility);
+    return () => document.removeEventListener("visibilitychange", handleVisibility);
+  }, []);
   const propsFreshAttemptedRef = useRef<Set<string>>(new Set());
   const playByPlayInFlightRef = useRef(false);
   const gameRefreshInFlightRef = useRef(false);
@@ -4592,12 +5060,14 @@ export function GameDetailPage() {
   useEffect(() => {
     setSportsbooksLoaded(false);
     setLineHistoryLoaded(false);
-    // Keep current valid game visible during transitions; only show full-screen loading when empty.
-    if (!game) {
-      setIsLoading(true);
-    }
+    setBoxScore(null);
+    setH2H(null);
+    setInjuries(null);
+    setPlayByPlay(null);
+    setLastPlay(null);
+    setLastPlayUpdated(null);
     setError(null);
-  }, [fullGameId]);
+  }, [fullGameId, marketGameId]);
 
   const mergeHeroOddsFromOddsApi = useCallback((prevOdds: OddsData | undefined, oddsData: any): OddsData => {
     const parse = (val: unknown): number | undefined => {
@@ -4746,31 +5216,32 @@ export function GameDetailPage() {
       return id || null;
     };
     try {
-      const json = await fetchJsonCached<any>(`/api/teams/${encodeURIComponent(sport)}/standings`, {
-        cacheKey: `team-standings:${sport}`,
-        ttlMs: 90_000,
-        timeoutMs: 4_500,
-        init: { credentials: "include" },
-      });
-      const teams = Array.isArray(json?.teams) ? json.teams : [];
-      let teamId = matchTeamId(teams);
-      // Reliability fallback: if first cached call is empty/missed, do one direct
-      // no-store fetch so a single click still resolves navigation.
-      if (!teamId) {
-        try {
-          const res = await fetch(`/api/teams/${encodeURIComponent(sport)}/standings`, {
-            credentials: "include",
-            cache: "no-store",
-          });
-          if (res.ok) {
-            const direct = await res.json().catch(() => null as any);
-            const directTeams = Array.isArray(direct?.teams) ? direct.teams : [];
-            teamId = matchTeamId(directTeams);
-          }
-        } catch {
-          // Non-fatal: keep null and let caller decide.
+      const today = new Date().toISOString().slice(0, 10);
+      const payload = await fetchJsonCached<any>(
+        `/api/page-data/games?date=${encodeURIComponent(today)}&sport=${encodeURIComponent(sport)}&tab=scores`,
+        {
+          cacheKey: `team-id-snapshot:${sport}:${today}`,
+          ttlMs: 60_000,
+          timeoutMs: 3_000,
+          init: { credentials: "include" },
         }
-      }
+      );
+      const games = Array.isArray(payload?.games) ? payload.games : [];
+      const teams = games.flatMap((g: any) => ([
+        {
+          id: g?.home_team_id || g?.homeTeamId,
+          alias: g?.home_team_code || g?.homeTeam,
+          name: g?.home_team_name || g?.homeTeamFull,
+          market: "",
+        },
+        {
+          id: g?.away_team_id || g?.awayTeamId,
+          alias: g?.away_team_code || g?.awayTeam,
+          name: g?.away_team_name || g?.awayTeamFull,
+          market: "",
+        },
+      ])).filter((row: any) => String(row?.id || "").trim());
+      const teamId = matchTeamId(teams);
       if (teamId) {
         resolvedTeamIdsRef.current.set(memoKey, teamId);
       }
@@ -4791,58 +5262,30 @@ export function GameDetailPage() {
     const teamId = await resolveTeamIdFromStandings(code, name);
     if (!teamId) return;
 
-    const profile = await fetchJsonCached<any>(`/api/teams/${sport}/${teamId}`, {
-      cacheKey: `team-profile:${sport}:${teamId}`,
+    const teamPayload = await fetchJsonCached<any>(`/api/page-data/team-profile?sport=${sport}&teamId=${teamId}`, {
+      cacheKey: `team-page-data:${sport}:${teamId}`,
       ttlMs: 60_000,
       timeoutMs: 4_500,
       init: { credentials: "include" },
     }).catch(() => null);
 
-    await Promise.all([
-      fetchJsonCached(`/api/teams/${sport}/${teamId}/schedule`, {
-        cacheKey: `team-schedule:${sport}:${teamId}`,
-        ttlMs: 45_000,
-        timeoutMs: 4_500,
-        init: { credentials: "include" },
-      }).catch(() => null),
-      fetchJsonCached(`/api/teams/${sport}/${teamId}/stats`, {
-        cacheKey: `team-stats:${sport}:${teamId}`,
-        ttlMs: 120_000,
-        timeoutMs: 4_000,
-        init: { credentials: "include" },
-      }).catch(() => null),
-      fetchJsonCached(`/api/teams/${sport}/${teamId}/injuries`, {
-        cacheKey: `team-injuries:${sport}:${teamId}`,
-        ttlMs: 45_000,
-        timeoutMs: 4_000,
-        init: { credentials: "include" },
-      }).catch(() => null),
-      fetchJsonCached(`/api/teams/${sport}/${teamId}/splits`, {
-        cacheKey: `team-splits:${sport}:${teamId}`,
-        ttlMs: 90_000,
-        timeoutMs: 4_000,
-        init: { credentials: "include" },
-      }).catch(() => null),
-      fetchJsonCached(`/api/games?sport=${sport}&includeOdds=0`, {
-        cacheKey: `games-lite:${sport}`,
-        ttlMs: 20_000,
-        timeoutMs: 3_500,
-        init: { credentials: "include" },
-      }).catch(() => null),
-    ]);
-
-    const roster = Array.isArray(profile?.roster) ? profile.roster : [];
-    const topNames = roster
-      .map((p: any) => String(p?.name || "").trim())
-      .filter(Boolean)
+    const roster = Array.isArray(teamPayload?.data?.profileJson?.roster)
+      ? teamPayload.data.profileJson.roster
+      : [];
+    const sk = normalizeSportKeyForRoute(String(normalizedSportKey || ""));
+    const topPlayers = roster
+      .map((p: any) => ({
+        name: String(p?.name || "").trim(),
+        id: resolveGameDetailNavigationPlayerId(p?.id, String(p?.name || "").trim(), sk),
+      }))
+      .filter((row: { name: string; id?: string }) => row.name && row.id)
       .slice(0, 8);
     await Promise.all(
-      topNames.map((playerName: string) =>
-        fetchJsonCached(`/api/player/${sport}/${encodeURIComponent(playerName)}`, {
-          cacheKey: `player-api:${sport}:${playerName}`,
-          ttlMs: 45_000,
-          timeoutMs: 4_000,
-          init: { credentials: "include" },
+      topPlayers.map(({ id }: { name: string; id: string }) =>
+        prefetchFullPlayerProfileSnapshot({
+          sport,
+          playerId: id,
+          timeoutMs: 22_000,
         }).catch(() => null)
       )
     );
@@ -4971,6 +5414,22 @@ export function GameDetailPage() {
     navigate(toGameDetailPath(sportKey, targetId));
   }, [isSoccerContext, navigateToSoccerGame, game?.sport, srSport, params.sportKey, league, navigate]);
 
+  const getGameIdCandidates = useCallback((): string[] => {
+    const normalize = (value: unknown): string => decodeURIComponent(String(value || "").trim());
+    const candidates = new Set<string>();
+    const pushCandidate = (value: unknown) => {
+      const normalized = normalize(value);
+      if (!normalized) return;
+      candidates.add(normalized);
+      const numeric = normalized.match(/(?:^|[_:])(\d{6,})$/)?.[1];
+      if (numeric) candidates.add(numeric);
+    };
+    pushCandidate(fullGameId);
+    pushCandidate(game?.id);
+    pushCandidate(marketGameId);
+    return Array.from(candidates);
+  }, [fullGameId, game?.id, marketGameId]);
+
   // Fetch play-by-play data
   const fetchPlayByPlay = useCallback(async () => {
     if (!fullGameId) return;
@@ -4978,72 +5437,204 @@ export function GameDetailPage() {
     playByPlayInFlightRef.current = true;
     
     try {
-      const data = await fetchJsonCached<PlayByPlayData>(`/api/games/${fullGameId}/playbyplay`, {
-        cacheKey: `game-detail:pbp:${fullGameId}`,
-        ttlMs: 5000,
-        timeoutMs: 12000,
-        init: { credentials: 'include' },
-      });
+      const gameIdCandidates = getGameIdCandidates().slice(0, 2);
+      let data: PlayByPlayData | null = null;
+      let firstResponse: PlayByPlayData | null = null;
+      for (const candidateId of gameIdCandidates) {
+        try {
+          const response = await fetchJsonCached<PlayByPlayData>(
+            `/api/games/${encodeURIComponent(candidateId)}/playbyplay`,
+            {
+              cacheKey: `game-detail:pbp:${candidateId}`,
+              ttlMs: 5000,
+              timeoutMs: 2500,
+              init: { credentials: 'include' },
+            }
+          );
+          if (!firstResponse && response) firstResponse = response;
+          if (response?.lastPlay || (Array.isArray(response?.plays) && response.plays.length > 0)) {
+            data = response;
+            break;
+          }
+        } catch {
+          // Continue to next candidate.
+        }
+      }
+      if (!data) {
+        data = firstResponse;
+      }
+      if (!data) return;
       setPlayByPlay(data);
       if (data?.lastPlay) {
         setLastPlay(data.lastPlay);
         setLastPlayUpdated(new Date());
+        const lpAway = Number(data.lastPlay.awayScore);
+        const lpHome = Number(data.lastPlay.homeScore);
+        if (Number.isFinite(lpAway) && Number.isFinite(lpHome)) {
+          setGame((prev) => {
+            if (!prev || !gameIdentityMatchesTarget(prev.id, fullGameId, marketGameId)) return prev;
+            const isMlb = String(prev.sport || "").toUpperCase() === "MLB";
+            const nextMlbLiveState = isMlb
+              ? {
+                  ...(prev.mlbLiveState || {
+                    inningNumber: null,
+                    inningHalf: null,
+                    outs: null,
+                    balls: null,
+                    strikes: null,
+                    runnersOnBase: null,
+                    currentBatter: null,
+                    currentPitcher: null,
+                    lastPlay: null,
+                  }),
+                  lastPlay: {
+                    type: data?.lastPlay?.type || null,
+                    player: data?.lastPlay?.playerName || null,
+                    text: data?.lastPlay?.description || null,
+                    timestamp: data?.lastPlay?.timestamp || null,
+                  },
+                }
+              : prev.mlbLiveState;
+            if (prev.awayScore === lpAway && prev.homeScore === lpHome && !isMlb) return prev;
+            return {
+              ...prev,
+              awayScore: lpAway,
+              homeScore: lpHome,
+              mlbLiveState: nextMlbLiveState || prev.mlbLiveState,
+            };
+          });
+        }
       }
     } catch (err) {
       console.error('[GameDetailPage] Failed to fetch play-by-play:', err);
     } finally {
       playByPlayInFlightRef.current = false;
     }
-  }, [fullGameId]);
+  }, [fullGameId, getGameIdCandidates, marketGameId]);
 
   const fetchBoxScore = useCallback(async ({ silent = false }: { silent?: boolean } = {}) => {
     if (!fullGameId) return;
     if (!silent) setBoxScoreLoading(true);
     try {
-      const data = await fetchJsonCached<BoxScoreData>(`/api/game-detail/${fullGameId}/box-score`, {
-        cacheKey: `game-detail:box:${fullGameId}`,
-        ttlMs: 8000,
-        timeoutMs: 12000,
-        init: { credentials: 'include', cache: 'no-store' },
-      });
-      if (data) setBoxScore(data);
+      const sportKey = String(game?.sport || league || "").toUpperCase();
+      const gameIdCandidates = getGameIdCandidates().slice(0, 2);
+      let data: BoxScoreData | null = null;
+      for (const candidateId of gameIdCandidates) {
+        const qs = new URLSearchParams({
+          gameId: candidateId,
+          ...(sportKey ? { sport: sportKey } : {}),
+        });
+        try {
+          const snapshotData = await fetchJsonCached<BoxScoreData>(
+            `/api/page-data/game-detail-box-score?${qs.toString()}`,
+            {
+              cacheKey: `page-data:game-detail-box:${candidateId}:${sportKey}`,
+              ttlMs: 8000,
+              timeoutMs: 2500,
+              init: { credentials: 'include', cache: 'no-store' },
+            }
+          );
+          if (!snapshotData) continue;
+          data = snapshotData;
+          if (hasBoxScoreData(snapshotData)) break;
+
+          // Snapshot path is intentionally sparse; enrich from legacy detail route when available.
+          const detailData = await fetchJsonCached<BoxScoreData>(
+            `/api/game-detail/${encodeURIComponent(candidateId)}/box-score`,
+            {
+              cacheKey: `legacy:game-detail-box:${candidateId}:${sportKey}`,
+              ttlMs: 8000,
+              timeoutMs: 2500,
+              init: { credentials: 'include', cache: 'no-store' },
+            }
+          ).catch(() => null);
+          if (!detailData) continue;
+          const mergedData: BoxScoreData = {
+            ...snapshotData,
+            ...detailData,
+            homeTeam: detailData.homeTeam || snapshotData.homeTeam,
+            awayTeam: detailData.awayTeam || snapshotData.awayTeam,
+            homePlayers: detailData.homePlayers?.length ? detailData.homePlayers : (snapshotData.homePlayers || []),
+            awayPlayers: detailData.awayPlayers?.length ? detailData.awayPlayers : (snapshotData.awayPlayers || []),
+            quarterScores: detailData.quarterScores?.length ? detailData.quarterScores : (snapshotData.quarterScores || []),
+          };
+          data = mergedData;
+          if (hasBoxScoreData(mergedData)) break;
+        } catch {
+          // Continue to next candidate.
+        }
+      }
+      if (data) {
+        setBoxScore(data);
+        const homePts = Number((data as any)?.homeTeam?.points);
+        const awayPts = Number((data as any)?.awayTeam?.points);
+        if (Number.isFinite(homePts) && Number.isFinite(awayPts)) {
+          setGame((prev) => {
+            if (!prev || !gameIdentityMatchesTarget(prev.id, fullGameId, marketGameId)) return prev;
+            if (prev.homeScore === homePts && prev.awayScore === awayPts) return prev;
+            return {
+              ...prev,
+              homeScore: homePts,
+              awayScore: awayPts,
+            };
+          });
+        }
+      }
     } catch (err) {
       console.error("[GameDetailPage] Failed to fetch box score:", err);
     } finally {
       if (!silent) setBoxScoreLoading(false);
     }
-  }, [fullGameId]);
+  }, [fullGameId, game?.sport, getGameIdCandidates, league, marketGameId]);
 
   const fetchGameProps = useCallback(async (targetGameId: string, targetSport?: string, allowFreshFallback = false) => {
     const gameIdForProps = String(targetGameId || '').trim();
     if (!gameIdForProps) return;
     const sportForProps = String(targetSport || league || '').toUpperCase();
+    const canonicalCandidate = (() => {
+      const match = decodeURIComponent(gameIdForProps).match(/(?:^|[_:])(\d{6,})$/);
+      return match?.[1] || "";
+    })();
+    const gameIdCandidates = Array.from(new Set([gameIdForProps, canonicalCandidate].filter(Boolean)));
 
     try {
       const fetchPropsVariant = async (fresh: boolean): Promise<{ normalized: PlayerProp[]; fallbackReason: string | null } | null> => {
-        const qs = new URLSearchParams({
-          sport: sportForProps || 'ALL',
-          game_id: gameIdForProps,
-          limit: fresh ? '500' : '200',
-          ...(fresh ? { fresh: '1' } : {}),
-        });
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), fresh ? 12000 : 9000);
-        try {
-          const res = await fetch(`/api/sports-data/props/today?${qs.toString()}`, {
-            credentials: 'include',
-            cache: 'no-store',
-            signal: controller.signal,
+        for (const candidateGameId of gameIdCandidates) {
+          const qs = new URLSearchParams({
+            sport: sportForProps || 'ALL',
+            game_id: candidateGameId,
+            limit: fresh ? '500' : '200',
+            ...(fresh ? { fresh: '1' } : {}),
           });
-          if (!res.ok) return null;
-          const data = await res.json();
-          return {
-            normalized: normalizeGameProps(Array.isArray(data?.props) ? data.props : []),
-            fallbackReason: data?.fallback_reason || null,
-          };
-        } finally {
-          clearTimeout(timer);
+          const controller = new AbortController();
+          const timer = setTimeout(() => controller.abort(), fresh ? 12000 : 9000);
+          try {
+            const res = await fetch(`/api/sports-data/props/today?${qs.toString()}`, {
+              credentials: 'include',
+              cache: 'no-store',
+              signal: controller.signal,
+            });
+            if (!res.ok) continue;
+            const data = await res.json();
+            const normalized = normalizeGameProps(Array.isArray(data?.props) ? data.props : []);
+            if (normalized.length > 0) {
+              return {
+                normalized,
+                fallbackReason: data?.fallback_reason || null,
+              };
+            }
+            // keep searching other id variants before declaring empty.
+            if (candidateGameId === gameIdCandidates[gameIdCandidates.length - 1]) {
+              return {
+                normalized,
+                fallbackReason: data?.fallback_reason || null,
+              };
+            }
+          } finally {
+            clearTimeout(timer);
+          }
         }
+        return null;
       };
 
       // Fast cached pass first. Optional fresh refresh is for explicit props-tab fallback.
@@ -5058,7 +5649,7 @@ export function GameDetailPage() {
       setGame((prev) => {
         if (!prev) return prev;
         const prevId = String(prev.id || "").trim();
-        if (prevId && prevId !== gameIdForProps) return prev;
+        if (prevId && !gameIdCandidates.includes(prevId)) return prev;
         if (normalized.length === 0 && Array.isArray(prev.props) && prev.props.length > 0) {
           return {
             ...prev,
@@ -5080,10 +5671,87 @@ export function GameDetailPage() {
     }
   }, [league]);
 
+  // Recovery path: when page-data game detail is sparse, enrich from legacy game detail.
+  useEffect(() => {
+    if (!fullGameId) return;
+    if (!game) return;
+    if (isSoccerContext) return;
+    const hasHeroOdds =
+      typeof game.odds?.spread === "number" ||
+      typeof game.odds?.total === "number" ||
+      typeof game.odds?.mlHome === "number" ||
+      typeof game.odds?.mlAway === "number";
+    const hasProps = Array.isArray(game.props) && game.props.length > 0;
+    if (hasHeroOdds && hasProps) return;
+
+    let cancelled = false;
+    const gameIdCandidates = Array.from(new Set([fullGameId, marketGameId].filter(Boolean)));
+    const loadRecovery = async () => {
+      for (const candidateId of gameIdCandidates) {
+        const request = fetch(`/api/games/${encodeURIComponent(candidateId)}?lite=1`, {
+          credentials: "include",
+          cache: "no-store",
+        })
+          .then((res) => (res.ok ? res.json() : null))
+          .catch(() => null);
+        const payload = await Promise.race([
+          request,
+          new Promise<null>((resolve) => setTimeout(() => resolve(null), 4500)),
+        ]);
+        if (cancelled || !payload?.game) continue;
+        const gamePayload = payload.game;
+        const normalizedOdds = (() => {
+          const oddsRows = Array.isArray(payload.odds) ? payload.odds : [];
+          const primary = oddsRows[0] || null;
+          if (!primary) return undefined;
+          const parse = (value: unknown): number | undefined => {
+            if (typeof value === "number" && Number.isFinite(value)) return value;
+            if (typeof value !== "string") return undefined;
+            const cleaned = value.replace(/[^\d.+-]/g, "");
+            if (!cleaned) return undefined;
+            const parsed = Number(cleaned);
+            return Number.isFinite(parsed) ? parsed : undefined;
+          };
+          return {
+            spread: parse(primary.spread),
+            total: parse(primary.total),
+            mlHome: parse(primary.moneylineHome),
+            mlAway: parse(primary.moneylineAway),
+          } as OddsData;
+        })();
+        const normalizedProps = normalizeGameProps(Array.isArray(payload.props) ? payload.props : []);
+        setGame((prev) => {
+          if (!prev || !gameIdentityMatchesTarget(prev.id, fullGameId, marketGameId)) return prev;
+          const mergedOdds = hasHeroOdds ? prev.odds : (normalizedOdds || prev.odds);
+          const mergedProps = (Array.isArray(prev.props) && prev.props.length > 0) ? prev.props : normalizedProps;
+          return {
+            ...prev,
+            homeTeamFull: prev.homeTeamFull || gamePayload.home_team_name || prev.homeTeamFull,
+            awayTeamFull: prev.awayTeamFull || gamePayload.away_team_name || prev.awayTeamFull,
+            odds: mergedOdds,
+            props: mergedProps,
+            mlbLiveState: normalizeMlbLiveState(gamePayload?.mlbLiveState || prev.mlbLiveState || null),
+            mlbPregameState: normalizeMlbPregameState(gamePayload?.mlbPregameState || prev.mlbPregameState || null, gamePayload),
+            probableAwayPitcher: prev.probableAwayPitcher || readProbablePitcher(gamePayload, "away"),
+            probableHomePitcher: prev.probableHomePitcher || readProbablePitcher(gamePayload, "home"),
+          };
+        });
+        if (normalizedProps.length > 0) break;
+      }
+    };
+    void loadRecovery();
+    return () => {
+      cancelled = true;
+    };
+  }, [fullGameId, game, isSoccerContext, marketGameId]);
+
   // Fetch game data
   const fetchGame = useCallback(async (options?: { refreshOnly?: boolean }) => {
     if (!gameId) return;
     const refreshOnly = options?.refreshOnly === true;
+    const isSoccerDetailRequest =
+      String(params.sportKey || league || "").toLowerCase() === "soccer" ||
+      location.pathname.includes("/sports/soccer/match/");
     const requestId = ++activeGameRequestRef.current;
     const startedAt = performance.now();
     const stopPerf = startPerfTimer('gameDetail.fetch');
@@ -5091,59 +5759,179 @@ export function GameDetailPage() {
     console.log('[GameDetailPage] Fetching game:', { league, gameId, fullGameId, isSportsRadarGame });
     
     try {
+      if (isSoccerDetailRequest) {
+        const soccerPathId = normalizeSoccerRouteId(fullGameId) || fullGameId;
+        const qs = new URLSearchParams();
+        if (refreshOnly) qs.set("live", "true");
+        const soccerPayload = await fetchJsonCached<any>(
+          `/api/soccer/match/${encodeURIComponent(soccerPathId)}${qs.toString() ? `?${qs.toString()}` : ""}`,
+          {
+            cacheKey: `soccer:match:${soccerPathId}:${refreshOnly ? "live" : "base"}`,
+            ttlMs: refreshOnly ? 0 : 6_000,
+            timeoutMs: refreshOnly ? 4_000 : 6_500,
+            bypassCache: refreshOnly,
+            init: { credentials: "include", cache: "no-store" },
+          }
+        ).catch(() => null);
+        if (requestId !== activeGameRequestRef.current) return;
+        const match = soccerPayload?.match;
+        if (!match || typeof match !== "object") {
+          setGame(null);
+          setSoccerDetailStatus("unavailable");
+          setError(null);
+          return;
+        }
+
+        const homeTeam = match?.homeTeam || {};
+        const awayTeam = match?.awayTeam || {};
+        const canonicalEventId = String(
+          soccerPayload?.canonicalEventId || match?.eventId || fullGameId
+        ).trim();
+        const normalizedStatus = normalizeStatus(match?.status || "SCHEDULED");
+        const nextHomeScore = Number(match?.homeScore);
+        const nextAwayScore = Number(match?.awayScore);
+        setGame((prev) => {
+          const stabilized = stabilizeLiveScore(
+            prev,
+            Number.isFinite(nextHomeScore) ? nextHomeScore : null,
+            Number.isFinite(nextAwayScore) ? nextAwayScore : null,
+            normalizedStatus
+          );
+          return {
+            ...(prev || {}),
+            id: canonicalEventId || fullGameId,
+            sport: "SOCCER",
+            homeTeam: String(homeTeam?.abbreviation || homeTeam?.name || "HOME"),
+            awayTeam: String(awayTeam?.abbreviation || awayTeam?.name || "AWAY"),
+            homeTeamFull: String(homeTeam?.name || ""),
+            awayTeamFull: String(awayTeam?.name || ""),
+            homeScore: stabilized.homeScore,
+            awayScore: stabilized.awayScore,
+            status: normalizedStatus,
+            period: String(match?.statusText || ""),
+            clock: "",
+            startTime: String(match?.startTime || ""),
+            venue: String(match?.venue || ""),
+            broadcast: prev?.broadcast,
+            odds: prev?.odds,
+            sportsbooks: prev?.sportsbooks || [],
+            lineHistory: prev?.lineHistory || [],
+            publicBetHome: prev?.publicBetHome,
+            publicBetAway: prev?.publicBetAway,
+            coachSignal: prev?.coachSignal,
+            predictorText: prev?.predictorText,
+            props: prev?.props || [],
+            propsSource: prev?.propsSource,
+            propsFallbackReason: prev?.propsFallbackReason || null,
+          } as GameData;
+        });
+        setSoccerDetailStatus("ready");
+        setError(null);
+        if (
+          canonicalEventId.startsWith("sr:sport_event:") &&
+          canonicalEventId !== fullGameId &&
+          location.pathname.includes("/sports/soccer/match/")
+        ) {
+          navigate(`/sports/soccer/match/${encodeURIComponent(canonicalEventId)}${location.search || ""}`, { replace: true });
+        }
+        return;
+      }
+
       {
         const isInitialRenderRequest = !game && !refreshOnly;
-        console.info("PAGE_DATA_START", { route: "game-detail", gameId: fullGameId, sport: String(league || "").toUpperCase(), refreshOnly });
+        const requestSport = String(
+          params.sportKey
+          || league
+          || (isSoccerDetailRequest ? "soccer" : "")
+        ).trim().toUpperCase();
+        console.info("PAGE_DATA_START", { route: "game-detail", gameId: fullGameId, sport: requestSport, refreshOnly });
         const qs = new URLSearchParams({
           gameId: fullGameId,
-          ...(league ? { sport: String(league).toUpperCase() } : {}),
+          ...(requestSport ? { sport: requestSport } : {}),
         });
-        const pagePayload = await fetchJsonCached<any>(`/api/page-data/game-detail?${qs.toString()}`, {
-          cacheKey: `page-data:game-detail:${fullGameId}:${String(league || "").toUpperCase()}`,
-          ttlMs: refreshOnly ? 0 : 3_000,
-          timeoutMs: isInitialRenderRequest ? 2_000 : 2_700,
-          bypassCache: refreshOnly,
-          init: { credentials: "include", cache: "no-store" },
-        });
+        if (refreshOnly) {
+          qs.set("fresh", "1");
+        }
+        const fetchPagePayload = async (): Promise<any> => {
+          try {
+            const payload = await fetchJsonCached<any>(`/api/page-data/game-detail?${qs.toString()}`, {
+              cacheKey: `page-data:game-detail:${fullGameId}:${String(league || "").toUpperCase()}`,
+              ttlMs: refreshOnly ? 0 : 3_000,
+              timeoutMs: isInitialRenderRequest ? 2_000 : 2_700,
+              bypassCache: refreshOnly,
+              init: { credentials: "include", cache: "no-store" },
+            });
+            return payload;
+          } catch (err) {
+            if (!isSoccerDetailRequest) throw err;
+            return { game: null, oddsSummary: null, status: "unavailable" as const };
+          }
+        };
+        const pagePayload = await fetchPagePayload();
         if (requestId !== activeGameRequestRef.current) return;
 
-        const pageGame = pagePayload?.game || null;
-        const summary = pagePayload?.oddsSummary || null;
-        const parseNum = (value: unknown): number | undefined => {
-          const n = Number(value);
-          return Number.isFinite(n) ? n : undefined;
-        };
-        const normalizedOdds: OddsData | undefined = summary
-          ? {
-              spread: parseNum(summary?.spread?.line ?? summary?.spread),
-              total: parseNum(summary?.total?.line ?? summary?.total),
-              mlHome: parseNum(summary?.moneyline?.home_price ?? summary?.moneylineHome),
-              mlAway: parseNum(summary?.moneyline?.away_price ?? summary?.moneylineAway),
-              openSpread: parseNum(summary?.opening_spread),
-              openTotal: parseNum(summary?.opening_total),
-              openMoneylineHome: parseNum(summary?.opening_home_ml),
-              spread1HHome: parseNum(summary?.first_half?.spread?.home_line),
-              spread1HAway: parseNum(summary?.first_half?.spread?.away_line),
-              total1H: parseNum(summary?.first_half?.total?.line),
-              ml1HHome: parseNum(summary?.first_half?.moneyline?.home_price),
-              ml1HAway: parseNum(summary?.first_half?.moneyline?.away_price),
-            }
-          : undefined;
+        let pageGame: any = null;
+        let summary: any = null;
+        let normalizedOdds: OddsData | undefined;
+        try {
+          pageGame = pagePayload?.game || null;
+          summary = pagePayload?.oddsSummary || null;
+          const parseNum = (value: unknown): number | undefined => {
+            const n = Number(value);
+            return Number.isFinite(n) ? n : undefined;
+          };
+          normalizedOdds = summary
+            ? {
+                spread: parseNum(summary?.spread?.line ?? summary?.spread),
+                total: parseNum(summary?.total?.line ?? summary?.total),
+                mlHome: parseNum(summary?.moneyline?.home_price ?? summary?.moneylineHome),
+                mlAway: parseNum(summary?.moneyline?.away_price ?? summary?.moneylineAway),
+                openSpread: parseNum(summary?.opening_spread),
+                openTotal: parseNum(summary?.opening_total),
+                openMoneylineHome: parseNum(summary?.opening_home_ml),
+                spread1HHome: parseNum(summary?.first_half?.spread?.home_line),
+                spread1HAway: parseNum(summary?.first_half?.spread?.away_line),
+                total1H: parseNum(summary?.first_half?.total?.line),
+                ml1HHome: parseNum(summary?.first_half?.moneyline?.home_price),
+                ml1HAway: parseNum(summary?.first_half?.moneyline?.away_price),
+              }
+            : undefined;
+        } catch (err) {
+          if (!isSoccerDetailRequest) throw err;
+          pageGame = null;
+          summary = null;
+          normalizedOdds = undefined;
+        }
 
         if (pageGame) {
           setGame((prev) => ({
+            ...(() => {
+              const normalizedStatus = normalizeStatus(pageGame?.status);
+              const stabilizedScore = stabilizeLiveScore(
+                prev,
+                pageGame?.home_score ?? pageGame?.homeScore ?? null,
+                pageGame?.away_score ?? pageGame?.awayScore ?? null,
+                normalizedStatus
+              );
+              return {
+                homeScore: stabilizedScore.homeScore,
+                awayScore: stabilizedScore.awayScore,
+                status: normalizedStatus,
+              };
+            })(),
             id: pageGame?.id || pageGame?.game_id || gameId,
             sport: pageGame?.sport || league?.toUpperCase() || "NBA",
             homeTeam: pageGame?.home_team_code || pageGame?.homeTeam || "HOME",
             awayTeam: pageGame?.away_team_code || pageGame?.awayTeam || "AWAY",
             homeTeamFull: pageGame?.home_team_name,
             awayTeamFull: pageGame?.away_team_name,
-            homeScore: pageGame?.home_score ?? pageGame?.homeScore ?? null,
-            awayScore: pageGame?.away_score ?? pageGame?.awayScore ?? null,
-            status: normalizeStatus(pageGame?.status),
             period: pageGame?.period_label || pageGame?.period,
             clock: pageGame?.clock,
             startTime: pageGame?.start_time || pageGame?.startTime,
+            probableAwayPitcher: readProbablePitcher(pageGame, "away"),
+            probableHomePitcher: readProbablePitcher(pageGame, "home"),
+            mlbLiveState: normalizeMlbLiveState(pageGame?.mlbLiveState || null) ?? prev?.mlbLiveState ?? null,
+            mlbPregameState: normalizeMlbPregameState(pageGame?.mlbPregameState || null, pageGame) ?? prev?.mlbPregameState ?? null,
             venue: pageGame?.venue,
             broadcast: pageGame?.broadcast,
             odds: normalizedOdds || prev?.odds,
@@ -5158,6 +5946,9 @@ export function GameDetailPage() {
             propsFallbackReason: pageGame?.propsFallbackReason || null,
           }));
           setError(null);
+          if (isSoccerDetailRequest) {
+            setSoccerDetailStatus("ready");
+          }
           if (flags.PAGE_DATA_OBSERVABILITY_ENABLED) {
             const loadMs = Math.max(0, Math.round(performance.now() - startedAt));
             void fetch("/api/page-data/telemetry", {
@@ -5178,7 +5969,12 @@ export function GameDetailPage() {
             hasGame: true,
             hasOdds: Boolean(normalizedOdds),
             degraded: Boolean(pagePayload?.degraded),
+            cache: pagePayload?.freshness?.source || "cold",
+            cache_hit: pagePayload?.freshness?.source === "l1" || pagePayload?.freshness?.source === "l2",
           });
+          const elapsedMs = Math.max(0, Math.round(performance.now() - startedAt));
+          console.info("FIRST_PAINT", { route: "game-detail", first_paint_time_ms: elapsedMs });
+          console.info("FULL_HYDRATION", { route: "game-detail", full_hydration_time_ms: elapsedMs });
           return;
         }
         if (summary) {
@@ -5187,18 +5983,33 @@ export function GameDetailPage() {
             : null;
           if (summaryGame) {
             setGame((prev) => ({
+              ...(() => {
+                const normalizedStatus = normalizeStatus(summaryGame?.status);
+                const stabilizedScore = stabilizeLiveScore(
+                  prev,
+                  summaryGame?.home_score ?? summaryGame?.homeScore ?? null,
+                  summaryGame?.away_score ?? summaryGame?.awayScore ?? null,
+                  normalizedStatus
+                );
+                return {
+                  homeScore: stabilizedScore.homeScore,
+                  awayScore: stabilizedScore.awayScore,
+                  status: normalizedStatus,
+                };
+              })(),
               id: summaryGame?.id || summaryGame?.game_id || gameId,
               sport: summaryGame?.sport || league?.toUpperCase() || "NBA",
               homeTeam: summaryGame?.home_team_code || summaryGame?.homeTeam || "HOME",
               awayTeam: summaryGame?.away_team_code || summaryGame?.awayTeam || "AWAY",
               homeTeamFull: summaryGame?.home_team_name,
               awayTeamFull: summaryGame?.away_team_name,
-              homeScore: summaryGame?.home_score ?? summaryGame?.homeScore ?? null,
-              awayScore: summaryGame?.away_score ?? summaryGame?.awayScore ?? null,
-              status: normalizeStatus(summaryGame?.status),
               period: summaryGame?.period_label || summaryGame?.period,
               clock: summaryGame?.clock,
               startTime: summaryGame?.start_time || summaryGame?.startTime,
+              probableAwayPitcher: readProbablePitcher(summaryGame, "away"),
+              probableHomePitcher: readProbablePitcher(summaryGame, "home"),
+              mlbLiveState: normalizeMlbLiveState(summaryGame?.mlbLiveState || null) ?? prev?.mlbLiveState ?? null,
+              mlbPregameState: normalizeMlbPregameState(summaryGame?.mlbPregameState || null, summaryGame) ?? prev?.mlbPregameState ?? null,
               venue: summaryGame?.venue,
               broadcast: summaryGame?.broadcast,
               odds: normalizedOdds || prev?.odds,
@@ -5213,6 +6024,11 @@ export function GameDetailPage() {
               propsFallbackReason: summaryGame?.propsFallbackReason || null,
             }));
             setError(null);
+            if (isSoccerDetailRequest) {
+              setSoccerDetailStatus("ready");
+            }
+            const elapsedMs = Math.max(0, Math.round(performance.now() - startedAt));
+            console.info("FIRST_PAINT", { route: "game-detail", first_paint_time_ms: elapsedMs });
             return;
           }
           setGame((prev) => {
@@ -5223,7 +6039,13 @@ export function GameDetailPage() {
         }
         console.warn("PAGE_DATA_FALLBACK_USED", { route: "game-detail", reason: "empty_payload_without_game", gameId: fullGameId });
         if (!game) {
-          setError('Failed to load game data');
+          if (isSoccerDetailRequest) {
+            setGame(null);
+            setSoccerDetailStatus("unavailable");
+            setError(null);
+          } else {
+            setError('Failed to load game data');
+          }
         }
         return;
       }
@@ -5236,7 +6058,15 @@ export function GameDetailPage() {
         console.warn("PAGE_DATA_TIMEOUT", { route: "game-detail", gameId: fullGameId });
       }
       console.warn("PAGE_DATA_FALLBACK_USED", { route: "game-detail", reason: "request_failed", gameId: fullGameId });
-      if (!game) setError('Failed to load game data');
+      if (!game) {
+        if (isSoccerDetailRequest) {
+          setGame(null);
+          setSoccerDetailStatus("unavailable");
+          setError(null);
+        } else {
+          setError('Failed to load game data');
+        }
+      }
     } finally {
       if (requestId !== activeGameRequestRef.current) return;
       stopPerf();
@@ -5250,6 +6080,10 @@ export function GameDetailPage() {
     fullGameId,
     gameId,
     league,
+    location.pathname,
+    location.search,
+    navigate,
+    params.sportKey,
   ]);
 
   // Initial fetch
@@ -5268,16 +6102,7 @@ export function GameDetailPage() {
     const scopeAll = canUseAllSoccerToday && searchParams.get("soccerNavScope") === "all";
 
     const normalizeId = (value: string): string => {
-      let raw = decodeURIComponent(String(value || "").trim()).replace(/^soccer_/, "");
-      if (raw.startsWith("sr_")) {
-        const parts = raw.split("_");
-        if (parts.length >= 3) raw = `sr:sport_event:${parts.slice(2).join("_")}`;
-      }
-      // Some payloads can be double-prefixed (sr:sport_event:sr:sport_event:xxx)
-      while (raw.startsWith("sr:sport_event:sr:sport_event:")) {
-        raw = raw.replace("sr:sport_event:sr:sport_event:", "sr:sport_event:");
-      }
-      return raw;
+      return normalizeSoccerRouteId(value) || decodeURIComponent(String(value || "").trim());
     };
     const eventKey = (value: string): string => {
       const normalized = normalizeId(value);
@@ -5356,7 +6181,7 @@ export function GameDetailPage() {
           }
         } else {
           // Soccer-home fallback: derive same-day adjacency from the generic games feed.
-          const res = await fetch(`/api/games?sport=soccer&date=${encodeURIComponent(dateKey)}&includeOdds=0`, {
+          const res = await fetch(`/api/page-data/games?sport=soccer&date=${encodeURIComponent(dateKey)}&tab=scores`, {
             credentials: "include",
             cache: "no-store",
           });
@@ -5445,7 +6270,7 @@ export function GameDetailPage() {
     const loadAdjacent = async () => {
       try {
         type Row = { id: string; ts: number; preview: string };
-        const res = await fetch(`/api/games?sport=${encodeURIComponent(sportKey)}&date=${encodeURIComponent(dateKey)}&includeOdds=0`, {
+        const res = await fetch(`/api/page-data/games?sport=${encodeURIComponent(sportKey)}&date=${encodeURIComponent(dateKey)}&tab=scores`, {
           credentials: "include",
           cache: "no-store",
         });
@@ -5457,7 +6282,7 @@ export function GameDetailPage() {
         let games = Array.isArray(data?.games) ? data.games : [];
         if (games.length <= 1) {
           // Date-scoped feeds can be sparse for some providers/time zones; broaden query.
-          const broadRes = await fetch(`/api/games?sport=${encodeURIComponent(sportKey)}&includeOdds=0`, {
+          const broadRes = await fetch(`/api/page-data/games?sport=${encodeURIComponent(sportKey)}&tab=scores`, {
             credentials: "include",
             cache: "no-store",
           });
@@ -5517,24 +6342,68 @@ export function GameDetailPage() {
     return () => { cancelled = true; };
   }, [isSoccerContext, fullGameId, gameId, srSport, params.sportKey, league, game?.id, game?.startTime, game?.sport]);
 
-  // Fetch sportsbook odds when tab is selected
+  // Fetch sportsbook odds on books tab, and prime live overview when hero odds are missing.
   useEffect(() => {
-    if (activeTab !== 'sportsbooks' || !fullGameId || sportsbooksLoaded) return;
+    const isSportsbookTab = activeTab === "sportsbooks";
+    const shouldPrimeLiveOverview =
+      activeTab === "overview" &&
+      game?.status === "LIVE" &&
+      (game?.odds?.spread == null ||
+        game?.odds?.total == null ||
+        Number.isNaN(Number(game?.odds?.spread)) ||
+        Number.isNaN(Number(game?.odds?.total)));
+    if ((!isSportsbookTab && !shouldPrimeLiveOverview) || !marketGameId || (sportsbooksLoaded && !shouldPrimeLiveOverview)) return;
     const controller = new AbortController();
     let cancelled = false;
     
     const fetchSportsbooks = async () => {
       try {
-        const res = await fetch(`/api/games/${fullGameId}/odds`, {
-          credentials: 'include',
-          cache: 'no-store',
-          signal: controller.signal,
-        });
+        const gameIdCandidates = Array.from(new Set([fullGameId, marketGameId].filter(Boolean)));
+        const requestByGameId = async (candidateId: string): Promise<{ gameId: string; payload: any | null }> => {
+          const request = fetch(`/api/games/${encodeURIComponent(candidateId)}/odds`, {
+            credentials: 'include',
+            cache: 'no-store',
+            signal: controller.signal,
+          })
+            .then((res) => (res.ok ? res.json() : null))
+            .catch(() => null);
+          const timed = await Promise.race([
+            request,
+            new Promise<null>((resolve) => setTimeout(() => resolve(null), 2200)),
+          ]);
+          return { gameId: candidateId, payload: timed };
+        };
+        let data: any = null;
+        let resolvedGameId: string | null = null;
+        const hasCoverage = (payload: any): boolean => {
+          if (!payload || typeof payload !== "object") return false;
+          if (payload.consensus) return true;
+          if (Array.isArray(payload.sportsbooks) && payload.sportsbooks.length > 0) return true;
+          const numericFields = [
+            payload.openSpread,
+            payload.openTotal,
+            payload.openMoneylineHome,
+            payload.openMoneylineAway,
+          ];
+          return numericFields.some((value) => typeof value === "number" && Number.isFinite(value));
+        };
+
+        const candidateResponses = await Promise.all(gameIdCandidates.map((candidateId) => requestByGameId(candidateId)));
         if (cancelled) return;
-        
-        if (res.ok) {
-          const data = await res.json();
-          if (cancelled) return;
+        for (const candidate of candidateResponses) {
+          if (!candidate.payload) continue;
+          if (!data) {
+            data = candidate.payload;
+            resolvedGameId = candidate.gameId;
+          }
+          if (hasCoverage(candidate.payload)) {
+            data = candidate.payload;
+            resolvedGameId = candidate.gameId;
+            break;
+          }
+        }
+
+        if (data) {
           
           // Track if we're getting live in-game odds
           setIsLiveOdds(data.isLiveOdds ?? false);
@@ -5567,7 +6436,7 @@ export function GameDetailPage() {
               console.log('[Books Tab] Updating game state with', lines.length, 'sportsbooks');
               if (!prev) return prev;
               const prevId = String(prev.id || "").trim();
-              if (prevId && prevId !== fullGameId) return prev;
+              if (prevId && prevId !== fullGameId && prevId !== marketGameId) return prev;
               const mergedOdds = mergeHeroOddsFromOddsApi(prev.odds, data);
               return {
                 ...prev,
@@ -5583,7 +6452,8 @@ export function GameDetailPage() {
 
           // If fast path only returned consensus, backfill full book grid in background.
           if (lines.length <= 1) {
-            fetch(`/api/games/${fullGameId}/odds?full=1`, {
+            const targetGameId = resolvedGameId || fullGameId || marketGameId;
+            fetch(`/api/games/${encodeURIComponent(targetGameId)}/odds?full=1`, {
               credentials: 'include',
               cache: 'no-store',
             })
@@ -5610,7 +6480,7 @@ export function GameDetailPage() {
                 setGame((prev) => {
                   if (!prev) return prev;
                   const prevId = String(prev.id || "").trim();
-                  if (prevId && prevId !== fullGameId) return prev;
+                  if (prevId && prevId !== fullGameId && prevId !== marketGameId) return prev;
                   const mergedOdds = mergeHeroOddsFromOddsApi(prev.odds, fullData);
                   return {
                     ...prev,
@@ -5640,27 +6510,47 @@ export function GameDetailPage() {
       cancelled = true;
       controller.abort();
     };
-  }, [activeTab, fullGameId, sportsbooksLoaded]);
+  }, [activeTab, fullGameId, game?.odds?.spread, game?.odds?.total, game?.status, marketGameId, sportsbooksLoaded, reconcileLineHistoryWithOdds]);
 
-  // Fetch line history when tab is selected
+  // Fetch line history when tab is selected, and prime live overview once.
   useEffect(() => {
-    if (activeTab !== 'line-movement' || !fullGameId) return;
+    const shouldPrimeLiveOverview = activeTab === "overview" && game?.status === "LIVE";
+    if ((activeTab !== 'line-movement' && !shouldPrimeLiveOverview) || !marketGameId) return;
     if (lineHistoryLoaded && (game?.lineHistory?.length || 0) > 0) return;
     const controller = new AbortController();
     let isCancelled = false;
     
     const fetchLineHistory = async () => {
       try {
-        const res = await fetch(`/api/games/${fullGameId}/line-history`, {
-          credentials: 'include',
-          cache: 'no-store',
-          signal: controller.signal,
-        });
+        const gameIdCandidates = Array.from(new Set([fullGameId, marketGameId].filter(Boolean)));
+        const requestByGameId = async (candidateId: string): Promise<any | null> => {
+          const request = fetch(`/api/games/${encodeURIComponent(candidateId)}/line-history`, {
+            credentials: 'include',
+            cache: 'no-store',
+            signal: controller.signal,
+          })
+            .then((res) => (res.ok ? res.json() : null))
+            .catch(() => null);
+          return await Promise.race([
+            request,
+            new Promise<null>((resolve) => setTimeout(() => resolve(null), 2200)),
+          ]);
+        };
+        const candidateResponses = await Promise.all(gameIdCandidates.map((candidateId) => requestByGameId(candidateId)));
         if (isCancelled) return;
+        let data: any = null;
+        for (const candidateData of candidateResponses) {
+          if (!candidateData) continue;
+          if (!data) data = candidateData;
+          const hasHistory = Array.isArray(candidateData?.history) && candidateData.history.length > 0;
+          const hasSummary = Boolean(candidateData?.opening || candidateData?.current);
+          if (hasHistory || hasSummary) {
+            data = candidateData;
+            break;
+          }
+        }
         
-        if (res.ok) {
-          const data = await res.json();
-          if (isCancelled) return;
+        if (data) {
           
           // Transform history to LineHistoryPoint format
           const history: LineHistoryPoint[] = (data.history || []).map((h: {
@@ -5706,7 +6596,7 @@ export function GameDetailPage() {
       isCancelled = true;
       controller.abort();
     };
-  }, [activeTab, fullGameId, lineHistoryLoaded, game?.lineHistory?.length, reconcileLineHistoryWithOdds]);
+  }, [activeTab, lineHistoryLoaded, game?.lineHistory?.length, game?.status, marketGameId, reconcileLineHistoryWithOdds]);
 
   // Fetch box score when tab is selected
   useEffect(() => {
@@ -5726,34 +6616,173 @@ export function GameDetailPage() {
     void fetchGameProps(targetGameId, String(game?.sport || league || ""), true);
   }, [activeTab, fetchGameProps, fullGameId, game?.id, game?.props, game?.sport, league]);
 
+  // Prime props for live overview so "featured props" does not stay in syncing state.
+  useEffect(() => {
+    if (activeTab !== "overview" || game?.status !== "LIVE") return;
+    const targetGameId = String(game?.id || marketGameId || fullGameId || "").trim();
+    if (!targetGameId) return;
+    if ((game?.props || []).length > 0) return;
+    if (propsFreshAttemptedRef.current.has(`overview:${targetGameId}`)) return;
+    propsFreshAttemptedRef.current.add(`overview:${targetGameId}`);
+    void fetchGameProps(targetGameId, String(game?.sport || league || ""), false);
+  }, [activeTab, fetchGameProps, fullGameId, game?.id, game?.props, game?.sport, game?.status, league, marketGameId]);
+
   // Fetch H2H when tab is selected
   useEffect(() => {
     if (activeTab !== 'h2h' || !fullGameId || h2h) return;
     setH2HLoading(true);
-    fetch(`/api/game-detail/${fullGameId}/h2h`, { credentials: 'include', cache: 'no-store' })
-      .then(res => res.ok ? res.json() : null)
-      .then(data => { if (data) setH2H(data); })
+    const sportKey = String(game?.sport || league || "").toUpperCase();
+    const home = String(game?.homeTeam || "").trim();
+    const away = String(game?.awayTeam || "").trim();
+    const homeName = String(game?.homeTeamFull || game?.homeTeam || "").trim();
+    const awayName = String(game?.awayTeamFull || game?.awayTeam || "").trim();
+    const normalize = (value: unknown): string =>
+      String(value || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+    const homeTokens = new Set([normalize(home), normalize(homeName)]);
+    const awayTokens = new Set([normalize(away), normalize(awayName)]);
+    const today = new Date().toISOString().slice(0, 10);
+    const gameIdCandidates = Array.from(new Set([fullGameId, marketGameId].filter(Boolean)));
+    const fetchLegacyH2H = async (): Promise<boolean> => {
+      for (const candidateId of gameIdCandidates) {
+        try {
+          const request = fetch(`/api/game-detail/${encodeURIComponent(candidateId)}/h2h`, {
+            credentials: "include",
+            cache: "no-store",
+          }).then((res) => (res.ok ? res.json() : null));
+          const payload = await Promise.race([
+            request,
+            new Promise<null>((resolve) => setTimeout(() => resolve(null), 3000)),
+          ]);
+          if (!payload || !Array.isArray(payload.matchups) || payload.matchups.length === 0) continue;
+          setH2H({
+            homeTeam: String(payload.homeTeam || home || homeName || "HOME"),
+            awayTeam: String(payload.awayTeam || away || awayName || "AWAY"),
+            matchups: payload.matchups,
+            series: payload.series || {},
+          });
+          return true;
+        } catch {
+          // Try next ID candidate.
+        }
+      }
+      return false;
+    };
+
+    fetchLegacyH2H()
+      .then((handled) => {
+        if (handled) return;
+        return fetchJsonCached<any>(
+      `/api/page-data/games?date=${encodeURIComponent(today)}&sport=${encodeURIComponent(sportKey)}&tab=scores`,
+      {
+        cacheKey: `h2h-tab-snapshot:${sportKey}:${home}:${away}:${today}`,
+        ttlMs: 45_000,
+        timeoutMs: 2_800,
+        init: { credentials: "include" },
+      }
+        )
+          .then((payload) => {
+        const games = Array.isArray(payload?.games) ? payload.games : [];
+        const matchups: H2HGame[] = games
+          .filter((g: any) => {
+            const homeCode = normalize(g?.home_team_code || g?.homeTeam);
+            const awayCode = normalize(g?.away_team_code || g?.awayTeam);
+            const homeNm = normalize(g?.home_team_name || g?.homeTeamFull);
+            const awayNm = normalize(g?.away_team_name || g?.awayTeamFull);
+            const homeIsHome = homeTokens.has(homeCode) || homeTokens.has(homeNm);
+            const awayIsAway = awayTokens.has(awayCode) || awayTokens.has(awayNm);
+            const homeIsAway = awayTokens.has(homeCode) || awayTokens.has(homeNm);
+            const awayIsHome = homeTokens.has(awayCode) || homeTokens.has(awayNm);
+            return (homeIsHome && awayIsAway) || (homeIsAway && awayIsHome);
+          })
+          .slice(0, 10)
+          .map((g: any) => {
+            const homeScore = Number(g?.home_score ?? g?.homeScore ?? 0);
+            const awayScore = Number(g?.away_score ?? g?.awayScore ?? 0);
+            const winner = homeScore === awayScore
+              ? "Tie"
+              : homeScore > awayScore
+                ? String(g?.home_team_code || g?.homeTeam || "HOME")
+                : String(g?.away_team_code || g?.awayTeam || "AWAY");
+            return {
+              date: String(g?.start_time || g?.startTime || ""),
+              homeTeam: String(g?.home_team_code || g?.homeTeam || "HOME"),
+              awayTeam: String(g?.away_team_code || g?.awayTeam || "AWAY"),
+              homeScore,
+              awayScore,
+              winner,
+              margin: Math.abs(homeScore - awayScore),
+              venue: String(g?.venue || ""),
+            };
+          });
+        const series: Record<string, number> = {};
+        for (const m of matchups) {
+          if (!m.winner || m.winner === "Tie") continue;
+          series[m.winner] = (series[m.winner] || 0) + 1;
+        }
+        if (matchups.length > 0) {
+          setH2H({
+            homeTeam: home || homeName || "HOME",
+            awayTeam: away || awayName || "AWAY",
+            matchups,
+            series,
+          });
+        }
+          });
+      })
       .catch((err) => {
-        console.error('[GameDetailPage] Failed to fetch head-to-head:', err);
+        console.error('[GameDetailPage] Failed to fetch snapshot head-to-head:', err);
       })
       .finally(() => setH2HLoading(false));
-  }, [activeTab, fullGameId, h2h]);
+  }, [activeTab, fullGameId, marketGameId, h2h, game?.sport, game?.homeTeam, game?.awayTeam, game?.homeTeamFull, game?.awayTeamFull, league]);
 
   // Fetch injuries when tab is selected
   useEffect(() => {
     if (activeTab !== 'injuries' || !fullGameId || injuries) return;
     setInjuriesLoading(true);
-    const homeTeamName = game?.homeTeamFull || game?.homeTeam || '';
-    const awayTeamName = game?.awayTeamFull || game?.awayTeam || '';
-    const injuriesUrl = `/api/game-detail/${fullGameId}/injuries?homeTeam=${encodeURIComponent(homeTeamName)}&awayTeam=${encodeURIComponent(awayTeamName)}`;
-    fetch(injuriesUrl, { credentials: 'include', cache: 'no-store' })
+    const sportKey = String(game?.sport || league || "").toUpperCase();
+    const qs = new URLSearchParams({
+      gameId: fullGameId,
+      ...(sportKey ? { sport: sportKey } : {}),
+    });
+    const gameIdCandidates = Array.from(new Set([fullGameId, marketGameId].filter(Boolean)));
+    fetch(`/api/page-data/game-detail-injuries?${qs.toString()}`, { credentials: 'include', cache: 'no-store' })
       .then(res => res.ok ? res.json() : null)
-      .then(data => { if (data) setInjuries(data); })
+      .then(async (data) => {
+        const hasRows =
+          Boolean(data?.injuries?.home?.length) ||
+          Boolean(data?.injuries?.away?.length);
+        if (data && hasRows) {
+          setInjuries(data);
+          return;
+        }
+        for (const candidateId of gameIdCandidates) {
+          const legacyQs = new URLSearchParams({
+            homeTeam: String(game?.homeTeamFull || game?.homeTeam || ""),
+            awayTeam: String(game?.awayTeamFull || game?.awayTeam || ""),
+          });
+          const request = fetch(
+            `/api/game-detail/${encodeURIComponent(candidateId)}/injuries?${legacyQs.toString()}`,
+            { credentials: "include", cache: "no-store" }
+          ).then((res) => (res.ok ? res.json() : null));
+          const legacyData = await Promise.race([
+            request,
+            new Promise<null>((resolve) => setTimeout(() => resolve(null), 3000)),
+          ]);
+          if (!legacyData) continue;
+          const legacyHasRows =
+            Boolean(legacyData?.injuries?.home?.length) ||
+            Boolean(legacyData?.injuries?.away?.length);
+          if (!legacyHasRows) continue;
+          setInjuries(legacyData);
+          return;
+        }
+        if (data) setInjuries(data);
+      })
       .catch((err) => {
         console.error('[GameDetailPage] Failed to fetch injuries:', err);
       })
       .finally(() => setInjuriesLoading(false));
-  }, [activeTab, fullGameId, injuries, game?.homeTeamFull, game?.homeTeam, game?.awayTeamFull, game?.awayTeam]);
+  }, [activeTab, fullGameId, marketGameId, injuries, game?.homeTeamFull, game?.homeTeam, game?.awayTeamFull, game?.awayTeam, game?.sport, league]);
 
   // Fetch play-by-play when tab is selected or for live games (for last play on overview)
   useEffect(() => {
@@ -5769,20 +6798,22 @@ export function GameDetailPage() {
 
   // Auto-refresh play-by-play for live games (every 17 seconds)
   useEffect(() => {
-    if (game?.status !== 'LIVE' || !fullGameId) return;
+    if (game?.status !== 'LIVE' || !fullGameId || !isTabVisible) return;
     
     const interval = setInterval(() => {
+      if (typeof document !== "undefined" && document.visibilityState !== "visible") return;
       fetchPlayByPlay();
     }, 17000); // 17 seconds - within 15-20s range
     
     return () => clearInterval(interval);
-  }, [game?.status, fullGameId, fetchPlayByPlay]);
+  }, [game?.status, fullGameId, fetchPlayByPlay, isTabVisible]);
 
   // Auto-refresh for live games (20s)
   useEffect(() => {
-    if (game?.status !== 'LIVE') return;
+    if (game?.status !== 'LIVE' || !isTabVisible) return;
 
     const tick = async () => {
+      if (typeof document !== "undefined" && document.visibilityState !== "visible") return;
       if (gameRefreshInFlightRef.current) return;
       gameRefreshInFlightRef.current = true;
       try {
@@ -5791,11 +6822,13 @@ export function GameDetailPage() {
         gameRefreshInFlightRef.current = false;
       }
     };
+    // Do not wait for the first interval tick when a live page opens.
+    void tick();
     const interval = setInterval(() => {
       void tick();
     }, 20000);
     return () => clearInterval(interval);
-  }, [game?.status, fetchGame]);
+  }, [game?.status, fetchGame, isTabVisible]);
 
   // Route-owned page-data refresh handles odds updates; avoid duplicate endpoint polling.
   useEffect(() => {
@@ -5828,16 +6861,41 @@ export function GameDetailPage() {
   
   // Helper to get display name for team (full name preferred)
   const getTeamDisplayName = useCallback((isHome: boolean) => {
-    // Priority: API full name > teamInfo lookup > abbreviation
+    // Priority: API full name > display/lookup name > abbreviation
     const fullName = isHome ? game?.homeTeamFull : game?.awayTeamFull;
     if (fullName) return fullName;
     
     const info = isHome ? teamInfo?.home : teamInfo?.away;
     if (info?.fullName) return info.fullName;
+    if ((info as { displayName?: string } | undefined)?.displayName) return (info as { displayName: string }).displayName;
+    if ((info as { name?: string } | undefined)?.name) return (info as { name: string }).name;
     
     const abbr = isHome ? game?.homeTeam : game?.awayTeam;
     return abbr || (isHome ? 'HOME' : 'AWAY');
   }, [game, teamInfo]);
+  const getTeamLogoCode = useCallback((isHome: boolean): string => {
+    const preferred = String(isHome ? game?.homeTeam : game?.awayTeam || "").trim();
+    if (preferred) return preferred;
+    const display = getTeamDisplayName(isHome);
+    const initials = String(display || "")
+      .split(/\s+/)
+      .filter(Boolean)
+      .map((part) => part[0])
+      .join("")
+      .slice(0, 3)
+      .toUpperCase();
+    return initials || (isHome ? "HOM" : "AWY");
+  }, [game?.awayTeam, game?.homeTeam, getTeamDisplayName]);
+  const soccerCompetitionLabel = useMemo(() => {
+    if (!isSoccerContext) return null;
+    if (fromLeagueIdParam) {
+      const meta = getSoccerLeagueMeta(fromLeagueIdParam);
+      if (meta?.name) return meta.name;
+    }
+    const leagueLabel = String(game?.league || "").trim();
+    if (leagueLabel && leagueLabel.toUpperCase() !== "SOCCER") return leagueLabel;
+    return "Soccer";
+  }, [isSoccerContext, fromLeagueIdParam, game?.league]);
   const hasPropsTab = true;
   const viewMode = useMemo<ViewMode>(() => deriveViewMode(game?.status || "SCHEDULED"), [game?.status]);
   const previousModeRef = useRef<ViewMode | null>(null);
@@ -5860,6 +6918,7 @@ export function GameDetailPage() {
   useEffect(() => {
     if (!fullGameId) return;
     let cancelled = false;
+    const shouldPoll = game?.status === "LIVE" && isTabVisible;
     const fetchJobs = async () => {
       try {
         const viewerOffset = new Date().getTimezoneOffset();
@@ -5909,22 +6968,31 @@ export function GameDetailPage() {
       }
     };
     void fetchJobs();
-    const timer = setInterval(fetchJobs, 20000);
+    if (!shouldPoll) {
+      return () => {
+        cancelled = true;
+      };
+    }
+    const timer = setInterval(() => {
+      if (typeof document !== "undefined" && document.visibilityState !== "visible") return;
+      void fetchJobs();
+    }, 20000);
     return () => {
       cancelled = true;
       clearInterval(timer);
     };
-  }, [fullGameId]);
+  }, [fullGameId, game?.status, isTabVisible]);
 
   // Auto-refresh box score for live games so player stats stay current.
   useEffect(() => {
-    if (game?.status !== "LIVE" || !fullGameId) return;
+    if (game?.status !== "LIVE" || !fullGameId || !isTabVisible) return;
     void fetchBoxScore({ silent: true });
     const interval = setInterval(() => {
+      if (typeof document !== "undefined" && document.visibilityState !== "visible") return;
       void fetchBoxScore({ silent: true });
     }, 20000);
     return () => clearInterval(interval);
-  }, [fetchBoxScore, fullGameId, game?.status]);
+  }, [fetchBoxScore, fullGameId, game?.status, isTabVisible]);
 
   const liveNotes = useMemo(() => {
     const notes: Array<{ time: string; note: string }> = [];
@@ -5982,7 +7050,7 @@ export function GameDetailPage() {
     if (hasViewParam) return;
     if (previousModeRef.current === viewMode) return;
     previousModeRef.current = viewMode;
-    setActiveTab(viewMode === "live" ? "box-score" : viewMode === "final" ? "box-score" : "overview");
+    setActiveTab("overview");
   }, [game, searchParams, viewMode]);
 
   useEffect(() => {
@@ -6019,6 +7087,11 @@ export function GameDetailPage() {
   }
 
   if (!game) {
+    const safeNoGameMessage = isSoccerContext
+      ? (soccerDetailStatus === "unavailable"
+          ? "Game data unavailable"
+          : "Soccer match data is temporarily unavailable. Try another match or check back shortly.")
+      : (error || "Game not found");
     return (
       <div className="min-h-screen flex flex-col">
         <CinematicBackground />
@@ -6035,7 +7108,7 @@ export function GameDetailPage() {
         <div className="flex-1 flex items-center justify-center">
           <GlassCard className="relative z-10 p-8 text-center max-w-sm mx-4">
             <AlertCircle className="w-10 h-10 text-red-400 mx-auto mb-4" />
-            <p className="text-[#9CA3AF]">{error || 'Game not found'}</p>
+            <p className="text-[#9CA3AF]">{safeNoGameMessage}</p>
           </GlassCard>
         </div>
       </div>
@@ -6322,9 +7395,12 @@ export function GameDetailPage() {
 
           {viewMode === "pregame" && (
             <>
+              <MlbTopStatePanel game={{ ...game, playByPlay }} lastPlayUpdated={lastPlayUpdated} />
               <GameHeroPanel
                 game={game}
                 getTeamName={getTeamDisplayName}
+                getTeamLogoCode={getTeamLogoCode}
+                competitionLabel={soccerCompetitionLabel}
                 onTeamNavigate={(teamCode, teamName) => { void handleTeamNavigate(teamCode, teamName); }}
                 onTeamPrefetch={(teamCode, teamName) => { void prefetchTeamData(teamCode, teamName); }}
               />
@@ -6344,16 +7420,23 @@ export function GameDetailPage() {
                   document.getElementById("coachg-full-breakdown")?.scrollIntoView({ behavior: "smooth", block: "start" });
                 }}
               />
-              <CoachGIntelligenceSections game={game} gameId={fullGameId} />
+              <CoachGIntelligenceSections
+                game={game}
+                gameId={fullGameId}
+                videoJob={latestCoachVideo || latestCoachVideoJob}
+              />
               <BettingIntelligencePanel game={game} />
             </>
           )}
 
           {viewMode === "live" && (
             <>
+              <MlbTopStatePanel game={{ ...game, playByPlay }} lastPlayUpdated={lastPlayUpdated} />
               <LiveHeroScoreboard
                 game={game}
                 getTeamName={getTeamDisplayName}
+                getTeamLogoCode={getTeamLogoCode}
+                competitionLabel={soccerCompetitionLabel}
                 lastPlay={lastPlay}
                 onTeamNavigate={(teamCode, teamName) => { void handleTeamNavigate(teamCode, teamName); }}
                 onTeamPrefetch={(teamCode, teamName) => { void prefetchTeamData(teamCode, teamName); }}
@@ -6373,6 +7456,8 @@ export function GameDetailPage() {
               <FinalHeroPanel
                 game={game}
                 getTeamName={getTeamDisplayName}
+                getTeamLogoCode={getTeamLogoCode}
+                competitionLabel={soccerCompetitionLabel}
                 onTeamNavigate={(teamCode, teamName) => { void handleTeamNavigate(teamCode, teamName); }}
                 onTeamPrefetch={(teamCode, teamName) => { void prefetchTeamData(teamCode, teamName); }}
               />
@@ -6459,6 +7544,172 @@ function normalizeStatus(status: string | undefined): 'LIVE' | 'SCHEDULED' | 'FI
   if (s === 'LIVE' || s === 'IN_PROGRESS') return 'LIVE';
   if (s === 'FINAL' || s === 'COMPLETE' || s === 'COMPLETED') return 'FINAL';
   return 'SCHEDULED';
+}
+
+function normalizeMlbLiveState(raw: any): MlbLiveState | null {
+  if (!raw || typeof raw !== "object") return null;
+  const toNum = (value: unknown): number | null => {
+    if (typeof value === "number" && Number.isFinite(value)) return value;
+    if (typeof value === "string" && value.trim().length > 0) {
+      const parsed = Number(value);
+      return Number.isFinite(parsed) ? parsed : null;
+    }
+    return null;
+  };
+  const toStr = (value: unknown): string | null => {
+    const normalized = String(value ?? "").trim();
+    return normalized || null;
+  };
+  const inningHalfRaw = toStr(raw?.inningHalf);
+  const inningHalf = inningHalfRaw
+    ? (inningHalfRaw.toLowerCase().startsWith("top") ? "top" : inningHalfRaw.toLowerCase().startsWith("bot") ? "bottom" : null)
+    : null;
+  const runners = raw?.runnersOnBase && typeof raw.runnersOnBase === "object"
+    ? {
+        first: Boolean(raw.runnersOnBase.first),
+        second: Boolean(raw.runnersOnBase.second),
+        third: Boolean(raw.runnersOnBase.third),
+      }
+    : null;
+  const currentBatter = raw?.currentBatter && typeof raw.currentBatter === "object"
+    ? {
+        name: toStr(raw.currentBatter.name),
+        handedness: toStr(raw.currentBatter.handedness),
+      }
+    : null;
+  const currentPitcher = raw?.currentPitcher && typeof raw.currentPitcher === "object"
+    ? {
+        name: toStr(raw.currentPitcher.name),
+        handedness: toStr(raw.currentPitcher.handedness),
+      }
+    : null;
+  const lastPlay = raw?.lastPlay && typeof raw.lastPlay === "object"
+    ? {
+        type: toStr(raw.lastPlay.type),
+        player: toStr(raw.lastPlay.player),
+        text: toStr(raw.lastPlay.text),
+        timestamp: toStr(raw.lastPlay.timestamp),
+      }
+    : null;
+  const normalized: MlbLiveState = {
+    inningNumber: toNum(raw?.inningNumber),
+    inningHalf,
+    outs: toNum(raw?.outs),
+    balls: toNum(raw?.balls),
+    strikes: toNum(raw?.strikes),
+    runnersOnBase: runners,
+    currentBatter,
+    currentPitcher,
+    lastPlay,
+  };
+  const hasAny =
+    normalized.inningNumber !== null
+    || normalized.inningHalf !== null
+    || normalized.outs !== null
+    || normalized.balls !== null
+    || normalized.strikes !== null
+    || Boolean(normalized.runnersOnBase && (normalized.runnersOnBase.first || normalized.runnersOnBase.second || normalized.runnersOnBase.third))
+    || Boolean(normalized.currentBatter?.name || normalized.currentPitcher?.name)
+    || Boolean(normalized.lastPlay?.text || normalized.lastPlay?.type);
+  return hasAny ? normalized : null;
+}
+
+function normalizeMlbPregamePitcher(raw: any): MlbPitcherState | null {
+  if (!raw || typeof raw !== "object") return null;
+  const toStr = (value: unknown): string | null => {
+    const normalized = String(value ?? "").trim();
+    return normalized || null;
+  };
+  const name = toStr(raw?.name);
+  const handedness = toStr(raw?.handedness);
+  const era = toStr(raw?.era);
+  const last5 = toStr(raw?.last5);
+  if (!name && !handedness && !era && !last5) return null;
+  return { name, handedness, era, last5 };
+}
+
+function normalizeMlbPregameState(raw: any, gameFallback?: any): MlbPregameState | null {
+  const primary = raw && typeof raw === "object" ? raw : {};
+  const probableHomePitcher = normalizeMlbPregamePitcher(primary?.probableHomePitcher);
+  const probableAwayPitcher = normalizeMlbPregamePitcher(primary?.probableAwayPitcher);
+  if (probableHomePitcher || probableAwayPitcher) {
+    return { probableHomePitcher, probableAwayPitcher };
+  }
+  const fallbackHome = readProbablePitcher(gameFallback, "home");
+  const fallbackAway = readProbablePitcher(gameFallback, "away");
+  if (!fallbackHome && !fallbackAway) return null;
+  return {
+    probableHomePitcher: fallbackHome
+      ? {
+          name: fallbackHome.name,
+          handedness: fallbackHome.handedness || null,
+          era: fallbackHome.era || null,
+          last5: fallbackHome.last5 || null,
+        }
+      : null,
+    probableAwayPitcher: fallbackAway
+      ? {
+          name: fallbackAway.name,
+          handedness: fallbackAway.handedness || null,
+          era: fallbackAway.era || null,
+          last5: fallbackAway.last5 || null,
+        }
+      : null,
+  };
+}
+
+function readProbablePitcher(
+  game: any,
+  side: "away" | "home"
+): { name: string; record?: string; handedness?: string; era?: string; last5?: string } | undefined {
+  if (!game || typeof game !== "object") return undefined;
+  const sideKey = side === "away" ? "away" : "home";
+  const mlbPregameNode = game?.mlbPregameState?.[side === "away" ? "probableAwayPitcher" : "probableHomePitcher"];
+  const nested = game?.probable_pitchers?.[sideKey] || game?.probablePitchers?.[sideKey];
+  const name = String(
+    mlbPregameNode?.name
+    || nested?.name
+    || nested?.full_name
+    || game?.[side === "away" ? "probable_away_pitcher_name" : "probable_home_pitcher_name"]
+    || game?.[side === "away" ? "probableAwayPitcherName" : "probableHomePitcherName"]
+    || ""
+  ).trim();
+  if (!name) return undefined;
+  const record = String(
+    nested?.record
+    || game?.[side === "away" ? "probable_away_pitcher_record" : "probable_home_pitcher_record"]
+    || game?.[side === "away" ? "probableAwayPitcherRecord" : "probableHomePitcherRecord"]
+    || ""
+  ).trim();
+  const handedness = String(
+    mlbPregameNode?.handedness
+    || nested?.handedness
+    || game?.[side === "away" ? "probable_away_pitcher_handedness" : "probable_home_pitcher_handedness"]
+    || game?.[side === "away" ? "probableAwayPitcherHandedness" : "probableHomePitcherHandedness"]
+    || ""
+  ).trim();
+  const era = String(
+    mlbPregameNode?.era
+    || nested?.era
+    || game?.[side === "away" ? "probable_away_pitcher_era" : "probable_home_pitcher_era"]
+    || game?.[side === "away" ? "probableAwayPitcherEra" : "probableHomePitcherEra"]
+    || ""
+  ).trim();
+  const last5 = String(
+    mlbPregameNode?.last5
+    || nested?.last5
+    || nested?.last_five
+    || game?.[side === "away" ? "probable_away_pitcher_last5" : "probable_home_pitcher_last5"]
+    || game?.[side === "away" ? "probableAwayPitcherLast5" : "probableHomePitcherLast5"]
+    || ""
+  ).trim();
+  return {
+    name,
+    record: record || undefined,
+    handedness: handedness || undefined,
+    era: era || undefined,
+    last5: last5 || undefined,
+  };
 }
 
 export default GameDetailPage;

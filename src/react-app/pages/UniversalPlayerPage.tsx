@@ -9,7 +9,7 @@ import {
 import { getTeamLogoUrl } from "@/react-app/lib/teamLogos";
 import { toGameDetailPath } from "@/react-app/lib/gameRoutes";
 import { fetchJsonCached } from "@/react-app/lib/fetchCache";
-import { buildTeamRoute, logTeamNavigation } from "@/react-app/lib/navigationRoutes";
+import { buildTeamRoute, canonicalPlayerIdQueryParam, logTeamNavigation } from "@/react-app/lib/navigationRoutes";
 
 // ============================================================
 // TYPES
@@ -570,7 +570,7 @@ export default function UniversalPlayerPage() {
   const [props, setProps] = useState<PropLine[]>([]);
   const [news, setNews] = useState<NewsItem[]>([]);
   const [nextGame, setNextGame] = useState<NextGame | null>(null);
-  
+
   const sportLower = sportKey?.toLowerCase() || 'nba';
   const config = SPORT_CONFIG[sportLower] || SPORT_CONFIG.nba;
 
@@ -599,57 +599,46 @@ export default function UniversalPlayerPage() {
       let apiCalls = 0;
       setLoading(true);
       setError(null);
-      
+
       try {
-        // Convert slug to player name for API
-        const playerName = playerId.split('-').map(p => 
-          p.charAt(0).toUpperCase() + p.slice(1)
-        ).join(' ');
-        setPlayer((prev) => prev ?? buildProvisionalPlayer(playerId));
-        setLoading(false);
-        
-        apiCalls += 1;
-        console.info("PAGE_DATA_START", { route: "universal-player", sport: sportLower.toUpperCase(), playerName });
-        const baseCacheKey = `page-data:universal-player:${sportLower.toUpperCase()}:${playerName}`;
-        let payload: { data?: { profile?: APIPlayerResponse; canonicalTeamRouteId?: string | null } } | null = null;
-        for (let attempt = 0; attempt < 2; attempt += 1) {
-          try {
-            payload = await fetchJsonCached<{ data?: { profile?: APIPlayerResponse; canonicalTeamRouteId?: string | null } }>(
-              `/api/page-data/player-profile?sport=${encodeURIComponent(sportLower.toUpperCase())}&playerName=${encodeURIComponent(playerName)}`,
-              {
-                cacheKey: attempt > 0 ? `${baseCacheKey}:retry` : baseCacheKey,
-                ttlMs: 45_000,
-                timeoutMs: 8_000,
-                bypassCache: attempt > 0,
-                init: { credentials: "include" },
-              }
-            );
-            break;
-          } catch (attemptErr: any) {
-            const msg = String(attemptErr?.message || "").toLowerCase();
-            if (msg.includes("timeout") && attempt === 0) {
-              console.warn("PAGE_DATA_TIMEOUT", { route: "universal-player", sport: sportLower.toUpperCase(), playerId, attempt: 1 });
-              continue;
-            }
-            throw attemptErr;
-          }
-        }
-        if (!payload) {
-          console.warn("PAGE_DATA_FALLBACK_USED", { route: "universal-player", reason: "empty_payload", sport: sportLower.toUpperCase(), playerId });
+        const canonicalPlayerId =
+          canonicalPlayerIdQueryParam(playerId)
+          ?? canonicalPlayerIdQueryParam(decodeURIComponent(String(playerId || "")));
+        if (!canonicalPlayerId) {
+          console.error("UNIVERSAL_PLAYER_MISSING_NUMERIC_ID", { sport: sportLower, playerId });
+          setPlayer((prev) => prev ?? buildProvisionalPlayer(playerId));
+          setLoading(false);
           return;
         }
-        
-        processPlayerData(payload?.data?.profile as APIPlayerResponse);
+        setPlayer((prev) => prev ?? buildProvisionalPlayer(playerId));
+        setLoading(false);
+
+        apiCalls += 1;
+        console.info("PAGE_DATA_START", { route: "universal-player", sport: sportLower.toUpperCase(), playerId: canonicalPlayerId });
+        const fetchCacheKey = `player-pd:${sportLower.toUpperCase()}:${canonicalPlayerId}`;
+        const pdUrl = `/api/page-data/player-profile?sport=${encodeURIComponent(sportLower.toUpperCase())}&playerId=${encodeURIComponent(canonicalPlayerId)}`;
+        const payload = await fetchJsonCached<{ data?: { profile?: APIPlayerResponse; canonicalTeamRouteId?: string | null } }>(
+          pdUrl,
+          {
+            cacheKey: fetchCacheKey,
+            ttlMs: 45_000,
+            timeoutMs: 8_000,
+            init: { credentials: "include" },
+          }
+        );
+
+        const prof = payload?.data?.profile as APIPlayerResponse;
+        processPlayerData(prof);
         setCanonicalTeamRouteId(String(payload?.data?.canonicalTeamRouteId || "").trim());
         console.info("PAGE_DATA_SUCCESS", {
           route: "universal-player",
           sport: sportLower.toUpperCase(),
-          playerName,
+          playerId: canonicalPlayerId,
           hasPlayer: Boolean(payload?.data?.profile?.player),
         });
         
       } catch (err) {
-        console.error('Error fetching player:', err);
+        console.error("Error fetching player:", err);
         const msg = String((err as any)?.message || "");
         if (msg.toLowerCase().includes("timeout") || String((err as any)?.name || "") === "AbortError") {
           console.warn("PAGE_DATA_TIMEOUT", { route: "universal-player", sport: sportLower.toUpperCase(), playerId });
@@ -770,8 +759,18 @@ export default function UniversalPlayerPage() {
 
   if (!player) {
     return (
-      <div className="min-h-screen bg-gradient-to-br from-slate-950 via-slate-900 to-slate-950 flex items-center justify-center">
-        <div className="text-white/60">Player not found</div>
+      <div className="min-h-screen bg-gradient-to-br from-slate-950 via-slate-900 to-slate-950 flex flex-col items-center justify-center px-6 text-center gap-4">
+        <p className="text-white/80 text-lg font-medium">Player link incomplete</p>
+        <p className="text-white/50 text-sm max-w-md">
+          Open a player from the sports hub or Player Props search for a full profile.
+        </p>
+        <button
+          type="button"
+          onClick={() => navigate(`/sports/${sportLower}`)}
+          className="px-4 py-2 rounded-xl bg-cyan-500/20 text-cyan-200 border border-cyan-500/40 hover:bg-cyan-500/30"
+        >
+          Back to {config.name}
+        </button>
       </div>
     );
   }

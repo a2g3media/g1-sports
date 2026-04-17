@@ -72,6 +72,45 @@ const errorCache = new Map<string, CacheEntry<string>>();
 
 let apiKey: string | null = null;
 
+type MlbPitcherState = {
+  name: string | null;
+  handedness: string | null;
+  era: string | null;
+  last5: string | null;
+};
+
+type MlbLiveState = {
+  inningNumber: number | null;
+  inningHalf: "top" | "bottom" | null;
+  outs: number | null;
+  balls: number | null;
+  strikes: number | null;
+  runnersOnBase: {
+    first: boolean;
+    second: boolean;
+    third: boolean;
+  } | null;
+  currentBatter: {
+    name: string | null;
+    handedness: string | null;
+  } | null;
+  currentPitcher: {
+    name: string | null;
+    handedness: string | null;
+  } | null;
+  lastPlay: {
+    type: string | null;
+    player: string | null;
+    text: string | null;
+    timestamp: string | null;
+  } | null;
+};
+
+type MlbPregameState = {
+  probableHomePitcher: MlbPitcherState | null;
+  probableAwayPitcher: MlbPitcherState | null;
+};
+
 /**
  * Initialize the SportsRadar provider with an API key
  */
@@ -232,6 +271,281 @@ function extractTeamName(team: any): string {
   return team?.name || team?.market || team?.alias || 'Unknown';
 }
 
+function extractPitcherRecord(source: any): string | undefined {
+  const direct = String(
+    source?.record?.summary
+    || source?.record?.display
+    || source?.record
+    || source?.summary
+    || source?.pitching_record
+    || source?.pitcher_record
+    || ""
+  ).trim();
+  const directMatch = direct.match(/\d+\s*-\s*\d+/);
+  if (directMatch) return directMatch[0].replace(/\s+/g, "");
+
+  const wins = Number(
+    source?.wins
+    ?? source?.win
+    ?? source?.w
+    ?? source?.statistics?.wins
+    ?? source?.stats?.wins
+  );
+  const losses = Number(
+    source?.losses
+    ?? source?.loss
+    ?? source?.l
+    ?? source?.statistics?.losses
+    ?? source?.stats?.losses
+  );
+  if (Number.isFinite(wins) && Number.isFinite(losses)) {
+    return `${Math.max(0, Math.trunc(wins))}-${Math.max(0, Math.trunc(losses))}`;
+  }
+
+  return undefined;
+}
+
+function asNullableString(value: unknown): string | null {
+  const normalized = String(value ?? "").trim();
+  return normalized ? normalized : null;
+}
+
+function asNullableNumber(value: unknown): number | null {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string" && value.trim().length > 0) {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return null;
+}
+
+function normalizeHandedness(value: unknown): string | null {
+  const raw = asNullableString(value);
+  if (!raw) return null;
+  const upper = raw.toUpperCase();
+  if (upper === "L" || upper.startsWith("LEFT")) return "LHP";
+  if (upper === "R" || upper.startsWith("RIGHT")) return "RHP";
+  if (upper === "S" || upper.startsWith("SWITCH")) return "S";
+  return raw;
+}
+
+function extractMlbPitcherSummary(source: any): MlbPitcherState | null {
+  if (!source || typeof source !== "object") return null;
+  const name = asNullableString(
+    source?.full_name
+    || `${source?.first_name || ""} ${source?.last_name || ""}`.trim()
+    || source?.name
+    || source?.display_name
+  );
+  const handedness = normalizeHandedness(
+    source?.throws
+    || source?.throw_hand
+    || source?.handedness
+    || source?.pitching_hand
+    || source?.throwing_hand
+  );
+  const eraRaw = asNullableNumber(
+    source?.era
+    ?? source?.statistics?.era
+    ?? source?.stats?.era
+    ?? source?.season?.era
+    ?? source?.season_stats?.era
+  );
+  const era = eraRaw !== null ? eraRaw.toFixed(2) : null;
+  const last5 = asNullableString(
+    source?.last5
+    || source?.last_five
+    || source?.last_five_starts
+    || source?.recent_form
+    || source?.form
+  );
+  const hasAny = Boolean(name || handedness || era || last5);
+  if (!hasAny) return null;
+  return { name, handedness, era, last5 };
+}
+
+function extractMlbProbablePitcher(team: any, srGame?: any): { name?: string; record?: string } {
+  const candidates: any[] = [
+    team?.probable_pitcher,
+    team?.probablePitcher,
+    team?.starting_pitcher,
+    team?.starter,
+    team?.probable,
+  ];
+  if (srGame && typeof srGame === "object") {
+    candidates.push(
+      srGame?.probable_pitcher,
+      srGame?.probablePitcher,
+      srGame?.starting_pitcher
+    );
+  }
+
+  const probable = candidates.find((row) => row && typeof row === "object");
+  if (!probable) return {};
+
+  const name = String(
+    probable?.full_name
+    || `${probable?.first_name || ""} ${probable?.last_name || ""}`.trim()
+    || probable?.name
+    || probable?.display_name
+    || ""
+  ).trim();
+  const record = extractPitcherRecord(probable);
+
+  return {
+    name: name || undefined,
+    record: record || undefined,
+  };
+}
+
+function extractMlbProbablePitcherNode(team: any, side: "home" | "away", srGame?: any): any {
+  const teamNodeCandidates = [
+    team?.probable_pitcher,
+    team?.probablePitcher,
+    team?.starting_pitcher,
+    team?.starter,
+    team?.probable,
+  ];
+  const sideNodeCandidates = srGame
+    ? [
+        srGame?.probable_pitchers?.[side],
+        srGame?.probablePitchers?.[side],
+        side === "home" ? srGame?.probable_home_pitcher : srGame?.probable_away_pitcher,
+        side === "home" ? srGame?.probableHomePitcher : srGame?.probableAwayPitcher,
+        side === "home" ? srGame?.starting_pitcher_home : srGame?.starting_pitcher_away,
+      ]
+    : [];
+  return [...teamNodeCandidates, ...sideNodeCandidates].find((node) => node && typeof node === "object") || null;
+}
+
+function extractMlbPregameState(srGame: any, homeTeam: any, awayTeam: any): MlbPregameState | undefined {
+  const homeNode = extractMlbProbablePitcherNode(homeTeam, "home", srGame);
+  const awayNode = extractMlbProbablePitcherNode(awayTeam, "away", srGame);
+  const probableHomePitcher = extractMlbPitcherSummary(homeNode);
+  const probableAwayPitcher = extractMlbPitcherSummary(awayNode);
+  return {
+    probableHomePitcher,
+    probableAwayPitcher,
+  };
+}
+
+function readBaseRunnerPresence(situation: any, baseKey: "first" | "second" | "third"): boolean {
+  const keyMap: Record<"first" | "second" | "third", string[]> = {
+    first: ["on_first", "first", "first_base", "runner_on_first", "is_first_base_occupied"],
+    second: ["on_second", "second", "second_base", "runner_on_second", "is_second_base_occupied"],
+    third: ["on_third", "third", "third_base", "runner_on_third", "is_third_base_occupied"],
+  };
+  for (const key of keyMap[baseKey]) {
+    const value = situation?.[key];
+    if (typeof value === "boolean") return value;
+    if (typeof value === "number") return value > 0;
+    if (typeof value === "string") {
+      const normalized = value.trim().toLowerCase();
+      if (["1", "true", "yes", "occupied"].includes(normalized)) return true;
+      if (["0", "false", "no", "empty"].includes(normalized)) return false;
+    }
+    if (value && typeof value === "object") return true;
+  }
+  return false;
+}
+
+function extractMlbLiveState(srGame: any): MlbLiveState | undefined {
+  if (!srGame || typeof srGame !== "object") return undefined;
+  const situation = srGame?.situation || srGame?.game_situation || srGame?.live || {};
+  const inningNumber = asNullableNumber(
+    situation?.inning
+    ?? situation?.inning_number
+    ?? srGame?.inning
+    ?? srGame?.current_inning
+    ?? srGame?.period
+  );
+  const inningHalfRaw = asNullableString(
+    situation?.inning_half
+    || situation?.half
+    || situation?.half_inning
+    || srGame?.inning_half
+    || srGame?.half_inning
+  );
+  const inningHalf = (() => {
+    const normalized = String(inningHalfRaw || "").toLowerCase();
+    if (!normalized) return null;
+    if (normalized.startsWith("top") || normalized === "t" || normalized === "1" || normalized === "away") return "top";
+    if (normalized.startsWith("bot") || normalized.startsWith("bottom") || normalized === "b" || normalized === "2" || normalized === "home") return "bottom";
+    return null;
+  })();
+  const outs = asNullableNumber(situation?.outs ?? situation?.out_count ?? srGame?.outs);
+  const balls = asNullableNumber(
+    situation?.balls
+    ?? situation?.count?.balls
+    ?? situation?.at_bat?.balls
+  );
+  const strikes = asNullableNumber(
+    situation?.strikes
+    ?? situation?.count?.strikes
+    ?? situation?.at_bat?.strikes
+  );
+  const runnersOnBase = situation
+    ? {
+        first: readBaseRunnerPresence(situation, "first"),
+        second: readBaseRunnerPresence(situation, "second"),
+        third: readBaseRunnerPresence(situation, "third"),
+      }
+    : null;
+  const batterNode = situation?.batter || situation?.current_batter || situation?.at_bat?.batter || null;
+  const pitcherNode = situation?.pitcher || situation?.current_pitcher || situation?.defense?.pitcher || null;
+  const currentBatter = batterNode
+    ? {
+        name: asNullableString(batterNode?.full_name || batterNode?.name || batterNode?.display_name),
+        handedness: normalizeHandedness(
+          batterNode?.bats
+          || batterNode?.bat_hand
+          || batterNode?.handedness
+        ),
+      }
+    : null;
+  const currentPitcher = pitcherNode
+    ? {
+        name: asNullableString(pitcherNode?.full_name || pitcherNode?.name || pitcherNode?.display_name),
+        handedness: normalizeHandedness(
+          pitcherNode?.throws
+          || pitcherNode?.throw_hand
+          || pitcherNode?.handedness
+          || pitcherNode?.pitching_hand
+        ),
+      }
+    : null;
+  const lastPlayNode =
+    situation?.last_play
+    || srGame?.last_play
+    || srGame?.lastPlay
+    || srGame?.scoring?.last_play
+    || null;
+  const lastPlay = lastPlayNode
+    ? {
+        type: asNullableString(lastPlayNode?.event_type || lastPlayNode?.type),
+        player: asNullableString(
+          lastPlayNode?.player?.full_name
+          || lastPlayNode?.player?.name
+          || lastPlayNode?.hitter?.full_name
+          || lastPlayNode?.hitter?.name
+        ),
+        text: asNullableString(lastPlayNode?.description || lastPlayNode?.text || lastPlayNode?.title),
+        timestamp: asNullableString(lastPlayNode?.updated || lastPlayNode?.timestamp || lastPlayNode?.wall_clock),
+      }
+    : null;
+  return {
+    inningNumber,
+    inningHalf,
+    outs,
+    balls,
+    strikes,
+    runnersOnBase,
+    currentBatter,
+    currentPitcher,
+    lastPlay,
+  };
+}
+
 // ============================================
 // FETCH WITH RETRY
 // ============================================
@@ -316,7 +630,16 @@ async function fetchWithRetry(url: string, maxRetries: number = 2): Promise<Resp
 export async function fetchLiveScores(
   sport: SportKey, 
   gameId: string
-): Promise<{ homeScore?: number; awayScore?: number; status?: string; period?: number; periodLabel?: string; clock?: string } | null> {
+): Promise<{
+  homeScore?: number;
+  awayScore?: number;
+  status?: string;
+  period?: number;
+  periodLabel?: string;
+  clock?: string;
+  mlbLiveState?: MlbLiveState;
+  mlbPregameState?: MlbPregameState;
+} | null> {
   const config = SPORT_API_CONFIG[sport];
   if (!config || !apiKey) return null;
   
@@ -342,6 +665,10 @@ export async function fetchLiveScores(
     }
     
     const periodInfo = mapPeriod(sport, data);
+    const homeTeam = data.home || data.home_team;
+    const awayTeam = data.away || data.away_team;
+    const mlbLiveState = sport === "mlb" ? extractMlbLiveState(data) : undefined;
+    const mlbPregameState = sport === "mlb" ? extractMlbPregameState(data, homeTeam, awayTeam) : undefined;
     
     // Extract scores - summary endpoint has them in various locations
     // For LIVE games, scores may be under .scoring or need to be summed from periods
@@ -378,7 +705,9 @@ export async function fetchLiveScores(
       status: actualStatus,
       period: periodInfo.period,
       periodLabel: periodInfo.periodLabel,
-      clock: periodInfo.clock
+      clock: periodInfo.clock,
+      mlbLiveState,
+      mlbPregameState,
     };
   } catch (err) {
     console.log(`[SR Game Provider] Failed to fetch live scores for ${gameId}: ${err}`);
@@ -472,6 +801,20 @@ async function fetchGamesFromSportsRadar(sport: SportKey, date: Date): Promise<{
         if (!home || !away) continue;
         
         const periodInfo = mapPeriod(sport, srGame);
+        const awayProbablePitcher = sport === "mlb" ? extractMlbProbablePitcher(away, srGame) : {};
+        const homeProbablePitcher = sport === "mlb" ? extractMlbProbablePitcher(home, srGame) : {};
+        const mlbPregameState = sport === "mlb" ? extractMlbPregameState(srGame, home, away) : undefined;
+        const mlbLiveState = sport === "mlb" ? extractMlbLiveState(srGame) : undefined;
+        const probablePitchers = sport === "mlb" && (awayProbablePitcher.name || homeProbablePitcher.name)
+          ? {
+              away: awayProbablePitcher.name
+                ? { name: awayProbablePitcher.name, record: awayProbablePitcher.record }
+                : undefined,
+              home: homeProbablePitcher.name
+                ? { name: homeProbablePitcher.name, record: homeProbablePitcher.record }
+                : undefined,
+            }
+          : undefined;
         
         // Extract scores with multiple fallback paths
         // MLB uses .runs, other sports use .points
@@ -517,6 +860,13 @@ async function fetchGamesFromSportsRadar(sport: SportKey, date: Date): Promise<{
           venue: srGame.venue?.name,
           broadcast: srGame.broadcast?.network || srGame.broadcasts?.[0]?.network,
           last_updated_at: new Date().toISOString(),
+          probable_away_pitcher_name: awayProbablePitcher.name,
+          probable_away_pitcher_record: awayProbablePitcher.record,
+          probable_home_pitcher_name: homeProbablePitcher.name,
+          probable_home_pitcher_record: homeProbablePitcher.record,
+          probable_pitchers: probablePitchers,
+          mlbLiveState,
+          mlbPregameState,
         };
         
         games.push(game);
@@ -569,6 +919,8 @@ async function fetchGamesFromSportsRadar(sport: SportKey, date: Date): Promise<{
             game.period = result.scores.period ?? game.period;
             game.period_label = result.scores.periodLabel ?? game.period_label;
             game.clock = result.scores.clock ?? game.clock;
+            game.mlbLiveState = result.scores.mlbLiveState ?? game.mlbLiveState;
+            game.mlbPregameState = result.scores.mlbPregameState ?? game.mlbPregameState;
           }
         }
       }
@@ -711,6 +1063,20 @@ export const sportsRadarGameProvider: SportsDataProvider = {
       }
       
       const periodInfo = mapPeriod(sport, srGame);
+      const awayProbablePitcher = sport === "mlb" ? extractMlbProbablePitcher(away, srGame) : {};
+      const homeProbablePitcher = sport === "mlb" ? extractMlbProbablePitcher(home, srGame) : {};
+      const mlbPregameState = sport === "mlb" ? extractMlbPregameState(srGame, home, away) : undefined;
+      const mlbLiveState = sport === "mlb" ? extractMlbLiveState(srGame) : undefined;
+      const probablePitchers = sport === "mlb" && (awayProbablePitcher.name || homeProbablePitcher.name)
+        ? {
+            away: awayProbablePitcher.name
+              ? { name: awayProbablePitcher.name, record: awayProbablePitcher.record }
+              : undefined,
+            home: homeProbablePitcher.name
+              ? { name: homeProbablePitcher.name, record: homeProbablePitcher.record }
+              : undefined,
+          }
+        : undefined;
       
       // Extract scores with multiple fallback paths
       // MLB uses .runs, other sports use .points
@@ -755,6 +1121,13 @@ export const sportsRadarGameProvider: SportsDataProvider = {
         venue: srGame.venue?.name,
         broadcast: srGame.broadcast?.network,
         last_updated_at: new Date().toISOString(),
+        probable_away_pitcher_name: awayProbablePitcher.name,
+        probable_away_pitcher_record: awayProbablePitcher.record,
+        probable_home_pitcher_name: homeProbablePitcher.name,
+        probable_home_pitcher_record: homeProbablePitcher.record,
+        probable_pitchers: probablePitchers,
+        mlbLiveState,
+        mlbPregameState,
       };
       
       // Build game detail with additional data

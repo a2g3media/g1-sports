@@ -9,6 +9,7 @@ import {
   SOCCER_COMPETITIONS
 } from '../services/sports-data/sportsRadarProvider';
 import { cachedFetch, API_CACHE_TTL } from '../services/apiCacheService';
+import { extractSoccerIdToken, toSoccerProviderMatchId } from '../../shared/canonicalSoccerId';
 
 // ============================================================================
 // ESPN LEAGUE IDS FOR SOCCER
@@ -193,6 +194,113 @@ type Bindings = {
 };
 
 const soccer = new Hono<{ Bindings: Bindings }>();
+const SOCCER_STANDINGS_TIMEOUT_MS = 1_500;
+const SOCCER_STANDINGS_HOT_TTL_MS = 60_000;
+const SOCCER_STANDINGS_STALE_TTL_MS = 10 * 60_000;
+const SOCCER_PLAYER_TIMEOUT_MS = 1_500;
+const SOCCER_PLAYER_HOT_TTL_MS = 60_000;
+const SOCCER_PLAYER_STALE_TTL_MS = 10 * 60_000;
+type SoccerPlayerApiPayload = {
+  player: {
+    id: string;
+    name: string;
+    nationality: string;
+    dateOfBirth: string | null;
+    height: number | string | null;
+    weight: number | string | null;
+    position: string;
+    jerseyNumber: number | null;
+    team: { id: string; name: string } | null;
+    competition: { id: string; name: string } | null;
+    photoUrl?: string | null;
+  };
+  stats: {
+    appearances: number;
+    goals: number;
+    assists: number;
+    yellowCards: number;
+    redCards: number;
+    minutesPlayed: number;
+  };
+  recentMatches: any[];
+  found: boolean;
+  status?: "ok" | "degraded" | "not_found";
+  pending_refresh?: boolean;
+  degraded?: boolean;
+  source?: string;
+  reason?: string;
+  cached?: boolean;
+};
+const soccerPlayerHotCache = new Map<string, {
+  payload: SoccerPlayerApiPayload;
+  expiresAtMs: number;
+  staleUntilMs: number;
+}>();
+
+function buildSoccerPlayerFallbackPayload(params: {
+  playerId: string;
+  playerName?: string;
+  reason: string;
+  seed?: Partial<SoccerPlayerApiPayload> | null;
+}): SoccerPlayerApiPayload {
+  const seed = params.seed || {};
+  const seedPlayer = (seed.player && typeof seed.player === "object") ? seed.player : null;
+  const safeName =
+    String(seedPlayer?.name || params.playerName || "").trim()
+    || (String(params.playerId || "").startsWith("espn:") ? `ESPN Player ${String(params.playerId || "").replace("espn:", "")}` : "Soccer Player");
+  return {
+    player: {
+      id: String(seedPlayer?.id || params.playerId || "").trim(),
+      name: safeName,
+      nationality: String(seedPlayer?.nationality || "").trim(),
+      dateOfBirth: seedPlayer?.dateOfBirth ?? null,
+      height: typeof seedPlayer?.height === "number" ? seedPlayer.height : null,
+      weight: typeof seedPlayer?.weight === "number" ? seedPlayer.weight : null,
+      position: String(seedPlayer?.position || "").trim() || "Unknown",
+      jerseyNumber: typeof seedPlayer?.jerseyNumber === "number" ? seedPlayer.jerseyNumber : null,
+      team: seedPlayer?.team || null,
+      competition: seedPlayer?.competition || null,
+      photoUrl: seedPlayer?.photoUrl || null,
+    },
+    stats: {
+      appearances: Number((seed.stats as any)?.appearances || 0) || 0,
+      goals: Number((seed.stats as any)?.goals || 0) || 0,
+      assists: Number((seed.stats as any)?.assists || 0) || 0,
+      yellowCards: Number((seed.stats as any)?.yellowCards || 0) || 0,
+      redCards: Number((seed.stats as any)?.redCards || 0) || 0,
+      minutesPlayed: Number((seed.stats as any)?.minutesPlayed || 0) || 0,
+    },
+    recentMatches: Array.isArray(seed.recentMatches) ? seed.recentMatches : [],
+    found: Boolean(seed.found && seedPlayer?.name),
+    status: "degraded",
+    pending_refresh: true,
+    degraded: true,
+    reason: params.reason,
+    source: String(seed.source || "fallback"),
+  };
+}
+
+function isLikelySoccerPlayerId(value: string): boolean {
+  const id = String(value || "").trim();
+  if (!id) return false;
+  if (/^\d+$/.test(id)) return true; // ESPN numeric athlete id
+  if (/^espn:\d+$/i.test(id)) return true;
+  if (/^sr:player:[\w:-]+$/i.test(id)) return true;
+  return false;
+}
+const soccerStandingsHotCache = new Map<string, {
+  payload: {
+    competition: any;
+    season: any;
+    standings: any[];
+    cached: boolean;
+    errors: string[];
+    status?: "ok" | "degraded";
+    pending_refresh?: boolean;
+  };
+  expiresAtMs: number;
+  staleUntilMs: number;
+}>();
 
 /**
  * Get league summaries for directory page
@@ -592,41 +700,95 @@ soccer.get('/standings/:competitionKey', async (c) => {
     }, 400);
   }
   
+  const competitionLabel = SOCCER_COMPETITIONS[competitionKey];
+  const staleEntry = soccerStandingsHotCache.get(competitionKey);
+  const nowMs = Date.now();
+  const freshEntry = staleEntry && staleEntry.expiresAtMs > nowMs ? staleEntry : null;
+  const usableStaleEntry = staleEntry && staleEntry.staleUntilMs > nowMs ? staleEntry : null;
+  const fallbackPayload = {
+    competition: { key: competitionKey, name: competitionLabel || competitionKey },
+    season: null,
+    standings: [] as any[],
+    cached: false,
+    errors: [] as string[],
+    status: "degraded" as const,
+    pending_refresh: true,
+  };
+  if (freshEntry) {
+    return c.json({ ...freshEntry.payload, cached: true });
+  }
+  
   const apiKey = c.env.SPORTSRADAR_API_KEY;
   if (!apiKey) {
-    return c.json({ error: 'SportsRadar API key not configured' }, 500);
+    return c.json(usableStaleEntry ? {
+      ...usableStaleEntry.payload,
+      cached: true,
+      status: "degraded",
+      pending_refresh: true,
+    } : fallbackPayload);
   }
   
   try {
-    // Use caching - 15 minute TTL
-    const result = await cachedFetch(
-      c.env.DB,
-      'sportsradar',
-      `soccer/standings/${competitionKey}`,
-      API_CACHE_TTL.SR_STANDINGS,
-      async () => {
-        const provider = getSportsRadarProvider(apiKey, null);
-        return provider.fetchSoccerStandings(competitionKey, apiKey);
-      }
-    );
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      const timer = setTimeout(() => {
+        clearTimeout(timer);
+        reject(new Error("standings_timeout"));
+      }, SOCCER_STANDINGS_TIMEOUT_MS);
+    });
+    const result = await Promise.race([
+      cachedFetch(
+        c.env.DB,
+        'sportsradar',
+        `soccer/standings/${competitionKey}`,
+        API_CACHE_TTL.SR_STANDINGS,
+        async () => {
+          const provider = getSportsRadarProvider(apiKey, null);
+          return provider.fetchSoccerStandings(competitionKey, apiKey);
+        }
+      ),
+      timeoutPromise,
+    ]);
     
     const data = result.data;
     
     if (data.errors.length > 0 && data.standings.length === 0) {
-      return c.json({ error: data.errors[0] }, 500);
+      if (usableStaleEntry) {
+        return c.json({
+          ...usableStaleEntry.payload,
+          cached: true,
+          status: "degraded",
+          pending_refresh: true,
+        });
+      }
+      return c.json(fallbackPayload);
     }
-    
-    return c.json({
+    const payload = {
       competition: data.competition,
       season: data.season,
       standings: data.standings,
       cached: result.fromCache,
-      errors: data.errors
+      errors: data.errors,
+      status: "ok" as const,
+      pending_refresh: false,
+    };
+    soccerStandingsHotCache.set(competitionKey, {
+      payload,
+      expiresAtMs: nowMs + SOCCER_STANDINGS_HOT_TTL_MS,
+      staleUntilMs: nowMs + SOCCER_STANDINGS_STALE_TTL_MS,
     });
+    return c.json(payload);
     
   } catch (err) {
     console.error('[Soccer API] Standings error:', err);
-    return c.json({ error: String(err) }, 500);
+    if (usableStaleEntry) {
+      return c.json({
+        ...usableStaleEntry.payload,
+        cached: true,
+        status: "degraded",
+        pending_refresh: true,
+      });
+    }
+    return c.json(fallbackPayload);
   }
 });
 
@@ -878,133 +1040,295 @@ soccer.get('/schedule/:competitionKey', async (c) => {
  * - Pre/post matches: 5min TTL to reduce API calls
  * - Pass ?live=true query param to force short cache
  */
-soccer.get('/match/:eventId', async (c) => {
-  const eventId = c.req.param('eventId');
-  const forceLive = c.req.query('live') === 'true';
-  
-  // ============================================================================
-  // ESPN MATCH LOOKUP (for IDs that aren't SportsRadar URNs)
-  // ============================================================================
-  if (!eventId.startsWith('sr:')) {
-    console.log(`[Soccer Match] ESPN lookup for ID: ${eventId}`);
-    
+function normalizeSoccerNameToken(value: unknown): string {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, "");
+}
+
+type SoccerResolveTraceEntry = {
+  stage: "espn_context" | "sr_seasons" | "sr_schedule";
+  competitionKey?: string;
+  endpoint: string;
+  url: string;
+  status: number | string;
+  shape: string;
+};
+
+const SOCCER_DETAIL_BASES = [
+  "https://api.sportradar.com/soccer/production/v4",
+  "https://api.sportradar.com/soccer/trial/v4",
+] as const;
+
+const soccerResolveHotCache = new Map<string, { canonicalEventId: string | null; expiresAtMs: number }>();
+const SOCCER_RESOLVE_HOT_TTL_MS = 15 * 60_000;
+
+function maskApiKeyInUrl(url: string): string {
+  return url.replace(/api_key=([^&]+)/i, (_m, value: string) => {
+    const masked = `${"*".repeat(Math.max(0, value.length - 4))}${value.slice(-4)}`;
+    return `api_key=${masked}`;
+  });
+}
+
+function summarizePayloadShape(payload: unknown): string {
+  if (!payload || typeof payload !== "object") return "non_json";
+  const obj = payload as Record<string, any>;
+  const keys = Object.keys(obj);
+  const chunks = keys.slice(0, 6);
+  if (Array.isArray(obj.seasons)) chunks.push(`seasons:${obj.seasons.length}`);
+  if (Array.isArray(obj.schedules)) chunks.push(`schedules:${obj.schedules.length}`);
+  if (Array.isArray(obj.sport_events)) chunks.push(`sport_events:${obj.sport_events.length}`);
+  if (obj.sport_event) chunks.push("sport_event");
+  if (obj.sport_event_status) chunks.push("sport_event_status");
+  return chunks.join(",");
+}
+
+async function fetchJsonWithTrace(
+  url: string,
+  timeoutMs: number,
+): Promise<{ status: number | string; ok: boolean; payload: any | null }> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(url, { signal: controller.signal });
+    const text = await response.text();
+    let payload: any = null;
     try {
-      // Try different ESPN league endpoints
-      const ESPN_LEAGUES = ['eng.1', 'esp.1', 'ita.1', 'ger.1', 'fra.1', 'usa.1', 'uefa.champions', 'uefa.europa'];
-      
-      for (const leagueId of ESPN_LEAGUES) {
-        const espnUrl = `https://site.api.espn.com/apis/site/v2/sports/soccer/${leagueId}/summary?event=${eventId}`;
-        
-        const response = await fetch(espnUrl);
-        if (!response.ok) continue;
-        
-        const data = await response.json() as any;
-        if (!data.header) continue;
-        
-        // Found the match - transform ESPN format to our standard format
-        const header = data.header;
-        const competition = header.competitions?.[0] || {};
+      payload = JSON.parse(text);
+    } catch {
+      payload = text ? { raw: text.slice(0, 300) } : null;
+    }
+    return { status: response.status, ok: response.ok, payload };
+  } catch (error) {
+    return {
+      status: error instanceof Error ? error.name : "error",
+      ok: false,
+      payload: error instanceof Error ? { message: error.message } : null,
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+const ESPN_TO_SR_COMPETITION_KEY: Record<string, string> = {
+  "eng.1": "premier-league",
+  "esp.1": "la-liga",
+  "ita.1": "serie-a",
+  "ger.1": "bundesliga",
+  "fra.1": "ligue-1",
+  "usa.1": "mls",
+  "uefa.champions": "champions-league",
+  "uefa.europa": "europa-league",
+};
+
+async function resolveCanonicalSportsRadarEventId(
+  inputId: string,
+  apiKey: string,
+  trace: SoccerResolveTraceEntry[] = []
+): Promise<string | null> {
+  const rawInput = String(inputId || "").trim();
+  const token = extractSoccerIdToken(inputId);
+  if (!token) return null;
+  const direct = toSoccerProviderMatchId(inputId);
+  if (rawInput.startsWith("sr:sport_event:") || rawInput.startsWith("sr:match:")) {
+    const canonicalTail = rawInput.replace(/^sr:sport_event:/i, "").replace(/^sr:match:/i, "");
+    if (!canonicalTail) return null;
+    return `sr:sport_event:${canonicalTail}`;
+  }
+  if (direct.startsWith("sr:sport_event:")) {
+    const tail = direct.replace(/^sr:sport_event:/, "");
+    if (tail && !/^\d+$/.test(tail)) return direct;
+  }
+  if (!/^\d+$/.test(token)) {
+    return direct || null;
+  }
+
+  const espnEventId = token;
+  const ESPN_LEAGUES = ['eng.1', 'esp.1', 'ita.1', 'ger.1', 'fra.1', 'usa.1', 'uefa.champions', 'uefa.europa'];
+  const contextResults = await Promise.all(
+    ESPN_LEAGUES.map(async (leagueId) => {
+      const espnUrl = `https://site.api.espn.com/apis/site/v2/sports/soccer/${leagueId}/summary?event=${encodeURIComponent(espnEventId)}`;
+      const espnResult = await fetchJsonWithTrace(espnUrl, 1_800);
+      trace.push({
+        stage: "espn_context",
+        endpoint: "summary",
+        url: maskApiKeyInUrl(espnUrl),
+        status: espnResult.status,
+        shape: summarizePayloadShape(espnResult.payload),
+      });
+      try {
+        if (!espnResult.ok || !espnResult.payload || typeof espnResult.payload !== "object") return null;
+        const data = espnResult.payload as any;
+        const competition = data?.header?.competitions?.[0] || {};
         const homeCompetitor = competition.competitors?.find((c: any) => c.homeAway === 'home');
         const awayCompetitor = competition.competitors?.find((c: any) => c.homeAway === 'away');
-        
-        // Map ESPN status to our standard statuses
-        const espnStatus = competition.status?.type?.name?.toLowerCase() || 'scheduled';
-        const mappedStatus = espnStatus === 'status_full_time' ? 'closed' :
-                             espnStatus === 'status_halftime' ? 'live' :
-                             espnStatus === 'status_in_progress' ? 'live' :
-                             espnStatus === 'in' ? 'live' :
-                             espnStatus;
-        
-        const match = {
-          eventId: `espn:${eventId}`,
-          // Match the Team interface: { id, name, abbreviation?, country? }
-          homeTeam: {
-            id: homeCompetitor?.team?.id ? `espn:team:${homeCompetitor.team.id}` : 'unknown',
-            name: homeCompetitor?.team?.displayName || 'Home',
-            abbreviation: homeCompetitor?.team?.abbreviation || undefined,
-            logo: homeCompetitor?.team?.logos?.[0]?.href || null,
-          },
-          awayTeam: {
-            id: awayCompetitor?.team?.id ? `espn:team:${awayCompetitor.team.id}` : 'unknown',
-            name: awayCompetitor?.team?.displayName || 'Away',
-            abbreviation: awayCompetitor?.team?.abbreviation || undefined,
-            logo: awayCompetitor?.team?.logos?.[0]?.href || null,
-          },
-          homeScore: parseInt(homeCompetitor?.score || '0'),
-          awayScore: parseInt(awayCompetitor?.score || '0'),
-          status: mappedStatus,
-          statusText: competition.status?.type?.shortDetail || '',
-          startTime: competition.date || header.timeValid,
-          venue: data.gameInfo?.venue?.fullName || null,
-          competition: header.league?.name || 'Unknown League',
-          competitionId: header.league?.id || null
-        };
-        
-        // Parse lineups from rosters if available
-        const lineups = { home: [] as any[], away: [] as any[] };
-        if (data.rosters) {
-          for (const roster of data.rosters) {
-            const isHome = roster.homeAway === 'home';
-            const players = roster.roster || [];
-            for (const player of players) {
-              const playerData = {
-                playerId: player.athlete?.id ? `espn:${player.athlete.id}` : null,
-                name: player.athlete?.displayName || player.athlete?.shortName || 'Unknown',
-                position: player.position?.abbreviation || player.position?.name || '',
-                jerseyNumber: player.jersey || '',
-                starter: player.starter || false,
-                photoUrl: player.athlete?.headshot?.href || null
-              };
-              if (isHome) lineups.home.push(playerData);
-              else lineups.away.push(playerData);
-            }
-          }
-        }
-        
-        // Parse basic stats from boxscore
-        const statistics = data.boxscore?.teams || null;
-        
-        // Return ESPN data in standard format
-        return c.json({
-          match,
-          lineups,
-          statistics,
-          timeline: [], // ESPN doesn't provide play-by-play in the same format
-          isLive: match.status === 'in' || match.status === 'live',
-          recommendedPollInterval: 60000,
-          cached: false,
-          source: 'espn',
-          errors: []
-        });
+        const startTime = String(competition.date || data?.header?.timeValid || "").trim();
+        const home = String(homeCompetitor?.team?.displayName || "").trim();
+        const away = String(awayCompetitor?.team?.displayName || "").trim();
+        if (!home || !away || !startTime) return null;
+        return { home, away, startTime, leagueId };
+      } catch {
+        return null;
       }
-      
-      // ESPN lookup failed for all leagues
-      return c.json({ error: 'Match not found in any league' }, 404);
-      
-    } catch (err) {
-      console.error('[Soccer API] ESPN match lookup error:', err);
-      return c.json({ error: String(err) }, 500);
+    })
+  );
+  const context = contextResults.find(Boolean) || null;
+  if (!context) return null;
+
+  const homeToken = normalizeSoccerNameToken(context.home);
+  const awayToken = normalizeSoccerNameToken(context.away);
+  const targetTs = new Date(context.startTime).getTime();
+  let bestMatch: { eventId: string; score: number } | null = null;
+
+  const mappedCompetition = ESPN_TO_SR_COMPETITION_KEY[context.leagueId];
+  const fallbackCompetitions = [
+    "premier-league",
+    "la-liga",
+    "serie-a",
+    "bundesliga",
+    "ligue-1",
+    "champions-league",
+    "europa-league",
+    "mls",
+  ];
+  const competitionQueue = Array.from(
+    new Set<string>([
+      ...(mappedCompetition ? [mappedCompetition] : []),
+      ...fallbackCompetitions,
+      ...Object.keys(SOCCER_COMPETITIONS),
+    ])
+  );
+  const deadline = Date.now() + 15_000;
+  for (const competitionKey of competitionQueue) {
+    if (Date.now() > deadline) break;
+    try {
+      const competition = SOCCER_COMPETITIONS[competitionKey];
+      if (!competition?.id) continue;
+      let schedule: any = null;
+      let usedBase: string | null = null;
+      for (const base of SOCCER_DETAIL_BASES) {
+        const seasonsUrl = `${base}/en/competitions/${competition.id}/seasons.json?api_key=${apiKey}`;
+        const seasonsResult = await fetchJsonWithTrace(seasonsUrl, 2_200);
+        trace.push({
+          stage: "sr_seasons",
+          competitionKey,
+          endpoint: "seasons",
+          url: maskApiKeyInUrl(seasonsUrl),
+          status: seasonsResult.status,
+          shape: summarizePayloadShape(seasonsResult.payload),
+        });
+        if (!seasonsResult.ok || !seasonsResult.payload || typeof seasonsResult.payload !== "object") {
+          continue;
+        }
+        const seasons = Array.isArray((seasonsResult.payload as any).seasons) ? (seasonsResult.payload as any).seasons : [];
+        const now = new Date();
+        const currentSeason = seasons.find((s: any) => s?.current === true)
+          || seasons.find((s: any) => new Date(String(s?.start_date || "")).getTime() <= now.getTime() && new Date(String(s?.end_date || "")).getTime() >= now.getTime())
+          || seasons[0];
+        if (!currentSeason?.id) continue;
+        const scheduleUrl = `${base}/en/seasons/${currentSeason.id}/schedules.json?api_key=${apiKey}`;
+        const scheduleResult = await fetchJsonWithTrace(scheduleUrl, 2_200);
+        trace.push({
+          stage: "sr_schedule",
+          competitionKey,
+          endpoint: "schedules",
+          url: maskApiKeyInUrl(scheduleUrl),
+          status: scheduleResult.status,
+          shape: summarizePayloadShape(scheduleResult.payload),
+        });
+        if (scheduleResult.ok) {
+          usedBase = base;
+          schedule = scheduleResult.payload;
+          break;
+        }
+      }
+      if (!usedBase || !schedule) continue;
+      const matches = Array.isArray(schedule?.matches) ? schedule.matches : [];
+      const scheduleRows = matches.length > 0
+        ? matches
+        : (Array.isArray(schedule?.schedules) ? schedule.schedules : []).map((row: any) => {
+            const sportEvent = row?.sport_event || row;
+            const competitors = Array.isArray(sportEvent?.competitors) ? sportEvent.competitors : [];
+            const home = competitors.find((c: any) => c?.qualifier === "home") || {};
+            const away = competitors.find((c: any) => c?.qualifier === "away") || {};
+            return {
+              eventId: sportEvent?.id,
+              homeTeamName: home?.name,
+              awayTeamName: away?.name,
+              startTime: sportEvent?.start_time,
+            };
+          });
+      for (const match of scheduleRows) {
+        const eventId = String(match?.eventId || "").trim();
+        if (!eventId.startsWith("sr:sport_event:")) continue;
+        const home = normalizeSoccerNameToken(match?.homeTeamName || "");
+        const away = normalizeSoccerNameToken(match?.awayTeamName || "");
+        if (!home || !away) continue;
+        const sameTeams =
+          (home === homeToken && away === awayToken) ||
+          (home === awayToken && away === homeToken);
+        if (!sameTeams) continue;
+        const matchTs = new Date(String(match?.startTime || "")).getTime();
+        const timeDelta = Number.isFinite(matchTs) && Number.isFinite(targetTs)
+          ? Math.abs(matchTs - targetTs)
+          : Number.POSITIVE_INFINITY;
+        const score = timeDelta;
+        if (!bestMatch || score < bestMatch.score) {
+          bestMatch = { eventId, score };
+        }
+      }
+    } catch {
+      // non-fatal
     }
   }
-  
-  // ============================================================================
-  // SPORTSRADAR MATCH LOOKUP (for sr: prefixed IDs)
-  // ============================================================================
+
+  if (bestMatch && bestMatch.score <= 12 * 60 * 60 * 1000) {
+    return bestMatch.eventId;
+  }
+  return null;
+}
+
+soccer.get('/match/:eventId', async (c) => {
+  const inputId = c.req.param('eventId');
+  const forceLive = c.req.query('live') === 'true';
+
   const apiKey = c.env.SPORTSRADAR_API_KEY;
   if (!apiKey) {
     return c.json({ error: 'SportsRadar API key not configured' }, 500);
   }
   
   try {
-    // First fetch to check if match is live (use default TTL initially)
+    const resolveCacheKey = String(inputId || "").trim();
+    const nowMs = Date.now();
+    const resolveTrace: SoccerResolveTraceEntry[] = [];
+    const cachedResolve = soccerResolveHotCache.get(resolveCacheKey);
+    let canonicalEventId = "";
+    if (cachedResolve && cachedResolve.expiresAtMs > nowMs) {
+      canonicalEventId = String(cachedResolve.canonicalEventId || "").trim();
+    } else {
+      canonicalEventId = String(await resolveCanonicalSportsRadarEventId(inputId, apiKey, resolveTrace) || "").trim();
+      soccerResolveHotCache.set(resolveCacheKey, {
+        canonicalEventId: canonicalEventId || null,
+        expiresAtMs: nowMs + SOCCER_RESOLVE_HOT_TTL_MS,
+      });
+    }
+    if (resolveTrace.length > 0) {
+      for (const entry of resolveTrace) {
+        console.log("[Soccer API][ResolveTrace]", entry);
+      }
+    }
+    if (!canonicalEventId.startsWith("sr:sport_event:")) {
+      return c.json({ error: 'Canonical SportsRadar event id not found' }, 404);
+    }
+
     const result = await cachedFetch(
       c.env.DB,
       'sportsradar',
-      `soccer/match/${eventId}`,
+      `soccer/match/${canonicalEventId}`,
       forceLive ? API_CACHE_TTL.SR_SOCCER_MATCH_LIVE : API_CACHE_TTL.SR_SOCCER_MATCH,
       async () => {
         const provider = getSportsRadarProvider(apiKey, null);
-        return provider.fetchSoccerMatchDetail(eventId, apiKey);
+        return provider.fetchSoccerMatchDetail(canonicalEventId, apiKey);
       }
     );
     
@@ -1020,6 +1344,7 @@ soccer.get('/match/:eventId', async (c) => {
                    data.match?.status === 'started';
     
     return c.json({
+      canonicalEventId,
       match: data.match,
       lineups: data.lineups,
       statistics: data.statistics,
@@ -1027,6 +1352,7 @@ soccer.get('/match/:eventId', async (c) => {
       isLive,
       recommendedPollInterval: isLive ? 15000 : 60000, // 15s for live, 60s otherwise
       cached: result.fromCache,
+      source: 'sportsradar',
       errors: data.errors
     });
     
@@ -1148,35 +1474,78 @@ soccer.get('/h2h/:team1Id/:team2Id', async (c) => {
  */
 soccer.get('/player/:playerId', async (c) => {
   const playerId = c.req.param('playerId');
+  const playerCacheKey = `v2:${playerId}`;
+  const playerNameHint = String(c.req.query('playerName') || "").trim();
+  const routeStartedAtMs = Date.now();
+  const nowMs = Date.now();
+  const staleEntry = soccerPlayerHotCache.get(playerCacheKey);
+  const freshEntry = staleEntry && staleEntry.expiresAtMs > nowMs ? staleEntry : null;
+  const usableStaleEntry = staleEntry && staleEntry.staleUntilMs > nowMs ? staleEntry : null;
+  if (freshEntry) {
+    return c.json({ ...freshEntry.payload, cached: true });
+  }
+  if (!isLikelySoccerPlayerId(playerId)) {
+    return c.json({
+      ...buildSoccerPlayerFallbackPayload({
+        playerId,
+        playerName: playerNameHint,
+        reason: "invalid_player_id",
+      }),
+      found: false,
+      status: "not_found",
+      pending_refresh: false,
+      degraded: false,
+    }, 404);
+  }
   
   // ============================================================================
   // ESPN PLAYER LOOKUP (for IDs from ESPN-powered leaders)
   // ============================================================================
-  if (playerId.startsWith('espn:')) {
-    const espnId = playerId.replace('espn:', '');
+  if (playerId.startsWith('espn:') || /^\d+$/.test(playerId)) {
+    const espnId = playerId.startsWith('espn:') ? playerId.replace('espn:', '') : playerId;
     
     try {
       // Use ESPN's common API which works for all soccer athletes
       const athleteUrl = `https://site.api.espn.com/apis/common/v3/sports/soccer/athletes/${espnId}`;
       console.log('[ESPN Player] Fetching from:', athleteUrl);
       
-      const response = await fetch(athleteUrl, {
-        headers: {
-          'Accept': 'application/json',
-          'User-Agent': 'GZSports/1.0',
-        },
-      });
+      const response = await Promise.race([
+        fetch(athleteUrl, {
+          headers: {
+            'Accept': 'application/json',
+            'User-Agent': 'GZSports/1.0',
+          },
+        }),
+        new Promise<never>((_, reject) => setTimeout(() => reject(new Error('soccer_player_timeout')), SOCCER_PLAYER_TIMEOUT_MS)),
+      ]);
       
-      if (!response.ok) {
-        console.error('[ESPN Player] API error:', response.status);
-        return c.json({ 
-          found: false, 
-          error: 'Player not found in ESPN database',
-          playerId 
-        }, 404);
+      if (!response || !(response as Response).ok) {
+        const responseStatus = response ? (response as Response).status : 0;
+        if (responseStatus === 404) {
+          return c.json({
+            ...buildSoccerPlayerFallbackPayload({
+              playerId,
+              playerName: playerNameHint,
+              reason: "player_not_found",
+            }),
+            found: false,
+            status: "not_found",
+            pending_refresh: false,
+            degraded: false,
+          }, 404);
+        }
+        const degradedFromStale = usableStaleEntry?.payload || null;
+        return c.json(
+          buildSoccerPlayerFallbackPayload({
+            playerId,
+            playerName: playerNameHint,
+            reason: responseStatus ? `espn_status_${responseStatus}` : "espn_player_fetch_failed",
+            seed: degradedFromStale,
+          })
+        );
       }
       
-      const athleteData = await response.json() as any;
+      const athleteData = await (response as Response).json() as any;
       
       // Extract player info from ESPN response
       // ESPN common API returns basic info - no team/stats in this endpoint
@@ -1185,8 +1554,8 @@ soccer.get('/player/:playerId', async (c) => {
       
       // Build player object with available data
       const player = {
-        id: playerId,
-        name: athlete.displayName || athlete.fullName || 'Unknown Player',
+        id: playerId.startsWith("espn:") ? playerId : `espn:${espnId}`,
+        name: athlete.displayName || athlete.fullName || playerNameHint || 'Unknown Player',
         nationality: athlete.citizenship || athlete.birthPlace?.country || '',
         dateOfBirth: athlete.dateOfBirth || null,
         height: athlete.height ? `${Math.floor(athlete.height / 12)}'${athlete.height % 12}"` : null,
@@ -1197,16 +1566,54 @@ soccer.get('/player/:playerId', async (c) => {
         competition: null as { id: string; name: string } | null,
         photoUrl: null as string | null,
       };
+
+      const buildQuickPayload = (reason: string, status: "ok" | "degraded" = "degraded"): SoccerPlayerApiPayload => ({
+        player,
+        stats: {
+          appearances: 0,
+          goals: 0,
+          assists: 0,
+          yellowCards: 0,
+          redCards: 0,
+          minutesPlayed: 0,
+        },
+        recentMatches: [],
+        found: true,
+        source: "espn",
+        status,
+        pending_refresh: status !== "ok",
+        degraded: status !== "ok",
+        reason: status !== "ok" ? reason : undefined,
+      });
+
+      const remainingBudgetMs = (): number =>
+        Math.max(0, SOCCER_PLAYER_TIMEOUT_MS - (Date.now() - routeStartedAtMs));
+      if (remainingBudgetMs() < 250) {
+        const quickPayload = buildQuickPayload("budget_exceeded_after_identity");
+        soccerPlayerHotCache.set(playerCacheKey, {
+          payload: quickPayload,
+          expiresAtMs: nowMs + SOCCER_PLAYER_HOT_TTL_MS,
+          staleUntilMs: nowMs + SOCCER_PLAYER_STALE_TTL_MS,
+        });
+        return c.json(quickPayload);
+      }
       
       // Fetch photo from TheSportsDB (ESPN doesn't have soccer headshots)
       const playerName = player.name;
       try {
+        if (remainingBudgetMs() < 250) {
+          throw new Error("budget_exhausted_before_photo_lookup");
+        }
+        const photoTimeoutMs = Math.max(250, Math.min(900, remainingBudgetMs()));
         const tsdbUrl = `https://www.thesportsdb.com/api/v1/json/3/searchplayers.php?p=${encodeURIComponent(playerName)}`;
-        const tsdbRes = await fetch(tsdbUrl, {
-          headers: { 'Accept': 'application/json', 'User-Agent': 'GZSports/1.0' },
-        });
-        if (tsdbRes.ok) {
-          const tsdbData = await tsdbRes.json() as any;
+        const tsdbRes = await Promise.race([
+          fetch(tsdbUrl, {
+            headers: { 'Accept': 'application/json', 'User-Agent': 'GZSports/1.0' },
+          }),
+          new Promise<never>((_, reject) => setTimeout(() => reject(new Error('soccer_player_photo_timeout')), photoTimeoutMs)),
+        ]);
+        if ((tsdbRes as Response).ok) {
+          const tsdbData = await (tsdbRes as Response).json() as any;
           const foundPlayer = tsdbData.player?.[0];
           if (foundPlayer) {
             // Prefer cutout image, fall back to thumb
@@ -1224,13 +1631,20 @@ soccer.get('/player/:playerId', async (c) => {
       
       // Search Premier League leaders (most likely source for ESPN player IDs)
       try {
+        if (remainingBudgetMs() < 250) {
+          throw new Error("budget_exhausted_before_stats_lookup");
+        }
+        const statsTimeoutMs = Math.max(250, Math.min(900, remainingBudgetMs()));
         const plStatsUrl = `https://site.api.espn.com/apis/site/v2/sports/soccer/eng.1/statistics`;
-        const statsRes = await fetch(plStatsUrl, {
-          headers: { 'Accept': 'application/json', 'User-Agent': 'GZSports/1.0' },
-        });
+        const statsRes = await Promise.race([
+          fetch(plStatsUrl, {
+            headers: { 'Accept': 'application/json', 'User-Agent': 'GZSports/1.0' },
+          }),
+          new Promise<never>((_, reject) => setTimeout(() => reject(new Error('soccer_player_stats_timeout')), statsTimeoutMs)),
+        ]);
         
-        if (statsRes.ok) {
-          const statsData = await statsRes.json() as any;
+        if ((statsRes as Response).ok) {
+          const statsData = await (statsRes as Response).json() as any;
           const categories = statsData.stats || [];
           
           // Search for player in goals and assists leaders
@@ -1279,13 +1693,20 @@ soccer.get('/player/:playerId', async (c) => {
       const teamId = player.team?.id?.replace('espn:', '');
       if (teamId) {
         try {
+          if (remainingBudgetMs() < 250) {
+            throw new Error("budget_exhausted_before_schedule_lookup");
+          }
+          const scheduleTimeoutMs = Math.max(250, Math.min(900, remainingBudgetMs()));
           const teamResultsUrl = `https://site.api.espn.com/apis/site/v2/sports/soccer/eng.1/teams/${teamId}/schedule`;
-          const teamRes = await fetch(teamResultsUrl, {
-            headers: { 'Accept': 'application/json', 'User-Agent': 'GZSports/1.0' },
-          });
+          const teamRes = await Promise.race([
+            fetch(teamResultsUrl, {
+              headers: { 'Accept': 'application/json', 'User-Agent': 'GZSports/1.0' },
+            }),
+            new Promise<never>((_, reject) => setTimeout(() => reject(new Error('soccer_player_schedule_timeout')), scheduleTimeoutMs)),
+          ]);
           
-          if (teamRes.ok) {
-            const teamData = await teamRes.json() as any;
+          if ((teamRes as Response).ok) {
+            const teamData = await (teamRes as Response).json() as any;
             const events = teamData.events || [];
             
             // Get completed matches
@@ -1329,17 +1750,34 @@ soccer.get('/player/:playerId', async (c) => {
         }
       }
       
-      return c.json({
+      const payload: SoccerPlayerApiPayload = {
         player,
         stats,
         recentMatches,
         found: true,
-        source: 'espn'
+        source: 'espn',
+        status: Date.now() - routeStartedAtMs > SOCCER_PLAYER_TIMEOUT_MS ? "degraded" : "ok",
+        pending_refresh: Date.now() - routeStartedAtMs > SOCCER_PLAYER_TIMEOUT_MS,
+        degraded: Date.now() - routeStartedAtMs > SOCCER_PLAYER_TIMEOUT_MS,
+        reason: Date.now() - routeStartedAtMs > SOCCER_PLAYER_TIMEOUT_MS ? "budget_exceeded_partial_payload" : undefined,
+      };
+      soccerPlayerHotCache.set(playerCacheKey, {
+        payload,
+        expiresAtMs: nowMs + SOCCER_PLAYER_HOT_TTL_MS,
+        staleUntilMs: nowMs + SOCCER_PLAYER_STALE_TTL_MS,
       });
+      return c.json(payload);
       
     } catch (err) {
       console.error('[ESPN Player] Error fetching player:', err);
-      return c.json({ error: String(err), found: false }, 500);
+      return c.json(
+        buildSoccerPlayerFallbackPayload({
+          playerId,
+          playerName: playerNameHint,
+          reason: err instanceof Error ? err.message : "espn_player_exception",
+          seed: usableStaleEntry?.payload || null,
+        })
+      );
     }
   }
   
@@ -1348,17 +1786,29 @@ soccer.get('/player/:playerId', async (c) => {
   // ============================================================================
   const apiKey = c.env.SPORTSRADAR_API_KEY;
   if (!apiKey) {
-    return c.json({ error: 'SportsRadar API key not configured' }, 500);
+    return c.json(
+      buildSoccerPlayerFallbackPayload({
+        playerId,
+        playerName: playerNameHint,
+        reason: "sportsradar_api_key_missing",
+        seed: usableStaleEntry?.payload || null,
+      })
+    );
   }
   
   try {
+    const startedAtMs = Date.now();
     const provider = getSportsRadarProvider(apiKey, null);
     
-    // Step 1: Search leaders across major competitions to find the player
-    // Use parallel search for speed - most will hit cache anyway
-    const competitionsToSearch = [
+    // Step 1: Search leaders across ALL configured competitions.
+    // Keep top leagues first for speed, then fall through to the full catalog.
+    const primaryCompetitions = [
       'premier-league', 'la-liga', 'serie-a', 'bundesliga', 'ligue-1',
       'champions-league', 'europa-league', 'mls'
+    ];
+    const competitionsToSearch = [
+      ...primaryCompetitions,
+      ...Object.keys(SOCCER_COMPETITIONS).filter((key) => !primaryCompetitions.includes(key)),
     ];
     
     let foundPlayer: any = null;
@@ -1369,6 +1819,9 @@ soccer.get('/player/:playerId', async (c) => {
     // Search competitions SEQUENTIALLY to avoid rate limiting
     // The queue system in sportsRadarProvider will space out the API calls
     for (const compKey of competitionsToSearch) {
+      if (Date.now() - startedAtMs > SOCCER_PLAYER_TIMEOUT_MS) {
+        break;
+      }
       try {
         const leadersResult = await cachedFetch(
           c.env.DB,
@@ -1502,17 +1955,35 @@ soccer.get('/player/:playerId', async (c) => {
       redCards: playerDetails?.redCards || 0,
       minutesPlayed: playerDetails?.minutesPlayed || 0
     };
-    
-    return c.json({
+
+    const payload: SoccerPlayerApiPayload = {
       player,
       stats,
       recentMatches,
-      found: !!foundPlayer
+      found: !!foundPlayer,
+      status: foundPlayer ? "ok" : "degraded",
+      pending_refresh: !foundPlayer,
+      degraded: !foundPlayer,
+      source: "sportsradar",
+      reason: foundPlayer ? undefined : "player_not_found_within_budget",
+    };
+    soccerPlayerHotCache.set(playerCacheKey, {
+      payload,
+      expiresAtMs: nowMs + SOCCER_PLAYER_HOT_TTL_MS,
+      staleUntilMs: nowMs + SOCCER_PLAYER_STALE_TTL_MS,
     });
+    return c.json(payload);
     
   } catch (err) {
     console.error('[Soccer API] Player profile error:', err);
-    return c.json({ error: String(err) }, 500);
+    return c.json(
+      buildSoccerPlayerFallbackPayload({
+        playerId,
+        playerName: playerNameHint,
+        reason: err instanceof Error ? err.message : "sportsradar_player_exception",
+        seed: usableStaleEntry?.payload || null,
+      })
+    );
   }
 });
 
@@ -1523,6 +1994,14 @@ soccer.get('/player/:playerId', async (c) => {
  */
 soccer.get('/team/:teamId', async (c) => {
   const teamId = c.req.param('teamId');
+  const normalizedEspnTeamId = String(teamId || "").replace(/^espn:/i, "").trim();
+  const requestedLeague = String(c.req.query('league') || "").trim() || null;
+  console.log('[Soccer API][team-roster] request', {
+    sport: 'soccer',
+    requestedLeague,
+    requestedTeamId: teamId,
+    normalizedProviderTeamId: normalizedEspnTeamId,
+  });
   
   // Check if this is an ESPN ID (not sr: format)
   const isEspnId = !teamId.startsWith('sr:');
@@ -1533,16 +2012,31 @@ soccer.get('/team/:teamId', async (c) => {
       const result = await cachedFetch(
         c.env.DB,
         'espn',
-        `soccer/team/${teamId}`,
+        `soccer/team/espn/v4/${normalizedEspnTeamId}`,
         1800, // 30 minutes
         async () => {
           // Try each ESPN league until we find the team
           const leagueIds = ['eng.1', 'esp.1', 'ita.1', 'ger.1', 'fra.1', 'usa.1'];
+          const orderedLeagueIds = requestedLeague && leagueIds.includes(requestedLeague)
+            ? [requestedLeague, ...leagueIds.filter((id) => id !== requestedLeague)]
+            : leagueIds;
+          let fallbackEmptyRosterPayload: {
+            team: any;
+            players: any[];
+            leagueId: string;
+            errors: string[];
+          } | null = null;
           
-          for (const leagueId of leagueIds) {
+          for (const leagueId of orderedLeagueIds) {
             try {
               // Fetch team info
-              const teamUrl = `https://site.api.espn.com/apis/site/v2/sports/soccer/${leagueId}/teams/${teamId}`;
+              const teamUrl = `https://site.api.espn.com/apis/site/v2/sports/soccer/${leagueId}/teams/${normalizedEspnTeamId}`;
+              console.log('[Soccer API][team-roster] team_lookup', {
+                requestedTeamId: teamId,
+                normalizedProviderTeamId: normalizedEspnTeamId,
+                leagueId,
+                outboundUrl: teamUrl,
+              });
               const teamResp = await fetch(teamUrl);
               if (!teamResp.ok) continue;
               
@@ -1552,14 +2046,76 @@ soccer.get('/team/:teamId', async (c) => {
               const team = teamData.team;
               
               // Fetch roster
-              const rosterUrl = `https://site.api.espn.com/apis/site/v2/sports/soccer/${leagueId}/teams/${teamId}/roster`;
+              const rosterUrl = `https://site.api.espn.com/apis/site/v2/sports/soccer/${leagueId}/teams/${normalizedEspnTeamId}/roster`;
               const rosterResp = await fetch(rosterUrl);
               const rosterData = rosterResp.ok 
-                ? await rosterResp.json() as { athletes?: Array<{ id: string; displayName: string; jersey?: string; position?: { name: string } }> }
+                ? await rosterResp.json() as {
+                    athletes?: Array<{ id: string; displayName: string; jersey?: string; position?: { name: string } }>;
+                    roster?: Array<{ id: string; athlete?: { id?: string; displayName?: string; jersey?: string; position?: { name?: string } }; displayName?: string; jersey?: string; position?: { name?: string } }>;
+                    entries?: Array<{ athlete?: { id?: string; displayName?: string; jersey?: string; position?: { name?: string } } }>;
+                    groups?: Array<{ athletes?: Array<{ id: string; displayName: string; jersey?: string; position?: { name: string } }> }>;
+                    positions?: Array<{ athletes?: Array<{ id: string; displayName: string; jersey?: string; position?: { name: string } }> }>;
+                  }
                 : { athletes: [] };
+              const rosterAthletes = (() => {
+                if (Array.isArray(rosterData.athletes) && rosterData.athletes.length > 0) return rosterData.athletes;
+                if (Array.isArray(rosterData.roster) && rosterData.roster.length > 0) {
+                  return rosterData.roster.map((entry) => ({
+                    id: String(entry?.id || entry?.athlete?.id || "").trim(),
+                    displayName: String(entry?.displayName || entry?.athlete?.displayName || "").trim(),
+                    jersey: String(entry?.jersey || entry?.athlete?.jersey || "").trim() || undefined,
+                    position: { name: String(entry?.position?.name || entry?.athlete?.position?.name || "").trim() || 'Unknown' },
+                  })).filter((row) => row.id && row.displayName);
+                }
+                if (Array.isArray(rosterData.entries) && rosterData.entries.length > 0) {
+                  return rosterData.entries.map((entry) => ({
+                    id: String(entry?.athlete?.id || "").trim(),
+                    displayName: String(entry?.athlete?.displayName || "").trim(),
+                    jersey: String(entry?.athlete?.jersey || "").trim() || undefined,
+                    position: { name: String(entry?.athlete?.position?.name || "").trim() || 'Unknown' },
+                  })).filter((row) => row.id && row.displayName);
+                }
+                const grouped = [...(Array.isArray(rosterData.groups) ? rosterData.groups : []), ...(Array.isArray(rosterData.positions) ? rosterData.positions : [])];
+                const fromGroups = grouped.flatMap((g) => Array.isArray(g?.athletes) ? g.athletes : []);
+                if (fromGroups.length > 0) return fromGroups;
+                return [] as Array<{ id: string; displayName: string; jersey?: string; position?: { name: string } }>;
+              })();
+              const rawRosterCount = rosterAthletes.length;
+              console.log('[Soccer API][team-roster] roster_raw', {
+                requestedTeamId: teamId,
+                normalizedProviderTeamId: normalizedEspnTeamId,
+                leagueId,
+                outboundUrl: rosterUrl,
+                rosterStatus: rosterResp.status,
+                rawRosterCount,
+              });
+              
+              // Transform players
+              const players = (rosterAthletes || []).map((a: { id: string; displayName: string; jersey?: string; position?: { name: string } }) => ({
+                id: `espn:${a.id}`,
+                name: a.displayName,
+                jerseyNumber: Number.isFinite(Number(a.jersey)) ? Number(a.jersey) : null,
+                position: a.position?.name || 'Unknown'
+              }));
+              console.log('[Soccer API][team-roster] roster_normalized', {
+                requestedTeamId: teamId,
+                normalizedProviderTeamId: normalizedEspnTeamId,
+                leagueId,
+                rawRosterCount,
+                normalizedRosterCount: players.length,
+              });
+              if (players.length === 0) {
+                fallbackEmptyRosterPayload = {
+                  team,
+                  players,
+                  leagueId,
+                  errors: ['Roster unavailable from provider for this team'],
+                };
+                continue;
+              }
               
               // Fetch schedule for recent results
-              const scheduleUrl = `https://site.api.espn.com/apis/site/v2/sports/soccer/${leagueId}/teams/${teamId}/schedule`;
+              const scheduleUrl = `https://site.api.espn.com/apis/site/v2/sports/soccer/${leagueId}/teams/${normalizedEspnTeamId}/schedule`;
               const scheduleResp = await fetch(scheduleUrl);
               const scheduleData = scheduleResp.ok 
                 ? await scheduleResp.json() as { events?: Array<{ id: string; date: string; name: string; competitions?: Array<{ status?: { type?: { name: string } }; competitors?: Array<{ id: string; team?: { name: string; logo: string }; score?: string; winner?: boolean }> }> }> }
@@ -1568,14 +2124,6 @@ soccer.get('/team/:teamId', async (c) => {
               // Extract record stats
               const recordStats = team.record?.items?.[0]?.stats || [];
               const getStat = (name: string) => recordStats.find((s: { name: string; value: number }) => s.name === name)?.value || 0;
-              
-              // Transform players
-              const players = (rosterData.athletes || []).map((a: { id: string; displayName: string; jersey?: string; position?: { name: string } }) => ({
-                id: `espn:${a.id}`,
-                name: a.displayName,
-                jerseyNumber: a.jersey || '',
-                position: a.position?.name || 'Unknown'
-              }));
               
               // Transform matches - separate recent results and upcoming
               const now = new Date();
@@ -1588,8 +2136,8 @@ soccer.get('/team/:teamId', async (c) => {
                 const isCompleted = status === 'STATUS_FULL_TIME' || status === 'STATUS_FINAL';
                 const eventDate = new Date(event.date);
                 
-                const homeComp = comp?.competitors?.find((x: { id: string }) => x.id !== teamId) || comp?.competitors?.[0];
-                const awayComp = comp?.competitors?.find((x: { id: string }) => x.id === teamId) || comp?.competitors?.[1];
+                const homeComp = comp?.competitors?.find((x: { id: string }) => String(x.id) !== normalizedEspnTeamId) || comp?.competitors?.[0];
+                const awayComp = comp?.competitors?.find((x: { id: string }) => String(x.id) === normalizedEspnTeamId) || comp?.competitors?.[1];
                 
                 const matchData = {
                   id: event.id,
@@ -1654,6 +2202,81 @@ soccer.get('/team/:teamId', async (c) => {
               continue;
             }
           }
+          if (fallbackEmptyRosterPayload) {
+            const leagueId = fallbackEmptyRosterPayload.leagueId;
+            const team = fallbackEmptyRosterPayload.team;
+            const recordStats = team.record?.items?.[0]?.stats || [];
+            const getStat = (name: string) => recordStats.find((s: { name: string; value: number }) => s.name === name)?.value || 0;
+            const scheduleUrl = `https://site.api.espn.com/apis/site/v2/sports/soccer/${leagueId}/teams/${normalizedEspnTeamId}/schedule`;
+            const scheduleResp = await fetch(scheduleUrl);
+            const scheduleData = scheduleResp.ok
+              ? await scheduleResp.json() as { events?: Array<{ id: string; date: string; competitions?: Array<{ status?: { type?: { name?: string } }; competitors?: Array<{ id: string; team?: { name?: string; logo?: string }; score?: string }> }> }> }
+              : { events: [] };
+            const now = new Date();
+            const recentResults: Array<{ id: string; date: string; homeTeam: { name: string; logo?: string }; awayTeam: { name: string; logo?: string }; homeScore: number; awayScore: number; status: string }> = [];
+            const upcomingFixtures: Array<{ id: string; date: string; homeTeam: { name: string; logo?: string }; awayTeam: { name: string; logo?: string }; status: string }> = [];
+            for (const event of (scheduleData.events || []).slice(0, 20)) {
+              const comp = event.competitions?.[0];
+              const status = comp?.status?.type?.name || '';
+              const isCompleted = status === 'STATUS_FULL_TIME' || status === 'STATUS_FINAL';
+              const eventDate = new Date(event.date);
+              const homeComp = comp?.competitors?.find((x: { id: string }) => String(x.id) !== normalizedEspnTeamId) || comp?.competitors?.[0];
+              const awayComp = comp?.competitors?.find((x: { id: string }) => String(x.id) === normalizedEspnTeamId) || comp?.competitors?.[1];
+              const matchData = {
+                id: event.id,
+                date: event.date,
+                homeTeam: { name: homeComp?.team?.name || 'TBD', logo: homeComp?.team?.logo },
+                awayTeam: { name: awayComp?.team?.name || 'TBD', logo: awayComp?.team?.logo },
+                status: isCompleted ? 'completed' : eventDate > now ? 'scheduled' : 'live'
+              };
+              if (isCompleted) {
+                recentResults.push({
+                  ...matchData,
+                  homeScore: parseInt(homeComp?.score || '0', 10),
+                  awayScore: parseInt(awayComp?.score || '0', 10)
+                });
+              } else if (eventDate > now) {
+                upcomingFixtures.push(matchData);
+              }
+            }
+            const leagueNames: Record<string, string> = {
+              'eng.1': 'Premier League',
+              'esp.1': 'La Liga',
+              'ita.1': 'Serie A',
+              'ger.1': 'Bundesliga',
+              'fra.1': 'Ligue 1',
+              'usa.1': 'MLS'
+            };
+            return {
+              team: {
+                id: `espn:${team.id}`,
+                name: team.name,
+                abbreviation: team.abbreviation || '',
+                logo: team.logos?.[0]?.href || '',
+                competition: leagueNames[leagueId] || leagueId
+              },
+              players: [],
+              recentResults: recentResults.slice(0, 10),
+              upcomingFixtures: upcomingFixtures.slice(0, 5),
+              leagueStanding: {
+                position: getStat('rank'),
+                points: getStat('points'),
+                played: getStat('gamesPlayed'),
+                won: getStat('wins'),
+                drawn: getStat('ties'),
+                lost: getStat('losses'),
+                goalsFor: getStat('pointsFor'),
+                goalsAgainst: getStat('pointsAgainst')
+              },
+              seasonStats: {
+                goalsScored: getStat('pointsFor'),
+                goalsConceded: getStat('pointsAgainst'),
+                cleanSheets: 0
+              },
+              errors: fallbackEmptyRosterPayload.errors,
+              source: 'espn'
+            };
+          }
           
           // No league found the team
           return {
@@ -1674,6 +2297,13 @@ soccer.get('/team/:teamId', async (c) => {
       if (!data.team) {
         return c.json({ error: 'Team not found' }, 404);
       }
+      console.log('[Soccer API][team-roster] response', {
+        requestedTeamId: teamId,
+        normalizedProviderTeamId: normalizedEspnTeamId,
+        source: 'espn',
+        cached: result.fromCache,
+        finalRenderedRosterCount: Array.isArray(data.players) ? data.players.length : 0,
+      });
       
       return c.json({
         team: data.team,

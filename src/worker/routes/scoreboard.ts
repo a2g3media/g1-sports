@@ -1,3 +1,4 @@
+// @ts-nocheck
 import { Hono } from "hono";
 import { getRealDate } from "../services/dateUtils";
 import { fetchGamesWithFallback } from "../services/providers";

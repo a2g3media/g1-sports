@@ -73,6 +73,20 @@ function cleanText(value: unknown): string {
   return String(value || "").replace(/\s+/g, " ").trim();
 }
 
+function hasInvalidZeroSignal(value: unknown): boolean {
+  const normalized = cleanText(value).toLowerCase();
+  if (!normalized) return false;
+  return (
+    normalized.includes("0.0 -> 0.0")
+    || normalized.includes("0.0 → 0.0")
+    || normalized.includes("0 -> 0")
+    || normalized.includes("0 → 0")
+    || normalized.includes("0% confidence")
+    || normalized.includes("0% conf")
+    || normalized.includes("edge 0")
+  );
+}
+
 function buildSurfaceSummary(surface: string, gameId?: string): string {
   const gameLabel = gameId ? `Game ${gameId}` : "this slate";
   if (surface === "game") return `Coach G is tracking ${gameLabel} and refreshing the latest line signals.`;
@@ -254,6 +268,24 @@ export function CoachGIntelligenceLayer({
   const sharpCount = payload?.sharp_radar?.length || 0;
   const actionableItems = normalizeActionables(payload);
   const summaryText = cleanText(payload?.summary) || buildSurfaceSummary(surface, gameId);
+  const edgeValue = Number(edge);
+  const hasRealEdge = Number.isFinite(edgeValue) && Math.abs(edgeValue) > 0;
+  const topPropEdgeValue = Number(topPropEdge?.edge_score);
+  const hasRealTopPropEdge = Number.isFinite(topPropEdgeValue) && Math.abs(topPropEdgeValue) > 0;
+  const currentLine = Number(linePrediction?.current_line);
+  const projectedLine = Number(linePrediction?.projected_line);
+  const confidenceValue = Number(linePrediction?.confidence);
+  const hasValidLine =
+    Boolean(linePrediction) &&
+    Number.isFinite(currentLine) &&
+    Number.isFinite(projectedLine) &&
+    Number.isFinite(confidenceValue) &&
+    currentLine > 0 &&
+    projectedLine > 0 &&
+    confidenceValue > 0;
+  const safeTopSignalMessage = !hasInvalidZeroSignal(topSignal?.message)
+    ? cleanText(topSignal?.message)
+    : "";
   const createVideo = async () => {
     if (!gameId || videoBusy) return;
     setVideoBusy(true);
@@ -277,22 +309,11 @@ export function CoachGIntelligenceLayer({
 
   const surfaceMeta = (() => {
     if (surface === "game") {
-      const lineText =
-        linePrediction?.current_line !== null &&
-        linePrediction?.current_line !== undefined &&
-        linePrediction?.projected_line !== null &&
-        linePrediction?.projected_line !== undefined
-          ? `${linePrediction.current_line.toFixed(1)} -> ${linePrediction.projected_line.toFixed(1)}`
-          : "Projection calibrating";
-      const confidence =
-        linePrediction?.confidence !== null &&
-        linePrediction?.confidence !== undefined
-          ? `${Math.round(linePrediction.confidence)}% conf`
-          : "Updating confidence";
+      if (!hasValidLine) return null;
       return {
         label: "Line Prediction",
-        value: lineText,
-        sub: confidence,
+        value: `${currentLine.toFixed(1)} -> ${projectedLine.toFixed(1)}`,
+        sub: `${Math.round(confidenceValue)}% conf`,
       };
     }
     if (surface === "watchboards") {
@@ -305,13 +326,13 @@ export function CoachGIntelligenceLayer({
     return {
       label: "Top Prop Edge",
       value:
-        topPropEdge?.player && topPropEdge?.prop
+        topPropEdge?.player && topPropEdge?.prop && hasRealTopPropEdge
           ? `${topPropEdge.player} ${topPropEdge.prop}`
-          : "Prop edge still forming",
+          : "Analyzing matchup...",
       sub:
-        topPropEdge?.edge_score !== null && topPropEdge?.edge_score !== undefined
-          ? `Edge ${Math.round(topPropEdge.edge_score)}`
-          : topSignal?.message || "Monitoring books for the next clear signal",
+        hasRealTopPropEdge
+          ? `Edge ${Math.round(topPropEdgeValue)}`
+          : safeTopSignalMessage || "Analyzing matchup...",
     };
   })();
 
@@ -332,12 +353,12 @@ export function CoachGIntelligenceLayer({
           {loading && !cleanText(payload?.summary) && (
             <p className="mt-1 text-[11px] text-white/55">Syncing Coach G intelligence...</p>
           )}
-          {topSignal?.message && (
+          {safeTopSignalMessage && (
             <p className={cn(
               "mt-1 text-xs",
               topSignal.importance === "high" ? "text-amber-300" : "text-slate-300"
             )}>
-              {(topSignal.icon || "📡")} {topSignal.message}
+              {(topSignal.icon || "📡")} {safeTopSignalMessage}
             </p>
           )}
           {actionableItems.length > 0 && (
@@ -366,11 +387,13 @@ export function CoachGIntelligenceLayer({
               {videoMessage && <span className="text-[10px] text-white/60">{videoMessage}</span>}
             </div>
           )}
-          <div className={cn("mt-2 rounded-md border border-white/10 bg-black/20 px-2 py-1.5", compact && "px-2 py-1")}>
-            <p className="text-[10px] uppercase tracking-wide text-white/55">{surfaceMeta.label}</p>
-            <p className={cn("truncate text-xs text-white/90", compact ? "mt-0.5" : "mt-1")}>{surfaceMeta.value}</p>
-            <p className="truncate text-[10px] text-white/55">{surfaceMeta.sub}</p>
-          </div>
+          {surfaceMeta && (
+            <div className={cn("mt-2 rounded-md border border-white/10 bg-black/20 px-2 py-1.5", compact && "px-2 py-1")}>
+              <p className="text-[10px] uppercase tracking-wide text-white/55">{surfaceMeta.label}</p>
+              <p className={cn("truncate text-xs text-white/90", compact ? "mt-0.5" : "mt-1")}>{surfaceMeta.value}</p>
+              <p className="truncate text-[10px] text-white/55">{surfaceMeta.sub}</p>
+            </div>
+          )}
           {surface === "watchboards" && watchSuggestions.length > 0 && (
             <div className="mt-2 flex flex-wrap gap-1.5">
               {watchSuggestions.map((s) => (
@@ -386,7 +409,7 @@ export function CoachGIntelligenceLayer({
                   title={s.signal || "Coach G watch suggestion"}
                 >
                   <span className="font-semibold">{s.label}</span>
-                  <span className="text-violet-300/90">Edge {Math.round(s.edge)}</span>
+                  {Math.round(s.edge) > 0 && <span className="text-violet-300/90">{`Edge ${Math.round(s.edge)}`}</span>}
                   <CoachGExternalLinkIcon />
                 </button>
               ))}
@@ -394,10 +417,12 @@ export function CoachGIntelligenceLayer({
           )}
         </div>
         <div className="flex shrink-0 items-center gap-2">
-          <div className="rounded-lg border border-white/20 bg-black/20 px-2 py-1 text-center">
-            <p className="text-[10px] uppercase tracking-wide text-white/60">Edge</p>
-            <p className="text-sm font-bold text-emerald-300">{edge ?? "--"}</p>
-          </div>
+          {hasRealEdge && (
+            <div className="rounded-lg border border-white/20 bg-black/20 px-2 py-1 text-center">
+              <p className="text-[10px] uppercase tracking-wide text-white/60">Edge</p>
+              <p className="text-sm font-bold text-emerald-300">{edgeValue}</p>
+            </div>
+          )}
           <button
             onClick={() => navigate("/scout")}
             className={cn(

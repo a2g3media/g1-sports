@@ -1,9 +1,11 @@
 import { useEffect, useMemo, useState } from "react";
 import { motion } from "framer-motion";
 import { TrendingUp, Award, Flame, Sparkles } from "lucide-react";
-import { Link } from "react-router-dom";
+import { Link, useNavigate } from "react-router-dom";
 import { PlayerPhoto } from "@/react-app/components/PlayerPhoto";
 import { buildPlayerRoute, logPlayerNavigation } from "@/react-app/lib/navigationRoutes";
+import { prefetchFullPlayerProfileSnapshot } from "@/react-app/lib/playerProfileSnapshotPrewarm";
+import { resolvePlayerIdForNavigation } from "@/react-app/lib/resolvePlayerIdForNavigation";
 
 // Use centralized PlayerPhoto component instead of inline implementation
 
@@ -428,7 +430,7 @@ function parseLeadersApiCategories(categoriesRaw: LeadersApiCategory[]): StatCat
     players: Array.isArray(cat.players)
       ? cat.players
         .map((player, idx) => ({
-          playerId: String(player.playerId || `${cat.key || "leader"}-${idx}`),
+          playerId: String(player.playerId || ""),
           name: String(player.name || "Unknown Player"),
           teamCode: String(player.teamCode || ""),
           teamName: String(player.teamName || ""),
@@ -612,7 +614,7 @@ export function HubLeaders({ sportKey }: HubLeadersProps) {
           players: Array.isArray(cat.players)
             ? cat.players
               .map((player, idx) => ({
-                playerId: String(player.playerId || `${cat.key || "leader"}-${idx}`),
+                playerId: String(player.playerId || ""),
                 name: String(player.name || "Unknown Player"),
                 teamCode: String(player.teamCode || ""),
                 teamName: String(player.teamName || ""),
@@ -900,7 +902,7 @@ export function HubLeaders({ sportKey }: HubLeadersProps) {
           <div className="flex gap-3 overflow-x-auto pb-2 scrollbar-hide snap-x">
             {activeCategoryData.players.map((player, index) => (
               <PlayerCard 
-                key={player.playerId}
+                key={`${player.playerId || "missing"}:${player.name}:${index}`}
                 player={player}
                 index={index}
                 sportKey={sportKey}
@@ -941,8 +943,127 @@ interface PlayerCardProps {
 function PlayerCard({ player, index, sportKey, unit }: PlayerCardProps) {
   const isFirst = player.rank === 1;
   const [headshotFailed, setHeadshotFailed] = useState(false);
-  const playerPath = buildPlayerRoute(String(sportKey || ""), player.name);
-  
+  const navigate = useNavigate();
+  const pid =
+    resolvePlayerIdForNavigation(player.playerId, player.name, String(sportKey || "").toLowerCase())
+    || undefined;
+  const goProfile = (e: React.MouseEvent) => {
+    e.preventDefault();
+    if (!pid) {
+      console.error("HUB_LEADER_NAV_MISSING_PLAYER_ID", { name: player.name, sportKey });
+      return;
+    }
+    logPlayerNavigation(pid, sportKey);
+    const hintedName = String(player.name || "").trim();
+    const routeBase = buildPlayerRoute(String(sportKey || ""), pid);
+    const route = hintedName
+      ? `${routeBase}?playerName=${encodeURIComponent(hintedName)}`
+      : routeBase;
+    navigate(route, {
+      state: { playerNameHint: String(player.name || "").trim() },
+    });
+  };
+
+  const prewarmProfile = () => {
+    if (!pid) return;
+    void prefetchFullPlayerProfileSnapshot({
+      sport: String(sportKey || "").toUpperCase(),
+      playerId: pid,
+      timeoutMs: 22_000,
+    });
+  };
+
+  const cardClass = `block w-[160px] sm:w-[200px] rounded-xl border transition-all group ${
+    isFirst
+      ? 'border-amber-500/30 bg-gradient-to-br from-amber-500/10 to-transparent'
+      : 'border-white/10 bg-white/[0.02] hover:border-white/25'
+  }`;
+
+  const cardInner = (
+    <>
+      {/* Rank Badge */}
+      <div className="p-3 pb-0 flex justify-between items-start">
+        <div className={`w-7 h-7 rounded-lg flex items-center justify-center text-xs font-bold ${
+          isFirst 
+            ? 'bg-gradient-to-br from-amber-400 to-amber-600 text-black' 
+            : player.rank <= 3
+              ? 'bg-white/20 text-white'
+              : 'bg-white/10 text-white/50'
+        }`}>
+          {player.rank}
+        </div>
+        
+        {player.trend && (
+          <TrendIndicator trend={player.trend} />
+        )}
+      </div>
+
+      {/* Player Info */}
+      <div className="p-3 pt-2 text-center">
+        {/* Player Photo or Silhouette Fallback */}
+        <div className={`w-[72px] h-[80px] sm:w-[88px] sm:h-[96px] mx-auto rounded-2xl flex items-center justify-center text-lg font-bold mb-2 overflow-hidden bg-gradient-to-b from-white/[0.06] to-white/[0.02] border border-white/10 ${
+          isFirst 
+            ? 'ring-2 ring-amber-500/30' 
+            : ''
+        }`}>
+          {!headshotFailed && player.imageUrl ? (
+            <img
+              src={player.imageUrl}
+              alt={player.name}
+              className="object-contain object-center rounded-2xl p-1"
+              style={{ width: "100%", height: "100%" }}
+              onError={() => setHeadshotFailed(true)}
+              loading="lazy"
+            />
+          ) : (
+            <PlayerPhoto
+              playerName={player.name}
+              sport={sportKey}
+              size={92}
+              highlight={isFirst}
+              shape="rounded"
+              className="object-contain object-center p-1"
+            />
+          )}
+        </div>
+
+        {/* Name */}
+        <div className="font-semibold text-white text-sm truncate group-hover:text-[var(--sport-accent)] transition-colors">
+          {getDisplayLastName(player.name)}
+        </div>
+        
+        {/* Team */}
+        <div className="text-[10px] text-white/40 mt-0.5">
+          {player.teamName}
+        </div>
+        {player.league ? (
+          <div className="text-[10px] text-white/30 mt-0.5">{player.league}</div>
+        ) : null}
+
+        {/* Stat Value */}
+        <div className={`mt-2 text-xl sm:text-2xl font-bold tabular-nums ${
+          isFirst ? 'text-amber-400' : 'text-white'
+        }`}>
+          {formatStatValue(player.value, unit)}
+        </div>
+        <div className="text-[10px] text-white/30 uppercase tracking-wider">
+          {formatUnitLabel(unit)}
+        </div>
+      </div>
+
+      {/* Footer */}
+      <div className="px-3 py-2 border-t border-white/5 flex justify-center">
+        <span className="text-[10px] text-white/30">
+          {player.sampleValue != null && player.sampleLabel
+            ? `${player.sampleValue} ${player.sampleLabel}`
+            : player.sampleSize
+              ? `${player.sampleSize} markets`
+              : `${player.gamesPlayed} GP`}
+        </span>
+      </div>
+    </>
+  );
+
   return (
     <motion.div
       initial={{ opacity: 0, x: 20 }}
@@ -950,96 +1071,21 @@ function PlayerCard({ player, index, sportKey, unit }: PlayerCardProps) {
       transition={{ delay: index * 0.05 }}
       className="snap-start"
     >
-      <Link
-        to={playerPath}
-        onClick={() => logPlayerNavigation(player.name, sportKey)}
-        className={`block w-[160px] sm:w-[200px] rounded-xl border transition-all group ${
-          isFirst 
-            ? 'border-amber-500/30 bg-gradient-to-br from-amber-500/10 to-transparent' 
-            : 'border-white/10 bg-white/[0.02] hover:border-white/25'
-        }`}
-      >
-        {/* Rank Badge */}
-        <div className="p-3 pb-0 flex justify-between items-start">
-          <div className={`w-7 h-7 rounded-lg flex items-center justify-center text-xs font-bold ${
-            isFirst 
-              ? 'bg-gradient-to-br from-amber-400 to-amber-600 text-black' 
-              : player.rank <= 3
-                ? 'bg-white/20 text-white'
-                : 'bg-white/10 text-white/50'
-          }`}>
-            {player.rank}
-          </div>
-          
-          {player.trend && (
-            <TrendIndicator trend={player.trend} />
-          )}
+      {pid ? (
+        <Link
+          to="#"
+          onClick={goProfile}
+          onMouseEnter={prewarmProfile}
+          onFocus={prewarmProfile}
+          className={cardClass}
+        >
+          {cardInner}
+        </Link>
+      ) : (
+        <div className={`${cardClass} opacity-70 cursor-default`}>
+          {cardInner}
         </div>
-
-        {/* Player Info */}
-        <div className="p-3 pt-2 text-center">
-          {/* Player Photo or Silhouette Fallback */}
-          <div className={`w-[72px] h-[80px] sm:w-[88px] sm:h-[96px] mx-auto rounded-2xl flex items-center justify-center text-lg font-bold mb-2 overflow-hidden bg-gradient-to-b from-white/[0.06] to-white/[0.02] border border-white/10 ${
-            isFirst 
-              ? 'ring-2 ring-amber-500/30' 
-              : ''
-          }`}>
-            {!headshotFailed && player.imageUrl ? (
-              <img
-                src={player.imageUrl}
-                alt={player.name}
-                className="object-contain object-center rounded-2xl p-1"
-                style={{ width: "100%", height: "100%" }}
-                onError={() => setHeadshotFailed(true)}
-                loading="lazy"
-              />
-            ) : (
-              <PlayerPhoto
-                playerName={player.name}
-                sport={sportKey}
-                size={92}
-                highlight={isFirst}
-                shape="rounded"
-                className="object-contain object-center p-1"
-              />
-            )}
-          </div>
-
-          {/* Name */}
-          <div className="font-semibold text-white text-sm truncate group-hover:text-[var(--sport-accent)] transition-colors">
-            {getDisplayLastName(player.name)}
-          </div>
-          
-          {/* Team */}
-          <div className="text-[10px] text-white/40 mt-0.5">
-            {player.teamName}
-          </div>
-          {player.league ? (
-            <div className="text-[10px] text-white/30 mt-0.5">{player.league}</div>
-          ) : null}
-
-          {/* Stat Value */}
-          <div className={`mt-2 text-xl sm:text-2xl font-bold tabular-nums ${
-            isFirst ? 'text-amber-400' : 'text-white'
-          }`}>
-            {formatStatValue(player.value, unit)}
-          </div>
-          <div className="text-[10px] text-white/30 uppercase tracking-wider">
-            {formatUnitLabel(unit)}
-          </div>
-        </div>
-
-        {/* Footer */}
-        <div className="px-3 py-2 border-t border-white/5 flex justify-center">
-          <span className="text-[10px] text-white/30">
-            {player.sampleValue != null && player.sampleLabel
-              ? `${player.sampleValue} ${player.sampleLabel}`
-              : player.sampleSize
-                ? `${player.sampleSize} markets`
-                : `${player.gamesPlayed} GP`}
-          </span>
-        </div>
-      </Link>
+      )}
     </motion.div>
   );
 }
@@ -1072,8 +1118,36 @@ interface QuickStatCardProps {
 }
 
 function QuickStatCard({ category, leader, sportKey, isActive, onClick }: QuickStatCardProps) {
+  const navigate = useNavigate();
   if (!leader) return null;
-  const playerPath = buildPlayerRoute(String(sportKey || ""), leader.name);
+  const pid =
+    resolvePlayerIdForNavigation(leader.playerId, leader.name, String(sportKey || "").toLowerCase())
+    || undefined;
+  const goProfile = (e: React.MouseEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (!pid) {
+      console.error("HUB_LEADER_NAV_MISSING_PLAYER_ID", { name: leader.name, sportKey });
+      return;
+    }
+    logPlayerNavigation(pid, sportKey);
+    const hintedName = String(leader.name || "").trim();
+    const routeBase = buildPlayerRoute(String(sportKey || ""), pid);
+    const route = hintedName
+      ? `${routeBase}?playerName=${encodeURIComponent(hintedName)}`
+      : routeBase;
+    navigate(route, {
+      state: { playerNameHint: String(leader.name || "").trim() },
+    });
+  };
+  const prewarmLeader = () => {
+    if (!pid) return;
+    void prefetchFullPlayerProfileSnapshot({
+      sport: String(sportKey || "").toUpperCase(),
+      playerId: pid,
+      timeoutMs: 22_000,
+    });
+  };
   return (
     <button
       onClick={onClick}
@@ -1086,16 +1160,21 @@ function QuickStatCard({ category, leader, sportKey, isActive, onClick }: QuickS
       <div className="text-[10px] text-white/40 uppercase tracking-wider mb-1">
         {category.shortLabel} Leader
       </div>
-      <Link
-        to={playerPath}
-        onClick={(event) => {
-          event.stopPropagation();
-          logPlayerNavigation(leader.name, sportKey);
-        }}
-        className="font-semibold text-white text-sm truncate hover:text-[var(--sport-accent)] transition-colors"
-      >
-        {getDisplayLastName(leader.name)}
-      </Link>
+      {pid ? (
+        <Link
+          to="#"
+          onClick={goProfile}
+          onMouseEnter={prewarmLeader}
+          onFocus={prewarmLeader}
+          className="font-semibold text-white text-sm truncate hover:text-[var(--sport-accent)] transition-colors"
+        >
+          {getDisplayLastName(leader.name)}
+        </Link>
+      ) : (
+        <span className="font-semibold text-white/75 text-sm truncate cursor-default">
+          {getDisplayLastName(leader.name)}
+        </span>
+      )}
       <div className="flex items-baseline gap-1 mt-1">
         <span className={`text-lg font-bold ${isActive ? 'text-[var(--sport-accent)]' : 'text-white'}`}>
           {formatStatValue(leader.value, category.unit)}

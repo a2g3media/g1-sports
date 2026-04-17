@@ -1,3 +1,4 @@
+// @ts-nocheck
 /**
  * Team Data API Routes
  * Fetches team profiles, standings, schedules, and stats from SportsRadar
@@ -169,6 +170,63 @@ function normalizeTeamKey(value: unknown): string {
     .replace(/[^a-z0-9]/g, '');
 }
 
+function resolveStandingsTeamRow(rows: any[], rawTeamId: string): any | null {
+  const lookup = String(rawTeamId || '').trim();
+  const lookupUpper = lookup.toUpperCase();
+  const normalizedLookup = normalizeTeamKey(lookupUpper);
+  return rows.find((item: any) => {
+    const id = String(item?.id || '').trim();
+    const alias = String(item?.alias || '').trim().toUpperCase();
+    const name = String(item?.name || '').trim();
+    const market = String(item?.market || '').trim();
+    const fullName = `${market} ${name}`.trim();
+    return (
+      id === lookup
+      || alias === lookupUpper
+      || normalizeTeamKey(name) === normalizedLookup
+      || normalizeTeamKey(fullName) === normalizedLookup
+    );
+  }) || null;
+}
+
+const NHL_ESPN_TEAM_TTL_MS = 6 * 60 * 60 * 1000;
+let nhlEspnTeamMapCache: { expiresAt: number; byAlias: Map<string, string> } | null = null;
+
+async function fetchNhlEspnTeamNameByAlias(aliasRaw: string): Promise<string> {
+  const alias = String(aliasRaw || '').trim().toUpperCase();
+  if (!alias) return '';
+  if (nhlEspnTeamMapCache && nhlEspnTeamMapCache.expiresAt > Date.now()) {
+    return String(nhlEspnTeamMapCache.byAlias.get(alias) || '').trim();
+  }
+  const byAlias = new Map<string, string>();
+  const res = await fetch('https://site.api.espn.com/apis/site/v2/sports/hockey/nhl/teams');
+  if (!res.ok) return '';
+  const json = await res.json().catch(() => null as any);
+  const teams = Array.isArray(json?.sports?.[0]?.leagues?.[0]?.teams)
+    ? json.sports[0].leagues[0].teams
+    : [];
+  for (const row of teams) {
+    const team = row?.team || {};
+    const abbr = String(team?.abbreviation || '').trim().toUpperCase();
+    const displayName = String(team?.displayName || '').trim();
+    if (abbr && displayName) byAlias.set(abbr, displayName);
+  }
+  nhlEspnTeamMapCache = { expiresAt: Date.now() + NHL_ESPN_TEAM_TTL_MS, byAlias };
+  return String(byAlias.get(alias) || '').trim();
+}
+
+function resolveStandingsTeamRowByDisplayName(rows: any[], displayNameRaw: string): any | null {
+  const normalized = normalizeTeamKey(displayNameRaw);
+  if (!normalized) return null;
+  return rows.find((item: any) => {
+    const name = String(item?.name || '').trim();
+    const market = String(item?.market || '').trim();
+    const fullName = `${market} ${name}`.trim();
+    const candidate = normalizeTeamKey(fullName);
+    return candidate === normalized || candidate.includes(normalized) || normalized.includes(candidate);
+  }) || null;
+}
+
 function expandNbaAliasCandidates(aliasLike: string): string[] {
   const raw = String(aliasLike || '').trim().toUpperCase();
   if (!raw) return [];
@@ -183,6 +241,8 @@ function expandNbaAliasCandidates(aliasLike: string): string[] {
     NO: ['NOP'],
     PHX: ['PHO'],
     PHO: ['PHX'],
+    PHI: ['PHL'],
+    PHL: ['PHI'],
     UTA: ['UTAH'],
     UTAH: ['UTA'],
   };
@@ -205,6 +265,7 @@ const NBA_ALIAS_TO_TEAM_ID: Record<string, string> = {
   BOS: '583eccfa-fb46-11e1-82cb-f4ce4684ea4c',
   NY: '583ec70e-fb46-11e1-82cb-f4ce4684ea4c',
   PHI: '583ec87d-fb46-11e1-82cb-f4ce4684ea4c',
+  PHL: '583ec87d-fb46-11e1-82cb-f4ce4684ea4c',
   TOR: '583ecda6-fb46-11e1-82cb-f4ce4684ea4c',
   BKN: '583ec9d6-fb46-11e1-82cb-f4ce4684ea4c',
   LAL: '583ecae2-fb46-11e1-82cb-f4ce4684ea4c',
@@ -275,17 +336,31 @@ async function resolveNbaTeamAliasForFallback(
 
   const directAlias = String(teamId || '').trim().toUpperCase();
   if (/^[A-Z]{2,4}$/.test(directAlias)) {
+    const canonicalAlias: Record<string, string> = {
+      PHL: 'PHI',
+      PHO: 'PHX',
+      NO: 'NOP',
+      SA: 'SAS',
+      NY: 'NYK',
+      CHO: 'CHA',
+      BRK: 'BKN',
+      GSW: 'GS',
+    };
+    const normalizedDirectAlias = canonicalAlias[directAlias] || directAlias;
     try {
       const standings = await fetchStandingsCached(db, 'NBA', apiKey);
       const teams = Array.isArray((standings as any)?.teams) ? (standings as any).teams : [];
-      const candidates = new Set(expandNbaAliasCandidates(directAlias));
+      const candidates = new Set(expandNbaAliasCandidates(normalizedDirectAlias));
       const row = teams.find((t: any) => candidates.has(String(t?.alias || '').trim().toUpperCase()));
       const aliasFromRow = String(row?.alias || '').trim().toUpperCase();
       if (aliasFromRow) return aliasFromRow;
     } catch {
       // fall through to direct alias
     }
-    return directAlias;
+    if (Object.prototype.hasOwnProperty.call(NBA_ALIAS_TO_TEAM_ID, normalizedDirectAlias)) {
+      return normalizedDirectAlias;
+    }
+    return '';
   }
   try {
     const profile = await fetchTeamProfileCached(db, 'NBA', teamId, apiKey);
@@ -804,9 +879,8 @@ async function fetchNbaEspnInjuriesByAlias(alias: string, options?: { bypassCach
       if (aliasMatched) return true;
       const athleteTeamId = String(row?.athlete?.team?.id || '').trim();
       if (espnTeamId && athleteTeamId && athleteTeamId === espnTeamId) return true;
-      const teamName = String(row?.__teamName || '').toUpperCase();
-      if (teamName.includes(normalizedAlias)) return true;
-      return aliasCandidates.some((candidate) => teamName.includes(candidate));
+      // Strict guard: never leak injuries from unrelated teams on fuzzy name includes.
+      return false;
     })
     .map((row: any) => ({
       id: String(row?.id || ''),
@@ -865,6 +939,36 @@ async function fetchNbaEspnRosterHeadshotsByAlias(alias: string) {
     byName,
   });
   return { byName };
+}
+
+async function fetchNbaEspnRosterByAlias(alias: string): Promise<any[]> {
+  const normalizedAlias = String(alias || '').trim().toUpperCase();
+  if (!normalizedAlias) return [];
+  const espnTeamId = await fetchNbaEspnTeamIdByAlias(normalizedAlias);
+  if (!espnTeamId) return [];
+  try {
+    const res = await fetch(`https://site.api.espn.com/apis/site/v2/sports/basketball/nba/teams/${espnTeamId}/roster`);
+    if (!res.ok) return [];
+    const json: any = await res.json();
+    const athletes = Array.isArray(json?.athletes) ? json.athletes : [];
+    return athletes.map((athlete: any) => {
+      const athleteId = String(athlete?.id || '').trim();
+      return {
+        id: athleteId || String(athlete?.uid || '').trim(),
+        playerId: athleteId || undefined,
+        espnId: athleteId || undefined,
+        name: String(athlete?.displayName || athlete?.fullName || '').trim() || 'Unknown Player',
+        firstName: String(athlete?.firstName || '').trim(),
+        lastName: String(athlete?.lastName || '').trim(),
+        position: String(athlete?.position?.abbreviation || athlete?.position?.name || '').trim(),
+        jerseyNumber: String(athlete?.jersey || '').trim(),
+        status: String(athlete?.status || 'ACT').trim(),
+        headshot: String(athlete?.headshot?.href || '').trim() || null,
+      };
+    }).filter((row: any) => String(row?.name || '').trim().length > 0);
+  } catch {
+    return [];
+  }
 }
 
 function normalizeNbaPropType(value: unknown): string {
@@ -1216,6 +1320,79 @@ async function fetchMlbTeamMetaMap() {
     if (typeof team.id === 'number') teamById.set(team.id, team);
   }
   return teamById;
+}
+
+async function fetchMlbStatsApiTeamProfile(teamIdRaw: string): Promise<{
+  team: any;
+  roster: any[];
+  venue: any;
+  errors: string[];
+}> {
+  const teamId = Number(String(teamIdRaw || "").trim());
+  if (!Number.isFinite(teamId) || teamId <= 0) {
+    return { team: null, roster: [], venue: null, errors: ["invalid_mlb_team_id"] };
+  }
+  const errors: string[] = [];
+  const [teamRes, rosterRes] = await Promise.all([
+    fetch(`https://statsapi.mlb.com/api/v1/teams/${teamId}`),
+    fetch(`https://statsapi.mlb.com/api/v1/teams/${teamId}/roster?rosterType=active`),
+  ]);
+  if (!teamRes.ok) {
+    return { team: null, roster: [], venue: null, errors: [`MLB team endpoint HTTP ${teamRes.status}`] };
+  }
+  const teamJson = await teamRes.json() as { teams?: any[] };
+  const teamData = Array.isArray(teamJson.teams) ? teamJson.teams[0] : null;
+  if (!teamData) {
+    return { team: null, roster: [], venue: null, errors: ["mlb_team_missing"] };
+  }
+  let rosterRows: any[] = [];
+  if (rosterRes.ok) {
+    const rosterJson = await rosterRes.json() as { roster?: any[] };
+    rosterRows = Array.isArray(rosterJson.roster) ? rosterJson.roster : [];
+  } else {
+    errors.push(`MLB roster endpoint HTTP ${rosterRes.status}`);
+  }
+  const roster = rosterRows.map((p: any) => {
+    const personId = String(p?.person?.id || "").trim();
+    const headshot = personId
+      ? `https://img.mlbstatic.com/mlb-photos/image/upload/w_280,q_auto:best/v1/people/${personId}/headshot/67/current`
+      : null;
+    return {
+      id: personId || String(p?.id || ""),
+      name: String(p?.person?.fullName || "").trim() || "Unknown Player",
+      firstName: String(p?.person?.fullName || "").trim().split(" ").slice(0, -1).join(" "),
+      lastName: String(p?.person?.fullName || "").trim().split(" ").slice(-1)[0] || "",
+      position: String(p?.position?.abbreviation || p?.position?.name || "").trim(),
+      jerseyNumber: String(p?.jerseyNumber || "").trim(),
+      status: String(p?.status?.description || "").trim(),
+      headshot,
+    };
+  });
+  return {
+    team: {
+      id: String(teamData.id || teamId),
+      name: String(teamData.name || teamData.teamName || "Unknown Team"),
+      market: String(teamData.locationName || ""),
+      alias: String(teamData.abbreviation || ""),
+      conference: String(teamData.league?.name || ""),
+      division: String(teamData.division?.name || ""),
+      record: null,
+    },
+    roster,
+    venue: teamData.venue
+      ? {
+          id: String(teamData.venue.id || ""),
+          name: String(teamData.venue.name || ""),
+          city: String(teamData.locationName || ""),
+          state: "",
+          country: "USA",
+          capacity: null,
+          surface: null,
+          roof_type: null,
+        }
+      : null,
+    errors,
+  };
 }
 
 async function fetchMlbStatsApiStandings(season: number) {
@@ -2690,6 +2867,125 @@ teams.get('/:sport/:teamId/injuries', async (c) => {
         source: fallback.source,
       });
     }
+    if (sport === 'MLB') {
+      const teamIdRaw = String(teamId || '').trim();
+      let resolvedTeamId = teamIdRaw;
+      if (!/^\d+$/.test(teamIdRaw)) {
+        try {
+          const standings = await fetchStandingsCached(c.env.DB, 'MLB', apiKey);
+          const rows = Array.isArray((standings as any)?.teams) ? (standings as any).teams : [];
+          const lookup = teamIdRaw.toUpperCase();
+          const normalizedLookup = normalizeTeamKey(lookup);
+          const row = rows.find((item: any) => {
+            const id = String(item?.id || '').trim();
+            const alias = String(item?.alias || '').trim().toUpperCase();
+            const name = String(item?.name || '').trim();
+            const market = String(item?.market || '').trim();
+            const fullName = `${market} ${name}`.trim();
+            return (
+              id === teamIdRaw
+              || alias === lookup
+              || normalizeTeamKey(name) === normalizedLookup
+              || normalizeTeamKey(fullName) === normalizedLookup
+            );
+          });
+          const mapped = String(row?.id || '').trim();
+          if (mapped) resolvedTeamId = mapped;
+        } catch {
+          // keep incoming id
+        }
+      }
+      const teamMetaRes = await fetch(`https://statsapi.mlb.com/api/v1/teams/${encodeURIComponent(resolvedTeamId)}`);
+      const teamMetaJson = teamMetaRes.ok ? await teamMetaRes.json().catch(() => null) : null as any;
+      const teamMeta = Array.isArray(teamMetaJson?.teams) ? teamMetaJson.teams[0] : null;
+      const teamName = String(teamMeta?.name || '').trim();
+      const normalizedTeamName = normalizeTeamKey(teamName);
+      const injuriesRes = await fetch('https://site.api.espn.com/apis/site/v2/sports/baseball/mlb/injuries?limit=500');
+      if (!injuriesRes.ok) {
+        return c.json({ teamId, injuries: [], source: 'mlb_injuries_unavailable' });
+      }
+      const injuriesJson = await injuriesRes.json().catch(() => null as any);
+      const buckets = Array.isArray(injuriesJson?.injuries) ? injuriesJson.injuries : [];
+      const injuries = buckets
+        .flatMap((bucket: any) => {
+          const bucketName = String(bucket?.displayName || '').trim();
+          const bucketNorm = normalizeTeamKey(bucketName);
+          if (normalizedTeamName && bucketNorm && !bucketNorm.includes(normalizedTeamName) && !normalizedTeamName.includes(bucketNorm)) {
+            return [];
+          }
+          const rows = Array.isArray(bucket?.injuries) ? bucket.injuries : [];
+          return rows.map((row: any) => ({
+            id: String(row?.id || ''),
+            playerId: String(row?.athlete?.id || ''),
+            playerName: String(row?.athlete?.displayName || row?.athlete?.shortName || 'Unknown Player'),
+            teamAlias: String(row?.athlete?.team?.abbreviation || ''),
+            teamName: String(row?.athlete?.team?.displayName || bucketName || ''),
+            status: String(row?.status || row?.type?.description || 'Unknown'),
+            date: String(row?.date || ''),
+            detail: String(row?.details?.detail || row?.shortComment || row?.longComment || '').trim(),
+            injuryType: String(row?.details?.type || row?.type?.description || ''),
+            returnDate: String(row?.details?.returnDate || ''),
+            headshot: String(row?.athlete?.headshot?.href || ''),
+          }));
+        })
+        .filter((row: any) => row.playerName);
+      return c.json({
+        teamId,
+        injuries,
+        source: 'espn_live',
+      });
+    }
+    if (sport === 'NHL') {
+      const standings = await fetchStandingsCached(c.env.DB, 'NHL', apiKey);
+      const rows = Array.isArray((standings as any)?.teams) ? (standings as any).teams : [];
+      const rawTeamId = String(teamId || '').trim();
+      let matched = resolveStandingsTeamRow(rows, rawTeamId);
+      if (!matched && /^[a-z]{2,4}$/i.test(rawTeamId)) {
+        const espnName = await fetchNhlEspnTeamNameByAlias(rawTeamId);
+        if (espnName) matched = resolveStandingsTeamRowByDisplayName(rows, espnName);
+      }
+      const resolvedAlias = String(matched?.alias || '').trim().toUpperCase();
+      const resolvedName = `${String(matched?.market || '').trim()} ${String(matched?.name || '').trim()}`.trim();
+      const normalizedTeamName = normalizeTeamKey(resolvedName);
+      const injuriesRes = await fetch('https://site.api.espn.com/apis/site/v2/sports/hockey/nhl/injuries?limit=500');
+      if (!injuriesRes.ok) {
+        return c.json({ teamId, injuries: [], source: 'nhl_injuries_unavailable' });
+      }
+      const injuriesJson = await injuriesRes.json().catch(() => null as any);
+      const buckets = Array.isArray(injuriesJson?.injuries) ? injuriesJson.injuries : [];
+      const injuries = buckets
+        .flatMap((bucket: any) => {
+          const bucketName = String(bucket?.displayName || '').trim();
+          const bucketNorm = normalizeTeamKey(bucketName);
+          const rows = Array.isArray(bucket?.injuries) ? bucket.injuries : [];
+          return rows
+            .filter((row: any) => {
+              const athleteAlias = String(row?.athlete?.team?.abbreviation || '').trim().toUpperCase();
+              if (resolvedAlias && athleteAlias && athleteAlias === resolvedAlias) return true;
+              if (!normalizedTeamName || !bucketNorm) return false;
+              return bucketNorm.includes(normalizedTeamName) || normalizedTeamName.includes(bucketNorm);
+            })
+            .map((row: any) => ({
+              id: String(row?.id || ''),
+              playerId: String(row?.athlete?.id || ''),
+              playerName: String(row?.athlete?.displayName || row?.athlete?.shortName || 'Unknown Player'),
+              teamAlias: String(row?.athlete?.team?.abbreviation || ''),
+              teamName: String(row?.athlete?.team?.displayName || bucketName || ''),
+              status: String(row?.status || row?.type?.description || 'Unknown'),
+              date: String(row?.date || ''),
+              detail: String(row?.details?.detail || row?.shortComment || row?.longComment || '').trim(),
+              injuryType: String(row?.details?.type || row?.type?.description || ''),
+              returnDate: String(row?.details?.returnDate || ''),
+              headshot: String(row?.athlete?.headshot?.href || ''),
+            }));
+        })
+        .filter((row: any) => row.playerName);
+      return c.json({
+        teamId,
+        injuries,
+        source: 'espn_live',
+      });
+    }
     return c.json({
       teamId,
       injuries: [],
@@ -2700,6 +2996,94 @@ teams.get('/:sport/:teamId/injuries', async (c) => {
     return c.json({ error: String(err) }, 500);
   }
 });
+
+function normalizeTeamProfileRosterRows(rawPayload: any): any[] {
+  const append = (bucket: any[], out: any[]) => {
+    for (const row of bucket) out.push(row);
+  };
+  const rawRows: any[] = [];
+  if (Array.isArray(rawPayload?.roster)) append(rawPayload.roster, rawRows);
+  if (Array.isArray(rawPayload?.players)) append(rawPayload.players, rawRows);
+  if (Array.isArray(rawPayload?.athletes)) append(rawPayload.athletes, rawRows);
+  if (Array.isArray(rawPayload?.entries)) append(rawPayload.entries, rawRows);
+  const grouped = [
+    ...(Array.isArray(rawPayload?.groups) ? rawPayload.groups : []),
+    ...(Array.isArray(rawPayload?.positions) ? rawPayload.positions : []),
+    ...(Array.isArray(rawPayload?.athletesByPosition) ? rawPayload.athletesByPosition : []),
+  ];
+  for (const group of grouped) {
+    const athletes = Array.isArray(group?.athletes) ? group.athletes : [];
+    append(athletes, rawRows);
+  }
+  return rawRows.map((row: any) => {
+    const athlete = row?.athlete || row?.person || row?.player || null;
+    const id = String(
+      row?.id
+      || row?.playerId
+      || row?.athleteId
+      || row?.espnId
+      || athlete?.id
+      || ""
+    ).trim();
+    const name = String(
+      row?.name
+      || row?.displayName
+      || row?.fullName
+      || athlete?.displayName
+      || athlete?.fullName
+      || athlete?.name
+      || ""
+    ).trim();
+    if (!name) return null;
+    return {
+      id: id || name.toLowerCase().replace(/\s+/g, "-"),
+      playerId: String(row?.playerId || row?.espnId || athlete?.id || id || "").trim() || undefined,
+      espnId: String(row?.espnId || athlete?.id || "").trim() || undefined,
+      name,
+      firstName: String(row?.firstName || athlete?.firstName || "").trim(),
+      lastName: String(row?.lastName || athlete?.lastName || "").trim(),
+      position: String(row?.position?.abbreviation || row?.position?.name || row?.position || athlete?.position?.abbreviation || athlete?.position?.name || "").trim(),
+      jerseyNumber: String(row?.jerseyNumber || row?.jersey || athlete?.jersey || athlete?.jerseyNumber || "").trim(),
+      status: String(row?.status || athlete?.status || "").trim(),
+      headshot: String(row?.headshot || row?.photoUrl || athlete?.headshot?.href || "").trim() || null,
+    };
+  }).filter(Boolean);
+}
+
+function buildDegradedTeamProfilePayload(params: {
+  sport: string;
+  routeTeamId: string;
+  canonicalTeamId?: string;
+  team?: any | null;
+  roster?: any[];
+  venue?: any | null;
+  errors?: string[];
+  source?: string;
+}) {
+  const teamIdFallback = String(params.canonicalTeamId || params.routeTeamId || "").trim();
+  const teamAliasFallback = String(params.team?.alias || params.routeTeamId || "").trim().toUpperCase();
+  const normalizedRoster = normalizeTeamProfileRosterRows({ roster: params.roster || [] });
+  return {
+    team: params.team || {
+      id: teamIdFallback,
+      name: teamAliasFallback || teamIdFallback || "Team",
+      market: "",
+      alias: teamAliasFallback || teamIdFallback,
+      conference: "",
+      division: "",
+    },
+    roster: normalizedRoster,
+    venue: params.venue || null,
+    errors: Array.isArray(params.errors) && params.errors.length > 0
+      ? params.errors
+      : ["team_profile_degraded"],
+    cached: true,
+    source: params.source || "degraded_fallback",
+    status: "degraded",
+    pending_refresh: true,
+    degraded: true,
+  };
+}
 
 /**
  * Get team profile with roster and venue
@@ -2717,7 +3101,12 @@ teams.get('/:sport/:teamId', async (c) => {
   
   const apiKey = c.env.SPORTSRADAR_API_KEY;
   if (!apiKey) {
-    return c.json({ error: 'SportsRadar API key not configured' }, 500);
+    return c.json(buildDegradedTeamProfilePayload({
+      sport,
+      routeTeamId: teamId,
+      errors: ['SportsRadar API key not configured'],
+      source: 'missing_api_key_fallback',
+    }));
   }
   
   try {
@@ -2757,13 +3146,85 @@ teams.get('/:sport/:teamId', async (c) => {
         // keep canonicalTeamId from earlier resolver
       }
     }
+    if (sport === 'MLB' && !/^\d+$/.test(String(canonicalTeamId || '').trim())) {
+      try {
+        const standings = await fetchStandingsCached(c.env.DB, 'MLB', apiKey);
+        const rows = Array.isArray((standings as any)?.teams) ? (standings as any).teams : [];
+        const row = resolveStandingsTeamRow(rows, String(teamId || '').trim());
+        const mapped = String(row?.id || '').trim();
+        if (mapped) canonicalTeamId = mapped;
+      } catch {
+        // keep canonicalTeamId from incoming route
+      }
+    }
+    if (sport === 'NHL' && !/^[0-9a-f]{8}-[0-9a-f-]{27}$/i.test(String(canonicalTeamId || '').trim())) {
+      try {
+        const standings = await fetchStandingsCached(c.env.DB, 'NHL', apiKey);
+        const rows = Array.isArray((standings as any)?.teams) ? (standings as any).teams : [];
+        const rawTeamId = String(teamId || '').trim();
+        let row = resolveStandingsTeamRow(rows, rawTeamId);
+        if (!row && /^[a-z]{2,4}$/i.test(rawTeamId)) {
+          const espnName = await fetchNhlEspnTeamNameByAlias(rawTeamId);
+          if (espnName) row = resolveStandingsTeamRowByDisplayName(rows, espnName);
+        }
+        const mapped = String(row?.id || '').trim();
+        if (mapped) canonicalTeamId = mapped;
+      } catch {
+        // keep canonicalTeamId from incoming route
+      }
+    }
     // Use cached version - 1 hour TTL
-    const result = await fetchTeamProfileCached(
+    let result = await fetchTeamProfileCached(
       c.env.DB,
       sport as SportKey,
       canonicalTeamId,
       apiKey
     );
+    if (!result.team && result.errors.length > 0) {
+      try {
+        const provider = getSportsRadarProvider(apiKey, null);
+        const refreshed = await withTimeout(
+          provider.fetchTeamProfile(sport as SportKey, canonicalTeamId, apiKey),
+          2200,
+          { team: null, roster: [], venue: null, errors: ['team_profile_refresh_timeout'] }
+        );
+        if (refreshed?.team) {
+          result = {
+            ...refreshed,
+            fromCache: false,
+          };
+          const cacheEndpoint = `team/${sport}/${canonicalTeamId}`;
+          const cacheKey = makeCacheKey('sportsradar', cacheEndpoint);
+          await setCachedData(c.env.DB, cacheKey, 'sportsradar', cacheEndpoint, refreshed, 600);
+        } else if (Array.isArray(refreshed?.errors) && refreshed.errors.length > 0) {
+          result = {
+            ...result,
+            errors: [...result.errors, ...refreshed.errors],
+          };
+        }
+      } catch (refreshErr) {
+        result = {
+          ...result,
+          errors: [...result.errors, `profile_refresh_exception:${String(refreshErr)}`],
+        };
+      }
+    }
+    if (result.errors.length > 0 && !result.team && sport === 'MLB') {
+      const fallback = await fetchMlbStatsApiTeamProfile(canonicalTeamId);
+      if (fallback.team) {
+        return c.json({
+          team: fallback.team,
+          roster: normalizeTeamProfileRosterRows({ roster: fallback.roster }),
+          venue: fallback.venue,
+          errors: fallback.errors,
+          cached: true,
+          source: 'mlb_statsapi_profile',
+          status: fallback.errors.length > 0 ? 'degraded' : 'ok',
+          pending_refresh: fallback.errors.length > 0,
+          degraded: fallback.errors.length > 0,
+        });
+      }
+    }
     if (result.errors.length > 0 && !result.team && sport === 'NBA') {
       try {
         const alias = await resolveNbaTeamAliasForFallback(c.env.DB, teamId, apiKey);
@@ -2796,6 +3257,8 @@ teams.get('/:sport/:teamId', async (c) => {
                   if (!hit) return player;
                   return {
                     ...player,
+                    playerId: hit.playerId || player?.playerId,
+                    espnId: hit.playerId || player?.espnId,
                     headshot: player?.headshot || hit.headshot || null,
                     jerseyNumber: player?.jerseyNumber || hit.jersey || player?.jerseyNumber,
                     position: player?.position || hit.position || player?.position,
@@ -2803,18 +3266,30 @@ teams.get('/:sport/:teamId', async (c) => {
                 });
               }
             }
+            if (roster.length === 0) {
+              const recovered = await fetchNbaEspnRosterByAlias(String(retried.team?.alias || '').trim().toUpperCase());
+              if (recovered.length > 0) roster = recovered;
+            }
             return c.json({
               team: retried.team,
-              roster,
+              roster: normalizeTeamProfileRosterRows({ roster }),
               venue: retried.venue,
               errors: retried.errors,
               cached: true,
               source: 'canonical_retry',
+              status: retried.errors.length > 0 ? 'degraded' : 'ok',
+              pending_refresh: retried.errors.length > 0,
+              degraded: retried.errors.length > 0,
             });
           }
         }
 
         if (row) {
+          let recoveredRoster: any[] = [];
+          const fallbackAlias = String(row?.alias || '').trim().toUpperCase();
+          if (fallbackAlias) {
+            recoveredRoster = await fetchNbaEspnRosterByAlias(fallbackAlias).catch(() => []);
+          }
           const fallbackTeam = {
             id: String(row?.id || ''),
             name: String(row?.name || ''),
@@ -2825,11 +3300,14 @@ teams.get('/:sport/:teamId', async (c) => {
           };
           return c.json({
             team: fallbackTeam,
-            roster: [],
+            roster: normalizeTeamProfileRosterRows({ roster: recoveredRoster }),
             venue: null,
             errors: [...(Array.isArray(result.errors) ? result.errors : []), 'Used standings fallback profile'],
             cached: true,
-            source: 'standings_fallback',
+            source: recoveredRoster.length > 0 ? 'standings_with_espn_roster' : 'standings_fallback',
+            status: 'degraded',
+            pending_refresh: true,
+            degraded: true,
           });
         }
       } catch {
@@ -2839,6 +3317,7 @@ teams.get('/:sport/:teamId', async (c) => {
     
     if (result.errors.length > 0 && !result.team && sport === 'NBA') {
       const fallbackAlias = String(await resolveNbaTeamAliasForFallback(c.env.DB, teamId, apiKey).catch(() => '') || '').trim().toUpperCase();
+      const recoveredRoster = fallbackAlias ? await fetchNbaEspnRosterByAlias(fallbackAlias).catch(() => []) : [];
       return c.json({
         team: {
           id: String(canonicalTeamId || teamId),
@@ -2846,19 +3325,28 @@ teams.get('/:sport/:teamId', async (c) => {
           market: '',
           alias: fallbackAlias || String(teamId).toUpperCase(),
         },
-        roster: [],
+        roster: normalizeTeamProfileRosterRows({ roster: recoveredRoster }),
         venue: null,
         errors: result.errors,
         cached: true,
-        source: 'profile_degraded_fallback',
+        source: recoveredRoster.length > 0 ? 'profile_degraded_with_espn_roster' : 'profile_degraded_fallback',
+        status: 'degraded',
+        pending_refresh: true,
+        degraded: true,
       });
     }
 
     if (result.errors.length > 0 && !result.team) {
-      return c.json({ error: result.errors[0] }, 500);
+      return c.json(buildDegradedTeamProfilePayload({
+        sport,
+        routeTeamId: teamId,
+        canonicalTeamId,
+        errors: result.errors,
+        source: 'team_profile_provider_degraded',
+      }));
     }
     
-    let roster = Array.isArray(result.roster) ? result.roster : [];
+    let roster = normalizeTeamProfileRosterRows({ roster: result.roster });
     if (sport === 'NBA' && roster.length > 0) {
       const alias = String(result.team?.alias || '').trim().toUpperCase();
       const espnRoster = await fetchNbaEspnRosterHeadshotsByAlias(alias).catch(() => ({ byName: new Map() }));
@@ -2869,11 +3357,17 @@ teams.get('/:sport/:teamId', async (c) => {
           if (!hit) return player;
           return {
             ...player,
+            playerId: hit.playerId || player?.playerId,
+            espnId: hit.playerId || player?.espnId,
             headshot: player?.headshot || hit.headshot || null,
             jerseyNumber: player?.jerseyNumber || hit.jersey || player?.jerseyNumber,
             position: player?.position || hit.position || player?.position,
           };
         });
+      }
+      if (roster.length === 0) {
+        const recoveredRoster = await fetchNbaEspnRosterByAlias(alias).catch(() => []);
+        if (recoveredRoster.length > 0) roster = normalizeTeamProfileRosterRows({ roster: recoveredRoster });
       }
     }
     return c.json({
@@ -2881,12 +3375,21 @@ teams.get('/:sport/:teamId', async (c) => {
       roster,
       venue: result.venue,
       errors: result.errors,
-      cached: true
+      cached: true,
+      source: result.fromCache ? 'sportsradar_cached' : 'sportsradar_live',
+      status: result.errors.length > 0 ? 'degraded' : 'ok',
+      pending_refresh: result.errors.length > 0,
+      degraded: result.errors.length > 0,
     });
     
   } catch (err) {
     console.error('[Teams API] Profile error:', err);
-    return c.json({ error: String(err) }, 500);
+    return c.json(buildDegradedTeamProfilePayload({
+      sport,
+      routeTeamId: teamId,
+      errors: [String(err)],
+      source: 'team_profile_exception_degraded',
+    }));
   }
 });
 

@@ -1132,83 +1132,156 @@ export class SportsRadarProvider implements OddsProviderInterface {
     errors: string[];
   }> {
     const errors: string[] = [];
+    const requestedEventId = String(eventId || "").trim();
+    const resolvedEventId = requestedEventId
+      .replace(/^sr:sport_event:/i, "")
+      .replace(/^sr:match:/i, "");
+    if (!resolvedEventId) {
+      errors.push("Soccer Match Detail API: missing event id");
+      return { match: null, lineups: { home: [], away: [] }, statistics: null, timeline: [], errors };
+    }
     
     try {
-      // Fetch from multiple endpoints in parallel
+      const maskUrl = (url: string): string =>
+        url.replace(/api_key=([^&]+)/i, (_m, value: string) => {
+          const tail = value.slice(-4);
+          const masked = `${"*".repeat(Math.max(0, value.length - 4))}${tail}`;
+          return `api_key=${masked}`;
+        });
+      const shapeSummary = (payload: any): string => {
+        if (!payload || typeof payload !== "object") return "non_json";
+        const keys = Object.keys(payload);
+        const chunks = keys.slice(0, 6);
+        if (Array.isArray(payload.schedules)) chunks.push(`schedules:${payload.schedules.length}`);
+        if (Array.isArray(payload.timeline)) chunks.push(`timeline:${payload.timeline.length}`);
+        if (Array.isArray(payload.lineups)) chunks.push(`lineups:${payload.lineups.length}`);
+        if (payload.sport_event && typeof payload.sport_event === "object") chunks.push("sport_event");
+        if (payload.sport_event_status && typeof payload.sport_event_status === "object") chunks.push("sport_event_status");
+        return chunks.join(",");
+      };
+      const logSoccerProbe = (endpoint: string, url: string, status: number | string, payload: any): void => {
+        console.log("[SportsRadar][SoccerDetailProbe]", {
+          endpoint,
+          url: maskUrl(url),
+          status,
+          shape: shapeSummary(payload),
+        });
+      };
+
+      const fetchEndpoint = async (
+        baseUrl: string,
+        endpointPath: string
+      ): Promise<{ response: Response | null; data: any | null; url: string }> => {
+        const url = `${baseUrl}/en/sport_events/${resolvedEventId}/${endpointPath}?api_key=${apiKey}`;
+        try {
+          const response = await this.fetchWithRetry(url);
+          let data: any = null;
+          if (response.ok) {
+            data = await response.json();
+          } else {
+            try {
+              data = await response.clone().text();
+            } catch {
+              data = null;
+            }
+          }
+          logSoccerProbe(endpointPath, url, response.status, data);
+          return { response, data, url };
+        } catch (err) {
+          logSoccerProbe(endpointPath, url, "error", err instanceof Error ? { message: err.message } : null);
+          return { response: null, data: null, url };
+        }
+      };
+
+      const fetchEndpointWithFallbacks = async (
+        baseUrl: string,
+        endpointCandidates: string[]
+      ): Promise<{ response: Response | null; data: any | null; endpointUsed: string | null }> => {
+        for (const endpointPath of endpointCandidates) {
+          const result = await fetchEndpoint(baseUrl, endpointPath);
+          if (result.response?.ok) {
+            return {
+              response: result.response,
+              data: result.data,
+              endpointUsed: endpointPath,
+            };
+          }
+        }
+        return { response: null, data: null, endpointUsed: null };
+      };
+
+      // Fetch with explicit endpoint sequencing:
+      // 1) summary.json (authoritative when available)
+      // 2) timeline.json / timelines.json (fallback authority)
+      // 3) lineups.json / lineup.json (auxiliary roster detail)
       let summaryData: any = null;
       let timelineData: any = null;
       let lineupsData: any = null;
       let workingBaseUrl: string | null = null;
+      let summaryEndpointUsed: string | null = null;
+      let timelineEndpointUsed: string | null = null;
+      let lineupsEndpointUsed: string | null = null;
       
-      // Try each base URL until one works for summary
+      // Try each base URL until one works for summary.
       for (const baseUrl of SOCCER_API_BASES) {
-        const summaryUrl = `${baseUrl}/en/sport_events/${eventId}/summary.json?api_key=${apiKey}`;
-        
-        console.log(`[SportsRadar] Trying Soccer match summary: ${baseUrl} for ${eventId}`);
-        
-        const summaryResponse = await this.fetchWithRetry(summaryUrl);
-        
-        if (summaryResponse.ok) {
-          summaryData = await summaryResponse.json();
+        const summaryResult = await fetchEndpointWithFallbacks(baseUrl, ["summary.json"]);
+        if (summaryResult.response?.ok) {
+          summaryData = summaryResult.data;
           workingBaseUrl = baseUrl;
-          console.log(`[SportsRadar] Summary successful with ${baseUrl}`);
+          summaryEndpointUsed = summaryResult.endpointUsed;
           break;
         }
       }
-      
+
+      // If summary is unavailable, fall back to timeline endpoint as secondary authority.
       if (!summaryData || !workingBaseUrl) {
-        const errorMsg = `Soccer Match Detail API: All base URLs failed`;
+        for (const baseUrl of SOCCER_API_BASES) {
+          const timelineFallback = await fetchEndpointWithFallbacks(baseUrl, ["timeline.json", "timelines.json"]);
+          const timelineSportEvent = timelineFallback.data?.sport_event;
+          const timelineStatus = timelineFallback.data?.sport_event_status;
+          if (timelineFallback.response?.ok && timelineSportEvent && timelineStatus) {
+            timelineData = timelineFallback.data;
+            summaryData = {
+              sport_event: timelineSportEvent,
+              sport_event_status: timelineStatus,
+              statistics: timelineFallback.data?.statistics || null,
+              timeline: timelineFallback.data?.timeline || [],
+            };
+            workingBaseUrl = baseUrl;
+            timelineEndpointUsed = timelineFallback.endpointUsed;
+            break;
+          }
+        }
+      }
+
+      if (!summaryData || !workingBaseUrl) {
+        const errorMsg = "Soccer Match Detail API: no usable summary/timeline payload";
         errors.push(errorMsg);
         return { match: null, lineups: { home: [], away: [] }, statistics: null, timeline: [], errors };
       }
       
-      // Now fetch timeline and lineups from the working base URL
-      const [timelineResponse, lineupsResponse] = await Promise.all([
-        this.fetchWithRetry(`${workingBaseUrl}/en/sport_events/${eventId}/timeline.json?api_key=${apiKey}`).catch(() => null),
-        this.fetchWithRetry(`${workingBaseUrl}/en/sport_events/${eventId}/lineups.json?api_key=${apiKey}`).catch(() => null)
-      ]);
-      
-      if (timelineResponse && timelineResponse.ok) {
-        timelineData = await timelineResponse.json();
-        console.log(`[SportsRadar] Timeline fetched successfully`);
-      } else {
-        console.log(`[SportsRadar] Timeline not available (may not exist for scheduled matches)`);
-      }
-      
-      if (lineupsResponse && lineupsResponse.ok) {
-        lineupsData = await lineupsResponse.json();
-        console.log(`[SportsRadar] Lineups fetched successfully for ${eventId}`);
-        console.log(`[SportsRadar] Lineups response keys:`, JSON.stringify(Object.keys(lineupsData || {})));
-        
-        // Log the actual structure to debug
-        if (lineupsData) {
-          if (lineupsData.lineups && Array.isArray(lineupsData.lineups)) {
-            console.log(`[SportsRadar] Found lineups array with ${lineupsData.lineups.length} items`);
-            if (lineupsData.lineups.length > 0 && lineupsData.lineups[0]) {
-              const sample = JSON.stringify(lineupsData.lineups[0]);
-              console.log(`[SportsRadar] First lineup sample:`, sample !== undefined ? sample.substring(0, 300) : 'undefined');
-            }
-          }
-          if (lineupsData.sport_event_competitors && Array.isArray(lineupsData.sport_event_competitors)) {
-            console.log(`[SportsRadar] Found sport_event_competitors with ${lineupsData.sport_event_competitors.length} items`);
-          }
-          if (lineupsData.sport_event_lineups && Array.isArray(lineupsData.sport_event_lineups)) {
-            console.log(`[SportsRadar] Found sport_event_lineups with ${lineupsData.sport_event_lineups.length} items`);
-            if (lineupsData.sport_event_lineups.length > 0 && lineupsData.sport_event_lineups[0]) {
-              const sample = JSON.stringify(lineupsData.sport_event_lineups[0]);
-              console.log(`[SportsRadar] First sport_event_lineup sample:`, sample !== undefined ? sample.substring(0, 300) : 'undefined');
-            }
-          }
-          // Log full structure if small enough
-          const fullJson = JSON.stringify(lineupsData);
-          if (fullJson !== undefined && fullJson.length < 2000) {
-            console.log(`[SportsRadar] Full lineups data:`, fullJson);
-          }
+      if (!timelineData) {
+        const timelineResult = await fetchEndpointWithFallbacks(workingBaseUrl, ["timeline.json", "timelines.json"]);
+        if (timelineResult.response?.ok) {
+          timelineData = timelineResult.data;
+          timelineEndpointUsed = timelineResult.endpointUsed;
         }
-      } else {
-        const status = lineupsResponse?.status || 'no response';
-        console.log(`[SportsRadar] Lineups not available for ${eventId} (status: ${status})`);
       }
+
+      const lineupsResult = await fetchEndpointWithFallbacks(workingBaseUrl, ["lineups.json", "lineup.json"]);
+      if (lineupsResult.response?.ok) {
+        lineupsData = lineupsResult.data;
+        lineupsEndpointUsed = lineupsResult.endpointUsed;
+      }
+
+      console.log("[SportsRadar][SoccerDetailStrategy]", {
+        resolvedEventId,
+        workingBaseUrl,
+        summaryEndpointUsed,
+        timelineEndpointUsed,
+        lineupsEndpointUsed,
+        usedTimelineAsPrimaryFallback: !summaryEndpointUsed && Boolean(timelineEndpointUsed),
+      });
       
       const data = summaryData;
       

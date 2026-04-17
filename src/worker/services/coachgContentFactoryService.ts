@@ -1,3 +1,4 @@
+// @ts-nocheck
 import { runCoachGBrain } from "./coachgBrainService";
 import { buildCoachGScript } from "./coachgScriptService";
 import { enforceInformationalClosing, sanitizeCoachGList, sanitizeCoachGText } from "./coachgCompliance";

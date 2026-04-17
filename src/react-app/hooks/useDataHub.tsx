@@ -13,6 +13,7 @@
 import { createContext, useContext, useState, useEffect, useCallback, useRef, useMemo, ReactNode } from 'react';
 import type { LiveGame } from './useLiveGames';
 import { getTeamOrCountryLogoUrl } from '@/react-app/lib/teamLogos';
+import { fetchJsonCached } from '@/react-app/lib/fetchCache';
 
 // ============================================
 // TYPES
@@ -151,33 +152,150 @@ function getDateInEastern(date: Date): string {
   }).format(date);
 }
 
-function isRelevantHomepageGame(game: DbGame, todayEt: string): boolean {
+const HOME_LIVE_STATUSES = new Set(['IN_PROGRESS', 'LIVE', 'INPROGRESS', 'HALFTIME']);
+const HOME_FINAL_STATUSES = new Set(['FINAL', 'COMPLETED', 'CLOSED']);
+const HOME_LIVE_RECENT_WINDOW_MS = 8 * 60 * 60 * 1000;
+const HOME_LIVE_FUTURE_GRACE_MS = 60 * 60 * 1000;
+const HOME_SOON_WINDOW_MS = 18 * 60 * 60 * 1000;
+const HOME_RECENT_START_GRACE_MS = 2 * 60 * 60 * 1000;
+const HOME_LOCKED = true;
+const HOME_SCHEDULE_ENDPOINT = '/api/games';
+let homeLockSelfTestRan = false;
+
+function runHomeLogicMutation<T>(action: string, override: boolean, mutation: () => T): T | null {
+  if (HOME_LOCKED && !override) {
+    console.warn("HOME LOCKED — CHANGE BLOCKED", { action });
+    return null;
+  }
+  return mutation();
+}
+
+function runHomeLockSelfTest(): void {
+  if (homeLockSelfTestRan) return;
+  homeLockSelfTestRan = true;
+  runHomeLogicMutation('home-lock-self-test', false, () => true);
+}
+
+function assertHomeScheduleOnlyEndpoint(url: string): void {
+  if (!String(url || '').startsWith(`${HOME_SCHEDULE_ENDPOINT}?`)) {
+    console.error('HOME DEPENDENCY VIOLATION', {
+      expected: HOME_SCHEDULE_ENDPOINT,
+      actual: url,
+      message: 'Home = schedule only; no fallback/detail/alternate sources allowed.',
+    });
+  }
+}
+
+function parseDateSafe(value: unknown): Date | null {
+  const raw = String(value || '').trim();
+  if (!raw) return null;
+  const parsed = new Date(raw);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
+function isSameLocalDay(a: Date, b: Date): boolean {
+  return a.getFullYear() === b.getFullYear()
+    && a.getMonth() === b.getMonth()
+    && a.getDate() === b.getDate();
+}
+
+function isSameUtcDay(a: Date, b: Date): boolean {
+  return a.getUTCFullYear() === b.getUTCFullYear()
+    && a.getUTCMonth() === b.getUTCMonth()
+    && a.getUTCDate() === b.getUTCDate();
+}
+
+function isTodayLocalOrUtc(date: Date, now: Date): boolean {
+  return isSameLocalDay(date, now) || isSameUtcDay(date, now);
+}
+
+function resolveFinalReferenceTime(game: DbGame): Date | null {
+  const candidates = [
+    (game as any).completed_at,
+    (game as any).completedAt,
+    (game as any).ended_at,
+    (game as any).endedAt,
+    (game as any).finished_at,
+    (game as any).finishedAt,
+    game.start_time,
+  ];
+  for (const candidate of candidates) {
+    const parsed = parseDateSafe(candidate);
+    if (parsed) return parsed;
+  }
+  return null;
+}
+
+function resolveLiveReferenceTime(game: DbGame): Date | null {
+  const candidates = [
+    (game as any).last_updated_at,
+    (game as any).lastUpdatedAt,
+    (game as any).updated_at,
+    (game as any).updatedAt,
+    (game as any).started_at,
+    (game as any).startedAt,
+    game.start_time,
+  ];
+  for (const candidate of candidates) {
+    const parsed = parseDateSafe(candidate);
+    if (parsed) return parsed;
+  }
+  return null;
+}
+
+function isRelevantHomepageGame(game: DbGame, nowMs = Date.now()): boolean {
   const status = String(game.status || '').toUpperCase();
-  const start = game.start_time ? new Date(game.start_time) : null;
-  const liveStatuses = new Set(['IN_PROGRESS', 'LIVE', 'INPROGRESS', 'HALFTIME']);
-  const scheduledStatuses = new Set(['SCHEDULED', 'NOT_STARTED', 'PRE_GAME', 'PREGAME']);
-  const finalStatuses = new Set(['FINAL', 'COMPLETED', 'CLOSED']);
+  if (HOME_LIVE_STATUSES.has(status)) {
+    // Defensive anti-stale guardrail:
+    // providers occasionally leave games flagged as live after they end.
+    const liveRef = resolveLiveReferenceTime(game);
+    if (!liveRef) return false;
+    const liveRefMs = liveRef.getTime();
+    return liveRefMs >= nowMs - HOME_LIVE_RECENT_WINDOW_MS
+      && liveRefMs <= nowMs + HOME_LIVE_FUTURE_GRACE_MS;
+  }
 
-  if (liveStatuses.has(status)) return true;
-  if (!start || Number.isNaN(start.getTime())) return false;
-
+  const now = new Date(nowMs);
+  const start = parseDateSafe(game.start_time);
+  if (!start) return false;
   const startMs = start.getTime();
-  const now = Date.now();
-  const gameEt = getDateInEastern(start);
+  const isToday = isTodayLocalOrUtc(start, now);
 
-  // Keep upcoming games for today, but avoid far-future bleed.
-  if (scheduledStatuses.has(status)) {
-    return gameEt === todayEt
-      && startMs >= now - 2 * 60 * 60 * 1000
-      && startMs <= now + 24 * 60 * 60 * 1000;
+  if (HOME_FINAL_STATUSES.has(status)) {
+    const finalRef = resolveFinalReferenceTime(game);
+    if (!finalRef) return false;
+    // Home display rule: finals are eligible when completed today (local or UTC).
+    return isTodayLocalOrUtc(finalRef, now);
   }
 
-  // Keep finals only from today ET to avoid yesterday bleed-through.
-  if (finalStatuses.has(status)) {
-    return gameEt === todayEt;
+  // Scheduled / pregame: only today, with a small grace window for start-time drift.
+  return isToday
+    && startMs >= nowMs - HOME_RECENT_START_GRACE_MS
+    && startMs <= nowMs + HOME_SOON_WINDOW_MS;
+}
+
+function isRelevantHomepageGameForSport(game: DbGame, sportKey: string, nowMs = Date.now()): boolean {
+  const normalizedSport = String(sportKey || '').toUpperCase();
+  if (normalizedSport !== 'SOCCER') {
+    return isRelevantHomepageGame(game, nowMs);
   }
 
-  return false;
+  // Temporary soccer override:
+  // - keep LIVE rows
+  // - keep all scheduled rows for today (local/UTC), regardless of time window
+  const status = String(game.status || '').toUpperCase();
+  if (HOME_LIVE_STATUSES.has(status)) return true;
+
+  const start = parseDateSafe(game.start_time);
+  if (!start) return false;
+  const isToday = isTodayLocalOrUtc(start, new Date(nowMs));
+  if (!isToday) return false;
+
+  const isScheduledLike = !HOME_FINAL_STATUSES.has(status);
+  if (isScheduledLike) return true;
+
+  // Keep existing recent-final logic for soccer finals.
+  return isRelevantHomepageGame(game, nowMs);
 }
 
 // ============================================
@@ -217,11 +335,14 @@ interface DbGame {
   clock: string | null;
   broadcast?: string | null;
   is_overtime?: boolean;
+  home_logo_url?: string | null;
+  away_logo_url?: string | null;
   spread?: number | null;
   overUnder?: number | null;
   moneylineHome?: number | null;
   moneylineAway?: number | null;
 }
+
 
 function shouldDeferDataHubGamesFetch(): boolean {
   // Keep DataHub scoped away from route-owned pages by default, but the home
@@ -230,171 +351,6 @@ function shouldDeferDataHubGamesFetch(): boolean {
   const path = String(window.location.pathname || '').toLowerCase();
   const isHomeRoute = path === '/' || path === '/home' || path.startsWith('/dashboard');
   return !isHomeRoute;
-}
-
-const DATAHUB_ODDS_HYDRATION_TTL_MS = 30000;
-const dataHubOddsHydrationCache = new Map<string, { expiresAt: number; byId: Record<string, any> }>();
-
-function normalizeOddsGameId(value: unknown): string {
-  return String(value || '').trim().toLowerCase();
-}
-
-function buildOddsLookupCandidates(value: unknown): string[] {
-  const raw = String(value || '').trim();
-  if (!raw) return [];
-  const out = new Set<string>();
-  const add = (v: string) => {
-    const n = normalizeOddsGameId(v);
-    if (n) out.add(n);
-  };
-  add(raw);
-  if (raw.startsWith('sr_')) {
-    const parts = raw.split('_');
-    const tail = parts.slice(2).join('_');
-    if (tail) {
-      add(`sr:sport_event:${tail}`);
-      add(`sr:sport_event:${tail.replace(/_/g, '-')}`);
-      add(`sr:match:${tail}`);
-      add(tail);
-      add(tail.replace(/_/g, '-'));
-    }
-  }
-  if (raw.startsWith('sr:sport_event:')) {
-    const tail = raw.replace('sr:sport_event:', '');
-    add(tail);
-    add(`sr_${tail.replace(/-/g, '_')}`);
-    add(tail.replace(/-/g, '_'));
-  }
-  if (raw.startsWith('sr:match:')) {
-    const tail = raw.replace('sr:match:', '');
-    add(tail);
-    add(`sr_${tail.replace(/-/g, '_')}`);
-  }
-  return Array.from(out);
-}
-
-function normalizeTeamToken(value: unknown): string {
-  return String(value || '').trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
-}
-
-function ymdPart(value: unknown): string {
-  const raw = String(value || '').trim();
-  if (!raw) return '';
-  const direct = raw.slice(0, 10);
-  if (/^\d{4}-\d{2}-\d{2}$/.test(direct)) return direct;
-  const dt = new Date(raw);
-  if (Number.isNaN(dt.getTime())) return '';
-  return dt.toISOString().slice(0, 10);
-}
-
-function buildOddsMatchKey(sport: unknown, home: unknown, away: unknown, startTime: unknown): string | null {
-  const s = String(sport || '').trim().toUpperCase();
-  const h = normalizeTeamToken(home);
-  const a = normalizeTeamToken(away);
-  const d = ymdPart(startTime);
-  if (!s || !h || !a) return null;
-  return `match::${s}|${h}|${a}|${d || 'nodate'}`;
-}
-
-function summaryStrength(summary: any): number {
-  if (!summary || typeof summary !== 'object') return 0;
-  const n = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) ? 1 : 0);
-  let score = 0;
-  score += n(summary?.spread?.home_line);
-  score += n(summary?.total?.line);
-  score += n(summary?.moneyline?.home_price) + n(summary?.moneyline?.away_price);
-  score += n(summary?.first_half?.spread?.home_line) + n(summary?.first_half?.spread?.away_line);
-  score += n(summary?.first_half?.total?.line);
-  score += n(summary?.first_half?.moneyline?.home_price) + n(summary?.first_half?.moneyline?.away_price);
-  return score;
-}
-
-function hasNativeOdds(game: DbGame): boolean {
-  return (
-    game.spread !== null && game.spread !== undefined ||
-    game.overUnder !== null && game.overUnder !== undefined ||
-    game.moneylineHome !== null && game.moneylineHome !== undefined ||
-    game.moneylineAway !== null && game.moneylineAway !== undefined
-  );
-}
-
-async function hydrateGamesWithOddsSummaries(games: DbGame[], dateStr: string): Promise<DbGame[]> {
-  if (!Array.isArray(games) || games.length === 0) return games;
-  const nativeCount = games.reduce((acc, g) => acc + (hasNativeOdds(g) ? 1 : 0), 0);
-  const nativeCoverage = nativeCount / games.length;
-  if (nativeCoverage >= 0.6) return games;
-
-  const ids = games.map((g) => String(g?.game_id || '').trim()).filter(Boolean).slice(0, 60);
-  if (ids.length === 0) return games;
-  const cacheKey = `${dateStr}|${ids.join('|')}`;
-  const cached = dataHubOddsHydrationCache.get(cacheKey);
-  const now = Date.now();
-  let byId: Record<string, any> = {};
-  if (cached && cached.expiresAt > now) {
-    byId = cached.byId;
-  } else {
-    const addSummary = (summary: any) => {
-      const strength = summaryStrength(summary);
-      if (strength <= 0) return;
-      const gameId = String(summary?.game?.game_id || summary?.game_id || '').trim();
-      for (const candidate of buildOddsLookupCandidates(gameId)) {
-        const prev = byId[candidate];
-        if (!prev || strength >= summaryStrength(prev)) byId[candidate] = summary;
-      }
-      const sportKey = String(summary?.game?.sport || '').toUpperCase();
-      const keys = [
-        buildOddsMatchKey(sportKey, summary?.game?.home_team_code, summary?.game?.away_team_code, summary?.game?.start_time),
-        buildOddsMatchKey(sportKey, summary?.game?.home_team_name, summary?.game?.away_team_name, summary?.game?.start_time),
-        buildOddsMatchKey(sportKey, summary?.game?.home_team_code || summary?.game?.home_team_name, summary?.game?.away_team_code || summary?.game?.away_team_name, summary?.game?.start_time),
-      ].filter((k): k is string => Boolean(k));
-      for (const key of keys) {
-        const prev = byId[key];
-        if (!prev || strength >= summaryStrength(prev)) byId[key] = summary;
-      }
-    };
-
-    const chunks: string[][] = [];
-    for (let i = 0; i < ids.length; i += 30) chunks.push(ids.slice(i, i + 30));
-    const chunkResponses = await Promise.allSettled(
-      chunks.map(async (chunk) => {
-        const qs = new URLSearchParams({ game_ids: chunk.join(','), scope: 'PROD', date: dateStr });
-        const res = await fetchWithTimeout(`/api/odds/slate?${qs.toString()}`, undefined, 10000);
-        if (!res.ok) return [];
-        const payload = await res.json();
-        return Array.isArray(payload?.summaries) ? payload.summaries : [];
-      })
-    );
-    for (const response of chunkResponses) {
-      if (response.status !== 'fulfilled') continue;
-      for (const summary of response.value) addSummary(summary);
-    }
-    dataHubOddsHydrationCache.set(cacheKey, {
-      expiresAt: now + DATAHUB_ODDS_HYDRATION_TTL_MS,
-      byId,
-    });
-  }
-
-  if (Object.keys(byId).length === 0) return games;
-
-  return games.map((game) => {
-    const gameId = String(game?.game_id || '').trim();
-    const idSummary = buildOddsLookupCandidates(gameId).map((candidate) => byId[candidate]).find(Boolean);
-    const matchupCandidates = [
-      buildOddsMatchKey(game.sport, game.home_team_code, game.away_team_code, game.start_time),
-      buildOddsMatchKey(game.sport, game.home_team_name, game.away_team_name, game.start_time),
-      buildOddsMatchKey(game.sport, game.home_team_code || game.home_team_name, game.away_team_code || game.away_team_name, game.start_time),
-    ].filter((k): k is string => Boolean(k));
-    const matchupSummary = matchupCandidates.map((candidate) => byId[candidate]).find(Boolean);
-    const summary = idSummary || matchupSummary;
-    if (!summary) return game;
-    return {
-      ...game,
-      spread: game.spread ?? summary?.spread?.home_line ?? null,
-      overUnder: game.overUnder ?? summary?.total?.line ?? null,
-      moneylineHome: game.moneylineHome ?? summary?.moneyline?.home_price ?? null,
-      moneylineAway: game.moneylineAway ?? summary?.moneyline?.away_price ?? null,
-    };
-  });
 }
 
 function mergeDbGames(base: DbGame, incoming: DbGame): DbGame {
@@ -415,6 +371,8 @@ function mergeDbGames(base: DbGame, incoming: DbGame): DbGame {
     period_label: pickText(base.period_label, incoming.period_label) as string | null,
     clock: pickText(base.clock, incoming.clock) as string | null,
     broadcast: pickText(base.broadcast, incoming.broadcast) as string | null | undefined,
+    home_logo_url: pickText(base.home_logo_url, incoming.home_logo_url) as string | null | undefined,
+    away_logo_url: pickText(base.away_logo_url, incoming.away_logo_url) as string | null | undefined,
     home_score: pickNum(base.home_score, incoming.home_score) as number | null,
     away_score: pickNum(base.away_score, incoming.away_score) as number | null,
     spread: pickNum(base.spread, incoming.spread) as number | null | undefined,
@@ -427,13 +385,60 @@ function mergeDbGames(base: DbGame, incoming: DbGame): DbGame {
 function normalizeSportKey(rawSport: string | null | undefined, rawLeague?: string | null | undefined): string {
   const upper = String(rawSport || '').toUpperCase();
   const league = String(rawLeague || '').toUpperCase();
+  const soccerLeagueHints = [
+    'UEFA',
+    'EUROPA',
+    'CHAMPIONS',
+    'PREMIER',
+    'EPL',
+    'MLS',
+    'LA_LIGA',
+    'LA LIGA',
+    'SERIE_A',
+    'SERIE A',
+    'BUNDES',
+    'LIGUE_1',
+    'LIGUE 1',
+    'LIGA_MX',
+    'LIGA MX',
+    'EREDIVISIE',
+    'PRIMEIRA',
+    'COPA',
+    'WORLD CUP',
+    'NATIONS LEAGUE',
+  ];
+  const hasSoccerLeagueSignal = soccerLeagueHints.some((hint) => league.includes(hint));
   if (upper === 'CBB' || upper === 'NCAAM' || upper === 'NCAA_MEN_BASKETBALL') return 'NCAAB';
   if (upper === 'CFB' || upper === 'NCAAFB' || upper === 'NCAA_FOOTBALL') return 'NCAAF';
   if (upper === 'ICEHOCKEY' || upper === 'HOCKEY') return 'NHL';
   if (upper === 'BASEBALL') return 'MLB';
+  if (
+    hasSoccerLeagueSignal ||
+    upper === 'SOCCER' ||
+    upper === 'FOOTBALL_SOCCER' ||
+    upper === 'EPL' ||
+    upper === 'MLS' ||
+    upper === 'UCL' ||
+    upper === 'UEFA' ||
+    upper === 'EUROPA_LEAGUE' ||
+    upper === 'EUROPA-LEAGUE' ||
+    upper === 'CHAMPIONS_LEAGUE' ||
+    upper === 'CHAMPIONS-LEAGUE' ||
+    upper === 'PREMIER_LEAGUE' ||
+    upper === 'PREMIER-LEAGUE' ||
+    upper === 'LA_LIGA' ||
+    upper === 'SERIE_A' ||
+    upper === 'BUNDESLIGA' ||
+    upper === 'LIGUE_1'
+  ) return 'SOCCER';
+  if (upper === 'PGA' || upper === 'LIV' || upper === 'DP' || upper === 'GOLF_TOURNAMENT') return 'GOLF';
   if (upper === 'BASKETBALL') {
     if (league.includes('NCAA') || league.includes('NCAAB') || league.includes('CBB')) return 'NCAAB';
     return 'NBA';
+  }
+  if (upper === 'FOOTBALL') {
+    if (league.includes('NCAA') || league.includes('NCAAF') || league.includes('COLLEGE')) return 'NCAAF';
+    return 'NFL';
   }
   return upper || 'NFL';
 }
@@ -448,100 +453,54 @@ function ordinalSuffix(n: number): string {
   return `${n}th`;
 }
 
-const SOCCER_PRIORITY_TEAMS = [
-  'REAL MADRID', 'BARCELONA', 'MANCHESTER CITY', 'LIVERPOOL', 'ARSENAL',
-  'MANCHESTER UNITED', 'BAYERN MUNICH', 'PARIS SAINT-GERMAIN', 'PSG',
-  'INTER MILAN', 'JUVENTUS', 'AC MILAN', 'ATLETICO MADRID', 'CHELSEA',
-  'TOTTENHAM', 'NEWCASTLE UNITED', 'BORUSSIA DORTMUND', 'NAPOLI',
-];
+function extractInningDisplayFromPlayLike(play: unknown): string | null {
+  if (!play || typeof play !== 'object') return null;
+  const obj = play as Record<string, unknown>;
+  const periodText = String(obj.period || '').trim();
+  const clockText = String(obj.clock || '').trim();
+  const raw = `${periodText} ${clockText}`.trim();
+  if (!raw) return null;
 
-const SOCCER_TEAM_ALIASES: Record<string, string> = {
-  'FC BARCELONA': 'BARCELONA',
-  'BARCA': 'BARCELONA',
-  'REAL MADRID CF': 'REAL MADRID',
-  'MANCHESTER UTD': 'MANCHESTER UNITED',
-  'MAN UTD': 'MANCHESTER UNITED',
-  'MAN UNITED': 'MANCHESTER UNITED',
-  'MAN CITY': 'MANCHESTER CITY',
-  'FC BAYERN MUNICH': 'BAYERN MUNICH',
-  'BAYERN': 'BAYERN MUNICH',
-  'PARIS SG': 'PARIS SAINT-GERMAIN',
-  'PARIS SAINT GERMAIN': 'PARIS SAINT-GERMAIN',
-  'INTER': 'INTER MILAN',
-  'ATLETICO': 'ATLETICO MADRID',
-  'SPURS': 'TOTTENHAM',
-  'NEWCASTLE': 'NEWCASTLE UNITED',
-  'DORTMUND': 'BORUSSIA DORTMUND',
-};
+  const sideMatch = raw.match(/\b(top|bot|bottom|mid|middle|end|t|b)\b(?:\s+of(?:\s+the)?|\s+the)?[\s:-]*(\d{1,2})(?:st|nd|rd|th)?/i);
+  if (sideMatch) {
+    const sideRaw = sideMatch[1].toLowerCase();
+    const inning = Number(sideMatch[2]);
+    if (!Number.isFinite(inning) || inning <= 0) return null;
+    const side = sideRaw === 'bottom' || sideRaw === 'b'
+      ? 'Bot'
+      : sideRaw === 'top' || sideRaw === 't'
+        ? 'Top'
+        : sideRaw === 'middle'
+          ? 'Mid'
+          : sideRaw.charAt(0).toUpperCase() + sideRaw.slice(1);
+    return `${side} ${ordinalSuffix(inning)}`;
+  }
 
-function normalizeSoccerTeamName(value: string | null | undefined): string {
-  const raw = String(value || '').trim().toUpperCase();
-  if (!raw) return '';
-  return SOCCER_TEAM_ALIASES[raw] || raw;
-}
+  const inningOnly = raw.match(/\b(\d{1,2})(?:st|nd|rd|th)?\s*(inning|inn|in)\b/i);
+  if (inningOnly) {
+    const inning = Number(inningOnly[1]);
+    if (Number.isFinite(inning) && inning > 0) return `${ordinalSuffix(inning)} Inning`;
+  }
 
-function soccerTeamRank(value: string | null | undefined): number {
-  const normalized = normalizeSoccerTeamName(value);
-  if (!normalized) return Number.MAX_SAFE_INTEGER;
-  const exact = SOCCER_PRIORITY_TEAMS.indexOf(normalized);
-  if (exact >= 0) return exact;
-  const containsIdx = SOCCER_PRIORITY_TEAMS.findIndex((name) =>
-    normalized.includes(name) || name.includes(normalized)
-  );
-  return containsIdx >= 0 ? containsIdx : Number.MAX_SAFE_INTEGER;
-}
-
-function soccerMatchPriorityScore(
-  homeName?: string | null,
-  awayName?: string | null,
-  homeCode?: string | null,
-  awayCode?: string | null
-): number {
-  const homeRank = Math.min(soccerTeamRank(homeName), soccerTeamRank(homeCode));
-  const awayRank = Math.min(soccerTeamRank(awayName), soccerTeamRank(awayCode));
-  const toScore = (rank: number) => (rank === Number.MAX_SAFE_INTEGER ? 0 : (SOCCER_PRIORITY_TEAMS.length - rank));
-  return toScore(homeRank) + toScore(awayRank);
+  return null;
 }
 
 async function fetchMlbInningLabel(gameId: string): Promise<string | null> {
   if (!gameId) return null;
   try {
-    const res = await fetchWithTimeout(`/api/games/${encodeURIComponent(gameId)}/playbyplay`, undefined, 3000);
+    const url = `/api/games/${encodeURIComponent(gameId)}/playbyplay`;
+    assertHomeScheduleOnlyEndpoint(url);
+    const res = await fetchWithTimeout(url, undefined, 3000);
     if (!res.ok) return null;
     const data = await res.json();
-    const plays = Array.isArray(data?.plays) ? data.plays : [];
-    const orderedCandidates = [
-      data?.lastPlay,
-      ...plays,
-    ].filter(Boolean);
-    const bestPlay = orderedCandidates.find((p: any) =>
-      /\b(top|bot|bottom|mid|middle|end|t|b)\b/i.test(String(p?.period || ''))
-    ) || orderedCandidates[0] || null;
-    const periodRaw = bestPlay?.period;
-    const clockRaw = bestPlay?.clock;
-    const periodText = periodRaw != null ? String(periodRaw).trim() : '';
-    const clockText = clockRaw != null ? String(clockRaw).trim() : '';
-
-    const sideMatch = periodText.match(/\b(top|bot|bottom|mid|middle|end)\b(?:\s+of(?:\s+the)?|\s+the)?[\s:-]*(\d{1,2})(?:st|nd|rd|th)?/i);
-    if (sideMatch) {
-      const sideRaw = sideMatch[1].toLowerCase();
-      const side =
-        sideRaw === 'bottom' ? 'Bot'
-        : sideRaw === 'middle' ? 'Mid'
-        : sideRaw.charAt(0).toUpperCase() + sideRaw.slice(1);
-      const inning = Number(sideMatch[2]);
-      const outsMatch = clockText.match(/(\d)\s*out/i);
-      if (Number.isFinite(inning) && inning > 0) {
-        const outsSuffix = outsMatch ? ` • ${outsMatch[1]} Out${outsMatch[1] === '1' ? '' : 's'}` : '';
-        return `${side} ${ordinalSuffix(inning)}${outsSuffix}`;
-      }
-    }
-
-    const numeric = Number(periodText.replace(/[^\d]/g, ''));
-    if (Number.isFinite(numeric) && numeric > 0) {
-      const outsMatch = clockText.match(/(\d)\s*out/i);
-      const outsSuffix = outsMatch ? ` • ${outsMatch[1]} Out${outsMatch[1] === '1' ? '' : 's'}` : '';
-      return `${ordinalSuffix(numeric)} Inning${outsSuffix}`;
+    const plays = Array.isArray((data as Record<string, unknown>)?.plays)
+      ? ((data as Record<string, unknown>).plays as unknown[])
+      : [];
+    const lastPlay = (data as Record<string, unknown>)?.lastPlay;
+    const ordered = [lastPlay, ...plays].filter(Boolean);
+    for (const play of ordered) {
+      const label = extractInningDisplayFromPlayLike(play);
+      if (label) return label;
     }
     return null;
   } catch {
@@ -565,6 +524,8 @@ function transformDbGameToLiveGame(game: DbGame): LiveGame {
 
   const homeAbbr = game.home_team_code || getTeamAbbreviation(game.home_team_name);
   const awayAbbr = game.away_team_code || getTeamAbbreviation(game.away_team_name);
+  const homeDirectLogo = String(game.home_logo_url || "").trim();
+  const awayDirectLogo = String(game.away_logo_url || "").trim();
 
   const normalizedStatus = String(game.status || '').toUpperCase();
   const liveStatuses = new Set(['LIVE', 'IN_PROGRESS', 'INPROGRESS']);
@@ -586,13 +547,13 @@ function transformDbGameToLiveGame(game: DbGame): LiveGame {
       name: getTeamShortName(game.home_team_name),
       abbreviation: homeAbbr,
       score: homeScore,
-      logo: getTeamOrCountryLogoUrl(homeAbbr, sportKey, game.league) || '',
+      logo: homeDirectLogo || getTeamOrCountryLogoUrl(homeAbbr, sportKey, game.league) || '',
     },
     awayTeam: {
       name: getTeamShortName(game.away_team_name),
       abbreviation: awayAbbr,
       score: awayScore,
-      logo: getTeamOrCountryLogoUrl(awayAbbr, sportKey, game.league) || '',
+      logo: awayDirectLogo || getTeamOrCountryLogoUrl(awayAbbr, sportKey, game.league) || '',
     },
     period: game.period_label || (isScheduled ? '' : ''),
     clock: game.clock || (isScheduled ? formatStartTime(game.start_time) : ''),
@@ -616,474 +577,355 @@ function transformDbGameToLiveGame(game: DbGame): LiveGame {
   };
 }
 
-async function fetchGamesData(): Promise<LiveGame[]> {
-  // Home feed should prioritize true live games across all sports,
-  // then include today's upcoming schedule.
-  const todayEt = getDateInEastern(new Date());
-  const tomorrowEt = getDateInEastern(new Date(Date.now() + 24 * 60 * 60 * 1000));
-  // Bundled home-path fetch first, then lightweight live overlay.
-  // This reduces home route request fanout from 4 blocking calls to 2.
-  const [baseRes, liveRes] = await Promise.allSettled([
-    fetchWithTimeout('/api/games?includeOdds=0', undefined, 5000),
-    fetchWithTimeout('/api/games/live', undefined, 1500),
-  ]);
+function getHomeSortBucket(game: LiveGame, nowMs: number): 0 | 1 | 2 | 3 {
+  const status = String(game.status || '').toUpperCase();
+  if (status === 'IN_PROGRESS') return 0;
 
-  const safeJsonGames = async (res: PromiseSettledResult<Response>): Promise<DbGame[]> => {
-    if (res.status !== 'fulfilled' || !res.value.ok) return [];
-    try {
-      const data = await res.value.json();
-      return Array.isArray(data?.games) ? data.games : [];
-    } catch {
-      return [];
-    }
-  };
+  const start = parseDateSafe(game.startTime);
+  const startMs = start ? start.getTime() : Number.NaN;
+  const hasStart = Number.isFinite(startMs);
+  const isToday = start ? isTodayLocalOrUtc(start, new Date(nowMs)) : false;
 
-  const [baseGamesRaw, liveGamesRaw] = await Promise.all([
-    safeJsonGames(baseRes),
-    safeJsonGames(liveRes),
-  ]);
-
-  // Keep this alias for downstream schedule-driven soccer fallback logic.
-  const dayGamesRaw = baseGamesRaw;
-  const merged = [...baseGamesRaw, ...liveGamesRaw];
-  const deduped = new Map<string, DbGame>();
-  for (const game of merged) {
-    const key = String(game?.game_id || '').trim();
-    if (!key) continue;
-    const existing = deduped.get(key);
-    deduped.set(key, existing ? mergeDbGames(existing, game) : game);
+  // Upcoming soon should surface right below live.
+  if (status === 'SCHEDULED' && hasStart && startMs >= nowMs && startMs <= nowMs + HOME_SOON_WINDOW_MS) {
+    return 1;
   }
 
-  let allDedupedGames = Array.from(deduped.values());
-  if (allDedupedGames.length === 0) {
-    // Defensive fallback: if concurrent endpoint calls timeout or fail together,
-    // use the base games feed so homepage never renders a false-empty slate.
-    try {
-      const fallbackRes = await fetchWithTimeout('/api/games?includeOdds=0', undefined, 5000);
-      if (fallbackRes.ok) {
-        const fallbackPayload = await fallbackRes.json();
-        const fallbackGames = Array.isArray(fallbackPayload?.games) ? fallbackPayload.games as DbGame[] : [];
-        if (fallbackGames.length > 0) {
-          allDedupedGames = fallbackGames;
-        }
-      }
-    } catch {
-      // Keep the original empty set when fallback feed is also unavailable.
-    }
-  }
-  let currentGames = allDedupedGames.filter((g) => isRelevantHomepageGame(g, todayEt));
+  // Remaining games from today's slate.
+  if (isToday) return 2;
 
-  // Guardrail: never return a false-empty homepage slate when valid games exist.
-  // If strict relevance filtering yields nothing, use a bounded near-term fallback set.
-  if (currentGames.length === 0 && allDedupedGames.length > 0) {
-    const now = Date.now();
-    const fallbackCandidates = allDedupedGames
-      .filter((g) => {
-        const status = String(g.status || '').toUpperCase();
-        if (status === 'IN_PROGRESS' || status === 'LIVE' || status === 'INPROGRESS') return true;
-        if (!g.start_time) return false;
-        const dt = new Date(g.start_time);
-        if (Number.isNaN(dt.getTime())) return false;
-        const gameEt = getDateInEastern(dt);
-        const ts = dt.getTime();
-        // Keep today/tomorrow ET rows in a practical visibility window.
-        const isNearDay = gameEt === todayEt || gameEt === tomorrowEt;
-        if (!isNearDay) return false;
-        if (status === 'FINAL' || status === 'COMPLETED' || status === 'CLOSED') {
-          return gameEt === todayEt;
-        }
-        return ts >= now - 3 * 60 * 60 * 1000 && ts <= now + 36 * 60 * 60 * 1000;
-      })
-      .sort((a, b) => {
-        const ta = a.start_time ? new Date(a.start_time).getTime() : Number.POSITIVE_INFINITY;
-        const tb = b.start_time ? new Date(b.start_time).getTime() : Number.POSITIVE_INFINITY;
-        return ta - tb;
+  // Any other edge rows (guardrail fallback paths) stay last.
+  return 3;
+}
+
+function getStatusTieBreakRank(status: LiveGame['status']): number {
+  if (status === 'SCHEDULED') return 0;
+  if (status === 'FINAL') return 1;
+  return 2;
+}
+
+function sortHomeGamesForDisplay(games: LiveGame[]): LiveGame[] {
+  const nowMs = Date.now();
+  const sorted = [...games].sort((a, b) => {
+    const bucketDiff = getHomeSortBucket(a, nowMs) - getHomeSortBucket(b, nowMs);
+    if (bucketDiff !== 0) return bucketDiff;
+
+    const statusDiff = getStatusTieBreakRank(a.status) - getStatusTieBreakRank(b.status);
+    if (statusDiff !== 0) return statusDiff;
+
+    const timeA = a.startTime ? new Date(a.startTime).getTime() : Number.POSITIVE_INFINITY;
+    const timeB = b.startTime ? new Date(b.startTime).getTime() : Number.POSITIVE_INFINITY;
+    if (Number.isFinite(timeA) || Number.isFinite(timeB)) return timeA - timeB;
+
+    // Stable deterministic fallback.
+    return String(a.id || '').localeCompare(String(b.id || ''));
+  });
+  return sorted;
+}
+
+function runHomeRuntimeAssertions(games: LiveGame[], source: string): void {
+  const nowMs = Date.now();
+  const seen = new Set<string>();
+  const sportCounts = new Map<string, number>();
+  const violations: Array<Record<string, unknown>> = [];
+
+  for (const game of games) {
+    const gameId = String(game.id || '').trim();
+    const sport = String(game.sport || '').toUpperCase().trim();
+    const startTime = String(game.startTime || '').trim();
+
+    if (!gameId) {
+      violations.push({ type: 'missing_game_id', source });
+    } else if (seen.has(gameId)) {
+      violations.push({ type: 'duplicate_game_id', gameId, source });
+    } else {
+      seen.add(gameId);
+    }
+
+    if (!sport) {
+      violations.push({ type: 'missing_sport', gameId, source });
+    } else {
+      sportCounts.set(sport, (sportCounts.get(sport) || 0) + 1);
+    }
+
+    if (!startTime) {
+      violations.push({ type: 'undefined_start_time', gameId, sport, source });
+    }
+
+    const dbLike: DbGame = {
+      game_id: gameId,
+      sport,
+      league: String(game.league || ''),
+      home_team_code: String(game.homeTeam?.abbreviation || ''),
+      away_team_code: String(game.awayTeam?.abbreviation || ''),
+      home_team_name: String(game.homeTeam?.name || ''),
+      away_team_name: String(game.awayTeam?.name || ''),
+      start_time: startTime,
+      status: String(game.status || ''),
+      home_score: Number.isFinite(Number(game.homeTeam?.score)) ? Number(game.homeTeam?.score) : null,
+      away_score: Number.isFinite(Number(game.awayTeam?.score)) ? Number(game.awayTeam?.score) : null,
+      period_label: String(game.period || '') || null,
+      clock: String(game.clock || '') || null,
+    };
+
+    if (!isRelevantHomepageGameForSport(dbLike, sport, nowMs)) {
+      violations.push({
+        type: 'stale_or_invalid_game_on_home',
+        gameId,
+        sport,
+        status: game.status,
+        startTime,
+        source,
       });
-    currentGames = fallbackCandidates.slice(0, 40);
-  }
-
-  // Ensure key sports appear in rotation when they have games today, even if
-  // strict relevance filtering excludes them (common with delayed statuses).
-  const mustShowSports = ['NBA', 'NFL', 'MLB', 'NHL', 'NCAAF', 'NCAAB', 'SOCCER'];
-  const presentSports = new Set(
-    currentGames.map((g) => normalizeSportKey(g.sport, g.league))
-  );
-  const statusRank = (status: string): number => {
-    const s = String(status || '').toUpperCase();
-    if (s === 'IN_PROGRESS' || s === 'LIVE' || s === 'INPROGRESS') return 0;
-    if (s === 'FINAL' || s === 'COMPLETED' || s === 'CLOSED') return 1;
-    return 2;
-  };
-
-  for (const sport of mustShowSports) {
-    if (presentSports.has(sport)) continue;
-    const candidates = allDedupedGames
-      .filter((g) => normalizeSportKey(g.sport, g.league) === sport)
-      .filter((g) => {
-        const status = String(g.status || '').toUpperCase();
-        if (status === 'IN_PROGRESS' || status === 'LIVE' || status === 'INPROGRESS') return true;
-        if (!g.start_time) return false;
-        const d = new Date(g.start_time);
-        if (Number.isNaN(d.getTime())) return false;
-        const ts = d.getTime();
-          if (status === 'FINAL' || status === 'COMPLETED' || status === 'CLOSED') {
-            return getDateInEastern(d) === todayEt;
-          }
-        return getDateInEastern(d) === todayEt
-          && ts >= Date.now() - 60 * 60 * 1000
-          && ts <= Date.now() + 12 * 60 * 60 * 1000;
-      })
-      .sort((a, b) => {
-        const sr = statusRank(a.status) - statusRank(b.status);
-        if (sr !== 0) return sr;
-        const ta = a.start_time ? new Date(a.start_time).getTime() : Number.POSITIVE_INFINITY;
-        const tb = b.start_time ? new Date(b.start_time).getTime() : Number.POSITIVE_INFINITY;
-        // Prefer latest finals and nearest upcoming/live-adjacent starts.
-        if (statusRank(a.status) === 1 && statusRank(b.status) === 1) return tb - ta;
-        return ta - tb;
-      });
-
-    if (candidates.length > 0) {
-      currentGames.push(candidates[0]);
-      presentSports.add(sport);
     }
   }
 
-  // NCAAB top-up: keep at least 3 games from today ET available for the sport carousel.
-  {
-    const ncaabExisting = currentGames.filter((g) => normalizeSportKey(g.sport, g.league) === 'NCAAB');
-    if (ncaabExisting.length < 3) {
-      const existingIds = new Set(ncaabExisting.map((g) => g.game_id));
-      const ncaabCandidates = allDedupedGames
-        .filter((g) => normalizeSportKey(g.sport, g.league) === 'NCAAB')
-        .filter((g) => {
-          const status = String(g.status || '').toUpperCase();
-          if (status === 'IN_PROGRESS' || status === 'LIVE' || status === 'INPROGRESS') return true;
-          if (!g.start_time) return false;
-          const d = new Date(g.start_time);
-          if (Number.isNaN(d.getTime())) return false;
-          const ts = d.getTime();
-          if (status === 'FINAL' || status === 'COMPLETED' || status === 'CLOSED') {
-            return getDateInEastern(d) === todayEt;
-          }
-          const sameDay = getDateInEastern(d) === todayEt;
-          return sameDay
-            && ts >= Date.now() - 60 * 60 * 1000
-            && ts <= Date.now() + 12 * 60 * 60 * 1000;
-        })
-        .sort((a, b) => {
-          const ra = statusRank(a.status);
-          const rb = statusRank(b.status);
-          if (ra !== rb) return ra - rb;
-          const ta = a.start_time ? new Date(a.start_time).getTime() : Number.POSITIVE_INFINITY;
-          const tb = b.start_time ? new Date(b.start_time).getTime() : Number.POSITIVE_INFINITY;
-          // Most recent today-finals first; nearest time first for others.
-          if (ra === 1 && rb === 1) return tb - ta;
-          return ta - tb;
-        });
-
-      const needed = 3 - ncaabExisting.length;
-      const additions: DbGame[] = [];
-      for (const g of ncaabCandidates) {
-        if (additions.length >= needed) break;
-        if (existingIds.has(g.game_id)) continue;
-        existingIds.add(g.game_id);
-        additions.push(g);
-      }
-      if (additions.length > 0) {
-        currentGames.push(...additions);
-        presentSports.add('NCAAB');
-      }
+  for (const [sport, count] of sportCounts.entries()) {
+    if (!(count > 0)) {
+      violations.push({ type: 'empty_sport_section', sport, count, source });
     }
   }
 
-  // If strict ET filtering leaves NHL/NCAAB empty, use provider day-slate as a
-  // controlled fallback (fresh window only) so those sports don't disappear.
-  // This keeps cards populated without reopening very old/stale results.
-  for (const sport of ['NHL', 'NCAAB']) {
-    if (currentGames.some((g) => normalizeSportKey(g.sport, g.league) === sport)) continue;
-    const existingIds = new Set(currentGames.map((g) => g.game_id));
-    const fallback = dayGamesRaw
-      .filter((g) => normalizeSportKey(g.sport, g.league) === sport)
-      .filter((g) => {
-        const status = String(g.status || '').toUpperCase();
-        if (!g.start_time) return status === 'IN_PROGRESS' || status === 'LIVE' || status === 'INPROGRESS';
-        const d = new Date(g.start_time);
-        if (Number.isNaN(d.getTime())) return false;
-        const gameEt = getDateInEastern(d);
-        const ts = d.getTime();
-        if (sport === 'NCAAB') {
-          // NCAA is sensitive to stale day-boundary data; keep strictly today ET.
-          if (gameEt !== todayEt) return false;
-        }
-        // Keep only fresh rows near "now", to avoid stale prior-day drift.
-        const withinFreshWindow = ts >= Date.now() - 36 * 60 * 60 * 1000 && ts <= Date.now() + 18 * 60 * 60 * 1000;
-        if (!withinFreshWindow) return false;
-        return status === 'IN_PROGRESS'
-          || status === 'LIVE'
-          || status === 'INPROGRESS'
-          || status === 'FINAL'
-          || status === 'COMPLETED'
-          || status === 'CLOSED'
-          || status === 'SCHEDULED';
-      })
-      .sort((a, b) => {
-        const ra = statusRank(a.status);
-        const rb = statusRank(b.status);
-        if (ra !== rb) return ra - rb;
-        const ta = a.start_time ? new Date(a.start_time).getTime() : Number.NEGATIVE_INFINITY;
-        const tb = b.start_time ? new Date(b.start_time).getTime() : Number.NEGATIVE_INFINITY;
-        if (ra === 1 && rb === 1) return tb - ta; // latest finals first
-        return ta - tb;
-      });
-
-    const additions: DbGame[] = [];
-    for (const g of fallback) {
-      if (additions.length >= 3) break;
-      if (existingIds.has(g.game_id)) continue;
-      existingIds.add(g.game_id);
-      additions.push(g);
-    }
-    if (additions.length > 0) {
-      currentGames.push(...additions);
-      presentSports.add(sport);
-    }
-  }
-
-  // Absolute guardrail: never render a false-empty home slate when base feeds have games.
-  // If all day-bound filters still eliminate everything, surface nearest upcoming games.
-  if (currentGames.length === 0 && allDedupedGames.length > 0) {
-    const now = Date.now();
-    currentGames = [...allDedupedGames]
-      .filter((g) => {
-        if (!g.start_time) return false;
-        const ts = new Date(g.start_time).getTime();
-        return Number.isFinite(ts);
-      })
-      .sort((a, b) => {
-        const ta = new Date(a.start_time).getTime();
-        const tb = new Date(b.start_time).getTime();
-        return Math.abs(ta - now) - Math.abs(tb - now);
-      })
-      .slice(0, 30);
-  }
-
-  // Soccer homepage cards should always reflect real schedule data from top leagues.
-  // Strictly keep today's ET slate (live, upcoming, final).
-  // Replace stale aggregate soccer rows with a schedule-driven top 3 selection.
-  const allowSoccerDeepHydration = false;
-  if (allowSoccerDeepHydration) {
-    const soccerLeagueKeys = [
-      'la-liga',
-      'premier-league',
-      'champions-league',
-      'serie-a',
-      'bundesliga',
-      'ligue-1',
-      'mls',
-      'europa-league',
-      'liga-mx',
-    ];
-    const nowTs = Date.now();
-    const soccerResponses = await Promise.allSettled(
-      soccerLeagueKeys.map((key) => fetchWithTimeout(`/api/soccer/schedule/${key}?filter=all`, undefined, 6000))
-    );
-    const soccerPool: DbGame[] = [];
-
-    for (let i = 0; i < soccerResponses.length; i++) {
-      const result = soccerResponses[i];
-      if (result.status !== 'fulfilled' || !result.value.ok) continue;
-      try {
-        const data = await result.value.json();
-        const matches = Array.isArray(data?.matches) ? data.matches : [];
-        for (const match of matches) {
-          const startRaw = String(match?.startTime || '');
-          if (!startRaw) continue;
-          const start = new Date(startRaw);
-          if (Number.isNaN(start.getTime())) continue;
-
-          const matchEt = getDateInEastern(start);
-          if (matchEt !== todayEt) continue;
-
-          const rawStatus = String(match?.status || '').toLowerCase();
-          const startTs = start.getTime();
-          const staleScheduled = rawStatus === 'scheduled' && startTs <= nowTs - 2 * 60 * 60 * 1000;
-          const status = rawStatus === 'live' || rawStatus === 'inprogress' || rawStatus === 'halftime'
-            ? 'IN_PROGRESS'
-            : rawStatus === 'closed' || rawStatus === 'ended' || rawStatus === 'finished' || rawStatus === 'final' || staleScheduled
-              ? 'FINAL'
-              : 'SCHEDULED';
-
-          const homeName = String(match?.homeTeamName || match?.homeTeam || 'Home');
-          const awayName = String(match?.awayTeamName || match?.awayTeam || 'Away');
-          const homeAbbrRaw = String(match?.homeTeamAbbreviation || match?.homeTeamAbbr || '').trim();
-          const awayAbbrRaw = String(match?.awayTeamAbbreviation || match?.awayTeamAbbr || '').trim();
-          const rawEventId = String(match?.eventId || `${soccerLeagueKeys[i]}_${homeName}_${awayName}_${startRaw}`);
-          const eventId = rawEventId.startsWith('sr:sport_event:')
-            ? rawEventId
-            : rawEventId.startsWith('soccer_sr:sport_event:')
-              ? rawEventId.replace(/^soccer_/, '')
-              : rawEventId;
-
-          soccerPool.push({
-            game_id: eventId,
-            sport: 'SOCCER',
-            league: soccerLeagueKeys[i],
-            home_team_code: (homeAbbrRaw || homeName.slice(0, 3)).toUpperCase(),
-            away_team_code: (awayAbbrRaw || awayName.slice(0, 3)).toUpperCase(),
-            home_team_name: homeName,
-            away_team_name: awayName,
-            start_time: start.toISOString(),
-            status,
-            home_score: match?.homeScore ?? null,
-            away_score: match?.awayScore ?? null,
-            period_label: match?.period ? String(match.period) : null,
-            clock: match?.clock ? String(match.clock) : null,
-            broadcast: null,
-            is_overtime: false,
-          });
-        }
-      } catch {}
-    }
-
-    if (soccerPool.length > 0) {
-      const dedupedSoccer = Array.from(
-        soccerPool.reduce((acc, game) => {
-          if (!acc.has(game.game_id)) acc.set(game.game_id, game);
-          return acc;
-        }, new Map<string, DbGame>()).values()
-      );
-      const scoreAndSort = (list: DbGame[], descendingTime = false) =>
-        list.sort((a, b) => {
-          const pa = soccerMatchPriorityScore(a.home_team_name, a.away_team_name, a.home_team_code, a.away_team_code);
-          const pb = soccerMatchPriorityScore(b.home_team_name, b.away_team_name, b.home_team_code, b.away_team_code);
-          if (pa !== pb) return pb - pa;
-          return descendingTime
-            ? b.start_time.localeCompare(a.start_time)
-            : a.start_time.localeCompare(b.start_time);
-        });
-
-      const liveSoccer = scoreAndSort(dedupedSoccer.filter((g) => g.status === 'IN_PROGRESS'));
-      const upcomingSoccer = scoreAndSort(
-        dedupedSoccer.filter((g) => g.status === 'SCHEDULED' && new Date(g.start_time).getTime() >= nowTs - 30 * 60 * 1000)
-      );
-      const todayFinalSoccer = scoreAndSort(
-        dedupedSoccer.filter((g) => g.status === 'FINAL' && getDateInEastern(new Date(g.start_time)) === todayEt),
-        true
-      );
-
-      const selectedSoccer: DbGame[] = [];
-      const seen = new Set<string>();
-      const addFrom = (list: DbGame[]) => {
-        for (const game of list) {
-          if (selectedSoccer.length >= 3) break;
-          if (seen.has(game.game_id)) continue;
-          seen.add(game.game_id);
-          selectedSoccer.push(game);
-        }
-      };
-      addFrom(liveSoccer);
-      addFrom(upcomingSoccer);
-      addFrom(todayFinalSoccer);
-
-      if (selectedSoccer.length > 0) {
-        for (let i = currentGames.length - 1; i >= 0; i--) {
-          if (normalizeSportKey(currentGames[i].sport, currentGames[i].league) === 'SOCCER') {
-            currentGames.splice(i, 1);
-          }
-        }
-        currentGames.push(...selectedSoccer);
-        presentSports.add('SOCCER');
-      }
-    }
-  }
-  
-  // Debug: Log sport counts from API
-  const sportCounts = currentGames.reduce((acc, g) => {
-    const sport = g.sport?.toUpperCase() || 'UNKNOWN';
-    acc[sport] = (acc[sport] || 0) + 1;
-    return acc;
-  }, {} as Record<string, number>);
-  console.log('[DataHub] API returned current games by sport:', sportCounts, 'Total:', currentGames.length);
-  
-  // Debug: Log first 3 games to verify game_id mapping
-  console.log('[DataHub] First 3 games from API:', currentGames.slice(0, 3).map(g => ({ 
-    game_id: g.game_id, sport: g.sport, status: g.status 
-  })));
-
-  // Guardrail: when base feeds lack odds fields, hydrate from odds summaries so cards don't go blank.
-  let gamesWithOdds = currentGames;
-  try {
-    gamesWithOdds = await hydrateGamesWithOddsSummaries(currentGames, todayEt);
-  } catch {
-    // Keep original games when odds hydration fails.
-  }
-  
-  // Transform all games
-  const transformed = gamesWithOdds.map(transformDbGameToLiveGame);
-
-  // MLB live feed frequently lacks inning fields in base game payload.
-  // Enrich a small capped subset from play-by-play so cards can show inning.
-  const mlbNeedingInning = transformed
-    .map((g, idx) => ({ g, idx }))
-    .filter(({ g }) =>
-      (g.sport || '').toUpperCase() === 'MLB' &&
-      g.status === 'IN_PROGRESS' &&
-      !String(g.period || '').trim() &&
-      !String(g.clock || '').trim()
-    )
-    .slice(0, 6);
-
-  if (mlbNeedingInning.length > 0) {
-    const inningLookups = await Promise.allSettled(
-      mlbNeedingInning.map(({ g }) => fetchMlbInningLabel(g.id))
-    );
-    inningLookups.forEach((result, i) => {
-      if (result.status !== 'fulfilled' || !result.value) return;
-      const targetIdx = mlbNeedingInning[i].idx;
-      transformed[targetIdx] = { ...transformed[targetIdx], period: result.value };
+  if (violations.length > 0) {
+    console.error('[Home][assertions] violation detected', {
+      source,
+      totalGames: games.length,
+      violations,
     });
   }
-  
-  // Separate by status for proper sorting
-  const liveGames = transformed.filter(g => g.status === 'IN_PROGRESS');
-  const scheduledGames = transformed.filter(g => g.status === 'SCHEDULED');
-  const finalGames = transformed.filter(g => g.status === 'FINAL');
-  
-  // Sort scheduled by start time
-  scheduledGames.sort((a, b) => {
-    const timeA = a.startTime ? new Date(a.startTime).getTime() : Infinity;
-    const timeB = b.startTime ? new Date(b.startTime).getTime() : Infinity;
-    return timeA - timeB;
-  });
-  
-  // Combine: live first, then scheduled, then finals so sports like NCAAB/Soccer
-  // still rotate when their slate is mostly completed.
-  const combined = [...liveGames, ...scheduledGames, ...finalGames];
+}
 
-  // Keep all relevant games for sport rotation; do not cap list by diversity helper.
-  const sportOrder = ['NBA', 'NFL', 'MLB', 'NHL', 'NCAAF', 'NCAAB', 'SOCCER', 'GOLF', 'MMA'];
-  const sportRank = (sport: string): number => {
-    const idx = sportOrder.indexOf(normalizeSportKey(sport));
-    return idx >= 0 ? idx : Number.MAX_SAFE_INTEGER;
-  };
-  const statusRankForSort = (status: LiveGame['status']): number =>
-    status === 'IN_PROGRESS' ? 0 : status === 'SCHEDULED' ? 1 : 2;
+async function fetchGamesData(onPartial?: (games: LiveGame[]) => void): Promise<LiveGame[]> {
+  return fetchHomeGamesFromSportSchedules(onPartial);
+}
 
-  return [...combined].sort((a, b) => {
-    const sr = statusRankForSort(a.status) - statusRankForSort(b.status);
-    if (sr !== 0) return sr;
-    const spr = sportRank(a.sport) - sportRank(b.sport);
-    if (spr !== 0) return spr;
-    if ((a.sport || '').toUpperCase() === 'SOCCER' && (b.sport || '').toUpperCase() === 'SOCCER') {
-      const pa = soccerMatchPriorityScore(a.homeTeam?.name, a.awayTeam?.name, a.homeTeam?.abbreviation, a.awayTeam?.abbreviation);
-      const pb = soccerMatchPriorityScore(b.homeTeam?.name, b.awayTeam?.name, b.homeTeam?.abbreviation, b.awayTeam?.abbreviation);
-      if (pa !== pb) return pb - pa;
+const HOME_SPORT_SCHEDULES = [
+  'MLB',
+  'NBA',
+  'NHL',
+  'NFL',
+  'SOCCER',
+  'NCAAB',
+  'NCAAF',
+  'MMA',
+  'GOLF',
+  'NASCAR',
+] as const;
+const HOME_SCHEDULE_TTL_MS = 8_000;
+const HOME_INITIAL_SPORT_TIMEOUT_MS = 1_800;
+const HOME_SOCCER_INITIAL_TIMEOUT_MS = 900;
+
+function buildHomeGamesFromEligibleBySport(eligibleBySport: Map<string, DbGame[]>): LiveGame[] {
+  const built = runHomeLogicMutation('build-home-games-from-eligible-by-sport', true, () => {
+    const deduped = new Map<string, DbGame>();
+    for (const rows of eligibleBySport.values()) {
+      for (const game of rows) {
+        const key = String(game?.game_id || "").trim();
+        if (!key) continue;
+        const existing = deduped.get(key);
+        deduped.set(key, existing ? mergeDbGames(existing, game) : game);
+      }
     }
-    const ta = a.startTime ? new Date(a.startTime).getTime() : Number.POSITIVE_INFINITY;
-    const tb = b.startTime ? new Date(b.startTime).getTime() : Number.POSITIVE_INFINITY;
-    return ta - tb;
+    if (deduped.size === 0) return [] as LiveGame[];
+    return sortHomeGamesForDisplay(Array.from(deduped.values()).map(transformDbGameToLiveGame));
   });
+  return built ?? [];
+}
+
+async function fetchHomeGamesFromSportSchedules(onPartial?: (games: LiveGame[]) => void): Promise<LiveGame[]> {
+  const todayEt = getDateInEastern(new Date());
+  const nowMs = Date.now();
+  const startedAt = Date.now();
+  let firstUsefulPublished = false;
+  let maxPartialCount = 0;
+  const eligibleBySport = new Map<string, DbGame[]>();
+  let firstFetchResolvedLogged = false;
+  let raceWinnerLogged = false;
+  let resolveFirstNonEmptySport: ((winner: { sport: string; games: LiveGame[] }) => void) | null = null;
+  const firstNonEmptySportPromise = new Promise<{ sport: string; games: LiveGame[] }>((resolve) => {
+    resolveFirstNonEmptySport = resolve;
+  });
+
+  const scheduleRequests = HOME_SPORT_SCHEDULES.map(async (sport) => {
+    const sportKey = String(sport || "").toUpperCase();
+    try {
+      const params = new URLSearchParams({
+        date: todayEt,
+        sport: String(sport || "").toLowerCase(),
+        includeOdds: "0",
+        fresh: "1",
+      });
+      const url = `/api/games?${params.toString()}`;
+      assertHomeScheduleOnlyEndpoint(url);
+      const isSoccer = sportKey === 'SOCCER';
+      const timeoutMs = isSoccer ? HOME_SOCCER_INITIAL_TIMEOUT_MS : HOME_INITIAL_SPORT_TIMEOUT_MS;
+      const cacheKey = isSoccer
+        ? `home:schedule:${todayEt}:${sport}:initial`
+        : `home:schedule:${todayEt}:${sport}`;
+      const payload = await fetchJsonCached<any>(url, {
+        cacheKey,
+        ttlMs: HOME_SCHEDULE_TTL_MS,
+        timeoutMs,
+        bypassCache: false,
+        init: { credentials: "include" },
+      });
+      const rows = Array.isArray(payload?.games) ? (payload.games as DbGame[]) : [];
+      if (!firstFetchResolvedLogged) {
+        firstFetchResolvedLogged = true;
+        console.info('[Home][perf]', {
+          first_fetch_resolve_ms: Date.now() - startedAt,
+          sport: sportKey,
+          fetchedCount: rows.length,
+        });
+      }
+      const totalFetched = rows.length;
+      if (sportKey === 'SOCCER') {
+        const now = new Date(nowMs);
+        const nowLocal = now.toLocaleString();
+        const nowUtc = now.toISOString();
+        for (const row of rows) {
+          const parsed = parseDateSafe(row.start_time);
+          console.info('[Home][soccer-time-debug]', {
+            game_id: String(row.game_id || ''),
+            start_time_raw: String(row.start_time || ''),
+            parsed_utc: parsed ? parsed.toISOString() : null,
+            parsed_local: parsed ? parsed.toLocaleString() : null,
+            now_utc: nowUtc,
+            now_local: nowLocal,
+          });
+        }
+      }
+      const filtered = rows.filter((row) => isRelevantHomepageGameForSport(row, sportKey, nowMs));
+      const afterFilter = filtered.length;
+      const reasonIfZero = afterFilter === 0
+        ? (totalFetched === 0 ? "no games today" : "filtered by time window")
+        : null;
+      console.info('[Home][sport-visibility]', {
+        sport: sportKey,
+        totalFetched,
+        afterFilter,
+        reasonIfZero,
+      });
+      if (afterFilter > 0) {
+        eligibleBySport.set(sportKey, filtered);
+        if (resolveFirstNonEmptySport) {
+          const winnerGames = buildHomeGamesFromEligibleBySport(eligibleBySport);
+          if (winnerGames.length > 0) {
+            resolveFirstNonEmptySport({ sport: sportKey, games: winnerGames });
+            resolveFirstNonEmptySport = null;
+          }
+        }
+        if (onPartial) {
+          const partialGames = buildHomeGamesFromEligibleBySport(eligibleBySport);
+          if (partialGames.length > 0 && partialGames.length >= maxPartialCount) {
+            maxPartialCount = partialGames.length;
+            if (!firstUsefulPublished) {
+              firstUsefulPublished = true;
+              console.info('[Home][perf]', {
+                first_useful_games_ms: Date.now() - startedAt,
+                sportsReady: Array.from(eligibleBySport.keys()),
+                gamesCount: partialGames.length,
+              });
+            }
+            onPartial(partialGames);
+          }
+        }
+      }
+    } catch (error) {
+      if (!firstFetchResolvedLogged) {
+        firstFetchResolvedLogged = true;
+        console.info('[Home][perf]', {
+          first_fetch_resolve_ms: Date.now() - startedAt,
+          sport: sportKey,
+          fetchedCount: 0,
+          reason: String((error as Error)?.message || 'fetch failed'),
+        });
+      }
+      if (sportKey === 'SOCCER') {
+        console.info('[Home][soccer-initial-skip]', {
+          reason: String((error as Error)?.message || 'soccer fetch failed'),
+          timeoutMs: HOME_SOCCER_INITIAL_TIMEOUT_MS,
+        });
+      }
+      console.info('[Home][sport-visibility]', {
+        sport: sportKey,
+        totalFetched: 0,
+        afterFilter: 0,
+        reasonIfZero: "no games today",
+      });
+    }
+  });
+
+  const allSettledPromise = (async (): Promise<LiveGame[]> => {
+    await Promise.allSettled(scheduleRequests);
+
+    if (eligibleBySport.size === 0) return [] as LiveGame[];
+
+    // Keep Home fast: transform schedule-level rows only, no detail calls.
+    const transformed = buildHomeGamesFromEligibleBySport(eligibleBySport);
+
+    // MLB scoreboard feeds can omit Top/Bot context; patch live rows from play-by-play.
+    const mlbLiveNeedingInning = transformed
+      .map((game, idx) => ({ game, idx }))
+      .filter(({ game }) => {
+        if (String(game.sport || '').toUpperCase() !== 'MLB') return false;
+        if (String(game.status || '').toUpperCase() !== 'IN_PROGRESS') return false;
+        const periodText = String(game.period || '').trim().toLowerCase();
+        return !periodText || /^\d{1,2}$/.test(periodText) || periodText === 'live';
+      })
+      .slice(0, 6);
+    if (mlbLiveNeedingInning.length > 0) {
+      const inningLookups = await Promise.allSettled(
+        mlbLiveNeedingInning.map(({ game }) => fetchMlbInningLabel(String(game.id || '')))
+      );
+      inningLookups.forEach((result, i) => {
+        if (result.status !== 'fulfilled' || !result.value) return;
+        const targetIdx = mlbLiveNeedingInning[i].idx;
+        runHomeLogicMutation('apply-mlb-inning-enrichment', true, () => {
+          transformed[targetIdx] = { ...transformed[targetIdx], period: result.value, clock: '' };
+          return true;
+        });
+      });
+    }
+
+    runHomeRuntimeAssertions(transformed, 'fetchHomeGamesFromSportSchedules');
+    return transformed;
+  })();
+
+  const firstWinnerOrFinal = await Promise.race([
+    firstNonEmptySportPromise.then((winner) => ({ type: 'winner' as const, winner })),
+    allSettledPromise.then((games) => ({ type: 'final' as const, games })),
+  ]);
+
+  if (firstWinnerOrFinal.type === 'winner' && firstWinnerOrFinal.winner.games.length > 0) {
+    if (!raceWinnerLogged) {
+      raceWinnerLogged = true;
+      console.info('[Home][perf]', {
+        first_non_empty_sport_ms: Date.now() - startedAt,
+        race_winner_sport: firstWinnerOrFinal.winner.sport,
+        initial_games_count: firstWinnerOrFinal.winner.games.length,
+      });
+    }
+    // Continue hydrating remaining sports in background.
+    void allSettledPromise.then((finalGames) => {
+      if (!onPartial || finalGames.length === 0) return;
+      onPartial(finalGames);
+    });
+    console.info('[Home][perf]', {
+      initial_snapshot_ms: Date.now() - startedAt,
+      initial_games_count: firstWinnerOrFinal.winner.games.length,
+      mode: 'first-valid-sport',
+    });
+    return firstWinnerOrFinal.winner.games;
+  }
+
+  const finalGames = firstWinnerOrFinal.type === 'final'
+    ? firstWinnerOrFinal.games
+    : await allSettledPromise;
+  if (resolveFirstNonEmptySport) {
+    resolveFirstNonEmptySport = null;
+  }
+  return finalGames;
 }
 
 // Helper to fetch a single soccer game from the soccer API
@@ -1203,13 +1045,14 @@ async function fetchAlertsData(isDemoMode: boolean): Promise<SharpAlert[]> {
 // ============================================
 
 // Cache version - increment to invalidate old caches when data structure changes
-const CACHE_VERSION = 'v12'; // Invalidate cache after UTC/ET day-slate merge fix
+const CACHE_VERSION = 'v14'; // Invalidate cache after Home schedule-only stabilization
 const CACHE_KEY = `gz_datahub_cache_${CACHE_VERSION}`;
-const CACHE_TTL = 60000; // 1 minute - data is fresh enough to show instantly
+const CACHE_TTL = 45 * 1000; // Keep Home fast while avoiding stale day bleed
 
 interface CachedData {
   games: LiveGame[];
   timestamp: number;
+  slateDateEt: string;
 }
 
 function loadCachedGames(): LiveGame[] {
@@ -1217,11 +1060,57 @@ function loadCachedGames(): LiveGame[] {
     const cached = localStorage.getItem(CACHE_KEY);
     if (!cached) return [];
     const data: CachedData = JSON.parse(cached);
-    // Return cached data if it's less than 1 minute old
-    if (Date.now() - data.timestamp < CACHE_TTL) {
-      return data.games;
+    const ageMs = Date.now() - Number(data.timestamp || 0);
+    const slateDateEt = String(data.slateDateEt || '').trim();
+    const games = Array.isArray(data.games) ? data.games : [];
+
+    if (!(ageMs < CACHE_TTL)) {
+      console.info('[DataHub][cache] Rejecting stale local cache by age', { ageMs, ttlMs: CACHE_TTL, key: CACHE_KEY });
+      return [];
     }
-    return [];
+
+    const filtered = games.filter((g) => {
+      const status = String(g?.status || '').toUpperCase();
+      if (status === 'IN_PROGRESS') return true;
+      const dbLike: DbGame = {
+        game_id: String(g?.id || ''),
+        sport: String(g?.sport || ''),
+        league: String(g?.league || ''),
+        home_team_code: String((g as any)?.homeTeam?.abbreviation || ''),
+        away_team_code: String((g as any)?.awayTeam?.abbreviation || ''),
+        home_team_name: String((g as any)?.homeTeam?.name || ''),
+        away_team_name: String((g as any)?.awayTeam?.name || ''),
+        start_time: String(g?.startTime || ''),
+        status,
+        home_score: Number.isFinite(Number((g as any)?.homeTeam?.score)) ? Number((g as any)?.homeTeam?.score) : null,
+        away_score: Number.isFinite(Number((g as any)?.awayTeam?.score)) ? Number((g as any)?.awayTeam?.score) : null,
+        period_label: String(g?.period || '') || null,
+        clock: String(g?.clock || '') || null,
+      };
+      return isRelevantHomepageGame(dbLike);
+    });
+    if (filtered.length !== games.length) {
+      console.info('[DataHub][cache] Discarding cache due to freshness guard mismatch', {
+        cachedCount: games.length,
+        validCount: filtered.length,
+        key: CACHE_KEY,
+      });
+      return [];
+    }
+    if (filtered.length === 0) {
+      console.info('[DataHub][cache] Rejecting cache with no currently valid rows', { count: games.length, key: CACHE_KEY });
+      return [];
+    }
+
+    console.info('[DataHub][cache] Using local cache for first paint', {
+      key: CACHE_KEY,
+      ageMs,
+      slateDateEt,
+      count: filtered.length,
+    });
+    const sorted = sortHomeGamesForDisplay(filtered);
+    runHomeRuntimeAssertions(sorted, 'loadCachedGames');
+    return sorted;
   } catch {
     return [];
   }
@@ -1229,7 +1118,11 @@ function loadCachedGames(): LiveGame[] {
 
 function saveCachedGames(games: LiveGame[]): void {
   try {
-    const data: CachedData = { games, timestamp: Date.now() };
+    const data: CachedData = {
+      games,
+      timestamp: Date.now(),
+      slateDateEt: getDateInEastern(new Date()),
+    };
     localStorage.setItem(CACHE_KEY, JSON.stringify(data));
   } catch {
     // localStorage might be full or disabled
@@ -1299,7 +1192,10 @@ export function DataHubProvider({
     }
 
     const run = async () => {
-      if (isManualRefresh) setIsRefreshing(true);
+      const deferGamesFetch = shouldDeferDataHubGamesFetch();
+      const hasCachedGames = gamesRef.current.length > 0;
+      const shouldShowBackgroundRefreshing = !isManualRefresh && !deferGamesFetch && hasCachedGames;
+      if (isManualRefresh || shouldShowBackgroundRefreshing) setIsRefreshing(true);
 
       let hasAnyError = false;
       const startedAt = Date.now();
@@ -1317,43 +1213,53 @@ export function DataHubProvider({
       // Start secondary feeds, but resolve games first so homepage paints fast.
       const watchboardsPromise = timed('watchboards', () => fetchWatchboardsData(userIdRef.current));
       const alertsPromise = timed('alerts', () => fetchAlertsData(isDemoModeRef.current));
-      const deferGamesFetch = shouldDeferDataHubGamesFetch();
-      const gamesResult = await Promise.allSettled([
-        deferGamesFetch ? Promise.resolve(gamesRef.current) : timed('games', () => fetchGamesData())
-      ]);
       if (deferGamesFetch) {
         timings.games = 0;
-      }
-
-      // Process games result first with stale-protection (never overwrite valid with empty/transient failures)
-      if (deferGamesFetch) {
         setGamesLoading(false);
         setGamesError(null);
-      } else if (gamesResult[0].status === 'fulfilled') {
-        const nextGames = Array.isArray(gamesResult[0].value) ? gamesResult[0].value : [];
-        if (nextGames.length > 0) {
-          setGames(nextGames);
-          gamesRef.current = nextGames;
-          saveCachedGames(nextGames); // Cache for instant navigation
-          setGamesError(null);
-        } else if (gamesRef.current.length > 0) {
-          console.warn('[DataHub] Empty games refresh ignored; preserving last-known-valid slate.');
-          setGamesError(null);
-        } else {
-          setGames(nextGames);
-          setGamesError(null);
-        }
       } else {
-        const message = (gamesResult[0].reason as Error)?.message || 'Failed to fetch games';
-        if (gamesRef.current.length === 0) {
-          setGamesError(message);
-        } else {
-          console.warn('[DataHub] Games refresh failed; preserving last-known-valid slate:', message);
-          setGamesError(null);
+        if (!hasCachedGames) {
+          setGamesLoading(true);
         }
-        hasAnyError = true;
+        let publishedPartial = false;
+        const handlePartialGames = (partialGames: LiveGame[]) => {
+          if (!Array.isArray(partialGames) || partialGames.length === 0) return;
+          publishedPartial = true;
+          setGames(partialGames);
+          gamesRef.current = partialGames;
+          saveCachedGames(partialGames);
+          setGamesError(null);
+          setGamesLoading(false);
+        };
+        const gamesResult = await Promise.allSettled([
+          timed('games', () => fetchGamesData(handlePartialGames))
+        ]);
+        if (gamesResult[0].status === 'fulfilled') {
+          const nextGames = Array.isArray(gamesResult[0].value) ? gamesResult[0].value : [];
+          if (nextGames.length > 0) {
+            setGames(nextGames);
+            gamesRef.current = nextGames;
+            saveCachedGames(nextGames);
+            setGamesError(null);
+          } else if (!hasCachedGames && !publishedPartial) {
+            setGames([]);
+            setGamesError(null);
+          } else {
+            // Keep the last-known-valid slate if a refresh returns empty.
+            setGamesError(null);
+          }
+        } else {
+          const message = (gamesResult[0].reason as Error)?.message || 'Failed to fetch games';
+          if (gamesRef.current.length === 0) {
+            setGamesError(message);
+          } else {
+            console.warn('[DataHub] Games refresh failed; preserving last-known-valid slate:', message);
+            setGamesError(null);
+          }
+          hasAnyError = true;
+        }
+        setGamesLoading(false);
       }
-      setGamesLoading(false);
 
       // Secondary feeds can finish after games are already rendered.
       const [watchboardsResult, alertsResult] = await Promise.allSettled([watchboardsPromise, alertsPromise]);
@@ -1394,7 +1300,7 @@ export function DataHubProvider({
       console.debug('[DataHub][perf]', {
         total_ms: totalMs,
         timings,
-        games_count: gamesResult[0].status === 'fulfilled' && Array.isArray(gamesResult[0].value) ? gamesResult[0].value.length : gamesRef.current.length,
+        games_count: gamesRef.current.length,
         backoff_multiplier: backoffMultiplierRef.current,
       });
 
@@ -1408,6 +1314,10 @@ export function DataHubProvider({
     } finally {
       fetchInFlightRef.current = null;
     }
+  }, []);
+
+  useEffect(() => {
+    runHomeLockSelfTest();
   }, []);
 
   // Initial fetch

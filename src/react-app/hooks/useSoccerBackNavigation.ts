@@ -8,6 +8,7 @@
 
 import { useCallback, useEffect, useRef } from "react";
 import { useNavigate, useLocation, useSearchParams } from "react-router-dom";
+import { normalizeSoccerDetailId } from "@/react-app/lib/gameRoutes";
 
 // Track if user has navigated within the app (not just direct entry)
 let hasAppNavigation = false;
@@ -148,7 +149,8 @@ export function buildSoccerMatchUrl(
   matchId: string,
   context?: { fromTeamId?: string; fromLeagueId?: string; from?: string }
 ): string {
-  let url = `/sports/soccer/match/${matchId}`;
+  const normalizedMatchId = normalizeSoccerDetailId(matchId);
+  let url = `/sports/soccer/match/${encodeURIComponent(normalizedMatchId)}`;
   const params = new URLSearchParams();
   
   if (context?.fromTeamId) params.set("fromTeamId", context.fromTeamId);

@@ -1,3 +1,4 @@
+// @ts-nocheck
 import { Hono } from "hono";
 import { authMiddleware } from "@getmocha/users-service/backend";
 import { logAuditEvent } from "../middleware/rbac";

@@ -69,6 +69,60 @@ export const GameSchema = z.object({
     points: z.number().optional(),
     status: z.string().optional(),
   })).optional(),
+  probable_away_pitcher_name: z.string().optional(),
+  probable_away_pitcher_record: z.string().optional(),
+  probable_home_pitcher_name: z.string().optional(),
+  probable_home_pitcher_record: z.string().optional(),
+  probable_pitchers: z.object({
+    away: z.object({
+      name: z.string(),
+      record: z.string().optional(),
+    }).optional(),
+    home: z.object({
+      name: z.string(),
+      record: z.string().optional(),
+    }).optional(),
+  }).optional(),
+  mlbLiveState: z.object({
+    inningNumber: z.number().nullable(),
+    inningHalf: z.enum(["top", "bottom"]).nullable(),
+    outs: z.number().nullable(),
+    balls: z.number().nullable(),
+    strikes: z.number().nullable(),
+    runnersOnBase: z.object({
+      first: z.boolean(),
+      second: z.boolean(),
+      third: z.boolean(),
+    }).nullable(),
+    currentBatter: z.object({
+      name: z.string().nullable(),
+      handedness: z.string().nullable(),
+    }).nullable(),
+    currentPitcher: z.object({
+      name: z.string().nullable(),
+      handedness: z.string().nullable(),
+    }).nullable(),
+    lastPlay: z.object({
+      type: z.string().nullable(),
+      player: z.string().nullable(),
+      text: z.string().nullable(),
+      timestamp: z.string().nullable(),
+    }).nullable(),
+  }).optional(),
+  mlbPregameState: z.object({
+    probableHomePitcher: z.object({
+      name: z.string().nullable(),
+      handedness: z.string().nullable(),
+      era: z.string().nullable(),
+      last5: z.string().nullable(),
+    }).nullable(),
+    probableAwayPitcher: z.object({
+      name: z.string().nullable(),
+      handedness: z.string().nullable(),
+      era: z.string().nullable(),
+      last5: z.string().nullable(),
+    }).nullable(),
+  }).optional(),
 });
 
 export type Game = z.infer<typeof GameSchema>;

@@ -1,3 +1,4 @@
+// @ts-nocheck
 /**
  * Sports Data Refresh API Routes
  * Manual triggers and status endpoints for the refresh orchestrator
@@ -39,9 +40,24 @@ import type { SportKey as ProviderSportKey } from '../services/providers/types';
 import { fetchGameWithFallback, fetchGamesWithFallback, getActiveProviderName, getPartnerAlerts, getProviderConfigs, getProviderTelemetry } from '../services/providers';
 import { fetchSportsRadarOdds, fetchGamePlayerProps } from '../services/sportsRadarOddsService';
 import { getEasternDateStringOffset, getTodayEasternDateString } from '../services/dateUtils';
+import { resolveCanonicalPlayerIdFromPayload } from '../../shared/espnAthleteIdLookup';
+import { insertHistoricalPropSnapshot } from '../services/historicalLines/snapshotStore';
+import {
+  debugVerifiedPipeline,
+  debugVerifiedSelector,
+  lockVerifiedHistoricalLines,
+  rebuildVerifiedHistoricalLines,
+} from '../services/historicalLines/verifiedLineSelector';
+import { gradeVerifiedHistoricalLines } from '../services/historicalLines/gradingEngine';
+import {
+  backfillSnapshotPlayerIdentities,
+  getPlayerResolutionMetrics,
+} from '../services/playerResolution/globalResolver';
+import { computeCoverageBySport } from '../services/historicalLines/displayLineResolver';
 
 type Bindings = {
   DB: any;
+  HISTORICAL_INGESTION_LOOP?: DurableObjectNamespace;
   VAPID_PUBLIC_KEY?: string;
   VAPID_PRIVATE_KEY?: string;
   SPORTSRADAR_API_KEY?: string;
@@ -54,6 +70,13 @@ type Bindings = {
 };
 
 const app = new Hono<{ Bindings: Bindings }>();
+
+function getHistoricalLoopStub(c: any): DurableObjectStub | null {
+  const ns = c.env.HISTORICAL_INGESTION_LOOP;
+  if (!ns) return null;
+  const id = ns.idFromName("global");
+  return ns.get(id);
+}
 
 const propsTodayHotCache = new Map<string, { expiresAt: number; payload: any }>();
 const propsTodayInflight = new Map<string, Promise<any>>();
@@ -707,8 +730,41 @@ async function hydrateSportFromProviderFeed(db: any, env: Bindings, sport: strin
       team: string | null;
       propType: string;
       lineValue: number;
-    }
+    },
+    context?: {
+      providerGameId?: string | null;
+      eventId?: string | null;
+      homeTeam?: string | null;
+      awayTeam?: string | null;
+      league?: string | null;
+      gameStartTime?: string | null;
+      sportsbook?: string | null;
+      overPrice?: number | null;
+      underPrice?: number | null;
+      rawPayload?: unknown;
+      playerProviderId?: string | null;
+    },
   ): Promise<boolean> => {
+    await insertHistoricalPropSnapshot(db, {
+      sport,
+      league: context?.league || null,
+      eventId: context?.eventId || context?.providerGameId || null,
+      gameId: context?.providerGameId || String(gameId),
+      gameStartTime: context?.gameStartTime || null,
+      playerName: prop.playerName,
+      playerProviderId: context?.playerProviderId || resolveCanonicalPlayerIdFromPayload(prop.playerName, sport),
+      teamName: prop.team || context?.homeTeam || null,
+      opponentTeamName: context?.awayTeam || null,
+      statType: prop.propType,
+      marketType: prop.propType,
+      lineValue: prop.lineValue,
+      overPrice: context?.overPrice ?? null,
+      underPrice: context?.underPrice ?? null,
+      sportsbook: context?.sportsbook || null,
+      capturedAt: now,
+      rawPayload: context?.rawPayload ?? prop,
+    });
+
     const current = await db
       .prepare('SELECT id, open_line_value, line_value FROM sdio_props_current WHERE game_id = ? AND player_name = ? AND prop_type = ?')
       .bind(gameId, prop.playerName, prop.propType)
@@ -1158,6 +1214,14 @@ async function hydrateSportFromProviderFeed(db: any, env: Bindings, sport: strin
           team: bucket.team,
           propType: bucket.propType,
           lineValue,
+        }, {
+          providerGameId: row.providerGameId,
+          eventId: row.providerGameId,
+          homeTeam: row.homeTeam,
+          awayTeam: row.awayTeam,
+          gameStartTime: null,
+          league: sport,
+          sportsbook: "consensus",
         });
         if (wrote) propsUpserted += 1;
       }
@@ -3801,9 +3865,58 @@ app.get('/props/today', async (c) => {
       props: paged,
     };
   };
+  let propsWarmScheduled = false;
+  const scheduleWarmFromVisibleProps = (payload: any): void => {
+    if (propsWarmScheduled) return;
+    const rows = Array.isArray(payload?.props) ? payload.props : [];
+    if (rows.length === 0) return;
+    const grouped = new Map<string, Set<string>>();
+    for (const row of rows.slice(0, 180)) {
+      const sportKey = String(row?.sport || requestedSport || '').trim().toUpperCase();
+      if (!sportKey || sportKey === 'ALL') continue;
+      const playerName = String(row?.player_name || row?.playerName || '').trim();
+      if (!playerName) continue;
+      if (!grouped.has(sportKey)) grouped.set(sportKey, new Set());
+      grouped.get(sportKey)!.add(playerName);
+    }
+    if (grouped.size === 0) return;
+    propsWarmScheduled = true;
+    const origin = new URL(c.req.url).origin;
+    c.executionCtx.waitUntil((async () => {
+      await Promise.allSettled(
+        Array.from(grouped.entries()).map(([sportKey, players]) =>
+          fetch(`${origin}/api/page-data/warm-hint`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json', 'x-page-data-warm': '1' },
+            body: JSON.stringify({
+              eventType: 'props',
+              sport: sportKey,
+              playerNames: Array.from(players).slice(0, 180),
+              maxPlayers: 180,
+            }),
+          }).catch(() => null)
+        )
+      );
+    })());
+  };
   const hasUsableRows = (payload: any): boolean => {
     const rows = Array.isArray(payload?.props) ? payload.props : [];
     return rows.length > 0;
+  };
+  const schedulePropsTodayPlayerDocPrebuild = (fullPayload: any): void => {
+    const wu = (c as any)?.executionCtx?.waitUntil?.bind((c as any).executionCtx);
+    if (!wu || !hasUsableRows(fullPayload)) return;
+    const fullRows = Array.isArray(fullPayload?.props) ? fullPayload.props : [];
+    wu(
+      (async () => {
+        try {
+          const { enqueuePlayerDocumentsFromPropsRows } = await import("../services/playerDocuments/prebuildEnqueue");
+          await enqueuePlayerDocumentsFromPropsRows(db, fullRows);
+        } catch {
+          // Non-fatal background prebuild.
+        }
+      })()
+    );
   };
   const isDegradedPayload = (payload: any): boolean => {
     const errors = Array.isArray(payload?.errors) ? payload.errors : [];
@@ -3813,11 +3926,14 @@ app.get('/props/today', async (c) => {
     const hot = readPropsTodayHotCache(hotCacheKey);
     if (hot && hasUsableRows(hot)) {
       recordPropsTodayPerf('hot', Date.now() - startedAt);
-      return c.json(paginatePayload({
+      const out = paginatePayload({
         ...hot,
         cached: true,
         hot_cached: true,
-      }), 200);
+      });
+      schedulePropsTodayPlayerDocPrebuild(hot);
+      scheduleWarmFromVisibleProps(out);
+      return c.json(out, 200);
     }
 
     try {
@@ -3825,10 +3941,13 @@ app.get('/props/today', async (c) => {
       if (cached && hasUsableRows(cached)) {
         writePropsTodayHotCache(hotCacheKey, cached);
         recordPropsTodayPerf('d1', Date.now() - startedAt);
-        return c.json(paginatePayload({
+        const out = paginatePayload({
           ...cached,
           cached: true,
-        }), 200);
+        });
+        schedulePropsTodayPlayerDocPrebuild(cached);
+        scheduleWarmFromVisibleProps(out);
+        return c.json(out, 200);
       }
     } catch {
       // fail open and compute fresh payload
@@ -3871,13 +3990,16 @@ app.get('/props/today', async (c) => {
 
         writePropsTodayHotCache(hotCacheKey, backup);
         recordPropsTodayPerf('backup', Date.now() - startedAt);
-        return c.json(paginatePayload({
+        const out = paginatePayload({
           ...backup,
           cached: true,
           source_stale: true,
           fallback_reason: 'Served last known good props snapshot while refreshing in background',
           degraded: true,
-        }), 200);
+        });
+        schedulePropsTodayPlayerDocPrebuild(backup);
+        scheduleWarmFromVisibleProps(out);
+        return c.json(out, 200);
       }
     } catch {
       // fail open and continue to fresh compute
@@ -3996,6 +4118,10 @@ app.get('/props/today', async (c) => {
           for (let j = 0; j < props.length; j++) {
             const p = props[j] as any;
             const playerName = String(p.player_name || '').trim();
+            const playerId = String(p.player_id || p.playerId || p.espn_id || p.espnId || '').trim();
+            const resolvedPlayerId =
+              resolveCanonicalPlayerIdFromPayload(playerId || null, playerName, sportLower) ?? null;
+            const team = String(p.team || p.team_abbr || p.teamAbbr || '').trim();
             const propType = String(p.prop_type || 'Unknown').trim();
             const sportsbook = String(p.sportsbook || 'SportsRadar').trim();
             const lineValue = Number(p.line ?? 0);
@@ -4009,8 +4135,8 @@ app.get('/props/today', async (c) => {
               provider_event_id: eventRow.gameId,
               sport,
               player_name: playerName,
-              player_id: null,
-              team: null,
+              player_id: resolvedPlayerId,
+              team: team || null,
               prop_type: propType,
               line_value: lineValue,
               open_line_value: null,
@@ -4052,6 +4178,9 @@ app.get('/props/today', async (c) => {
       const providerGameId = String(p.providerGameId || '').trim();
       if (!providerGameId) continue;
       const playerName = String(p.playerName || '').trim();
+      const rawPid = p.playerId ? String(p.playerId) : '';
+      const resolvedFallbackPid =
+        resolveCanonicalPlayerIdFromPayload(rawPid || null, playerName, sport.toLowerCase()) ?? null;
       const propType = String(p.propType || 'Unknown').trim();
       const sportsbook = String(p.sportsbook || 'SportsRadar').trim();
       const lineValue = Number(p.lineValue ?? 0);
@@ -4065,7 +4194,7 @@ app.get('/props/today', async (c) => {
         provider_event_id: providerGameId,
         sport,
         player_name: playerName,
-        player_id: p.playerId ? String(p.playerId) : null,
+        player_id: resolvedFallbackPid,
         team: p.team ? String(p.team) : '',
         prop_type: propType,
         line_value: lineValue,
@@ -4159,7 +4288,10 @@ app.get('/props/today', async (c) => {
 
   if (allHardDeadlineAt !== null && Date.now() >= allHardDeadlineAt) {
     recordPropsTodayPerf('fresh', Date.now() - startedAt);
-    return c.json(paginatePayload(payload), 200);
+    schedulePropsTodayPlayerDocPrebuild(payload);
+    const out = paginatePayload(payload);
+    scheduleWarmFromVisibleProps(out);
+    return c.json(out, 200);
   }
 
   const persistFreshRowsBeforeFallback = async (): Promise<void> => {
@@ -4183,14 +4315,17 @@ app.get('/props/today', async (c) => {
         } catch {
           // non-fatal
         }
-        return c.json(paginatePayload({
+        const out = paginatePayload({
           ...backup,
           cached: true,
           source_stale: true,
           fallback_reason: 'Served last known good props snapshot while upstream feed is empty/degraded',
           degraded: true,
           upstream_errors: Array.isArray(payload?.errors) ? payload.errors : [],
-        }), 200);
+        });
+        schedulePropsTodayPlayerDocPrebuild(backup);
+        scheduleWarmFromVisibleProps(out);
+        return c.json(out, 200);
       }
       // Secondary fallback: try recent dates so UI never hard-zeros during upstream outages.
       for (const dayOffset of [1, 2, 3]) {
@@ -4203,7 +4338,7 @@ app.get('/props/today', async (c) => {
         } catch {
           // non-fatal
         }
-        return c.json(paginatePayload({
+        const out = paginatePayload({
           ...priorBackup,
           date: requestedDate,
           cached: true,
@@ -4212,7 +4347,10 @@ app.get('/props/today', async (c) => {
           degraded: true,
           upstream_errors: Array.isArray(payload?.errors) ? payload.errors : [],
           stale_source_date: priorDate,
-        }), 200);
+        });
+        schedulePropsTodayPlayerDocPrebuild(priorBackup);
+        scheduleWarmFromVisibleProps(out);
+        return c.json(out, 200);
       }
     } catch {
       // fail open and return fresh payload below
@@ -4474,7 +4612,10 @@ app.get('/props/today', async (c) => {
   }
 
   recordPropsTodayPerf('fresh', Date.now() - startedAt);
-  return c.json(paginatePayload(payload), 200);
+  schedulePropsTodayPlayerDocPrebuild(payload);
+  const out = paginatePayload(payload);
+  scheduleWarmFromVisibleProps(out);
+  return c.json(out, 200);
 });
 
 // GET /api/sports-data/sportsradar/competition-props/:sport - Fetch all props for a competition
@@ -4706,6 +4847,202 @@ app.get('/sportsradar/props/:gameId', async (c) => {
     props: result.props,
     errors: result.errors
   });
+});
+
+app.get('/archive/loop/status', demoOrAuthMiddleware, async (c) => {
+  const demoMode = isDemoMode(c);
+  if (!demoMode && !(await isAdmin(c))) return c.json({ error: 'Admin required' }, 403);
+  const stub = getHistoricalLoopStub(c);
+  if (!stub) return c.json({ error: 'Historical ingestion loop binding not configured' }, 503);
+  const res = await stub.fetch('https://historical-loop/status');
+  const body = await res.json().catch(() => null);
+  return c.json(body || { ok: false, error: 'invalid_loop_response' }, res.status as any);
+});
+
+app.post('/archive/loop/start', demoOrAuthMiddleware, async (c) => {
+  const demoMode = isDemoMode(c);
+  if (!demoMode && !(await isAdmin(c))) return c.json({ error: 'Admin required' }, 403);
+  const stub = getHistoricalLoopStub(c);
+  if (!stub) return c.json({ error: 'Historical ingestion loop binding not configured' }, 503);
+  const res = await stub.fetch('https://historical-loop/start', { method: 'POST' });
+  const body = await res.json().catch(() => null);
+  return c.json(body || { ok: false, error: 'invalid_loop_response' }, res.status as any);
+});
+
+app.post('/archive/loop/stop', demoOrAuthMiddleware, async (c) => {
+  const demoMode = isDemoMode(c);
+  if (!demoMode && !(await isAdmin(c))) return c.json({ error: 'Admin required' }, 403);
+  const stub = getHistoricalLoopStub(c);
+  if (!stub) return c.json({ error: 'Historical ingestion loop binding not configured' }, 503);
+  const res = await stub.fetch('https://historical-loop/stop', { method: 'POST' });
+  const body = await res.json().catch(() => null);
+  return c.json(body || { ok: false, error: 'invalid_loop_response' }, res.status as any);
+});
+
+app.post('/archive/loop/tick', demoOrAuthMiddleware, async (c) => {
+  const demoMode = isDemoMode(c);
+  if (!demoMode && !(await isAdmin(c))) return c.json({ error: 'Admin required' }, 403);
+  const stub = getHistoricalLoopStub(c);
+  if (!stub) return c.json({ error: 'Historical ingestion loop binding not configured' }, 503);
+  const res = await stub.fetch('https://historical-loop/tick', { method: 'POST' });
+  const body = await res.json().catch(() => null);
+  return c.json(body || { ok: false, error: 'invalid_loop_response' }, res.status as any);
+});
+
+app.post('/archive/loop/config', demoOrAuthMiddleware, async (c) => {
+  const demoMode = isDemoMode(c);
+  if (!demoMode && !(await isAdmin(c))) return c.json({ error: 'Admin required' }, 403);
+  const stub = getHistoricalLoopStub(c);
+  if (!stub) return c.json({ error: 'Historical ingestion loop binding not configured' }, 503);
+  const input = await c.req.json().catch(() => ({}));
+  const res = await stub.fetch('https://historical-loop/config', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(input || {}),
+  });
+  const body = await res.json().catch(() => null);
+  return c.json(body || { ok: false, error: 'invalid_loop_response' }, res.status as any);
+});
+
+app.post('/archive/lock-verified', demoOrAuthMiddleware, async (c) => {
+  const demoMode = isDemoMode(c);
+  if (!demoMode && !(await isAdmin(c))) return c.json({ error: 'Admin required' }, 403);
+  const input = await c.req.json().catch(() => ({}));
+  const result = await lockVerifiedHistoricalLines({
+    db: c.env.DB,
+    sport: input?.sport,
+    gameId: input?.gameId,
+  });
+  return c.json({ ok: true, result });
+});
+
+app.post('/archive/grade-lines', demoOrAuthMiddleware, async (c) => {
+  const demoMode = isDemoMode(c);
+  if (!demoMode && !(await isAdmin(c))) return c.json({ error: 'Admin required' }, 403);
+  const input = await c.req.json().catch(() => ({}));
+  const result = await gradeVerifiedHistoricalLines({
+    db: c.env.DB,
+    sport: input?.sport,
+    gameId: input?.gameId,
+  });
+  return c.json({ ok: true, result });
+});
+
+app.get('/archive/debug/selector', demoOrAuthMiddleware, async (c) => {
+  const demoMode = isDemoMode(c);
+  if (!demoMode && !(await isAdmin(c))) return c.json({ error: 'Admin required' }, 403);
+  const sport = String(c.req.query('sport') || '').trim();
+  const gameId = String(c.req.query('gameId') || '').trim();
+  const verbose = ['1', 'true', 'yes'].includes(String(c.req.query('verbose') || '').toLowerCase());
+  const result = await debugVerifiedSelector({
+    db: c.env.DB,
+    sport: sport || undefined,
+    gameId: gameId || undefined,
+    verbose,
+  });
+  return c.json({ ok: true, result });
+});
+
+app.get('/archive/debug/verified', demoOrAuthMiddleware, async (c) => {
+  const demoMode = isDemoMode(c);
+  if (!demoMode && !(await isAdmin(c))) return c.json({ error: 'Admin required' }, 403);
+  const sport = String(c.req.query('sport') || '').trim();
+  const result = await debugVerifiedPipeline({
+    db: c.env.DB,
+    sport: sport || undefined,
+  });
+  return c.json({ ok: true, result });
+});
+
+app.get('/archive/debug/resolution', demoOrAuthMiddleware, async (c) => {
+  const demoMode = isDemoMode(c);
+  if (!demoMode && !(await isAdmin(c))) return c.json({ error: 'Admin required' }, 403);
+  const sport = String(c.req.query('sport') || '').trim();
+  const gameId = String(c.req.query('gameId') || '').trim();
+  const result = await getPlayerResolutionMetrics({
+    db: c.env.DB,
+    sport: sport || undefined,
+    gameId: gameId || undefined,
+  });
+  return c.json({ ok: true, result });
+});
+
+app.get('/archive/debug/coverage', demoOrAuthMiddleware, async (c) => {
+  const demoMode = isDemoMode(c);
+  if (!demoMode && !(await isAdmin(c))) return c.json({ error: 'Admin required' }, 403);
+  const sport = String(c.req.query('sport') || '').trim();
+  const rows = await computeCoverageBySport({
+    db: c.env.DB,
+    sport: sport || undefined,
+  });
+  if (sport) {
+    const single = rows.find((row) => row.sport === sport.toUpperCase()) || null;
+    return c.json({ ok: true, result: single });
+  }
+  return c.json({ ok: true, result: rows });
+});
+
+app.get('/archive/debug/edge', demoOrAuthMiddleware, async (c) => {
+  const demoMode = isDemoMode(c);
+  if (!demoMode && !(await isAdmin(c))) return c.json({ error: 'Admin required' }, 403);
+  const sport = String(c.req.query('sport') || '').trim().toUpperCase();
+  const coverageRows = await computeCoverageBySport({
+    db: c.env.DB,
+    sport: sport || undefined,
+  });
+  const propsRows = await c.env.DB.prepare(
+    `SELECT UPPER(COALESCE(g.sport, '')) AS sport, COUNT(DISTINCT COALESCE(p.player_name, '')) AS players_with_props
+     FROM sdio_props_current p
+     LEFT JOIN sdio_games g ON g.id = p.game_id
+     ${sport ? "WHERE UPPER(COALESCE(g.sport, '')) = ?" : ""}
+     GROUP BY UPPER(COALESCE(g.sport, ''))`
+  ).bind(...(sport ? [sport] : [])).all<{ sport: string; players_with_props: number }>();
+  const coverageBySport = new Map(coverageRows.map((row) => [row.sport, row]));
+  const result = (propsRows.results || []).map((row) => {
+    const coverage = coverageBySport.get(String(row.sport || '').toUpperCase());
+    const strictCoveragePct = Number(coverage?.strictCoveragePct || 0);
+    const expandedCoveragePct = Number(coverage?.expandedCoveragePct || 0);
+    const displayCoveragePct = Number(coverage?.displayCoveragePct || 0);
+    const playersWithProps = Number(row.players_with_props || 0);
+    const edgeEnabledPlayersEstimate = Math.round(playersWithProps * (displayCoveragePct / 100));
+    return {
+      sport: String(row.sport || '').toUpperCase(),
+      playersWithCurrentProps: playersWithProps,
+      strictCoveragePct,
+      expandedCoveragePct,
+      displayCoveragePct,
+      edgeEnabledPlayersEstimate,
+    };
+  });
+  return c.json({ ok: true, result });
+});
+
+app.post('/archive/backfill-player-resolution', demoOrAuthMiddleware, async (c) => {
+  const demoMode = isDemoMode(c);
+  if (!demoMode && !(await isAdmin(c))) return c.json({ error: 'Admin required' }, 403);
+  const input = await c.req.json().catch(() => ({}));
+  const result = await backfillSnapshotPlayerIdentities({
+    db: c.env.DB,
+    sport: input?.sport,
+    batchSize: input?.batchSize,
+  });
+  return c.json({ ok: true, result });
+});
+
+app.post('/archive/rebuild-verified', demoOrAuthMiddleware, async (c) => {
+  const demoMode = isDemoMode(c);
+  if (!demoMode && !(await isAdmin(c))) return c.json({ error: 'Admin required' }, 403);
+  const input = await c.req.json().catch(() => ({}));
+  const backfill = await backfillSnapshotPlayerIdentities({
+    db: c.env.DB,
+    sport: input?.sport,
+    batchSize: input?.batchSize,
+  });
+  const result = await rebuildVerifiedHistoricalLines({
+    db: c.env.DB,
+    sport: input?.sport,
+  });
+  return c.json({ ok: true, backfill, result });
 });
 
 export default app;

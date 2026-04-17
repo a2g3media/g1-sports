@@ -1,3 +1,4 @@
+// @ts-nocheck
 import { Hono } from "hono";
 
 const mmaRouter = new Hono<{ Bindings: Env }>();

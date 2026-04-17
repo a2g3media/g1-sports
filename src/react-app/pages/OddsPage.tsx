@@ -222,6 +222,52 @@ const SPORT_FILTERS = [
   { key: 'SOCCER', label: 'Soccer', emoji: '⚽' },
 ];
 
+function normalizeSportForOddsPage(rawSport: unknown, rawLeague?: unknown): string {
+  const upper = String(rawSport || '').toUpperCase();
+  const league = String(rawLeague || '').toUpperCase();
+  const soccerLeagueHints = [
+    'UEFA', 'EUROPA', 'CHAMPIONS', 'PREMIER', 'EPL', 'MLS',
+    'LA_LIGA', 'LA LIGA', 'SERIE_A', 'SERIE A', 'BUNDES',
+    'LIGUE_1', 'LIGUE 1', 'LIGA_MX', 'LIGA MX', 'EREDIVISIE',
+    'PRIMEIRA', 'COPA', 'WORLD CUP', 'NATIONS LEAGUE',
+  ];
+  const hasSoccerLeagueSignal = soccerLeagueHints.some((hint) => league.includes(hint));
+  if (upper === 'CBB' || upper === 'NCAAM' || upper === 'NCAA_MEN_BASKETBALL') return 'NCAAB';
+  if (upper === 'CFB' || upper === 'NCAAFB' || upper === 'NCAA_FOOTBALL') return 'NCAAF';
+  if (upper === 'ICEHOCKEY' || upper === 'HOCKEY') return 'NHL';
+  if (upper === 'BASEBALL') return 'MLB';
+  if (
+    hasSoccerLeagueSignal ||
+    upper === 'SOCCER' ||
+    upper === 'FOOTBALL_SOCCER' ||
+    upper === 'EPL' ||
+    upper === 'MLS' ||
+    upper === 'UCL' ||
+    upper === 'UEFA' ||
+    upper === 'EUROPA_LEAGUE' ||
+    upper === 'EUROPA-LEAGUE' ||
+    upper === 'CHAMPIONS_LEAGUE' ||
+    upper === 'CHAMPIONS-LEAGUE' ||
+    upper === 'PREMIER_LEAGUE' ||
+    upper === 'PREMIER-LEAGUE' ||
+    upper === 'LA_LIGA' ||
+    upper === 'SERIE_A' ||
+    upper === 'BUNDESLIGA' ||
+    upper === 'LIGUE_1'
+  ) return 'SOCCER';
+  if (upper === 'PGA' || upper === 'LIV' || upper === 'DP' || upper === 'GOLF_TOURNAMENT') return 'GOLF';
+  if (upper === 'BASKETBALL') {
+    if (league.includes('NCAA') || league.includes('NCAAB') || league.includes('CBB')) return 'NCAAB';
+    return 'NBA';
+  }
+  if (upper === 'FOOTBALL') {
+    if (league.includes('NCAA') || league.includes('NCAAF') || league.includes('COLLEGE')) return 'NCAAF';
+    if (hasSoccerLeagueSignal) return 'SOCCER';
+    return 'NFL';
+  }
+  return upper || 'NBA';
+}
+
 export function OddsPage() {
   // Safely access hooks with defensive destructuring
   const watchboardsResult = useWatchboards();
@@ -457,11 +503,13 @@ export function OddsPage() {
       return rawGames
         .filter(g => g && typeof g === 'object' && (g.game_id || g.id))
         .map((g) => {
-          const sportKey = (g.sport || 'NBA').toUpperCase();
+          const rawSportKey = (g.sport || 'NBA').toUpperCase();
+          const sportKey = normalizeSportForOddsPage(g.sport, g.league);
           const homeAbbr = g.home_team_code || 'TBD';
           const awayAbbr = g.away_team_code || 'TBD';
           const gameKey = g.game_id || g.id || '';
           const matchKey = buildOddsMatchKey(
+            rawSportKey,
             g.home_team_code || g.home_team_name || g.homeTeamCode || g.homeTeam,
             g.away_team_code || g.away_team_name || g.awayTeamCode || g.awayTeam,
             g.start_time || g.startTime

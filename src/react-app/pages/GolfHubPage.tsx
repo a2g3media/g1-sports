@@ -438,8 +438,7 @@ export function GolfHubPage() {
       const response = await fetch('/api/golf/schedule');
       
       if (!response.ok) {
-        const data = await response.json();
-        throw new Error(data.error || 'Failed to fetch schedule');
+        throw new Error(`Failed to fetch golf schedule (${response.status})`);
       }
       
       const data = await response.json();
@@ -450,7 +449,10 @@ export function GolfHubPage() {
         setSelectedTournamentId(data.current.id);
       }
     } catch (err) {
-      setError(String(err));
+      console.warn('[GolfHubPage] schedule unavailable, using launch placeholder UI', err);
+      setScheduleData(null);
+      setSelectedTournamentId(null);
+      setError('Golf data coming soon');
     } finally {
       setLoading(false);
     }
@@ -498,6 +500,7 @@ export function GolfHubPage() {
   const currentTournament = scheduleData?.current;
   const upcomingTournaments = scheduleData?.upcoming || [];
   const recentResults = scheduleData?.completed || [];
+  const hasTournamentData = Boolean(currentTournament) || upcomingTournaments.length > 0 || recentResults.length > 0;
 
   const handleResultClick = (result: GolfScheduleData['completed'][0]) => {
     setSelectedResult(result);
@@ -511,17 +514,6 @@ export function GolfHubPage() {
     return (
       <div className="min-h-screen bg-[#0a0a0a]">
         <GolfLoadingState />
-      </div>
-    );
-  }
-
-  if (error) {
-    return (
-      <div className="min-h-screen bg-[#0a0a0a] p-4">
-        <div className="max-w-4xl mx-auto">
-          <BackButton onClick={() => navigate('/sports')} />
-          <GolfErrorState error={error} onRetry={fetchSchedule} />
-        </div>
       </div>
     );
   }
@@ -584,6 +576,19 @@ export function GolfHubPage() {
           </div>
         </div>
 
+
+        {/* Golf launch placeholder (non-blocking when feed is unavailable) */}
+        {!hasTournamentData && (
+          <div className="mb-6 rounded-2xl border border-emerald-500/20 bg-gradient-to-br from-emerald-950/35 via-black/50 to-transparent p-6 sm:p-7">
+            <div className="flex items-center gap-3">
+              <Flag className="h-5 w-5 text-emerald-300" />
+              <h2 className="text-lg font-bold text-white">Golf data coming soon</h2>
+            </div>
+            <p className="mt-2 text-sm text-white/60">
+              Live golf schedule and leaderboard data are temporarily unavailable.
+            </p>
+          </div>
+        )}
 
         {/* Hero Tournament Card */}
         {currentTournament ? (
@@ -922,23 +927,6 @@ function GolfLoadingState() {
         <p className="text-white font-medium">Loading PGA Tour</p>
         <p className="text-white/40 text-sm">Fetching tournament data...</p>
       </div>
-    </div>
-  );
-}
-
-// Error State
-function GolfErrorState({ error, onRetry }: { error: string; onRetry: () => void }) {
-  return (
-    <div className="rounded-2xl border border-red-500/20 bg-red-950/20 p-8 text-center">
-      <AlertCircle className="w-12 h-12 text-red-400 mx-auto mb-4" />
-      <h3 className="text-lg font-bold text-white mb-2">Unable to Load Data</h3>
-      <p className="text-white/50 text-sm mb-4 max-w-md mx-auto">{error}</p>
-      <button 
-        onClick={onRetry}
-        className="px-6 py-3 bg-red-500/20 text-red-400 rounded-xl font-bold border border-red-500/30 hover:bg-red-500/30 transition-colors min-h-[48px]"
-      >
-        Try Again
-      </button>
     </div>
   );
 }

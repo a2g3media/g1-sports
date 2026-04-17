@@ -259,7 +259,7 @@ export async function getCoachGPipelineConfig(db: D1Database): Promise<Record<st
   const rows = await db.prepare(`
     SELECT config_key, config_value
     FROM coachg_pipeline_config
-  `).all<QueryResults<{ config_key: string; config_value: string }>>();
+  `).all<{ config_key: string; config_value: string }>();
   const output: Record<string, string> = {};
   for (const row of rows.results || []) {
     output[row.config_key] = row.config_value;
@@ -409,7 +409,7 @@ export async function listCoachGFeaturedItems(
     ORDER BY sport ASC, updated_at DESC
     LIMIT ?
   `;
-  const rows = await db.prepare(sql).bind(...values).all<QueryResults<Record<string, unknown>>>();
+  const rows = await db.prepare(sql).bind(...values).all<Record<string, unknown>>();
   return (rows.results || []).map(mapFeaturedRow);
 }
 
@@ -522,7 +522,7 @@ export async function listCoachGSocialPostsForItem(db: D1Database, itemId: strin
     FROM coachg_social_posts
     WHERE item_id = ?
     ORDER BY created_at DESC
-  `).bind(itemId).all<QueryResults<Record<string, unknown>>>();
+  `).bind(itemId).all<Record<string, unknown>>();
   return (rows.results || []).map((row) => ({
     postJobId: String(row.post_job_id || ""),
     itemId: String(row.item_id || ""),

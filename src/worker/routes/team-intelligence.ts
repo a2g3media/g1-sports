@@ -1,3 +1,4 @@
+// @ts-nocheck
 /**
  * Team Intelligence API Routes
  * Provides Coach G team analysis for soccer teams

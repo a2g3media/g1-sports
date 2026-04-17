@@ -11,15 +11,20 @@
 
 import { getCachedData, setCachedData } from './apiCacheService';
 
-// Cache TTL - 1 minute for odds to preserve movement fidelity.
-const ODDS_CACHE_TTL_SECONDS = 60;
+// SportsRadar cache policy:
+// - live-ish slate reads: very short (5-10s)
+// - pregame/non-live: longer (60-120s)
+const ODDS_CACHE_TTL_LIVE_SECONDS = 8;
+const ODDS_CACHE_TTL_PREGAME_SECONDS = 90;
 
 // Rate limit backoff - cache empty results for 2 minutes when rate limited
 const RATE_LIMIT_BACKOFF_SECONDS = 2 * 60;
+const propsResponseCache = new Map<string, { expiresAt: number; payload: GamePlayerProp[] }>();
+const propsInFlight = new Map<string, Promise<GamePlayerProp[]>>();
 
 // Rate limiting - reduced with full access
 let lastApiCallTimestamp = 0;
-const MIN_API_INTERVAL_MS = 500; // 500ms between API calls (full access allows more)
+const MIN_API_INTERVAL_MS = 90; // Keep some spacing but allow multi-competition sports (soccer) to complete within route budgets.
 
 // Competition ID mapping for SportsRadar Odds Comparison API
 // These IDs are specific to the Odds Comparison product and differ from
@@ -82,6 +87,13 @@ function getTodayEasternDateString(): string {
     month: "2-digit",
     day: "2-digit",
   }).format(new Date());
+}
+
+function resolveOddsCacheTtlSeconds(date?: string): number {
+  const requested = String(date || "").trim();
+  if (!requested) return ODDS_CACHE_TTL_LIVE_SECONDS;
+  const todayEt = getTodayEasternDateString();
+  return requested === todayEt ? ODDS_CACHE_TTL_LIVE_SECONDS : ODDS_CACHE_TTL_PREGAME_SECONDS;
 }
 
 // Market types we care about
@@ -159,6 +171,7 @@ export async function fetchSportsRadarOdds(
   const effectiveApiKey = oddsApiKey || apiKey;
   const sportLower = sport.toLowerCase();
   const cacheKey = `sr_odds_${sportLower}_${date || 'all'}`;
+  const oddsCacheTtlSeconds = resolveOddsCacheTtlSeconds(date);
   
   // Check D1 database cache first if available
   if (db) {
@@ -267,7 +280,7 @@ export async function fetchSportsRadarOdds(
     if (db && oddsMap.size > 0) {
       try {
         const cacheData = Object.fromEntries(oddsMap);
-        await setCachedData(db, cacheKey, 'sportsradar_odds', sport, cacheData, ODDS_CACHE_TTL_SECONDS);
+        await setCachedData(db, cacheKey, 'sportsradar_odds', sport, cacheData, oddsCacheTtlSeconds);
         console.log(`[SportsRadar Odds] ${sport}: ${oddsMap.size} games cached in DB`);
       } catch (err) {
         console.error(`[SportsRadar Odds] DB cache write error:`, err);
@@ -308,7 +321,7 @@ export async function fetchSportsRadarOdds(
     if (db && oddsMap.size > 0) {
       try {
         const cacheData = Object.fromEntries(oddsMap);
-        await setCachedData(db, cacheKey, 'sportsradar_odds', sport, cacheData, ODDS_CACHE_TTL_SECONDS);
+        await setCachedData(db, cacheKey, 'sportsradar_odds', sport, cacheData, oddsCacheTtlSeconds);
         console.log(`[SportsRadar Odds] ${sport}: ${oddsMap.size} fallback games cached in DB`);
       } catch (err) {
         console.error(`[SportsRadar Odds] DB fallback cache write error:`, err);
@@ -373,7 +386,7 @@ export async function fetchSportsRadarOdds(
     if (db && oddsMap.size > 0) {
       try {
         const cacheData = Object.fromEntries(oddsMap);
-        await setCachedData(db, cacheKey, 'sportsradar_odds', sport, cacheData, ODDS_CACHE_TTL_SECONDS);
+        await setCachedData(db, cacheKey, 'sportsradar_odds', sport, cacheData, oddsCacheTtlSeconds);
         console.log(`[SportsRadar Odds] ${sport}: ${oddsMap.size} schedule-fallback games cached in DB`);
       } catch (err) {
         console.error(`[SportsRadar Odds] DB schedule-fallback cache write error:`, err);
@@ -1439,6 +1452,8 @@ const PLAYER_PROPS_COMPETITION_IDS: Record<string, string> = {
 
 export interface GamePlayerProp {
   player_name: string;
+  player_id?: string;
+  team?: string;
   prop_type: string;
   line: number;
   over_odds: number;
@@ -1490,6 +1505,17 @@ export async function fetchGamePlayerProps(
   const encodedEventId = encodeURIComponent(sportEventId);
   const status = String(gameStatus || "").toUpperCase();
   const isLiveGame = status === "LIVE" || status === "IN_PROGRESS";
+  const propsCacheTtlMs = isLiveGame ? 8_000 : 90_000;
+  const propsCacheKey = `${String(sport || "").toUpperCase()}|${sportEventId}|${isLiveGame ? "live" : "pregame"}`;
+  const nowMs = Date.now();
+  const cachedProps = propsResponseCache.get(propsCacheKey);
+  if (cachedProps && cachedProps.expiresAt > nowMs) {
+    return cachedProps.payload;
+  }
+  const inFlightProps = propsInFlight.get(propsCacheKey);
+  if (inFlightProps) {
+    return inFlightProps;
+  }
   const candidateUrls = isLiveGame
     ? [
         // Prefer live feed first for in-progress games.
@@ -1517,7 +1543,8 @@ export async function fetchGamePlayerProps(
   
   console.log(`[SportsRadar Props] Fetching for: ${awayClean} @ ${homeClean}`);
 
-  try {
+  const requestPromise = (async (): Promise<GamePlayerProp[]> => {
+    try {
     let data: any = null;
     let lastError: string | null = null;
     for (const url of candidateUrls) {
@@ -1566,6 +1593,22 @@ export async function fetchGamePlayerProps(
       // Try multiple paths for player name (spec can expose player on object or in outcomes)
       const playerName = pm.player?.name || pm.name || pm.player_name || '';
       if (!playerName) continue;
+      const playerId = String(
+        pm.player?.id
+        || pm.player?.player_id
+        || pm.player_id
+        || pm.playerId
+        || ''
+      ).trim();
+      const playerTeam = String(
+        pm.player?.team
+        || pm.player?.team_name
+        || pm.player?.competitor?.abbreviation
+        || pm.player?.competitor?.name
+        || pm.team
+        || pm.team_name
+        || ''
+      ).trim();
       
       const markets = pm.markets || pm.player_props || [];
       
@@ -1602,6 +1645,8 @@ export async function fetchGamePlayerProps(
           if (line !== undefined && playerName) {
             props.push({
               player_name: playerName,
+              player_id: playerId || undefined,
+              team: playerTeam || undefined,
               prop_type: propType,
               line,
               over_odds: overOdds,
@@ -1631,6 +1676,8 @@ export async function fetchGamePlayerProps(
           if (line !== undefined) {
             props.push({
               player_name: playerName,
+              player_id: playerId || undefined,
+              team: playerTeam || undefined,
               prop_type: propType,
               line,
               over_odds: overOdds,
@@ -1645,11 +1692,22 @@ export async function fetchGamePlayerProps(
     }
     
     console.log(`[SportsRadar Props] Extracted ${props.length} props`);
-    return props;
-
-  } catch (err) {
-    console.error('[SportsRadar Props] Error:', err);
-    return [];
+      return props;
+    } catch (err) {
+      console.error('[SportsRadar Props] Error:', err);
+      return [];
+    }
+  })();
+  propsInFlight.set(propsCacheKey, requestPromise);
+  try {
+    const payload = await requestPromise;
+    propsResponseCache.set(propsCacheKey, {
+      payload,
+      expiresAt: Date.now() + propsCacheTtlMs,
+    });
+    return payload;
+  } finally {
+    propsInFlight.delete(propsCacheKey);
   }
 }
 

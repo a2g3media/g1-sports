@@ -8,6 +8,7 @@ import { Hono } from "hono";
 import {
   getUserSubscription,
   getUserFeatureAccess,
+  getFeatureAccess,
   startTrial,
   cancelSubscription,
   calculatePoolAccessCredit,
@@ -24,6 +25,32 @@ const app = new Hono<{
   };
 }>();
 
+function buildFreeFallbackSubscription(userId: string | null): {
+  userId: string;
+  tier: GZSportsTier;
+  productKey: null;
+  billingPeriod: null;
+  status: "active";
+  isTrialing: false;
+  trialEndsAt: null;
+  currentPeriodEnd: null;
+  cancelAtPeriodEnd: false;
+  downgradeToProductKey: null;
+} {
+  return {
+    userId: String(userId || ""),
+    tier: "free",
+    productKey: null,
+    billingPeriod: null,
+    status: "active",
+    isTrialing: false,
+    trialEndsAt: null,
+    currentPeriodEnd: null,
+    cancelAtPeriodEnd: false,
+    downgradeToProductKey: null,
+  };
+}
+
 // =====================================================
 // ROUTES
 // =====================================================
@@ -34,34 +61,63 @@ const app = new Hono<{
  */
 app.get("/", async (c) => {
   const userId = c.get("userId");
+  const fallbackSubscription = buildFreeFallbackSubscription(userId);
+  const fallbackFeatures = getFeatureAccess("free");
 
   try {
-    const subscription = await getUserSubscription(c.env.DB, userId);
-    const features = await getUserFeatureAccess(c.env.DB, userId);
+    const [subscriptionResult, featuresResult, productsResult] = await Promise.allSettled([
+      getUserSubscription(c.env.DB, userId),
+      getUserFeatureAccess(c.env.DB, userId),
+      c.env.DB.prepare(`
+        SELECT 
+          product_key,
+          name,
+          tier_level,
+          price_monthly_cents,
+          price_annual_cents,
+          billing_period,
+          features_json
+        FROM subscription_products
+        WHERE is_active = 1
+        ORDER BY tier_level ASC
+      `).all(),
+    ]);
 
-    // Get available products
-    const products = await c.env.DB.prepare(`
-      SELECT 
-        product_key,
-        name,
-        tier_level,
-        price_monthly_cents,
-        price_annual_cents,
-        billing_period,
-        features_json
-      FROM subscription_products
-      WHERE is_active = 1
-      ORDER BY tier_level ASC
-    `).all();
+    const degraded =
+      subscriptionResult.status !== "fulfilled"
+      || featuresResult.status !== "fulfilled"
+      || productsResult.status !== "fulfilled";
+
+    if (degraded) {
+      console.warn("[subscription] degraded response fallback", {
+        userId,
+        subscriptionOk: subscriptionResult.status === "fulfilled",
+        featuresOk: featuresResult.status === "fulfilled",
+        productsOk: productsResult.status === "fulfilled",
+      });
+    }
+
+    const products =
+      productsResult.status === "fulfilled" && Array.isArray(productsResult.value.results)
+        ? productsResult.value.results
+        : [];
 
     return c.json({
-      subscription,
-      features,
-      products: products.results,
+      subscription: subscriptionResult.status === "fulfilled" ? subscriptionResult.value : fallbackSubscription,
+      features: featuresResult.status === "fulfilled" ? featuresResult.value : fallbackFeatures,
+      products,
+      degraded,
+      pending_refresh: degraded,
     });
   } catch (error) {
-    console.error("Failed to fetch subscription:", error);
-    return c.json({ error: "Failed to fetch subscription" }, 500);
+    console.error("[subscription] hard fallback:", error);
+    return c.json({
+      subscription: fallbackSubscription,
+      features: fallbackFeatures,
+      products: [],
+      degraded: true,
+      pending_refresh: true,
+    });
   }
 });
 

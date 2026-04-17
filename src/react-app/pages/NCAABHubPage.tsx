@@ -11,7 +11,13 @@ import { PlayerSearch } from "@/react-app/components/PlayerSearch";
 import { TeamLogo } from "@/react-app/components/TeamLogo";
 import { CoachGAvatar } from "@/react-app/components/CoachGAvatar";
 import { getNcaabTournamentState } from "@/react-app/lib/ncaabTournamentSeason";
-import { buildPlayerRoute, buildTeamRoute, logPlayerNavigation, logTeamNavigation } from "@/react-app/lib/navigationRoutes";
+import {
+  buildTeamRoute,
+  logPlayerNavigation,
+  logTeamNavigation,
+} from "@/react-app/lib/navigationRoutes";
+import { navigateToPlayerProfile } from "@/react-app/lib/playerProfileNavigation";
+import { resolvePlayerIdForNavigation } from "@/react-app/lib/resolvePlayerIdForNavigation";
 
 function getDateInEastern(dateInput: string | Date): string {
   const date = dateInput instanceof Date ? dateInput : new Date(dateInput);
@@ -1144,10 +1150,19 @@ export default function NCAABHubPage() {
                 <div
                   key={player.id}
                   onClick={() => {
-                    logPlayerNavigation(player.name, "ncaab");
-                    navigate(buildPlayerRoute("ncaab", player.name));
+                    const pid = resolvePlayerIdForNavigation(player.id, player.name, "ncaab") || "";
+                    if (!pid) return;
+                    logPlayerNavigation(pid, "ncaab");
+                    void navigateToPlayerProfile(navigate, "ncaab", pid, {
+                      displayName: player.name,
+                      source: "NCAABHubLeaderCard",
+                    });
                   }}
-                  className="flex items-center gap-4 px-4 py-3 border-t border-white/5 first:border-t-0 hover:bg-white/5 cursor-pointer transition-colors"
+                  className={`flex items-center gap-4 px-4 py-3 border-t border-white/5 first:border-t-0 transition-colors ${
+                    resolvePlayerIdForNavigation(player.id, player.name, "ncaab")
+                      ? "hover:bg-white/5 cursor-pointer"
+                      : "opacity-70 cursor-not-allowed"
+                  }`}
                 >
                   <span className={`w-6 text-center font-bold ${idx < 3 ? "text-amber-400" : "text-white/40"}`}>
                     {idx + 1}

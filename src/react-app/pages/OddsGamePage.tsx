@@ -24,6 +24,9 @@ import { generateCoachWhisper, getWhisperColors } from "@/react-app/lib/coachWhi
 import { toGameDetailPath } from "@/react-app/lib/gameRoutes";
 import { getMarketPeriodLabels } from "@/react-app/lib/marketPeriodLabels";
 import { fetchJsonCached } from "@/react-app/lib/fetchCache";
+import { prefetchFullPlayerProfileSnapshot } from "@/react-app/lib/playerProfileSnapshotPrewarm";
+import { resolveCanonicalPlayerIdFromPayload } from "@/shared/espnAthleteIdLookup";
+import { normalizeSportKeyForRoute } from "@/react-app/lib/navigationRoutes";
 import { useParlayBuilder } from "@/react-app/context/ParlayBuilderContext";
 import { GameContextCard } from "@/react-app/components/GameContextCard";
 import { useFeatureFlags } from "@/react-app/hooks/useFeatureFlags";
@@ -1120,17 +1123,66 @@ function MatchupTrendsSection({ game }: { game: GameData }) {
     let cancelled = false;
     const fetchH2H = async () => {
       try {
-        const teamA = encodeURIComponent(game.homeTeamCode || game.homeTeam);
-        const teamB = encodeURIComponent(game.awayTeamCode || game.awayTeam);
+        const teamA = String(game.homeTeamCode || game.homeTeam || "").trim();
+        const teamB = String(game.awayTeamCode || game.awayTeam || "").trim();
         const sportKey = String(game.sport || '').toUpperCase();
-        const res = await fetch(`/api/teams/${sportKey}/h2h?teamA=${teamA}&teamB=${teamB}&window=10`, {
-          credentials: 'include',
-          cache: 'no-store',
-        });
-        if (!res.ok) return;
-        const json = await res.json();
-        if (!cancelled && Number(json?.sampleSize) > 0) {
-          setRemoteH2H(json as TeamH2HPayload);
+        const normalize = (value: unknown): string =>
+          String(value || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+        const teamATokens = new Set([normalize(teamA), normalize(game.homeTeam)]);
+        const teamBTokens = new Set([normalize(teamB), normalize(game.awayTeam)]);
+        const today = new Date().toISOString().slice(0, 10);
+        const payload = await fetchJsonCached<any>(
+          `/api/page-data/games?date=${encodeURIComponent(today)}&sport=${encodeURIComponent(sportKey)}&tab=scores`,
+          {
+            cacheKey: `odds-h2h-snapshot:${sportKey}:${teamA}:${teamB}:${today}`,
+            ttlMs: 45_000,
+            timeoutMs: 2_500,
+            init: { credentials: "include" },
+          }
+        );
+        const games = Array.isArray(payload?.games) ? payload.games : [];
+        const meetings = games
+          .filter((g: any) => {
+            const homeCode = normalize(g?.home_team_code || g?.homeTeam);
+            const awayCode = normalize(g?.away_team_code || g?.awayTeam);
+            const homeName = normalize(g?.home_team_name || g?.homeTeamFull);
+            const awayName = normalize(g?.away_team_name || g?.awayTeamFull);
+            const homeIsA = teamATokens.has(homeCode) || teamATokens.has(homeName);
+            const awayIsA = teamATokens.has(awayCode) || teamATokens.has(awayName);
+            const homeIsB = teamBTokens.has(homeCode) || teamBTokens.has(homeName);
+            const awayIsB = teamBTokens.has(awayCode) || teamBTokens.has(awayName);
+            return (homeIsA && awayIsB) || (homeIsB && awayIsA);
+          })
+          .slice(0, 10)
+          .map((g: any) => {
+            const homeScore = Number(g?.home_score ?? g?.homeScore ?? 0);
+            const awayScore = Number(g?.away_score ?? g?.awayScore ?? 0);
+            const homeCode = String(g?.home_team_code || g?.homeTeam || "HOME");
+            const awayCode = String(g?.away_team_code || g?.awayTeam || "AWAY");
+            const winner =
+              homeScore === awayScore ? "tie" : homeScore > awayScore ? homeCode : awayCode;
+            return {
+              winner,
+              awayScore,
+              homeScore,
+              date: String(g?.start_time || g?.startTime || ""),
+            };
+          });
+        let teamAWins = 0;
+        let teamBWins = 0;
+        for (const m of meetings) {
+          const winnerToken = normalize(m.winner);
+          if (teamATokens.has(winnerToken)) teamAWins += 1;
+          else if (teamBTokens.has(winnerToken)) teamBWins += 1;
+        }
+        if (!cancelled && meetings.length > 0) {
+          setRemoteH2H({
+            sampleSize: meetings.length,
+            series: { teamAWins, teamBWins },
+            ats: { sampleWithLine: 0, teamACovers: 0, teamBCovers: 0 },
+            totals: { sampleWithLine: 0, overs: 0, unders: 0 },
+            meetings,
+          });
         }
       } catch {
         // Non-fatal; fallback trends stay visible.
@@ -1464,13 +1516,31 @@ export default function OddsGamePage() {
     const memoizedId = resolvedTeamIdsRef.current.get(memoKey);
     if (memoizedId) return memoizedId;
     try {
-      const json = await fetchJsonCached<any>(`/api/teams/${encodeURIComponent(sport)}/standings`, {
-        cacheKey: `team-standings:${sport}`,
-        ttlMs: 90_000,
-        timeoutMs: 4_500,
-        init: { credentials: "include" },
-      });
-      const teams = Array.isArray(json?.teams) ? json.teams : [];
+      const today = new Date().toISOString().slice(0, 10);
+      const payload = await fetchJsonCached<any>(
+        `/api/page-data/games?date=${encodeURIComponent(today)}&sport=${encodeURIComponent(sport)}&tab=scores`,
+        {
+          cacheKey: `team-id-snapshot:${sport}:${today}`,
+          ttlMs: 60_000,
+          timeoutMs: 3_000,
+          init: { credentials: "include" },
+        }
+      );
+      const games = Array.isArray(payload?.games) ? payload.games : [];
+      const teams = games.flatMap((g: any) => ([
+        {
+          id: g?.home_team_id || g?.homeTeamId,
+          alias: g?.home_team_code || g?.homeTeam,
+          name: g?.home_team_name || g?.homeTeamFull,
+          market: "",
+        },
+        {
+          id: g?.away_team_id || g?.awayTeamId,
+          alias: g?.away_team_code || g?.awayTeam,
+          name: g?.away_team_name || g?.awayTeamFull,
+          market: "",
+        },
+      ])).filter((row: any) => String(row?.id || "").trim());
       const hit = teams.find((row: any) => {
         const rowAlias = normalize(row?.alias || row?.abbreviation || row?.teamCode || row?.code);
         const rowName = normalize(row?.name);
@@ -1512,44 +1582,30 @@ export default function OddsGamePage() {
     const teamId = await resolveTeamId(code, name);
     if (!teamId) return;
 
-    const profile = await fetchJsonCached<any>(`/api/teams/${sport}/${teamId}`, {
-      cacheKey: `team-profile:${sport}:${teamId}`,
+    const teamPayload = await fetchJsonCached<any>(`/api/page-data/team-profile?sport=${sport}&teamId=${teamId}`, {
+      cacheKey: `team-page-data:${sport}:${teamId}`,
       ttlMs: 60_000,
       timeoutMs: 4_500,
       init: { credentials: "include" },
     }).catch(() => null);
 
-    const endpoints = [
-      { url: `/api/teams/${sport}/${teamId}/schedule`, cacheKey: `team-schedule:${sport}:${teamId}`, ttlMs: 45_000, timeoutMs: 4_500 },
-      { url: `/api/teams/${sport}/${teamId}/stats`, cacheKey: `team-stats:${sport}:${teamId}`, ttlMs: 120_000, timeoutMs: 4_000 },
-      { url: `/api/teams/${sport}/${teamId}/injuries`, cacheKey: `team-injuries:${sport}:${teamId}`, ttlMs: 45_000, timeoutMs: 4_000 },
-      { url: `/api/teams/${sport}/${teamId}/splits`, cacheKey: `team-splits:${sport}:${teamId}`, ttlMs: 90_000, timeoutMs: 4_000 },
-      { url: `/api/games?sport=${sport}&includeOdds=0`, cacheKey: `games-lite:${sport}`, ttlMs: 20_000, timeoutMs: 3_500 },
-    ] as const;
-
-    await Promise.all(
-      endpoints.map((entry) =>
-        fetchJsonCached(entry.url, {
-          cacheKey: entry.cacheKey,
-          ttlMs: entry.ttlMs,
-          timeoutMs: entry.timeoutMs,
-          init: { credentials: "include" },
-        }).catch(() => null)
-      )
-    );
-
-    const roster = Array.isArray(profile?.roster) ? profile.roster : [];
-    const topNames = roster
-      .map((p: any) => String(p?.name || "").trim())
-      .filter(Boolean)
+    const roster = Array.isArray(teamPayload?.data?.profileJson?.roster)
+      ? teamPayload.data.profileJson.roster
+      : [];
+    const sk = normalizeSportKeyForRoute(String(normalizedSportKey || ""));
+    const topPlayers = roster
+      .map((p: any) => ({
+        name: String(p?.name || "").trim(),
+        id: resolveCanonicalPlayerIdFromPayload(p?.id, String(p?.name || "").trim(), sk),
+      }))
+      .filter((row: { name: string; id?: string }): row is { name: string; id: string } => Boolean(row.name && row.id))
       .slice(0, 8);
     await Promise.all(
-      topNames.map((playerName: string) =>
-        fetchJsonCached(`/api/player/${sport}/${encodeURIComponent(playerName)}`, {
-          cacheKey: `player-api:${sport}:${playerName}`,
-          ttlMs: 45_000,
-          timeoutMs: 4_000,
-          init: { credentials: "include" },
+      topPlayers.map(({ id }: { name: string; id: string }) =>
+        prefetchFullPlayerProfileSnapshot({
+          sport,
+          playerId: id,
+          timeoutMs: 22_000,
         }).catch(() => null)
       )
     );
@@ -1669,227 +1725,17 @@ export default function OddsGamePage() {
             return;
           }
         }
-
-        const lookupIds: string[] = [normalizedMatchId];
-        if (normalizedMatchId.startsWith('sr:sport_event:') && String(sportKey || '').toLowerCase() !== 'soccer') {
-          try {
-            const sportParam = String(sportKey || '').toUpperCase();
-            const slate = await fetchJsonWithTimeout(`/api/games?sport=${encodeURIComponent(sportParam)}&includeOdds=1`, 8000);
-            const games = Array.isArray(slate?.games) ? slate.games : [];
-            const eventTail = normalizedMatchId.split(':').pop() || '';
-            const matched = games.find((g: any) => {
-              const gid = String(g?.game_id || '').trim();
-              const externalId = String(g?.external_id || '').trim();
-              return gid === normalizedMatchId || externalId === normalizedMatchId || externalId === eventTail;
-            });
-            const mappedGameId = String(matched?.game_id || '').trim();
-            if (mappedGameId && mappedGameId !== normalizedMatchId) {
-              lookupIds.unshift(mappedGameId);
-            }
-          } catch {
-            // Non-fatal: keep original lookup id.
-          }
-        }
-
-        let summaryJson: any = null;
-        let liteJson: any = null;
-        let requestLookupId = normalizedMatchId;
-
-        for (const lookupId of lookupIds) {
-          const encodedLookupId = encodeURIComponent(lookupId);
-          const [summaryResult, liteResult] = await Promise.allSettled([
-            fetchJsonWithTimeout(`/api/odds/summary/${encodedLookupId}?scope=PROD`, 10000),
-            fetchJsonWithTimeout(`/api/games/${encodedLookupId}?lite=1`, 10000),
-          ]);
-
-          if (cancelled || requestId !== activeFetchRequestRef.current) return;
-
-          const candidateSummary = summaryResult.status === "fulfilled" ? summaryResult.value : null;
-          const candidateLite = liteResult.status === "fulfilled" ? liteResult.value : null;
-          const candidateGame = candidateLite?.game || candidateLite || null;
-          const candidateSummaryGame = candidateSummary?.game || null;
-          const candidateHasOdds = Boolean(
-            candidateSummary?.spread ||
-            candidateSummary?.total ||
-            candidateSummary?.moneyline ||
-            candidateSummary?.first_half?.spread?.home_line != null ||
-            candidateSummary?.first_half?.spread?.away_line != null ||
-            candidateSummary?.first_half?.total?.line != null ||
-            candidateSummary?.first_half?.moneyline?.home_price != null ||
-            candidateSummary?.first_half?.moneyline?.away_price != null
-          );
-
-          if (candidateGame || candidateSummaryGame || candidateHasOdds) {
-            summaryJson = candidateSummary;
-            liteJson = candidateLite;
-            requestLookupId = lookupId;
-            break;
-          }
-
-          if (!summaryJson) summaryJson = candidateSummary;
-          if (!liteJson) liteJson = candidateLite;
-        }
-
-        const encodedId = encodeURIComponent(requestLookupId);
-        const gameData = liteJson?.game || liteJson || null;
-        const oddsData = liteJson?.odds?.[0] || gameData?.odds || null;
-        const summaryGame = summaryJson?.game || null;
-        const firstHalfSummary = summaryJson?.first_half || null;
-        const resolvedGameId = gameData?.game_id || gameData?.id || summaryGame?.game_id || normalizedMatchId;
-
-        const spreadValue = summaryJson?.spread?.home_line ?? gameData?.spread ?? oddsData?.spread ?? oddsData?.spreadHome ?? null;
-        const totalValue = summaryJson?.total?.line ?? gameData?.overUnder ?? gameData?.over_under ?? oddsData?.total ?? oddsData?.overUnder ?? null;
-        const mlHomeValue = summaryJson?.moneyline?.home_price ?? gameData?.moneylineHome ?? gameData?.moneyline_home ?? oddsData?.moneylineHome ?? oddsData?.ml_home ?? null;
-        const mlAwayValue = summaryJson?.moneyline?.away_price ?? gameData?.moneylineAway ?? gameData?.moneyline_away ?? oddsData?.moneylineAway ?? oddsData?.ml_away ?? null;
-        const spread1HHomeValue =
-          gameData?.spread1HHome ??
-          gameData?.spread_1h_home ??
-          oddsData?.spread1HHome ??
-          oddsData?.spread_1h_home ??
-          oddsData?.spread1H ??
-          oddsData?.spread_1h ??
-          firstHalfSummary?.spread?.home_line ??
-          null;
-        const spread1HAwayValue =
-          gameData?.spread1HAway ??
-          gameData?.spread_1h_away ??
-          oddsData?.spread1HAway ??
-          oddsData?.spread_1h_away ??
-          (spread1HHomeValue !== null ? -Number(spread1HHomeValue) : null);
-        const total1HValue =
-          gameData?.total1H ??
-          gameData?.total_1h ??
-          gameData?.overUnder1H ??
-          gameData?.over_under_1h ??
-          oddsData?.total1H ??
-          oddsData?.total_1h ??
-          oddsData?.overUnder1H ??
-          oddsData?.over_under_1h ??
-          firstHalfSummary?.total?.line ??
-          null;
-        const ml1HHomeValue =
-          gameData?.moneyline1HHome ??
-          gameData?.moneyline_1h_home ??
-          oddsData?.moneyline1HHome ??
-          oddsData?.moneyline_1h_home ??
-          oddsData?.ml1HHome ??
-          oddsData?.ml_1h_home ??
-          firstHalfSummary?.moneyline?.home_price ??
-          null;
-        const ml1HAwayValue =
-          gameData?.moneyline1HAway ??
-          gameData?.moneyline_1h_away ??
-          oddsData?.moneyline1HAway ??
-          oddsData?.moneyline_1h_away ??
-          oddsData?.ml1HAway ??
-          oddsData?.ml_1h_away ??
-          firstHalfSummary?.moneyline?.away_price ??
-          null;
-
-        const hasOdds =
-          spreadValue !== null ||
-          totalValue !== null ||
-          mlHomeValue !== null ||
-          mlAwayValue !== null ||
-          spread1HHomeValue !== null ||
-          spread1HAwayValue !== null ||
-          total1HValue !== null ||
-          ml1HHomeValue !== null ||
-          ml1HAwayValue !== null;
-
-        if (!gameData && !summaryGame && !hasOdds) {
-          throw new Error("Failed to load game");
-        }
-
-        setGame({
-          id: resolvedGameId,
-          homeTeam: gameData?.home_team_name || gameData?.home_team || gameData?.homeTeam || summaryGame?.home_team || "Home",
-          awayTeam: gameData?.away_team_name || gameData?.away_team || gameData?.awayTeam || summaryGame?.away_team || "Away",
-          homeTeamCode: gameData?.home_team_code || gameData?.homeTeamCode || gameData?.home_team_abbr || summaryGame?.home_team || "",
-          awayTeamCode: gameData?.away_team_code || gameData?.awayTeamCode || gameData?.away_team_abbr || summaryGame?.away_team || "",
-          homeScore: gameData?.home_score ?? gameData?.homeScore ?? null,
-          awayScore: gameData?.away_score ?? gameData?.awayScore ?? null,
-          status: gameData?.status || summaryGame?.status || "SCHEDULED",
-          startTime: gameData?.start_time || gameData?.startTime || summaryGame?.start_time || "",
-          league: gameData?.league || sportKey?.toUpperCase() || "",
-          sport: gameData?.sport || summaryGame?.sport || sportKey || "nba",
-          odds: hasOdds
-            ? {
-                spread: spreadValue,
-                spreadHome: spreadValue,
-                spreadAway: spreadValue !== null ? -spreadValue : undefined,
-                openSpread: summaryJson?.opening_spread ?? oddsData?.open_spread ?? undefined,
-                total: totalValue,
-                openTotal: summaryJson?.opening_total ?? oddsData?.open_total ?? undefined,
-                mlHome: mlHomeValue,
-                mlAway: mlAwayValue,
-                openMlHome: summaryJson?.opening_home_ml ?? oddsData?.open_ml_home ?? undefined,
-                openMlAway: summaryJson?.opening_away_ml ?? oddsData?.open_ml_away ?? undefined,
-                spread1HHome: spread1HHomeValue ?? undefined,
-                spread1HAway: spread1HAwayValue ?? undefined,
-                total1H: total1HValue ?? undefined,
-                ml1HHome: ml1HHomeValue ?? undefined,
-                ml1HAway: ml1HAwayValue ?? undefined,
-              }
-            : gameRef.current?.odds,
-          lineHistory:
-            Array.isArray(liteJson?.lineHistory) && liteJson.lineHistory.length > 0
-              ? liteJson.lineHistory
-              : (gameRef.current?.lineHistory || []),
-          sportsbooks:
-            Array.isArray(liteJson?.sportsbooks) && liteJson.sportsbooks.length > 0
-              ? liteJson.sportsbooks
-              : (gameRef.current?.sportsbooks || []),
-          props:
-            Array.isArray(liteJson?.props) && liteJson.props.length > 0
-              ? liteJson.props.map((p: any) => ({
-                  playerName: p.playerName || p.player_name || "",
-                  propType: p.propType || p.prop_type || "",
-                  line: p.line ?? 0,
-                  overOdds: p.overOdds ?? p.over_odds ?? -110,
-                  underOdds: p.underOdds ?? p.under_odds ?? -110,
-                }))
-              : (gameRef.current?.props || []),
+        // Snapshot-first contract: do not execute legacy live-assembly fallback on request path.
+        console.warn("PAGE_DATA_FALLBACK_USED", {
+          route: "odds-game",
+          reason: "snapshot_missing_or_disabled",
+          gameId: normalizedMatchId,
         });
+        if (!gameRef.current) {
+          setError("Game snapshot is unavailable. Please retry shortly.");
+        }
+        return;
 
-        void (async () => {
-          try {
-            const fullJson = await fetchJsonWithTimeout(`/api/games/${encodedId}`, 15000);
-            if (cancelled) return;
-            const fullGame = fullJson?.game || fullJson || {};
-            const fullProps = Array.isArray(fullJson?.props) ? fullJson.props : [];
-            const fullBooks = Array.isArray(fullJson?.sportsbooks) ? fullJson.sportsbooks : [];
-            setGame((prev) => {
-              if (!prev) return prev;
-              return {
-                ...prev,
-                homeTeam: fullGame.home_team_name || fullGame.home_team || fullGame.homeTeam || prev.homeTeam,
-                awayTeam: fullGame.away_team_name || fullGame.away_team || fullGame.awayTeam || prev.awayTeam,
-                homeTeamCode: fullGame.home_team_code || fullGame.homeTeamCode || fullGame.home_team_abbr || prev.homeTeamCode,
-                awayTeamCode: fullGame.away_team_code || fullGame.awayTeamCode || fullGame.away_team_abbr || prev.awayTeamCode,
-                homeScore: fullGame.home_score ?? fullGame.homeScore ?? prev.homeScore,
-                awayScore: fullGame.away_score ?? fullGame.awayScore ?? prev.awayScore,
-                status: fullGame.status || prev.status,
-                startTime: fullGame.start_time || fullGame.startTime || prev.startTime,
-                league: fullGame.league || prev.league,
-                sport: fullGame.sport || prev.sport,
-                lineHistory: fullJson?.lineHistory || prev.lineHistory,
-                sportsbooks: fullBooks.length > 0 ? fullBooks : prev.sportsbooks,
-                props: fullProps.length > 0
-                  ? fullProps.map((p: any) => ({
-                      playerName: p.playerName || p.player_name || "",
-                      propType: p.propType || p.prop_type || "",
-                      line: p.line ?? 0,
-                      overOdds: p.overOdds ?? p.over_odds ?? -110,
-                      underOdds: p.underOdds ?? p.under_odds ?? -110,
-                    }))
-                  : prev.props,
-              };
-            });
-          } catch {
-            // Non-blocking: page already has core market data.
-          }
-        })();
       } catch (err) {
         console.error("Error loading game:", err);
         if (!cancelled && requestId === activeFetchRequestRef.current && !gameRef.current) {

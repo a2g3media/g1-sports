@@ -27,7 +27,23 @@
   ],
   "triggers": {
     "crons": [
-      "*/3 * * * *"
+      "* * * * *"
     ]
-  }
+  },
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "HISTORICAL_INGESTION_LOOP",
+        "class_name": "HistoricalIngestionLoopDO"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "historical-ingestion-loop-v1",
+      "new_sqlite_classes": [
+        "HistoricalIngestionLoopDO"
+      ]
+    }
+  ]
 }

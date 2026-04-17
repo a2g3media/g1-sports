@@ -427,7 +427,10 @@ export async function fetchGamesWithFallback(
       error: result.error
     });
     
-    if (!result.error || result.data.length > 0) {
+    const hasRows = Array.isArray(result.data) && result.data.length > 0;
+    const hasHardError = Boolean(result.error);
+    const shouldAllowEmptyFallback = !hasRows && !hasHardError;
+    if (hasRows) {
       recordProviderAttempt({
         at: new Date().toISOString(),
         operation: "games",
@@ -440,6 +443,25 @@ export async function fetchGamesWithFallback(
         fallbackFrom: attemptedProviders.length > 1 ? attemptedProviders[0] : undefined,
       });
       return result;
+    }
+
+    if (shouldAllowEmptyFallback) {
+      recordProviderAttempt({
+        at: new Date().toISOString(),
+        operation: "games",
+        provider: provider.name,
+        sport,
+        success: false,
+        fromCache: !!result.fromCache,
+        returnedCount: result.data.length,
+        fallbackUsed: false,
+        error: "empty_result_trying_fallback",
+        errorCategory: "no_data",
+      });
+      console.log(
+        `[SCORES API] ${provider.name} returned empty slate for ${sport}; trying fallback provider`
+      );
+      continue;
     }
 
     recordProviderAttempt({

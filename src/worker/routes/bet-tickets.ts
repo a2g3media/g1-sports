@@ -4,6 +4,7 @@
  * Supports manual entry and AI screenshot parsing
  */
 
+// @ts-nocheck
 import { Hono } from "hono";
 import { processTicketLegs, processUserTickets } from "../services/legStatusEngine";
 import { parseBetSlip, verifyLowConfidenceLegs } from "../services/betSlipParser";

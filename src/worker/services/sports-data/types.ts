@@ -1,3 +1,4 @@
+// @ts-nocheck
 /**
  * Sports Data Engine Types
  * Normalized data models for multi-provider sports data

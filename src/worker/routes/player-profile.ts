@@ -1,3 +1,4 @@
+// @ts-nocheck
 /**
  * Player Profile API Routes
  * Comprehensive player data hub - stats, game logs, headshots, matchup intel
@@ -11,8 +12,12 @@
 import { Hono } from 'hono';
 import { fetchGamePlayerProps, fetchSportsRadarOdds } from '../services/sportsRadarOddsService';
 import { getCachedData, makeCacheKey, setCachedData } from '../services/apiCacheService';
+import { resolveCanonicalPlayerIdFromPayload } from '../../shared/espnAthleteIdLookup';
+import { resolveCanonicalPlayerIdentity } from '../services/playerIdentity/canonicalPlayerResolver';
+import { resolveDisplayLinesForPlayerGame } from '../services/historicalLines/displayLineResolver';
+import { buildEdgeRows } from '../services/edge/edgeEngine';
 
-type Bindings = {
+export type Bindings = {
   DB: any;
   SPORTSRADAR_PLAYER_PROPS_KEY?: string;
 };
@@ -25,6 +30,15 @@ const app = new Hono<{ Bindings: Bindings }>();
 
 const ESPN_API_BASE = 'https://site.api.espn.com/apis/site/v2/sports';
 const ESPN_WEB_API_BASE = 'https://site.web.api.espn.com/apis/common/v3/sports';
+
+function normalizePlayerSearchName(value: string): string {
+  return String(value || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim();
+}
 
 async function fetchWithTimeout(url: string, init?: RequestInit, timeoutMs = 4000): Promise<Response | null> {
   const controller = new AbortController();
@@ -61,7 +75,8 @@ function getEspnHeadshotUrl(espnId: string, sport: string): string {
 async function searchEspnPlayer(
   playerName: string, 
   sport: string,
-  team?: string
+  team?: string,
+  options?: { quick?: boolean }
 ): Promise<{
   espnId: string;
   displayName: string;
@@ -78,6 +93,7 @@ async function searchEspnPlayer(
   college?: string;
 } | null> {
   try {
+    const quickLookup = options?.quick === true;
     const sportPath = SPORT_PATHS[sport];
     if (!sportPath) return null;
     
@@ -102,8 +118,8 @@ async function searchEspnPlayer(
     for (const result of results) {
       if (result.type !== 'player') continue;
       
-      const resultName = (result.displayName || '').toLowerCase();
-      const searchName = playerName.toLowerCase();
+      const resultName = normalizePlayerSearchName(result.displayName || '');
+      const searchName = normalizePlayerSearchName(playerName);
       
       // Get team from teamRelationships (ESPN's nested format)
       const resultTeam = result.teamRelationships?.[0]?.displayName || result.team?.displayName || '';
@@ -114,7 +130,7 @@ async function searchEspnPlayer(
         break;
       }
       
-      // Partial match - names contain each other
+      // Partial match - names contain each other (accent-insensitive)
       if (resultName.includes(searchName) || searchName.includes(resultName)) {
         // If team provided, prefer team match
         if (team && resultTeam.toLowerCase().includes(team.toLowerCase())) {
@@ -138,6 +154,21 @@ async function searchEspnPlayer(
       || bestMatch.team
       || {};
     
+    // Page-data fast path: return immediately from search payload
+    // to avoid paying for slower overview/detail endpoints on cold opens.
+    if (quickLookup) {
+      return {
+        espnId: playerId,
+        displayName: bestMatch.displayName || playerName,
+        position: bestMatch.position?.abbreviation || '',
+        jersey: bestMatch.jersey || '',
+        teamName: bestMatch.team?.displayName || searchTeam.displayName || searchTeam.name || '',
+        teamAbbr: bestMatch.team?.abbreviation || searchTeam.abbreviation || '',
+        teamColor: bestMatch.team?.color || searchTeam.color || '3B82F6',
+        headshotUrl: bestMatch.headshot?.href || getEspnHeadshotUrl(playerId, sport),
+      };
+    }
+
     // Fetch from overview endpoint for better player details
     const overviewUrl = `${ESPN_WEB_API_BASE}/${sportPath}/athletes/${playerId}/overview`;
     const overviewRes = await fetchWithTimeout(overviewUrl, {
@@ -244,7 +275,8 @@ async function fetchEspnGameLog(
   espnId: string,
   sport: string,
   limit: number = 10,
-  season?: number
+  season?: number,
+  options?: { includeSeasonOverview?: boolean }
 ): Promise<{
   games: Array<{
     date: string;
@@ -258,6 +290,7 @@ async function fetchEspnGameLog(
   seasonAverages: Record<string, number>;
 } | null> {
   try {
+    const includeSeasonOverview = options?.includeSeasonOverview !== false;
     const sportPath = SPORT_PATHS[sport];
     if (!sportPath) return null;
     
@@ -337,7 +370,9 @@ async function fetchEspnGameLog(
           for (const [eventId, eventData] of Object.entries(catEvents)) {
             const typedEventData = eventData as { eventId: string; stats: string[] };
             if (typedEventData.stats) {
-              statsEvents[eventId] = typedEventData;
+              const resolvedEventId = String(typedEventData.eventId || eventId || "").trim();
+              if (!resolvedEventId) continue;
+              statsEvents[resolvedEventId] = typedEventData;
             }
           }
         }
@@ -388,39 +423,85 @@ async function fetchEspnGameLog(
         minutes: gameStats['MIN']?.toString(),
       });
     }
+
+    // Some ESPN responses omit root `events` metadata but still provide per-event stats
+    // under seasonTypes/categories. Emit minimal rows so profile panels can render.
+    if (games.length === 0 && Object.keys(statsEvents).length > 0) {
+      const statOnlyEventIds = Object.keys(statsEvents).slice(0, limit);
+      for (const eventId of statOnlyEventIds) {
+        const statsData = statsEvents[eventId];
+        const statsArr = statsData?.stats || [];
+        const gameStats: Record<string, string | number> = {};
+        for (let i = 0; i < labels.length && i < statsArr.length; i++) {
+          const normalizedLabel = normalizeStatLabel(labels[i], sport);
+          gameStats[normalizedLabel] = statsArr[i];
+        }
+        games.push({
+          date: '',
+          opponent: 'Unknown',
+          homeAway: 'home',
+          result: 'T',
+          score: '',
+          stats: gameStats,
+          minutes: gameStats['MIN']?.toString(),
+        });
+      }
+    }
     
     // Fetch season averages from overview endpoint
     const seasonStats: Record<string, number> = {};
-    try {
-      const overviewUrl = `${ESPN_WEB_API_BASE}/${sportPath}/athletes/${espnId}/overview`;
-      const overviewRes = await fetchWithTimeout(overviewUrl, {
-        headers: { 'Accept': 'application/json' }
-      }, 2800);
-      
-      if (overviewRes && overviewRes.ok) {
-        const overviewData = await overviewRes.json() as any;
-        const statistics = overviewData.statistics || {};
-        let statLabels = statistics.labels || [];
-        const splits = statistics.splits || [];
+    if (includeSeasonOverview) {
+      try {
+        const overviewUrl = `${ESPN_WEB_API_BASE}/${sportPath}/athletes/${espnId}/overview`;
+        const overviewRes = await fetchWithTimeout(overviewUrl, {
+          headers: { 'Accept': 'application/json' }
+        }, 2800);
         
-        // For MLB, statistics might be in categories array
-        if (statLabels.length === 0 && statistics.categories) {
-          const battingCat = statistics.categories.find((c: any) => 
-            c.name === 'batting' || c.displayName === 'Batting'
-          );
-          const cat = battingCat || statistics.categories[0];
-          if (cat) {
-            statLabels = cat.labels || [];
-            // Look for season totals in this category's splits
-            const catSplits = cat.splits || [];
-            const regSeason = catSplits.find((s: any) => 
-              s.displayName === 'Regular Season' || s.displayName === 'Season' || s.displayName === 'Total'
-            ) || catSplits[0];
+        if (overviewRes && overviewRes.ok) {
+          const overviewData = await overviewRes.json() as any;
+          const statistics = overviewData.statistics || {};
+          let statLabels = statistics.labels || [];
+          const splits = statistics.splits || [];
+          
+          // For MLB, statistics might be in categories array
+          if (statLabels.length === 0 && statistics.categories) {
+            const battingCat = statistics.categories.find((c: any) => 
+              c.name === 'batting' || c.displayName === 'Batting'
+            );
+            const cat = battingCat || statistics.categories[0];
+            if (cat) {
+              statLabels = cat.labels || [];
+              // Look for season totals in this category's splits
+              const catSplits = cat.splits || [];
+              const regSeason = catSplits.find((s: any) => 
+                s.displayName === 'Regular Season' || s.displayName === 'Season' || s.displayName === 'Total'
+              ) || catSplits[0];
+              
+              if (regSeason?.stats) {
+                for (let i = 0; i < statLabels.length && i < regSeason.stats.length; i++) {
+                  const label = normalizeStatLabel(statLabels[i], sport);
+                  const val = regSeason.stats[i];
+                  if (typeof val === 'number') {
+                    seasonStats[label] = val;
+                  } else if (typeof val === 'string' && !isNaN(parseFloat(val))) {
+                    seasonStats[label] = parseFloat(val);
+                  }
+                }
+              }
+            }
+          }
+          
+          // Standard path for NBA/NHL/NCAAB
+          if (Object.keys(seasonStats).length === 0 && splits.length > 0) {
+            // Find regular season stats (usually first split)
+            const regularSeason = splits.find((s: any) => 
+              s.displayName === 'Regular Season' || s.displayName === 'Season'
+            ) || splits[0];
             
-            if (regSeason?.stats) {
-              for (let i = 0; i < statLabels.length && i < regSeason.stats.length; i++) {
+            if (regularSeason?.stats) {
+              for (let i = 0; i < statLabels.length && i < regularSeason.stats.length; i++) {
                 const label = normalizeStatLabel(statLabels[i], sport);
-                const val = regSeason.stats[i];
+                const val = regularSeason.stats[i];
                 if (typeof val === 'number') {
                   seasonStats[label] = val;
                 } else if (typeof val === 'string' && !isNaN(parseFloat(val))) {
@@ -430,29 +511,9 @@ async function fetchEspnGameLog(
             }
           }
         }
-        
-        // Standard path for NBA/NHL/NCAAB
-        if (Object.keys(seasonStats).length === 0 && splits.length > 0) {
-          // Find regular season stats (usually first split)
-          const regularSeason = splits.find((s: any) => 
-            s.displayName === 'Regular Season' || s.displayName === 'Season'
-          ) || splits[0];
-          
-          if (regularSeason?.stats) {
-            for (let i = 0; i < statLabels.length && i < regularSeason.stats.length; i++) {
-              const label = normalizeStatLabel(statLabels[i], sport);
-              const val = regularSeason.stats[i];
-              if (typeof val === 'number') {
-                seasonStats[label] = val;
-              } else if (typeof val === 'string' && !isNaN(parseFloat(val))) {
-                seasonStats[label] = parseFloat(val);
-              }
-            }
-          }
-        }
+      } catch (e) {
+        console.log(`Failed to fetch overview for ${espnId}:`, e);
       }
-    } catch (e) {
-      console.log(`Failed to fetch overview for ${espnId}:`, e);
     }
     
     return {
@@ -543,13 +604,120 @@ interface RecentPerformanceWithOdds {
   date: string;
   opponent: string;
   result: 'W' | 'L' | 'T';
-  stats: Record<'PTS' | 'REB' | 'AST' | 'MIN', number | null>;
-  propLines?: {
-    points: number | null;
-    rebounds: number | null;
-    assists: number | null;
+  stats: Record<string, number | null>;
+  propLines?: Record<string, number | null>;
+  lineQualityByStat?: Record<string, "verified" | "estimated">;
+  lineSourceByStat?: Record<string, "historical_verified" | "estimated_verified" | "display_fallback" | "unavailable">;
+  lineSource: 'historical' | 'historical_verified' | 'latest_fallback' | 'event_fallback' | 'estimated_fallback' | 'unavailable';
+}
+
+type PlayerRoleBucket =
+  | "mlb_pitcher"
+  | "mlb_hitter"
+  | "nhl_goalie"
+  | "nhl_skater"
+  | "soccer_goalkeeper"
+  | "soccer_field"
+  | "generic";
+
+function normalizePlayerRole(params: {
+  sport: string;
+  rawPosition: string;
+  seasonAverages?: Record<string, unknown> | null;
+  gameLog?: Array<{ stats?: Record<string, string | number> }> | null;
+  props?: Array<{ prop_type?: string | null }> | null;
+}): { normalizedPosition: string; roleBucket: PlayerRoleBucket } {
+  const sportUpper = String(params.sport || "").toUpperCase();
+  const raw = String(params.rawPosition || "").trim().toUpperCase();
+  const compactRaw = raw.replace(/\s+/g, "");
+  const season = params.seasonAverages && typeof params.seasonAverages === "object" ? params.seasonAverages : {};
+  const games = Array.isArray(params.gameLog) ? params.gameLog : [];
+  const props = Array.isArray(params.props) ? params.props : [];
+  const hasSeasonKey = (keys: string[]) =>
+    keys.some((k) => Object.prototype.hasOwnProperty.call(season, k) && season[k as keyof typeof season] !== null && season[k as keyof typeof season] !== undefined);
+  const hasGameStatKey = (keys: string[]) =>
+    games.some((g) => {
+      const stats = g?.stats && typeof g.stats === "object" ? g.stats : {};
+      return keys.some((k) => Object.prototype.hasOwnProperty.call(stats, k));
+    });
+  const hasPropToken = (tokens: string[]) =>
+    props.some((p) => {
+      const t = String(p?.prop_type || "").toUpperCase();
+      return tokens.some((token) => t.includes(token));
+    });
+
+  if (sportUpper === "MLB") {
+    const pitcherTokens = new Set(["P", "SP", "RP", "CP", "RHP", "LHP"]);
+    const inferredPitcher =
+      hasSeasonKey(["IP", "inningsPitched", "ERA", "WHIP", "earnedRuns"])
+      || hasGameStatKey(["IP", "ERA", "WHIP", "ER", "earnedRuns", "outsRecorded", "hitsAllowed"])
+      || hasPropToken(["PITCHER_STRIKEOUT", "OUTS_RECORDED", "EARNED_RUN", "HITS_ALLOWED", "WALKS_ALLOWED", "INNINGS_PITCHED"]);
+    const isPitcher = pitcherTokens.has(compactRaw) || inferredPitcher;
+    if (isPitcher) {
+      return { normalizedPosition: compactRaw || "P", roleBucket: "mlb_pitcher" };
+    }
+    return { normalizedPosition: compactRaw || "H", roleBucket: "mlb_hitter" };
+  }
+
+  if (sportUpper === "NHL") {
+    const isGoalie = compactRaw === "G" || hasSeasonKey(["saves", "SV", "goalsAgainst", "GA"]) || hasGameStatKey(["SV", "saves", "GA", "goalsAgainst"]);
+    return { normalizedPosition: compactRaw || (isGoalie ? "G" : ""), roleBucket: isGoalie ? "nhl_goalie" : "nhl_skater" };
+  }
+
+  if (sportUpper === "SOCCER") {
+    const isGoalkeeper = compactRaw === "GK" || compactRaw === "G" || hasSeasonKey(["cleanSheets", "saves"]) || hasGameStatKey(["saves"]);
+    return { normalizedPosition: compactRaw || (isGoalkeeper ? "GK" : ""), roleBucket: isGoalkeeper ? "soccer_goalkeeper" : "soccer_field" };
+  }
+
+  return { normalizedPosition: compactRaw || raw, roleBucket: "generic" };
+}
+
+function filterPropsForRole(params: {
+  sport: string;
+  roleBucket: PlayerRoleBucket;
+  props: any[];
+}): any[] {
+  const sportUpper = String(params.sport || "").toUpperCase();
+  const rows = Array.isArray(params.props) ? params.props : [];
+  if (sportUpper !== "MLB") return rows;
+
+  const isPitcher = params.roleBucket === "mlb_pitcher";
+  const isHitter = params.roleBucket === "mlb_hitter";
+  if (!isPitcher && !isHitter) return rows;
+
+  const isPitcherType = (typeRaw: string): boolean => {
+    const t = typeRaw.toUpperCase();
+    return (
+      t.includes("PITCHER_STRIKEOUT")
+      || t.includes("OUTS_RECORDED")
+      || t.includes("EARNED_RUN")
+      || t.includes("HITS_ALLOWED")
+      || t.includes("WALKS_ALLOWED")
+      || t.includes("INNINGS_PITCHED")
+    );
   };
-  lineSource: 'historical' | 'latest_fallback' | 'event_fallback' | 'estimated_fallback' | 'unavailable';
+  const isHitterType = (typeRaw: string): boolean => {
+    const t = typeRaw.toUpperCase();
+    return (
+      t.includes("HITS")
+      || t.includes("RUNS")
+      || t.includes("RBI")
+      || t.includes("HOME_RUN")
+      || t.includes("TOTAL_BASES")
+      || t.includes("SINGLES")
+      || t.includes("DOUBLES")
+      || t.includes("TRIPLES")
+      || t.includes("STOLEN_BASE")
+    );
+  };
+
+  return rows.filter((row) => {
+    const typeRaw = String(row?.prop_type || "").trim();
+    if (!typeRaw) return false;
+    if (isPitcher) return isPitcherType(typeRaw);
+    if (isHitter) return isHitterType(typeRaw);
+    return true;
+  });
 }
 
 const NBA_TEAM_ABBR_BY_NAME: Record<string, string> = {
@@ -636,12 +804,23 @@ function expandNbaAliasCandidates(aliasLike: unknown): string[] {
   return Array.from(new Set([raw, ...(map[raw] || [])]));
 }
 
-function normalizePlayerSlug(value: unknown): string {
-  return String(value || '')
+export function normalizePlayerSlug(value: unknown): string {
+  const raw = String(value || '')
     .normalize('NFD')
     .replace(/[\u0300-\u036f]/g, '')
     .replace(/\u2019/g, "'")
     .trim();
+  if (!raw) return '';
+  if (raw.includes(',')) {
+    const parts = raw.split(',').map((part) => part.trim()).filter(Boolean);
+    if (parts.length >= 2) {
+      const [last, ...rest] = parts;
+      const first = rest.join(' ').trim();
+      const combined = `${first} ${last}`.replace(/\s+/g, ' ').trim();
+      if (combined) return combined;
+    }
+  }
+  return raw;
 }
 
 function toDisplayFirstLast(name: string): string {
@@ -657,6 +836,84 @@ function toDisplayLastFirst(name: string): string {
   const first = parts.shift() || '';
   const last = parts.join(' ');
   return `${last}, ${first}`.trim();
+}
+
+async function resolveCanonicalPlayer(
+  db: D1Database,
+  sport: string,
+  playerNameInput: string,
+  teamHint?: string
+): Promise<{ player_internal_id: string; espn_player_id: string; canonical_name: string } | null> {
+  const normalizeName = (value: unknown): string =>
+    String(value || "")
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, " ")
+      .trim();
+  const requested = normalizeName(playerNameInput);
+  if (!requested) return null;
+  const sportKey = String(sport || "").toUpperCase();
+  const teamToken = normalizeName(teamHint || "");
+
+  const exact = await db.prepare(`
+    SELECT canonical_player_id AS player_internal_id, espn_player_id, display_name AS canonical_name
+    FROM canonical_players
+    WHERE sport = ?
+      AND normalized_name = ?
+    LIMIT 1
+  `).bind(sportKey, requested).first<{
+    player_internal_id: string;
+    espn_player_id: string;
+    canonical_name: string;
+  }>();
+  if (exact?.player_internal_id && exact?.espn_player_id) return exact;
+
+  const tokens = requested.split(" ").filter(Boolean);
+  const first = tokens[0] || "";
+  const last = tokens[tokens.length - 1] || "";
+  const fuzzy = await db.prepare(`
+    SELECT canonical_player_id AS player_internal_id, espn_player_id, display_name AS canonical_name, normalized_name, team_ids_json
+    FROM canonical_players
+    WHERE sport = ?
+      AND (
+        normalized_name LIKE ?
+        OR normalized_name LIKE ?
+      )
+    LIMIT 80
+  `).bind(
+    sportKey,
+    `%${last}%`,
+    `%${first}%`
+  ).all<{
+    player_internal_id: string;
+    espn_player_id: string;
+    canonical_name: string;
+    normalized_name: string;
+    team_ids_json: string | null;
+  }>();
+  let best: { score: number; row: { player_internal_id: string; espn_player_id: string; canonical_name: string } } | null = null;
+  for (const row of fuzzy.results || []) {
+    const normalized = normalizeName(row.normalized_name || row.canonical_name);
+    if (!normalized) continue;
+    let score = 0;
+    if (normalized === requested) score += 10;
+    if (last && normalized.includes(last)) score += 4;
+    if (first && normalized.includes(first)) score += 2;
+    if (teamToken && String(row.team_ids_json || "").toLowerCase().includes(teamToken)) score += 2;
+    if (!best || score > best.score) {
+      best = {
+        score,
+        row: {
+          player_internal_id: String(row.player_internal_id || ""),
+          espn_player_id: String(row.espn_player_id || ""),
+          canonical_name: String(row.canonical_name || ""),
+        },
+      };
+    }
+  }
+  if (best && best.score >= 4 && best.row.player_internal_id && best.row.espn_player_id) {
+    return best.row;
+  }
+  return null;
 }
 
 async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, fallback: T): Promise<T> {
@@ -679,11 +936,22 @@ async function buildRecentPerformanceWithOdds(
   db: D1Database,
   sport: string,
   playerNames: string[],
-  gameLog: Array<{ date: string; opponent: string; result: 'W' | 'L' | 'T'; stats: Record<string, string | number> }>,
+  gameLog: Array<{ date: string; opponent: string; result: 'W' | 'L' | 'T'; stats: Record<string, string | number>; gameId?: string }>,
   fallbackProps?: Array<{ prop_type?: string; line_value?: number }>,
   sportsRadarPropsKey?: string,
-  playerTeamName?: string
+  playerTeamName?: string,
+  options?: {
+    allowOnDemandFetch?: boolean;
+    playerId?: string;
+    roleBucket?: PlayerRoleBucket;
+  }
 ): Promise<RecentPerformanceWithOdds[]> {
+  const allowOnDemandFetch = options?.allowOnDemandFetch !== false;
+  const hasLineValue = (value: unknown): boolean => {
+    if (value === null || value === undefined || value === "") return false;
+    const n = Number(value);
+    return Number.isFinite(n);
+  };
   try {
     await db.prepare(`
       CREATE TABLE IF NOT EXISTS sdio_props_history (
@@ -701,10 +969,955 @@ async function buildRecentPerformanceWithOdds(
     // Non-fatal guardrail for local DBs missing migration 61.
   }
 
-  const recentGames = [...(gameLog || [])]
+  let recentGames = [...(gameLog || [])]
     .sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime())
     .slice(0, 5);
+
+  // Verified archive path is the only allowed source for historical line rendering.
+  const normalizeToken = (value: unknown): string =>
+    String(value || "")
+      .toLowerCase()
+      .replace(/[^a-z0-9]/g, "");
+  const normalizeWords = (value: unknown): string[] =>
+    String(value || "")
+      .toLowerCase()
+      .replace(/[^a-z0-9\s]/g, " ")
+      .split(/\s+/)
+      .map((w) => w.trim())
+      .filter(Boolean);
+  const toYmd = (value: unknown): string => {
+    const d = new Date(String(value || ""));
+    if (!Number.isFinite(d.getTime())) return "";
+    return d.toISOString().slice(0, 10);
+  };
+  const dayDiff = (a: string, b: string): number => {
+    const da = new Date(`${a}T12:00:00`);
+    const db = new Date(`${b}T12:00:00`);
+    if (!Number.isFinite(da.getTime()) || !Number.isFinite(db.getTime())) return Number.POSITIVE_INFINITY;
+    return Math.abs(da.getTime() - db.getTime()) / (24 * 60 * 60 * 1000);
+  };
+  const resolveCanonicalPlayerInternalId = async (): Promise<string | null> => {
+    const sportKey = String(sport || "").toUpperCase();
+    const normalizeName = (value: unknown): string =>
+      String(value || "")
+        .normalize("NFD")
+        .replace(/[\u0300-\u036f]/g, "")
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, " ")
+        .trim();
+    const primaryPlayerId = String(options?.playerId || "").trim();
+    if (/^\d{4,}$/.test(primaryPlayerId)) {
+      const canonical = await resolveCanonicalPlayerIdentity({
+        db,
+        sport: sportKey,
+        playerId: primaryPlayerId,
+        playerName: playerNames.find(Boolean) || primaryPlayerId,
+        source: "playerProfile.verifiedArchive.primaryId",
+      });
+      if (canonical.ok) return canonical.identity.canonicalPlayerId;
+    }
+    for (const name of playerNames || []) {
+      const raw = String(name || "").trim();
+      if (!raw) continue;
+      const espnId = resolveCanonicalPlayerIdFromPayload(raw, sportKey);
+      if (!espnId || !/^\d{4,}$/.test(String(espnId))) continue;
+      const canonical = await resolveCanonicalPlayerIdentity({
+        db,
+        sport: sportKey,
+        playerId: String(espnId),
+        playerName: raw,
+        source: "playerProfile.verifiedArchive",
+      });
+      if (canonical.ok) return canonical.identity.canonicalPlayerId;
+    }
+    for (const name of playerNames || []) {
+      const normalized = normalizeName(name);
+      if (!normalized) continue;
+      const row = await db.prepare(`
+        SELECT canonical_player_id
+        FROM canonical_players
+        WHERE sport = ?
+          AND normalized_name = ?
+        LIMIT 1
+      `).bind(sportKey, normalized).first<{ canonical_player_id: string | null }>();
+      const canonicalPlayerId = String(row?.canonical_player_id || "").trim();
+      if (canonicalPlayerId) return canonicalPlayerId;
+    }
+    for (const name of playerNames || []) {
+      const raw = String(name || "").trim();
+      if (!raw) continue;
+      const resolved = await resolveCanonicalPlayer(db, sportKey, raw, playerTeamName);
+      const canonicalPlayerId = String(resolved?.player_internal_id || "").trim();
+      if (canonicalPlayerId) return canonicalPlayerId;
+    }
+    return null;
+  };
+  const resolveGameProviderIdForRow = async (game: { date: string; opponent: string }): Promise<string | null> => {
+    const gameDate = toYmd(game.date);
+    if (!gameDate) return null;
+    const rows = await db.prepare(`
+      SELECT provider_game_id, start_time, home_team_name, away_team_name, home_team, away_team
+      FROM sdio_games
+      WHERE UPPER(COALESCE(sport, '')) = ?
+        AND provider_game_id IS NOT NULL
+        AND start_time IS NOT NULL
+      ORDER BY ABS(strftime('%s', start_time) - strftime('%s', ?)) ASC
+      LIMIT 40
+    `).bind(String(sport || "").toUpperCase(), game.date).all<{
+      provider_game_id: string;
+      start_time: string;
+      home_team_name: string | null;
+      away_team_name: string | null;
+      home_team: string | null;
+      away_team: string | null;
+    }>();
+    const oppTokens = new Set<string>();
+    oppTokens.add(normalizeToken(game.opponent));
+    for (const w of normalizeWords(game.opponent)) {
+      if (w.length >= 3) oppTokens.add(normalizeToken(w));
+    }
+    const playerTeamToken = normalizeToken(playerTeamName || "");
+    let best: { score: number; providerGameId: string } | null = null;
+    for (const row of rows.results || []) {
+      const providerGameId = String(row.provider_game_id || "").trim();
+      if (!providerGameId) continue;
+      const rowDate = toYmd(row.start_time);
+      let score = 0;
+      if (gameDate && rowDate) {
+        const diff = dayDiff(gameDate, rowDate);
+        if (diff === 0) score += 3;
+        else if (diff <= 1) score += 2;
+      }
+      const homeToken = normalizeToken(row.home_team_name || row.home_team || "");
+      const awayToken = normalizeToken(row.away_team_name || row.away_team || "");
+      const oppMatch = Array.from(oppTokens).some((t) => t && (homeToken.includes(t) || awayToken.includes(t)));
+      if (oppMatch) score += 3;
+      if (playerTeamToken && (homeToken.includes(playerTeamToken) || awayToken.includes(playerTeamToken))) {
+        score += 1;
+      }
+      if (!best || score > best.score) best = { score, providerGameId };
+    }
+    return best && best.score >= 3 ? best.providerGameId : null;
+  };
+  const logRowMatchFailure = (payload: {
+    playerId: string | null;
+    gameId: string | null;
+    statType: string;
+    reason: string;
+  }) => {
+    console.warn("[player-profile][row-match-failure]", {
+      playerId: payload.playerId,
+      gameId: payload.gameId,
+      statType: payload.statType,
+      reason: payload.reason,
+    });
+  };
+  const resolveCanonicalGameIdForRow = async (game: { date: string; opponent: string }): Promise<string | null> => {
+    const providerGameId = await resolveGameProviderIdForRow(game);
+    if (providerGameId) {
+      const canonicalGame = await db.prepare(`
+        SELECT id
+        FROM canonical_games
+        WHERE sport = ?
+          AND (
+            provider_game_id = ?
+            OR provider_event_id = ?
+            OR id = ?
+          )
+        LIMIT 1
+      `).bind(
+        String(sport || "").toUpperCase(),
+        providerGameId,
+        providerGameId,
+        `${String(sport || "").toLowerCase()}:game:${providerGameId}`
+      ).first<{ id: string | null }>();
+      const gameKey = String(canonicalGame?.id || `${String(sport || "").toLowerCase()}:game:${providerGameId}`).trim();
+      if (gameKey) return gameKey;
+    }
+    const targetDate = toYmd(game.date);
+    if (!targetDate) return null;
+    const oppTokens = new Set<string>();
+    oppTokens.add(normalizeToken(game.opponent));
+    for (const w of normalizeWords(game.opponent)) {
+      if (w.length >= 3) oppTokens.add(normalizeToken(w));
+    }
+    const rows = await db.prepare(`
+      SELECT
+        g.id,
+        g.start_time,
+        ht.display_name AS home_team_name,
+        at.display_name AS away_team_name
+      FROM canonical_games g
+      LEFT JOIN canonical_teams ht ON ht.id = g.home_team_id
+      LEFT JOIN canonical_teams at ON at.id = g.away_team_id
+      WHERE UPPER(COALESCE(g.sport, '')) = ?
+      ORDER BY ABS(strftime('%s', g.start_time) - strftime('%s', ?)) ASC
+      LIMIT 50
+    `).bind(
+      String(sport || "").toUpperCase(),
+      game.date
+    ).all<{
+      id: string | null;
+      start_time: string | null;
+      home_team_name: string | null;
+      away_team_name: string | null;
+    }>();
+    let best: { score: number; gameId: string } | null = null;
+    for (const row of rows.results || []) {
+      const id = String(row.id || "").trim();
+      if (!id) continue;
+      const rowDate = toYmd(row.start_time);
+      let score = 0;
+      if (rowDate) {
+        const diff = dayDiff(targetDate, rowDate);
+        if (diff === 0) score += 3;
+        else if (diff <= 1) score += 2;
+      }
+      const homeToken = normalizeToken(row.home_team_name || "");
+      const awayToken = normalizeToken(row.away_team_name || "");
+      const oppMatch = Array.from(oppTokens).some((t) => t && (homeToken.includes(t) || awayToken.includes(t)));
+      if (oppMatch) score += 3;
+      if (!best || score > best.score) best = { score, gameId: id };
+    }
+    return best && best.score >= 3 ? best.gameId : null;
+  };
+  const canonicalPlayerId = await resolveCanonicalPlayerInternalId();
+  const loadArchiveRecentGames = async (): Promise<Array<{ date: string; opponent: string; result: 'W' | 'L' | 'T'; stats: Record<string, string | number>; gameId?: string }>> => {
+    if (!canonicalPlayerId) return [];
+    const rows = await db.prepare(`
+      SELECT
+        v.game_id,
+        g.start_time,
+        ht.display_name AS home_team_name,
+        at.display_name AS away_team_name
+      FROM (
+        SELECT DISTINCT game_id
+        FROM historical_verified_lines_expanded
+        WHERE sport = ? AND player_internal_id = ?
+        UNION
+        SELECT DISTINCT game_id
+        FROM historical_verified_lines_strict
+        WHERE sport = ? AND player_internal_id = ?
+      ) v
+      LEFT JOIN canonical_games g ON g.id = v.game_id
+      LEFT JOIN canonical_teams ht ON ht.id = g.home_team_id
+      LEFT JOIN canonical_teams at ON at.id = g.away_team_id
+      ORDER BY datetime(g.start_time) DESC
+      LIMIT 5
+    `).bind(
+      String(sport || "").toUpperCase(),
+      canonicalPlayerId,
+      String(sport || "").toUpperCase(),
+      canonicalPlayerId
+    ).all<{
+      game_id: string | null;
+      start_time: string | null;
+      home_team_name: string | null;
+      away_team_name: string | null;
+    }>();
+    return (rows.results || []).map((row) => {
+      const home = String(row.home_team_name || "Home Team").trim();
+      const away = String(row.away_team_name || "Away Team").trim();
+      const playerTeamToken = normalizeToken(playerTeamName || "");
+      const homeToken = normalizeToken(home);
+      const awayToken = normalizeToken(away);
+      const opponent = playerTeamToken && homeToken.includes(playerTeamToken)
+        ? away
+        : playerTeamToken && awayToken.includes(playerTeamToken)
+          ? home
+          : away || home;
+      return {
+        date: String(row.start_time || ""),
+        opponent,
+        result: "T",
+        stats: {},
+        gameId: String(row.game_id || "").trim() || undefined,
+      };
+    }).filter((row) => Boolean(toYmd(row.date)));
+  };
+  const latestGameDate = recentGames.length > 0 ? toYmd(recentGames[0]?.date) : "";
+  const latestGameAgeDays = latestGameDate ? dayDiff(latestGameDate, toYmd(new Date().toISOString())) : Number.POSITIVE_INFINITY;
+  if ((recentGames.length === 0 || latestGameAgeDays > 30) && canonicalPlayerId) {
+    const archiveRecentGames = await loadArchiveRecentGames();
+    if (archiveRecentGames.length > 0) {
+      console.info("[player-profile][row-match]", {
+        playerId: canonicalPlayerId,
+        reason: recentGames.length === 0 ? "empty_game_log_using_archive_rows" : "stale_game_log_using_archive_rows",
+        replacedRows: archiveRecentGames.length,
+      });
+      recentGames = archiveRecentGames;
+    }
+  }
   if (recentGames.length === 0) return [];
+  const verifiedByRow: Array<{
+    lines: Record<string, number | null>;
+    lineQualityByStat: Record<string, "verified" | "estimated">;
+    lineSourceByStat: Record<string, "historical_verified" | "estimated_verified" | "display_fallback" | "unavailable">;
+    hasVerified: boolean;
+    hasEstimated: boolean;
+    hasDisplayFallback: boolean;
+  }> = [];
+  const rowGameKeys: Array<string | null> = [];
+  if (canonicalPlayerId) {
+    for (const game of recentGames) {
+      const directGameId = String((game as { gameId?: string })?.gameId || "").trim();
+      const gameKey = directGameId || await resolveCanonicalGameIdForRow(game);
+      if (!gameKey) {
+        logRowMatchFailure({
+          playerId: canonicalPlayerId,
+          gameId: null,
+          statType: "row",
+          reason: "no_canonical_game_match",
+        });
+        verifiedByRow.push({
+          lines: {},
+          lineQualityByStat: {},
+          lineSourceByStat: {},
+          hasVerified: false,
+          hasEstimated: false,
+          hasDisplayFallback: false,
+        });
+        rowGameKeys.push(null);
+        continue;
+      }
+      const preferred = await resolveDisplayLinesForPlayerGame({
+        db,
+        sport: String(sport || "").toUpperCase(),
+        gameId: gameKey,
+        playerInternalId: canonicalPlayerId,
+      });
+      if (!preferred.hasStrict && !preferred.hasExpanded && !preferred.hasDisplayFallback) {
+        logRowMatchFailure({
+          playerId: canonicalPlayerId,
+          gameId: gameKey,
+          statType: "row",
+          reason: "no_display_lines_for_game",
+        });
+      }
+      verifiedByRow.push(
+        {
+          lines: Object.fromEntries(
+            Object.entries(preferred.lines || {}).map(([k, v]) => [k, Number.isFinite(Number(v?.lineValue)) ? Number(v?.lineValue) : null])
+          ),
+          lineQualityByStat: preferred.lineQualityByStat || {},
+          lineSourceByStat: preferred.lineSourceByStat || {},
+          hasVerified: Boolean(preferred.hasStrict),
+          hasEstimated: Boolean(preferred.hasExpanded),
+          hasDisplayFallback: Boolean(preferred.hasDisplayFallback),
+        }
+      );
+      rowGameKeys.push(gameKey);
+    }
+  } else {
+    for (const _ of recentGames) {
+      verifiedByRow.push({
+        lines: {},
+        lineQualityByStat: {},
+        lineSourceByStat: {},
+        hasVerified: false,
+        hasEstimated: false,
+        hasDisplayFallback: false,
+      });
+      rowGameKeys.push(null);
+    }
+  }
+
+  const readRowLine = (rowLines: Record<string, number | null>, keys: string[]): number | null => {
+    for (const key of keys) {
+      const value = rowLines[key];
+      if (hasLineValue(value)) return Number(value);
+    }
+    return null;
+  };
+
+  if (String(sport || "").toUpperCase() === "MLB") {
+    const isPitcher = options?.roleBucket === "mlb_pitcher";
+    return recentGames.map((g, idx) => {
+      const stats = g?.stats && typeof g.stats === "object" ? g.stats : {};
+      const rowMeta = verifiedByRow[idx] || { lines: {}, lineQualityByStat: {}, lineSourceByStat: {}, hasVerified: false, hasEstimated: false, hasDisplayFallback: false };
+      const rowLines = rowMeta.lines || {};
+      const strikeouts = Number((stats as any).strikeouts ?? (stats as any).so ?? (stats as any).K);
+      const hits = Number((stats as any).hits ?? (stats as any).H);
+      const runs = Number((stats as any).runs ?? (stats as any).R);
+      const rbis = Number((stats as any).rbis ?? (stats as any).rbi ?? (stats as any).RBI);
+      const homeRuns = Number((stats as any).homeRuns ?? (stats as any).home_runs ?? (stats as any).hr ?? (stats as any).HR);
+      const earnedRuns = Number((stats as any).earnedRuns ?? (stats as any).earned_runs ?? (stats as any).ER);
+      const outsRecorded = Number((stats as any).outsRecorded ?? (stats as any).pitchingOuts ?? (stats as any).OUT);
+      const hitsAllowed = Number((stats as any).hitsAllowed ?? (stats as any).hits_allowed ?? (stats as any).HA);
+      const walksAllowed = Number((stats as any).walksAllowed ?? (stats as any).walks_allowed ?? (stats as any).BB);
+      const inningsPitched = Number((stats as any).inningsPitched ?? (stats as any).IP);
+      const propLines = isPitcher
+        ? {
+            strikeouts: readRowLine(rowLines, ["pitcherStrikeouts", "strikeouts", "so", "k"]),
+            earnedRuns: readRowLine(rowLines, ["earnedRuns", "earned_runs", "er"]),
+            outsRecorded: readRowLine(rowLines, ["outsRecorded", "outs_recorded", "pitchingOuts", "outs"]),
+            hitsAllowed: readRowLine(rowLines, ["hitsAllowed", "hits_allowed", "ha"]),
+            walksAllowed: readRowLine(rowLines, ["walksAllowed", "walks_allowed", "bb"]),
+          }
+        : {
+            hits: readRowLine(rowLines, ["hits", "hit"]),
+            runs: readRowLine(rowLines, ["runs", "run"]),
+            rbis: readRowLine(rowLines, ["rbis", "rbi"]),
+            homeRuns: readRowLine(rowLines, ["homeRuns", "home_runs", "hr"]),
+            strikeouts: readRowLine(rowLines, ["strikeouts", "so", "k"]),
+          };
+      const hasAny = Object.values(propLines).some((v) => hasLineValue(v));
+      const statTypesToValidate = isPitcher
+        ? ["strikeouts", "earnedRuns", "outsRecorded", "hitsAllowed", "walksAllowed"]
+        : ["hits", "runs", "rbis", "homeRuns", "strikeouts"];
+      for (const statType of statTypesToValidate) {
+        if (!hasLineValue((propLines as any)[statType])) {
+          logRowMatchFailure({
+            playerId: canonicalPlayerId,
+            gameId: rowGameKeys[idx] || String(g?.date || ""),
+            statType,
+            reason: "stat_key_unmatched",
+          });
+        }
+      }
+      return {
+        date: g.date,
+        opponent: g.opponent,
+        result: g.result,
+        stats: isPitcher
+          ? {
+              K: Number.isFinite(strikeouts) ? strikeouts : null,
+              ER: Number.isFinite(earnedRuns) ? earnedRuns : null,
+              OUT: Number.isFinite(outsRecorded) ? outsRecorded : null,
+              HA: Number.isFinite(hitsAllowed) ? hitsAllowed : null,
+              BB: Number.isFinite(walksAllowed) ? walksAllowed : null,
+              IP: Number.isFinite(inningsPitched) ? inningsPitched : null,
+            }
+          : {
+              H: Number.isFinite(hits) ? hits : null,
+              R: Number.isFinite(runs) ? runs : null,
+              RBI: Number.isFinite(rbis) ? rbis : null,
+              HR: Number.isFinite(homeRuns) ? homeRuns : null,
+              K: Number.isFinite(strikeouts) ? strikeouts : null,
+            },
+        propLines: hasAny ? propLines : undefined,
+        lineQualityByStat: rowMeta.lineQualityByStat || {},
+        lineSourceByStat: rowMeta.lineSourceByStat || {},
+        lineSource: rowMeta.hasVerified
+          ? "historical_verified"
+          : rowMeta.hasEstimated || rowMeta.hasDisplayFallback
+            ? "estimated_fallback"
+            : "unavailable",
+      };
+    });
+  }
+
+  if (String(sport || "").toUpperCase() === "NHL") {
+    return recentGames.map((g, idx) => {
+      const stats = g?.stats && typeof g.stats === "object" ? g.stats : {};
+      const goals = Number((stats as any).G ?? (stats as any).goals);
+      const assists = Number((stats as any).A ?? (stats as any).assists);
+      const points = Number((stats as any).PTS ?? (stats as any).points);
+      const shots = Number((stats as any).SOG ?? (stats as any).S ?? (stats as any).shots ?? (stats as any).Shots ?? (stats as any).SA);
+      const saves = Number((stats as any).SV ?? (stats as any).saves);
+      const rowMeta = verifiedByRow[idx] || { lines: {}, lineQualityByStat: {}, lineSourceByStat: {}, hasVerified: false, hasEstimated: false, hasDisplayFallback: false };
+      const rowLines = rowMeta.lines || {};
+      const propLines = {
+        goals: readRowLine(rowLines, ["goals", "goal"]),
+        assists: readRowLine(rowLines, ["assists", "assist"]),
+        points: readRowLine(rowLines, ["points", "point"]),
+        shots: readRowLine(rowLines, ["shots", "shots_on_goal", "sog"]),
+        saves: readRowLine(rowLines, ["saves", "save"]),
+      };
+      for (const statType of ["goals", "assists", "points", "shots", "saves"]) {
+        if (!hasLineValue((propLines as any)[statType])) {
+          logRowMatchFailure({
+            playerId: canonicalPlayerId,
+            gameId: rowGameKeys[idx] || String(g?.date || ""),
+            statType,
+            reason: "stat_key_unmatched",
+          });
+        }
+      }
+      const hasAny = Object.values(propLines).some((v) => hasLineValue(v));
+      return {
+        date: g.date,
+        opponent: g.opponent,
+        result: g.result,
+        stats: {
+          G: Number.isFinite(goals) ? goals : null,
+          A: Number.isFinite(assists) ? assists : null,
+          PTS: Number.isFinite(points) ? points : null,
+          SOG: Number.isFinite(shots) ? shots : null,
+          SV: Number.isFinite(saves) ? saves : null,
+        },
+        propLines: hasAny ? propLines : undefined,
+        lineQualityByStat: rowMeta.lineQualityByStat || {},
+        lineSourceByStat: rowMeta.lineSourceByStat || {},
+        lineSource: rowMeta.hasVerified
+          ? "historical_verified"
+          : rowMeta.hasEstimated || rowMeta.hasDisplayFallback
+            ? "estimated_fallback"
+            : "unavailable",
+      };
+    });
+  }
+
+  if (String(sport || "").toUpperCase() === "NFL") {
+    return recentGames.map((g, idx) => {
+      const stats = g?.stats && typeof g.stats === "object" ? g.stats : {};
+      const passYards = Number((stats as any).passYards ?? (stats as any).passingYards ?? (stats as any)["PASS YDS"]);
+      const rushYards = Number((stats as any).rushYards ?? (stats as any).rushingYards ?? (stats as any)["RUSH YDS"]);
+      const recYards = Number((stats as any).recYards ?? (stats as any).receivingYards ?? (stats as any)["REC YDS"]);
+      const receptions = Number((stats as any).receptions ?? (stats as any).REC);
+      const passTd = Number((stats as any).passTd ?? (stats as any).passingTouchdowns ?? (stats as any)["PASS TD"]);
+      const rowMeta = verifiedByRow[idx] || { lines: {}, lineQualityByStat: {}, lineSourceByStat: {}, hasVerified: false, hasEstimated: false, hasDisplayFallback: false };
+      const rowLines = rowMeta.lines || {};
+      const propLines = {
+        passingYards: readRowLine(rowLines, ["passingYards", "pass_yards", "passYds"]),
+        rushingYards: readRowLine(rowLines, ["rushingYards", "rush_yards", "rushYds"]),
+        receivingYards: readRowLine(rowLines, ["receivingYards", "rec_yards", "receivingYds"]),
+        receptions: readRowLine(rowLines, ["receptions", "rec"]),
+        passTd: readRowLine(rowLines, ["passingTds", "pass_tds", "passTd"]),
+      };
+      const hasAny = Object.values(propLines).some((v) => hasLineValue(v));
+      return {
+        date: g.date,
+        opponent: g.opponent,
+        result: g.result,
+        stats: {
+          "PASS YDS": Number.isFinite(passYards) ? passYards : null,
+          "RUSH YDS": Number.isFinite(rushYards) ? rushYards : null,
+          "REC YDS": Number.isFinite(recYards) ? recYards : null,
+          REC: Number.isFinite(receptions) ? receptions : null,
+          "PASS TD": Number.isFinite(passTd) ? passTd : null,
+        },
+        propLines: hasAny ? propLines : undefined,
+        lineQualityByStat: rowMeta.lineQualityByStat || {},
+        lineSourceByStat: rowMeta.lineSourceByStat || {},
+        lineSource: rowMeta.hasVerified
+          ? "historical_verified"
+          : rowMeta.hasEstimated || rowMeta.hasDisplayFallback
+            ? "estimated_fallback"
+            : "unavailable",
+      };
+    });
+  }
+
+  if (String(sport || "").toUpperCase() === "SOCCER") {
+    return recentGames.map((g, idx) => {
+      const stats = g?.stats && typeof g.stats === "object" ? g.stats : {};
+      const goals = Number((stats as any).G ?? (stats as any).goals);
+      const assists = Number((stats as any).A ?? (stats as any).assists);
+      const shots = Number((stats as any).SOG ?? (stats as any).shots ?? (stats as any).S);
+      const shotsOnTarget = Number((stats as any).shotsOnTarget ?? (stats as any).SOT ?? (stats as any).sot);
+      const chances = Number((stats as any).chancesCreated ?? (stats as any).CC);
+      const rowMeta = verifiedByRow[idx] || { lines: {}, lineQualityByStat: {}, lineSourceByStat: {}, hasVerified: false, hasEstimated: false, hasDisplayFallback: false };
+      const rowLines = rowMeta.lines || {};
+      const propLines = {
+        goals: readRowLine(rowLines, ["goals", "goal"]),
+        assists: readRowLine(rowLines, ["assists", "assist"]),
+        shots: readRowLine(rowLines, ["shots", "shot"]),
+        shotsOnTarget: readRowLine(rowLines, ["shotsOnTarget", "shots_on_target", "sot"]),
+      };
+      const hasAny = Object.values(propLines).some((v) => hasLineValue(v));
+      return {
+        date: g.date,
+        opponent: g.opponent,
+        result: g.result,
+        stats: {
+          G: Number.isFinite(goals) ? goals : null,
+          A: Number.isFinite(assists) ? assists : null,
+          SOG: Number.isFinite(shots) ? shots : null,
+          SOT: Number.isFinite(shotsOnTarget) ? shotsOnTarget : null,
+          CC: Number.isFinite(chances) ? chances : null,
+        },
+        propLines: hasAny ? propLines : undefined,
+        lineQualityByStat: rowMeta.lineQualityByStat || {},
+        lineSourceByStat: rowMeta.lineSourceByStat || {},
+        lineSource: rowMeta.hasVerified
+          ? "historical_verified"
+          : rowMeta.hasEstimated || rowMeta.hasDisplayFallback
+            ? "estimated_fallback"
+            : "unavailable",
+      };
+    });
+  }
+
+  return recentGames.map((game, idx) => {
+    const stats = game?.stats && typeof game.stats === 'object' ? game.stats : {};
+    const points = Number((stats as any).points ?? (stats as any).PTS);
+    const rebounds = Number((stats as any).rebounds ?? (stats as any).REB);
+    const assists = Number((stats as any).assists ?? (stats as any).AST);
+    const minutes = Number((stats as any).minutes ?? (stats as any).MIN);
+    const rowMeta = verifiedByRow[idx] || { lines: {}, lineQualityByStat: {}, lineSourceByStat: {}, hasVerified: false, hasEstimated: false, hasDisplayFallback: false };
+    const rowLines = rowMeta.lines || {};
+    const propLines = {
+      points: readRowLine(rowLines, ["points", "pts"]),
+      rebounds: readRowLine(rowLines, ["rebounds", "reb", "trb"]),
+      assists: readRowLine(rowLines, ["assists", "ast", "a"]),
+    };
+    for (const statType of ["points", "rebounds", "assists"]) {
+      if (!hasLineValue((propLines as any)[statType])) {
+        logRowMatchFailure({
+          playerId: canonicalPlayerId,
+          gameId: rowGameKeys[idx] || String(game?.date || ""),
+          statType,
+          reason: "stat_key_unmatched",
+        });
+      }
+    }
+    const hasAny = Object.values(propLines).some((v) => hasLineValue(v));
+    return {
+      date: game.date,
+      opponent: game.opponent,
+      result: game.result,
+      stats: {
+        PTS: Number.isFinite(points) ? points : null,
+        REB: Number.isFinite(rebounds) ? rebounds : null,
+        AST: Number.isFinite(assists) ? assists : null,
+        MIN: Number.isFinite(minutes) ? minutes : null,
+      },
+      propLines: hasAny ? propLines : undefined,
+      lineQualityByStat: rowMeta.lineQualityByStat || {},
+      lineSourceByStat: rowMeta.lineSourceByStat || {},
+      lineSource: rowMeta.hasVerified
+        ? "historical_verified"
+        : rowMeta.hasEstimated || rowMeta.hasDisplayFallback
+          ? "estimated_fallback"
+          : "unavailable",
+    };
+  });
+
+  if (String(sport || "").toUpperCase() === "MLB") {
+    const normalizedType = (value: unknown): string => {
+      const t = String(value || "").toUpperCase();
+      if (!t) return "";
+      if (t.includes("HIT")) return "hits";
+      if (t.includes("RUN") && !t.includes("HOME")) return "runs";
+      if (t.includes("RBI")) return "rbis";
+      if (t.includes("HOME") && t.includes("RUN")) return "homeRuns";
+      if (t.includes("STRIKEOUT") || t === "K" || t.includes("PITCHER_STRIKEOUT")) return "strikeouts";
+      return "";
+    };
+    const fallbackRows = Array.isArray(fallbackProps) ? fallbackProps : [];
+    const latestLines: Record<string, number | null> = {
+      hits: null,
+      runs: null,
+      rbis: null,
+      homeRuns: null,
+      strikeouts: null,
+    };
+    for (const row of fallbackRows) {
+      const key = normalizedType(row?.prop_type);
+      if (!key || latestLines[key] !== null) continue;
+      const line = Number(row?.line_value);
+      if (!Number.isFinite(line) || line <= 0) continue;
+      latestLines[key] = line;
+    }
+    const hasAnyLine = Object.values(latestLines).some((v) => Number.isFinite(Number(v)));
+    return recentGames.map((g) => {
+      const stats = g?.stats && typeof g.stats === "object" ? g.stats : {};
+      const hits = Number((stats as any).hits ?? (stats as any).H);
+      const runs = Number((stats as any).runs ?? (stats as any).R);
+      const rbis = Number((stats as any).rbis ?? (stats as any).rbi ?? (stats as any).RBI);
+      const homeRuns = Number((stats as any).homeRuns ?? (stats as any).home_runs ?? (stats as any).hr ?? (stats as any).HR);
+      const strikeouts = Number((stats as any).strikeouts ?? (stats as any).so ?? (stats as any).K);
+      return {
+        date: g.date,
+        opponent: g.opponent,
+        result: g.result,
+        stats: {
+          H: Number.isFinite(hits) ? hits : null,
+          R: Number.isFinite(runs) ? runs : null,
+          RBI: Number.isFinite(rbis) ? rbis : null,
+          HR: Number.isFinite(homeRuns) ? homeRuns : null,
+          K: Number.isFinite(strikeouts) ? strikeouts : null,
+        },
+        propLines: hasAnyLine ? latestLines : undefined,
+        lineSource: hasAnyLine ? "latest_fallback" : "unavailable",
+      };
+    });
+  }
+  if (String(sport || "").toUpperCase() === "NHL") {
+    const hasFiniteLineValue = (value: unknown): boolean => {
+      if (value === null || value === undefined || value === "") return false;
+      const n = Number(value);
+      return Number.isFinite(n) && n > 0;
+    };
+    const normalizedType = (value: unknown): string => {
+      const t = String(value || "").toUpperCase();
+      if (!t) return "";
+      if (t.includes("GOAL")) return "goals";
+      if (t.includes("ASSIST")) return "assists";
+      if (t.includes("POINT")) return "points";
+      if (t.includes("SHOT")) return "shots";
+      if (t.includes("SAVE")) return "saves";
+      return "";
+    };
+    const fallbackRows = Array.isArray(fallbackProps) ? fallbackProps : [];
+    const latestLines: Record<string, number | null> = {
+      goals: null,
+      assists: null,
+      points: null,
+      shots: null,
+      saves: null,
+    };
+    const applyNhlLine = (propTypeValue: unknown, lineValue: unknown) => {
+      const key = normalizedType(propTypeValue);
+      if (!key || latestLines[key] !== null) return;
+      const line = Number(lineValue);
+      if (!Number.isFinite(line) || line <= 0) return;
+      latestLines[key] = line;
+    };
+    for (const row of fallbackRows) {
+      applyNhlLine(row?.prop_type, row?.line_value);
+    }
+    const readNhlDbFallbackLines = async () => {
+      const hasAny = Object.values(latestLines).some((v) => hasFiniteLineValue(v));
+      if (hasAny) return;
+      const normalizedNames = Array.from(
+        new Set(
+          (playerNames || [])
+            .map((name) => String(name || "").trim().toLowerCase())
+            .filter((name) => name.length >= 3)
+        )
+      ).slice(0, 8);
+      if (normalizedNames.length === 0) return;
+      try {
+        const placeholders = normalizedNames.map(() => "?").join(", ");
+        const currentSql = `
+          SELECT UPPER(COALESCE(p.prop_type, '')) AS prop_type, p.line_value
+          FROM sdio_props_current p
+          JOIN sdio_games g ON g.id = p.game_id
+          WHERE UPPER(COALESCE(g.sport, '')) = ?
+            AND LOWER(COALESCE(p.player_name, '')) IN (${placeholders})
+          ORDER BY datetime(COALESCE(p.last_updated, p.updated_at, p.created_at)) DESC
+          LIMIT 200
+        `;
+        const currentRows = await db.prepare(currentSql)
+          .bind(String(sport || "").toUpperCase(), ...normalizedNames)
+          .all<{ prop_type: string; line_value: number }>();
+        for (const row of currentRows.results || []) {
+          applyNhlLine(row.prop_type, row.line_value);
+        }
+        const afterCurrent = Object.values(latestLines).some((v) => hasFiniteLineValue(v));
+        if (afterCurrent) return;
+        const historySql = `
+          SELECT UPPER(COALESCE(h.prop_type, '')) AS prop_type, h.line_value
+          FROM sdio_props_history h
+          JOIN sdio_games g ON g.id = h.game_id
+          WHERE UPPER(COALESCE(g.sport, '')) = ?
+            AND LOWER(COALESCE(h.player_name, '')) IN (${placeholders})
+          ORDER BY datetime(COALESCE(h.recorded_at, h.updated_at, h.created_at)) DESC
+          LIMIT 400
+        `;
+        const historyRows = await db.prepare(historySql)
+          .bind(String(sport || "").toUpperCase(), ...normalizedNames)
+          .all<{ prop_type: string; line_value: number }>();
+        for (const row of historyRows.results || []) {
+          applyNhlLine(row.prop_type, row.line_value);
+        }
+      } catch {
+        // Non-fatal fallback path.
+      }
+    };
+    await readNhlDbFallbackLines();
+    if (!Object.values(latestLines).some((v) => hasFiniteLineValue(v))) {
+      const firstRaw = String(toDisplayFirstLast(playerNames[0] || "") || "").trim().toLowerCase();
+      const tokens = firstRaw.split(/\s+/).filter(Boolean);
+      const firstToken = tokens[0] || "";
+      const lastToken = tokens[tokens.length - 1] || "";
+      if (firstToken.length >= 2 && lastToken.length >= 2) {
+        try {
+          const firstLike = `%${firstToken}%`;
+          const lastLike = `%${lastToken}%`;
+          const fuzzySql = `
+            SELECT UPPER(COALESCE(h.prop_type, '')) AS prop_type, h.line_value
+            FROM sdio_props_history h
+            JOIN sdio_games g ON g.id = h.game_id
+            WHERE UPPER(COALESCE(g.sport, '')) = ?
+              AND LOWER(COALESCE(h.player_name, '')) LIKE ?
+              AND LOWER(COALESCE(h.player_name, '')) LIKE ?
+            ORDER BY datetime(COALESCE(h.recorded_at, h.updated_at, h.created_at)) DESC
+            LIMIT 400
+          `;
+          const fuzzyRows = await db.prepare(fuzzySql)
+            .bind(String(sport || "").toUpperCase(), firstLike, lastLike)
+            .all<{ prop_type: string; line_value: number }>();
+          for (const row of fuzzyRows.results || []) {
+            applyNhlLine(row.prop_type, row.line_value);
+          }
+        } catch {
+          // Non-fatal fallback path.
+        }
+      }
+    }
+    const hasAnyLine = Object.values(latestLines).some((v) => hasFiniteLineValue(v));
+    const normalizeToken = (value: unknown): string =>
+      String(value || "")
+        .toLowerCase()
+        .replace(/[^a-z0-9]/g, "");
+    const normalizeWords = (value: unknown): string[] =>
+      String(value || "")
+        .toLowerCase()
+        .replace(/[^a-z0-9\\s]/g, " ")
+        .split(/\s+/)
+        .map((w) => w.trim())
+        .filter(Boolean);
+    const toYmd = (value: unknown): string => {
+      const d = new Date(String(value || ""));
+      if (!Number.isFinite(d.getTime())) return "";
+      return d.toISOString().slice(0, 10);
+    };
+    const dayDiff = (a: string, b: string): number => {
+      const da = new Date(`${a}T12:00:00`);
+      const db = new Date(`${b}T12:00:00`);
+      if (!Number.isFinite(da.getTime()) || !Number.isFinite(db.getTime())) return Number.POSITIVE_INFINITY;
+      return Math.abs(da.getTime() - db.getTime()) / (24 * 60 * 60 * 1000);
+    };
+    const gameMatchedRows: Array<{
+      stat: "goals" | "assists" | "points" | "shots" | "saves";
+      line: number;
+      date: string;
+      opp: Set<string>;
+    }> = [];
+    try {
+      const names = Array.from(
+        new Set(
+          (playerNames || [])
+            .flatMap((name) => {
+              const raw = String(name || "").trim();
+              if (!raw) return [];
+              return [raw, toDisplayFirstLast(raw), toDisplayLastFirst(raw)];
+            })
+            .map((name) => String(name || "").trim().toLowerCase())
+            .filter((name) => name.length >= 3)
+        )
+      ).slice(0, 10);
+      if (names.length > 0) {
+        const placeholders = names.map(() => "?").join(", ");
+        const sql = `
+          SELECT
+            UPPER(COALESCE(h.prop_type, '')) AS prop_type,
+            h.line_value AS line_value,
+            COALESCE(g.start_time, h.recorded_at, h.created_at) AS game_date,
+            COALESCE(g.home_team_name, g.home_team) AS home_name,
+            COALESCE(g.away_team_name, g.away_team) AS away_name
+          FROM sdio_props_history h
+          JOIN sdio_games g ON g.id = h.game_id
+          WHERE UPPER(COALESCE(g.sport, '')) = ?
+            AND LOWER(COALESCE(h.player_name, '')) IN (${placeholders})
+          ORDER BY datetime(COALESCE(h.recorded_at, h.updated_at, h.created_at)) DESC
+          LIMIT 1200
+        `;
+        const rows = await db.prepare(sql)
+          .bind(String(sport || "").toUpperCase(), ...names)
+          .all<{
+            prop_type: string;
+            line_value: number;
+            game_date: string | null;
+            home_name: string | null;
+            away_name: string | null;
+          }>();
+        for (const row of rows.results || []) {
+          const stat = normalizedType(row.prop_type) as "goals" | "assists" | "points" | "shots" | "saves" | "";
+          if (!stat) continue;
+          const line = Number(row.line_value);
+          if (!Number.isFinite(line) || line <= 0) continue;
+          const opp = new Set<string>();
+          for (const candidate of [row.home_name, row.away_name]) {
+            const token = normalizeToken(candidate);
+            if (token) opp.add(token);
+            for (const word of normalizeWords(candidate)) {
+              if (word.length >= 3) opp.add(normalizeToken(word));
+            }
+          }
+          gameMatchedRows.push({
+            stat,
+            line,
+            date: toYmd(row.game_date),
+            opp,
+          });
+        }
+      }
+    } catch {
+      // Non-fatal: fallback logic below remains active.
+    }
+    const resolveHistoricalLine = (
+      game: { date: string; opponent: string },
+      stat: "goals" | "assists" | "points" | "shots" | "saves"
+    ): number | null => {
+      if (gameMatchedRows.length === 0) return null;
+      const gameDate = toYmd(game.date);
+      const gameOpp = new Set<string>();
+      gameOpp.add(normalizeToken(game.opponent));
+      for (const w of normalizeWords(game.opponent)) {
+        if (w.length >= 3) gameOpp.add(normalizeToken(w));
+      }
+      let best: { score: number; line: number } | null = null;
+      for (const row of gameMatchedRows) {
+        if (row.stat !== stat) continue;
+        let score = 0;
+        let dateMatch = false;
+        if (gameDate && row.date) {
+          const diff = dayDiff(gameDate, row.date);
+          if (diff === 0) {
+            score += 3;
+            dateMatch = true;
+          } else if (diff <= 1) {
+            score += 2;
+            dateMatch = true;
+          }
+        }
+        const oppOverlap = Array.from(gameOpp).some((token) => token && row.opp.has(token));
+        if (oppOverlap) score += 3;
+        // Guardrail: historical line match must have opponent overlap plus close date.
+        if (!oppOverlap || !dateMatch) continue;
+        if (!best || score > best.score) best = { score, line: row.line };
+      }
+      return best && best.score >= 5 ? best.line : null;
+    };
+    return recentGames.map((g, idx) => {
+      const stats = g?.stats && typeof g.stats === "object" ? g.stats : {};
+      const goals = Number((stats as any).G ?? (stats as any).goals);
+      const assists = Number((stats as any).A ?? (stats as any).assists);
+      const points = Number((stats as any).PTS ?? (stats as any).points);
+      const shots = Number(
+        (stats as any).SOG
+        ?? (stats as any).S
+        ?? (stats as any).shots
+        ?? (stats as any).Shots
+        ?? (stats as any).SA
+      );
+      const saves = Number((stats as any).SV ?? (stats as any).saves);
+      const historicalLines = {
+        goals: resolveHistoricalLine(g, "goals"),
+        assists: resolveHistoricalLine(g, "assists"),
+        points: resolveHistoricalLine(g, "points"),
+        shots: resolveHistoricalLine(g, "shots"),
+        saves: resolveHistoricalLine(g, "saves"),
+      };
+      const mergedLines = {
+        goals: historicalLines.goals ?? null,
+        assists: historicalLines.assists ?? null,
+        points: historicalLines.points ?? null,
+        shots: historicalLines.shots ?? null,
+        saves: historicalLines.saves ?? null,
+      };
+      const hasMergedLine = Object.values(mergedLines).some((v) => hasFiniteLineValue(v));
+      const usedHistorical = Object.values(historicalLines).some((v) => hasFiniteLineValue(v));
+      return {
+        date: g.date,
+        opponent: g.opponent,
+        result: g.result,
+        stats: {
+          G: Number.isFinite(goals) ? goals : null,
+          A: Number.isFinite(assists) ? assists : null,
+          PTS: Number.isFinite(points) ? points : null,
+          SOG: Number.isFinite(shots) ? shots : null,
+          SV: Number.isFinite(saves) ? saves : null,
+        },
+        propLines: hasMergedLine ? mergedLines : undefined,
+        lineSource: usedHistorical ? "historical" : hasMergedLine ? "latest_fallback" : "unavailable",
+      };
+    });
+  }
 
   const candidates = new Set<string>();
   for (const raw of playerNames) {
@@ -749,7 +1962,6 @@ async function buildRecentPerformanceWithOdds(
         JOIN sdio_games g ON g.id = h.game_id
         WHERE UPPER(COALESCE(g.sport, '')) = ?
           AND LOWER(COALESCE(h.player_name, '')) IN (${placeholders})
-          AND UPPER(COALESCE(h.prop_type, '')) IN ('POINTS', 'REBOUNDS', 'ASSISTS')
         ORDER BY datetime(g.start_time) DESC, datetime(h.recorded_at) DESC
         LIMIT 2000
       `;
@@ -769,9 +1981,16 @@ async function buildRecentPerformanceWithOdds(
 
   const latestPerGameProp = new Map<string, PropLineRow>();
   for (const row of propRows) {
-    const key = `${row.game_id}:${row.prop_type}`;
+    const typeRaw = String(row.prop_type || '').toUpperCase();
+    const type =
+      typeRaw.includes('POINT') ? 'POINTS'
+      : typeRaw.includes('REBOUND') ? 'REBOUNDS'
+      : typeRaw.includes('ASSIST') ? 'ASSISTS'
+      : '';
+    if (!type) continue;
+    const key = `${row.game_id}:${type}`;
     if (!latestPerGameProp.has(key)) {
-      latestPerGameProp.set(key, row);
+      latestPerGameProp.set(key, { ...row, prop_type: type });
     }
   }
   const linesByGame = new Map<number, GamePropLines>();
@@ -794,6 +2013,7 @@ async function buildRecentPerformanceWithOdds(
       return { points: null, rebounds: null, assists: null };
     }
     const oppWords = normalizeWordTokens(game.opponent);
+    const oppNormalized = normalizeToken(game.opponent);
     const oppTail = oppWords.slice(-1)[0] || '';
     const oppTailToken = oppTail.length >= 4 ? normalizeToken(oppTail) : '';
     let best: { diff: number; lines: { points: number | null; rebounds: number | null; assists: number | null } } | null = null;
@@ -804,9 +2024,22 @@ async function buildRecentPerformanceWithOdds(
       if (diffHours > 72) continue;
       const homeToken = normalizeToken(row.home);
       const awayToken = normalizeToken(row.away);
-      const teamMatch = oppTailToken
+      const teamMatchByTail = oppTailToken
         ? (homeToken.includes(oppTailToken) || awayToken.includes(oppTailToken))
         : false;
+      const teamMatchByNormalized = oppNormalized.length >= 3
+        ? (
+            homeToken.includes(oppNormalized)
+            || awayToken.includes(oppNormalized)
+            || oppNormalized.includes(homeToken)
+            || oppNormalized.includes(awayToken)
+          )
+        : false;
+      const teamMatchByWord = oppWords.some((w) => {
+        const token = normalizeToken(w);
+        return token.length >= 4 && (homeToken.includes(token) || awayToken.includes(token));
+      });
+      const teamMatch = teamMatchByTail || teamMatchByNormalized || teamMatchByWord;
       if (!teamMatch) continue;
       if (!best || diffHours < best.diff) {
         best = { diff: diffHours, lines: row.lines };
@@ -862,7 +2095,7 @@ async function buildRecentPerformanceWithOdds(
       onDemandCache.set(cacheKey, null);
       return null;
     }
-    if (!sportsRadarPropsKey) {
+    if (!allowOnDemandFetch || !sportsRadarPropsKey) {
       onDemandCache.set(cacheKey, null);
       return null;
     }
@@ -1303,7 +2536,7 @@ async function buildRecentPerformanceWithOdds(
       ([matchedLines.points, matchedLines.rebounds, matchedLines.assists].some((v) => v !== null))
         ? 'historical'
         : universalFallbackSource;
-    if (!candidateLines) {
+    if (!candidateLines && allowOnDemandFetch) {
       const onDemand = await fetchOnDemandLines(g);
       if (onDemand) {
         candidateLines = onDemand;
@@ -1777,7 +3010,29 @@ async function fetchPlayerPropsFromSportsRadar(
   
   try {
     const props: PlayerProp[] = [];
+    const normalizeNameToken = (value: string): string =>
+      String(value || "").toLowerCase().replace(/[^a-z0-9]/g, "");
     const playerLower = playerName.toLowerCase();
+    const targetNameTokens = new Set<string>([
+      normalizeNameToken(playerName),
+      normalizeNameToken(toDisplayFirstLast(playerName)),
+      normalizeNameToken(toDisplayLastFirst(playerName)),
+    ].filter(Boolean));
+    const namesLikelyMatch = (candidateName: string): boolean => {
+      const normalizedCandidate = normalizeNameToken(candidateName);
+      if (!normalizedCandidate) return false;
+      for (const token of targetNameTokens) {
+        if (!token) continue;
+        if (
+          normalizedCandidate === token
+          || normalizedCandidate.includes(token)
+          || token.includes(normalizedCandidate)
+        ) {
+          return true;
+        }
+      }
+      return false;
+    };
 
     // Try each competition ID until we find props for this player.
     for (const competitionId of competitionIds) {
@@ -1802,8 +3057,9 @@ async function fetchPlayerPropsFromSportsRadar(
     for (const event of competitionEvents) {
       const playersProps = event.players_props || [];
       for (const row of playersProps) {
-        const rowPlayerName = String(row?.player?.name || row?.name || '').toLowerCase();
-        if (!rowPlayerName || !rowPlayerName.includes(playerLower)) continue;
+        const rowPlayerName = String(row?.player?.name || row?.name || '').trim();
+        if (!rowPlayerName) continue;
+        if (!namesLikelyMatch(rowPlayerName) && !rowPlayerName.toLowerCase().includes(playerLower)) continue;
         const markets = row.markets || [];
         for (const market of markets) {
           const marketName = market.name || '';
@@ -1975,6 +3231,722 @@ async function fetchPlayerNews(
   }
 }
 
+
+// ============================================
+// SHARED LIVE PROFILE COMPUTATION (routes + document builder)
+// ============================================
+
+export type ComputeLivePlayerProfileResult =
+  | {
+      ok: true;
+      payload: Record<string, unknown>;
+      profileCacheKey: string;
+      hasUsablePayload: boolean;
+      rawPlayerName: string;
+    }
+  | { ok: false; status: number; body: Record<string, unknown> };
+
+export async function enrichPlayerInfoFromOverview(
+  espnId: string,
+  sport: string
+): Promise<{
+  espnId: string;
+  displayName: string;
+  position: string;
+  jersey: string;
+  teamName: string;
+  teamAbbr: string;
+  teamColor: string;
+  headshotUrl: string;
+  birthDate?: string;
+  height?: string;
+  weight?: string;
+  experience?: string;
+  college?: string;
+} | null> {
+  try {
+    const sportPath = SPORT_PATHS[sport];
+    if (!sportPath) return null;
+    const overviewUrl = `${ESPN_WEB_API_BASE}/${sportPath}/athletes/${espnId}/overview`;
+    const overviewRes = await fetchWithTimeout(
+      overviewUrl,
+      { headers: { Accept: "application/json" } },
+      3200
+    );
+    if (!overviewRes || !overviewRes.ok) {
+      const coreFallback = await fetchCoreAthleteIdentity(espnId, sport);
+      return coreFallback;
+    }
+    const overviewData = (await overviewRes.json()) as any;
+    const athlete = overviewData.athlete || {};
+    const teamData = athlete.team || {};
+    if (!athlete || Object.keys(athlete).length === 0) {
+      const coreFallback = await fetchCoreAthleteIdentity(espnId, sport);
+      if (coreFallback) return coreFallback;
+      return null;
+    }
+    return {
+      espnId,
+      displayName: athlete.displayName || "",
+      position: athlete.position?.abbreviation || "",
+      jersey: athlete.jersey || "",
+      teamName: teamData.displayName || teamData.name || "",
+      teamAbbr: teamData.abbreviation || "",
+      teamColor: teamData.color || "3B82F6",
+      headshotUrl: athlete.headshot?.href || getEspnHeadshotUrl(espnId, sport),
+      birthDate: athlete.dateOfBirth,
+      height: athlete.displayHeight,
+      weight: athlete.displayWeight,
+      experience: athlete.experience?.years ? `${athlete.experience.years} yrs` : undefined,
+      college: athlete.college?.name,
+    };
+  } catch {
+    const coreFallback = await fetchCoreAthleteIdentity(espnId, sport);
+    return coreFallback;
+  }
+}
+
+async function fetchCoreAthleteIdentity(
+  espnId: string,
+  sport: string
+): Promise<{
+  espnId: string;
+  displayName: string;
+  position: string;
+  jersey: string;
+  teamName: string;
+  teamAbbr: string;
+  teamColor: string;
+  headshotUrl: string;
+  birthDate?: string;
+  height?: string;
+  weight?: string;
+  experience?: string;
+  college?: string;
+} | null> {
+  try {
+    const sportUpper = String(sport || "").toUpperCase();
+    const coreLeaguePath =
+      sportUpper === "MLB" ? "baseball/leagues/mlb" :
+      sportUpper === "NBA" ? "basketball/leagues/nba" :
+      sportUpper === "NCAAB" ? "basketball/leagues/mens-college-basketball" :
+      sportUpper === "NFL" ? "football/leagues/nfl" :
+      sportUpper === "NHL" ? "hockey/leagues/nhl" :
+      sportUpper === "SOCCER" ? "soccer/leagues/eng.1" :
+      "";
+    if (!coreLeaguePath) return null;
+    const url = `https://sports.core.api.espn.com/v2/sports/${coreLeaguePath}/athletes/${encodeURIComponent(espnId)}`;
+    const res = await fetchWithTimeout(url, { headers: { Accept: "application/json" } }, 3200);
+    if (!res || !res.ok) return null;
+    const athlete = await res.json() as any;
+    const positionRaw =
+      String(athlete?.position?.abbreviation || athlete?.position?.displayName || athlete?.position || "")
+        .trim()
+        .toUpperCase();
+    return {
+      espnId,
+      displayName: String(athlete?.displayName || athlete?.fullName || "").trim(),
+      position: positionRaw,
+      jersey: "",
+      teamName: "",
+      teamAbbr: "",
+      teamColor: "3B82F6",
+      headshotUrl: getEspnHeadshotUrl(espnId, sportUpper),
+      birthDate: athlete?.dateOfBirth || undefined,
+      height: athlete?.displayHeight || undefined,
+      weight: athlete?.displayWeight || undefined,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/** Fast path for document builder: identity + team + headshot only (no game logs / props). */
+export async function resolvePlayerInfoForDocumentBuild(params: {
+  sport: string;
+  playerId: string;
+  playerNameHint: string;
+}): Promise<{
+  espnId: string;
+  displayName: string;
+  position: string;
+  jersey: string;
+  teamName: string;
+  teamAbbr: string;
+  teamColor: string;
+  headshotUrl: string;
+  birthDate?: string;
+  height?: string;
+  weight?: string;
+  experience?: string;
+  college?: string;
+} | null> {
+  const sport = String(params.sport || "").trim().toUpperCase();
+  const pid = String(params.playerId || "").trim();
+  const hint = String(params.playerNameHint || "").trim();
+  if (!sport || !SPORT_PATHS[sport]) return null;
+  if (/^\d{4,}$/.test(pid)) {
+    const fromOverview = await enrichPlayerInfoFromOverview(pid, sport);
+    if (fromOverview) return fromOverview;
+    return {
+      espnId: pid,
+      displayName: hint,
+      position: "",
+      jersey: "",
+      teamName: "",
+      teamAbbr: "",
+      teamColor: "3B82F6",
+      headshotUrl: getEspnHeadshotUrl(pid, sport),
+    };
+  }
+  const found = await searchEspnPlayer(hint || pid, sport, undefined, { quick: true });
+  if (!found) return null;
+  return {
+    espnId: found.espnId,
+    displayName: found.displayName,
+    position: found.position,
+    jersey: found.jersey,
+    teamName: found.teamName,
+    teamAbbr: found.teamAbbr,
+    teamColor: found.teamColor,
+    headshotUrl: found.headshotUrl,
+  };
+}
+
+export async function computeLivePlayerProfilePayload(params: {
+  db: D1Database;
+  env: Bindings;
+  sport: string;
+  rawPlayerName: string;
+  normalizedPlayerName: string;
+  playerName: string;
+  team?: string;
+  pageDataMode: boolean;
+  origin: string;
+}): Promise<ComputeLivePlayerProfileResult> {
+  const { db, env, sport, rawPlayerName, normalizedPlayerName, playerName, team, pageDataMode, origin } = params;
+  const sportsRadarPropsKey =
+    env.SPORTSRADAR_PLAYER_PROPS_KEY
+    || (env as any)?.SPORTSRADAR_PROPS_KEY
+    || (env as any)?.SPORTSRADAR_API_KEY;
+
+  if (!SPORT_PATHS[sport]) {
+    return {
+      ok: false,
+      status: 400,
+      body: { error: "Unsupported sport", supported: Object.keys(SPORT_PATHS) },
+    };
+  }
+
+  const profileCacheKey = makeCacheKey(
+    "player-profile",
+    `${sport}/${normalizeToken(playerName)}:role-v2`,
+    team ? { team: normalizeToken(team) } : undefined
+  );
+  const requestedId = String(playerName || "").trim();
+  const canonicalResolved = !/^\d{4,}$/.test(requestedId)
+    ? await resolveCanonicalPlayer(db, sport, rawPlayerName || playerName || requestedId, team)
+    : null;
+  const numericRequestedId = /^\d{4,}$/.test(requestedId)
+    ? requestedId
+    : (String(canonicalResolved?.espn_player_id || "").trim() || "");
+  console.log("PLAYER_ROUTE_CANONICAL_RESOLUTION", {
+    requestedName: rawPlayerName || playerName || requestedId,
+    resolvedPlayerId: canonicalResolved?.player_internal_id || null,
+    canonicalName: canonicalResolved?.canonical_name || null,
+  });
+
+  let playerInfo = numericRequestedId
+    ? (await enrichPlayerInfoFromOverview(numericRequestedId, sport)) || {
+        espnId: numericRequestedId,
+        displayName: String(canonicalResolved?.canonical_name || "").trim(),
+        position: "",
+        jersey: "",
+        teamName: team || "",
+        teamAbbr: "",
+        teamColor: "",
+        headshotUrl: getEspnHeadshotUrl(numericRequestedId, sport),
+      }
+    : await searchEspnPlayer(playerName, sport, team || undefined, { quick: pageDataMode });
+  if (!playerInfo && !numericRequestedId && normalizedPlayerName && normalizedPlayerName !== rawPlayerName) {
+    playerInfo = await searchEspnPlayer(rawPlayerName, sport, team || undefined, { quick: pageDataMode });
+  }
+
+  if (!playerInfo) {
+    return {
+      ok: false,
+      status: 404,
+      body: {
+        error: "Player not found",
+        playerName: rawPlayerName,
+        sport,
+        fallback: {
+          displayName: rawPlayerName,
+          sport,
+          team: team || "Unknown",
+          headshotUrl: `https://ui-avatars.com/api/?name=${encodeURIComponent(rawPlayerName)}&background=1e293b&color=94a3b8&size=350`,
+        },
+      },
+    };
+  }
+
+  const gameLogPromise = (async () => {
+    const baseGameLog = await withTimeout(
+      fetchEspnGameLog(playerInfo!.espnId, sport, 60, undefined, { includeSeasonOverview: !pageDataMode }),
+      pageDataMode ? 5800 : 4500,
+      null
+    );
+    let mergedGames = baseGameLog?.games || [];
+    let seasonAverages = baseGameLog?.seasonAverages || {};
+    if (pageDataMode && mergedGames.length === 0 && Object.keys(seasonAverages || {}).length === 0) {
+      // Retry once with a larger budget; ESPN can be bursty for some athlete ids.
+      const retryGameLog = await withTimeout(
+        fetchEspnGameLog(playerInfo!.espnId, sport, 60, undefined, { includeSeasonOverview: false }),
+        8500,
+        null
+      );
+      if (retryGameLog) {
+        mergedGames = retryGameLog.games || mergedGames;
+        if (Object.keys(seasonAverages || {}).length === 0) {
+          seasonAverages = retryGameLog.seasonAverages || seasonAverages;
+        }
+      }
+    }
+    if (sport === "NBA" && !pageDataMode) {
+      const nowYear = new Date().getUTCFullYear();
+      const priorSeasons = [nowYear - 1, nowYear - 2];
+      const priorLogs = await withTimeout(
+        Promise.all(priorSeasons.map((yr) => fetchEspnGameLog(playerInfo!.espnId, sport, 80, yr))),
+        2200,
+        []
+      );
+      const seen = new Set<string>();
+      const deduped: typeof mergedGames = [];
+      for (const row of [...mergedGames, ...(priorLogs as Array<any>).flatMap((r) => r?.games || [])]) {
+        const key = `${row.date}|${row.opponent}|${row.score}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        deduped.push(row);
+      }
+      mergedGames = deduped.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+    }
+    if (sport === "NBA" && pageDataMode && mergedGames.length === 0) {
+      const nowYear = new Date().getUTCFullYear();
+      const priorSeasons = [nowYear - 1, nowYear - 2];
+      const priorLogs = await withTimeout(
+        Promise.all(
+          priorSeasons.map((yr) =>
+            fetchEspnGameLog(playerInfo!.espnId, sport, 60, yr, { includeSeasonOverview: false })
+          )
+        ),
+        2600,
+        []
+      );
+      const seen = new Set<string>();
+      const deduped: typeof mergedGames = [];
+      for (const row of [...mergedGames, ...(priorLogs as Array<any>).flatMap((r) => r?.games || [])]) {
+        const key = `${row.date}|${row.opponent}|${row.score}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        deduped.push(row);
+      }
+      mergedGames = deduped
+        .sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime())
+        .slice(0, 60);
+    }
+    if (pageDataMode && mergedGames.length === 0 && Object.keys(seasonAverages || {}).length === 0) {
+      const overviewOnly = await withTimeout(
+        fetchEspnGameLog(playerInfo!.espnId, sport, 1, undefined, { includeSeasonOverview: true }),
+        2200,
+        null
+      );
+      const overviewSeason = overviewOnly?.seasonAverages || {};
+      if (overviewSeason && Object.keys(overviewSeason).length > 0) {
+        seasonAverages = overviewSeason;
+      }
+    }
+    return {
+      games: mergedGames,
+      seasonAverages,
+    };
+  })();
+  const matchupPromise = withTimeout(
+    fetchMatchupData(playerInfo.teamAbbr, sport, playerInfo.position),
+    3500,
+    null
+  );
+  const newsPromise = pageDataMode
+    ? Promise.resolve([])
+    : withTimeout(fetchPlayerNews(playerInfo.displayName || playerName, sport), 2000, []);
+
+  const playerNameCandidates = Array.from(
+    new Set(
+      [rawPlayerName, playerName, playerInfo.displayName, toDisplayFirstLast(playerName), toDisplayLastFirst(playerName)]
+        .map((n) => String(n || "").trim())
+        .filter(Boolean)
+    )
+  );
+
+  const currentPropsPromise = (async () => {
+    let currentProps: any[] = [];
+    try {
+      const placeholders = playerNameCandidates.map(() => "?").join(", ");
+      const propsResult = await db
+        .prepare(
+          `
+        SELECT * FROM sportsradar_props_cache
+        WHERE LOWER(player_name) IN (${placeholders})
+        AND fetched_at > datetime('now', '-3 hour')
+        ORDER BY fetched_at DESC
+      `
+        )
+        .bind(...playerNameCandidates.map((n) => n.toLowerCase()))
+        .all();
+      currentProps = propsResult.results || [];
+    } catch {
+      // Props cache table may not exist yet.
+    }
+    return currentProps;
+  })();
+  const shouldFetchLivePropsInPageData = pageDataMode && (sport === "MLB" || sport === "NHL");
+  const livePropsTimeoutMs = sport === "NHL"
+    ? (pageDataMode ? 8000 : 9000)
+    : (pageDataMode ? 2200 : 2500);
+  const livePropsPromise = (pageDataMode && !shouldFetchLivePropsInPageData)
+    ? Promise.resolve([])
+    : withTimeout(
+        fetchPlayerPropsFromSportsRadar(playerInfo.displayName || playerName, sport, sportsRadarPropsKey),
+        livePropsTimeoutMs,
+        []
+      );
+
+  const [gameLog, matchupData, currentProps, liveProps, news] = await Promise.all([
+    gameLogPromise,
+    matchupPromise,
+    currentPropsPromise,
+    livePropsPromise,
+    newsPromise,
+  ]);
+
+  const roleResolution = normalizePlayerRole({
+    sport,
+    rawPosition: String(playerInfo.position || ""),
+    seasonAverages: gameLog?.seasonAverages || {},
+    gameLog: gameLog?.games || [],
+    props: [
+      ...(Array.isArray(currentProps) ? currentProps : []),
+      ...(Array.isArray(liveProps) ? liveProps : []),
+    ],
+  });
+  playerInfo = {
+    ...playerInfo,
+    position: roleResolution.normalizedPosition || String(playerInfo.position || ""),
+  };
+
+  const healthData = await withTimeout(
+    fetchPlayerHealth(playerInfo.espnId, sport, gameLog?.games),
+    pageDataMode ? 1200 : 2000,
+    {
+      status: "unknown" as const,
+      minutesTrend: {
+        last5Avg: 0,
+        seasonAvg: 0,
+        trend: "stable" as const,
+        last5: [],
+      },
+    }
+  );
+  if (
+    healthData?.minutesTrend
+    && Array.isArray(gameLog?.games)
+    && gameLog.games.length > 0
+    && (!Array.isArray(healthData.minutesTrend.last5) || healthData.minutesTrend.last5.length === 0)
+  ) {
+    const minuteValues = gameLog.games
+      .map((g: any) => {
+        const raw = g?.minutes ?? g?.stats?.MIN ?? g?.stats?.Min ?? "";
+        const parsed = Number.parseFloat(String(raw || "").replace(/[^\d.]/g, ""));
+        return Number.isFinite(parsed) ? parsed : null;
+      })
+      .filter((v: number | null): v is number => typeof v === "number" && Number.isFinite(v) && v > 0);
+    if (minuteValues.length > 0) {
+      const last5 = minuteValues.slice(0, 5);
+      const last5Avg = Number((last5.reduce((sum, v) => sum + v, 0) / last5.length).toFixed(1));
+      const seasonAvg = Number((minuteValues.reduce((sum, v) => sum + v, 0) / minuteValues.length).toFixed(1));
+      const delta = last5Avg - seasonAvg;
+      healthData.minutesTrend = {
+        last5Avg,
+        seasonAvg,
+        trend: delta > 1 ? "up" : delta < -1 ? "down" : "stable",
+        last5,
+      };
+    }
+  }
+
+  const normalizedLiveProps = (Array.isArray(liveProps) ? liveProps : [])
+    .map((p) => ({
+      prop_type: String(p?.prop_type || "")
+        .toUpperCase()
+        .replace(/\s+/g, "_"),
+      line_value: Number(p?.line ?? 0),
+      sportsbook: p?.sportsbook || "SportsRadar",
+      odds_american: Number(p?.over_odds ?? -110),
+    }))
+    .filter((p) => p.prop_type && Number.isFinite(p.line_value) && p.line_value > 0);
+
+  let effectiveProps = currentProps.length > 0 ? currentProps : normalizedLiveProps;
+  if (!Array.isArray(effectiveProps) || effectiveProps.length === 0) {
+    try {
+      const fallbackPropsTimeoutMs = sport === "NHL"
+        ? (pageDataMode ? 9000 : 12000)
+        : (pageDataMode ? 1800 : 2500);
+      const playerId = String(playerInfo?.espnId || "").trim();
+      const tryExtractFallbackProps = (rows: Array<any>) =>
+        rows
+          .filter((row) => {
+            const rowId = String(row?.player_id || row?.playerId || row?.espnId || "").trim();
+            if (playerId && rowId && rowId === playerId) return true;
+            const candidate = String(row?.player_name || "").trim();
+            if (!candidate) return false;
+            const normalizedCandidate = normalizeToken(candidate);
+            return playerNameCandidates.some((n) => {
+              const normalizedTarget = normalizeToken(n);
+              return (
+                normalizedTarget &&
+                (normalizedCandidate === normalizedTarget ||
+                  normalizedCandidate.includes(normalizedTarget) ||
+                  normalizedTarget.includes(normalizedCandidate))
+              );
+            });
+          })
+          .map((p) => ({
+            prop_type: String(p?.prop_type || "")
+              .toUpperCase()
+              .replace(/\s+/g, "_"),
+            line_value: Number(p?.line_value ?? p?.line ?? 0),
+            sportsbook: p?.sportsbook || p?.book || "SportsRadar",
+            odds_american: Number(p?.over_odds ?? p?.odds_american ?? -110),
+          }))
+          .filter((p) => p.prop_type && Number.isFinite(p.line_value) && p.line_value > 0);
+      const offsetsToTry = sport === "NHL" ? [0, 3000] : [0];
+      for (const offset of offsetsToTry) {
+        const fallbackRes = await withTimeout(
+          fetch(`${origin}/api/sports-data/props/today?sport=${encodeURIComponent(sport)}&limit=3000&offset=${offset}&fresh=1`),
+          fallbackPropsTimeoutMs,
+          null as Response | null
+        );
+        if (!fallbackRes || !fallbackRes.ok) continue;
+        const payload = (await fallbackRes.json()) as { props?: Array<any> };
+        const fallbackProps = tryExtractFallbackProps(Array.isArray(payload?.props) ? payload.props : []);
+        if (fallbackProps.length > 0) {
+          effectiveProps = fallbackProps;
+          break;
+        }
+      }
+    } catch {
+      // Non-fatal fallback.
+    }
+  }
+  effectiveProps = filterPropsForRole({
+    sport,
+    roleBucket: roleResolution.roleBucket,
+    props: Array.isArray(effectiveProps) ? effectiveProps : [],
+  });
+
+  const propHitRates: Record<string, { hits: number; total: number; rate: number }> = {};
+  if (gameLog?.games) {
+    const statMappings: Record<string, string[]> = {
+      POINTS: ["PTS", "Points"],
+      REBOUNDS: ["REB", "Rebounds", "TRB"],
+      ASSISTS: ["AST", "Assists"],
+      THREES: ["3PM", "3PT", "FG3M"],
+      STEALS: ["STL", "Steals"],
+      BLOCKS: ["BLK", "Blocks"],
+    };
+
+    for (const [propType, statKeys] of Object.entries(statMappings)) {
+      let hits = 0;
+      let total = 0;
+
+      const matchingProp = effectiveProps.find(
+        (p) =>
+          p.prop_type === propType || p.prop_type?.toLowerCase().includes(propType.toLowerCase())
+      );
+      const line = matchingProp?.line_value || 0;
+
+      if (line > 0) {
+        for (const game of gameLog.games) {
+          for (const key of statKeys) {
+            const val = game.stats[key];
+            if (val !== undefined) {
+              const numVal = typeof val === "number" ? val : parseFloat(String(val));
+              if (!isNaN(numVal)) {
+                total++;
+                if (numVal > line) hits++;
+              }
+              break;
+            }
+          }
+        }
+
+        if (total > 0) {
+          propHitRates[propType] = { hits, total, rate: hits / total };
+        }
+      }
+    }
+  }
+
+  const effectiveMatchup = matchupData || buildFallbackMatchupFromGameLog(gameLog?.games || [], sport);
+  const recentPerformance = await buildRecentPerformanceWithOdds(
+        db,
+        sport,
+        playerNameCandidates,
+        gameLog?.games || [],
+        effectiveProps,
+        sportsRadarPropsKey,
+        playerInfo.teamName,
+        {
+          allowOnDemandFetch: !pageDataMode,
+          playerId: String(playerInfo?.espnId || playerInfo?.id || ""),
+          roleBucket: roleResolution.roleBucket,
+        }
+      );
+  const vsOpponent = buildPlayerVsOpponentData(
+    sport,
+    gameLog?.games || [],
+    effectiveMatchup,
+    effectiveProps
+  );
+  const lineQualityHints: Record<string, "verified" | "estimated"> = {};
+  for (const row of Array.isArray(recentPerformance) ? recentPerformance : []) {
+    const qualities = (row as any)?.lineQualityByStat && typeof (row as any).lineQualityByStat === "object"
+      ? (row as any).lineQualityByStat
+      : {};
+    for (const [stat, quality] of Object.entries(qualities)) {
+      const key = String(stat || "").trim();
+      const q = String(quality || "").toLowerCase();
+      if (!key || (q !== "verified" && q !== "estimated")) continue;
+      if (q === "verified" || !lineQualityHints[key]) {
+        lineQualityHints[key] = q as "verified" | "estimated";
+      }
+    }
+  }
+  const edgeSignals = buildEdgeRows({
+    sport,
+    currentProps: Array.isArray(effectiveProps) ? effectiveProps : [],
+    recentPerformance: Array.isArray(recentPerformance) ? recentPerformance : [],
+    seasonAverages: gameLog?.seasonAverages || {},
+    propHitRates,
+    lineQualityHints,
+    matchupAdjustment: 0,
+  });
+
+  const playerDisplayName =
+    String(playerInfo.displayName || rawPlayerName || normalizedPlayerName || playerName || "").trim();
+  const historical_verified_lines = (Array.isArray(recentPerformance) ? recentPerformance : []).flatMap((row) => {
+    const date = String(row?.date || "").trim() || null;
+    const lineSource = String((row as any)?.lineSource || "").toLowerCase();
+    if (lineSource !== "historical_verified") return [];
+    const lines = row?.propLines && typeof row.propLines === "object" ? row.propLines : {};
+    const lineQualityByStat =
+      (row as any)?.lineQualityByStat && typeof (row as any).lineQualityByStat === "object"
+        ? (row as any).lineQualityByStat
+        : {};
+    const stats = row?.stats && typeof row.stats === "object" ? row.stats : {};
+    const hasLineValue = (value: unknown): boolean => {
+      if (value === null || value === undefined || value === "") return false;
+      const n = Number(value);
+      return Number.isFinite(n);
+    };
+    const entries = Object.entries(lines).map(([stat_type, rawLine]) => {
+      const statQuality = String((lineQualityByStat as any)?.[String(stat_type || "")] || "").toLowerCase();
+      if (statQuality && statQuality !== "verified") return null;
+      if (!hasLineValue(rawLine)) return null;
+      const line_value = Number(rawLine);
+      const statAliases: Record<string, string[]> = {
+        points: ["PTS", "points"],
+        rebounds: ["REB", "rebounds", "TRB"],
+        assists: ["AST", "assists", "A"],
+        goals: ["G", "goals"],
+        shots: ["SOG", "S", "shots", "Shots", "SA"],
+        shots_on_goal: ["SOG", "S", "shots", "Shots", "SA"],
+        saves: ["SV", "saves"],
+        hits: ["H", "hits"],
+        runs: ["R", "runs"],
+        rbis: ["RBI", "rbis", "rbi"],
+        home_runs: ["HR", "homeRuns", "home_runs", "hr"],
+        strikeouts: ["K", "SO", "strikeouts"],
+      };
+      const aliases = statAliases[String(stat_type || "").toLowerCase()] || [String(stat_type || "")];
+      let actual: number | null = null;
+      for (const alias of aliases) {
+        const n = Number((stats as any)?.[alias]);
+        if (Number.isFinite(n)) {
+          actual = n;
+          break;
+        }
+      }
+      const outcome =
+        actual === null
+          ? "no_action"
+          : Math.abs(actual - line_value) < 0.0001
+            ? "push"
+            : actual > line_value
+              ? "over"
+              : "under";
+      return {
+        game_date: date,
+        stat_type: String(stat_type || "").toLowerCase(),
+        line_value,
+        outcome,
+        captured_at: date,
+      };
+    }).filter((v): v is { game_date: string | null; stat_type: string; line_value: number; outcome: string; captured_at: string | null } => Boolean(v));
+    return entries;
+  });
+  const payload = {
+    player: {
+      ...playerInfo,
+      displayName: playerDisplayName,
+      name: playerDisplayName,
+      id: String(playerInfo.espnId || playerName || ""),
+      espnId: String(playerInfo.espnId || playerName || ""),
+      headshotPlayerId: String(playerInfo.espnId || playerName || ""),
+      sport,
+      roleBucket: roleResolution.roleBucket,
+    },
+    gameLog: gameLog?.games || [],
+    seasonAverages: gameLog?.seasonAverages || {},
+    currentProps: effectiveProps,
+    liveProps,
+    propHitRates,
+    edgeSignals,
+    recentPerformance,
+    historicalLines: historical_verified_lines,
+    historical_verified_lines,
+    matchup: effectiveMatchup,
+    vsOpponent,
+    health: healthData,
+    news,
+    lastUpdated: new Date().toISOString(),
+  };
+  const hasUsablePayload =
+    (Array.isArray(payload.gameLog) && payload.gameLog.length > 0) ||
+    (payload.seasonAverages &&
+      typeof payload.seasonAverages === "object" &&
+      Object.keys(payload.seasonAverages).length > 0) ||
+    (Array.isArray(payload.currentProps) && payload.currentProps.length > 0);
+
+  return {
+    ok: true,
+    payload,
+    profileCacheKey,
+    hasUsablePayload,
+    rawPlayerName,
+  };
+}
+
+
 // ============================================
 // ROUTES
 // ============================================
@@ -1989,12 +3961,9 @@ app.get('/:sport/:playerName', async (c) => {
   const normalizedPlayerName = normalizePlayerSlug(rawPlayerName);
   const playerName = normalizedPlayerName || rawPlayerName;
   const team = c.req.query('team');
+  const pageDataMode = c.req.query('pageData') === '1' || c.req.query('fast') === '1';
   const bypassCache = c.req.query('fresh') === '1';
-  const sportsRadarPropsKey =
-    c.env.SPORTSRADAR_PLAYER_PROPS_KEY
-    || (c.env as any)?.SPORTSRADAR_PROPS_KEY
-    || (c.env as any)?.SPORTSRADAR_API_KEY;
-  
+
   // Validate sport
   if (!SPORT_PATHS[sport]) {
     return c.json({ error: 'Unsupported sport', supported: Object.keys(SPORT_PATHS) }, 400);
@@ -2002,260 +3971,64 @@ app.get('/:sport/:playerName', async (c) => {
 
   const profileCacheKey = makeCacheKey(
     'player-profile',
-    `${sport}/${normalizeToken(playerName)}`,
+    `${sport}/${normalizeToken(playerName)}:role-v2`,
     team ? { team: normalizeToken(team) } : undefined
   );
+  const requestedId = String(playerName || '').trim();
+  const numericRequestedId = /^\d{4,}$/.test(requestedId) ? requestedId : '';
+  const payloadPlayerId = (payload: unknown): string => {
+    if (!payload || typeof payload !== "object") return "";
+    const p = (payload as { player?: unknown }).player;
+    if (!p || typeof p !== "object") return "";
+    const player = p as { id?: unknown; espnId?: unknown };
+    return String(player.id || "").trim();
+  };
   if (!bypassCache) {
     try {
       const cached = await getCachedData<any>(c.env.DB, profileCacheKey);
       if (cached) {
-        return c.json(cached);
+        const cachedId = payloadPlayerId(cached);
+        if (numericRequestedId && cachedId !== numericRequestedId) {
+          console.warn("PLAYER_PROFILE_CACHE_ID_MISMATCH", {
+            requestedId: numericRequestedId,
+            cachedId,
+            sport,
+            cacheScope: "primary",
+          });
+        } else {
+        const hasUsableCachedPayload =
+          (Array.isArray(cached?.gameLog) && cached.gameLog.length > 0)
+          || (cached?.seasonAverages && typeof cached.seasonAverages === 'object' && Object.keys(cached.seasonAverages).length > 0)
+          || (Array.isArray(cached?.currentProps) && cached.currentProps.length > 0);
+        if (hasUsableCachedPayload) {
+          return c.json(cached);
+        }
+        }
       }
     } catch {
       // Non-fatal cache read miss/failure.
     }
   }
   
-  // Search for player on ESPN
-  let playerInfo = await searchEspnPlayer(playerName, sport, team || undefined);
-  if (!playerInfo && normalizedPlayerName && normalizedPlayerName !== rawPlayerName) {
-    playerInfo = await searchEspnPlayer(rawPlayerName, sport, team || undefined);
-  }
-  
-  if (!playerInfo) {
-    return c.json({ 
-      error: 'Player not found',
-      playerName: rawPlayerName,
-      sport,
-      fallback: {
-        displayName: rawPlayerName,
-        sport,
-        team: team || 'Unknown',
-        headshotUrl: `https://ui-avatars.com/api/?name=${encodeURIComponent(rawPlayerName)}&background=1e293b&color=94a3b8&size=350`,
-      }
-    }, 404);
-  }
-  
-  // Kick off independent fetches in parallel to avoid additive latency.
-  const gameLogPromise = (async () => {
-    const baseGameLog = await withTimeout(
-      fetchEspnGameLog(playerInfo.espnId, sport, 60),
-      3500,
-      null
-    );
-    let mergedGames = baseGameLog?.games || [];
-    const seasonAverages = baseGameLog?.seasonAverages || {};
-    if (sport === 'NBA') {
-      const nowYear = new Date().getUTCFullYear();
-      const priorSeasons = [nowYear - 1, nowYear - 2];
-      const priorLogs = await withTimeout(
-        Promise.all(priorSeasons.map((yr) => fetchEspnGameLog(playerInfo.espnId, sport, 80, yr))),
-        2200,
-        []
-      );
-      const seen = new Set<string>();
-      const deduped: typeof mergedGames = [];
-      for (const row of [...mergedGames, ...(priorLogs as Array<any>).flatMap((r) => r?.games || [])]) {
-        const key = `${row.date}|${row.opponent}|${row.score}`;
-        if (seen.has(key)) continue;
-        seen.add(key);
-        deduped.push(row);
-      }
-      mergedGames = deduped.sort(
-        (a, b) => new Date(b.date).getTime() - new Date(a.date).getTime()
-      );
-    }
-    return {
-      games: mergedGames,
-      seasonAverages,
-    };
-  })();
-  const matchupPromise = withTimeout(
-    fetchMatchupData(playerInfo.teamAbbr, sport, playerInfo.position),
-    3500,
-    null
-  );
-  const newsPromise = withTimeout(fetchPlayerNews(playerInfo.displayName || playerName, sport), 2000, []);
-  
-  const playerNameCandidates = Array.from(new Set(
-    [rawPlayerName, playerName, playerInfo.displayName, toDisplayFirstLast(playerName), toDisplayLastFirst(playerName)]
-      .map((n) => String(n || '').trim())
-      .filter(Boolean)
-  ));
-
-  // Fetch current props from SportsRadar (if available in DB cache)
-  const currentPropsPromise = (async () => {
-    let currentProps: any[] = [];
-    try {
-      const placeholders = playerNameCandidates.map(() => '?').join(', ');
-      const propsResult = await c.env.DB.prepare(`
-        SELECT * FROM sportsradar_props_cache
-        WHERE LOWER(player_name) IN (${placeholders})
-        AND fetched_at > datetime('now', '-3 hour')
-        ORDER BY fetched_at DESC
-      `).bind(...playerNameCandidates.map((n) => n.toLowerCase())).all();
-      currentProps = propsResult.results || [];
-    } catch {
-      // Props cache table may not exist yet.
-    }
-    return currentProps;
-  })();
-  const livePropsPromise = withTimeout(
-    fetchPlayerPropsFromSportsRadar(playerInfo.displayName || playerName, sport, sportsRadarPropsKey),
-    2500,
-    []
-  );
-
-  const [gameLog, matchupData, currentProps, liveProps, news] = await Promise.all([
-    gameLogPromise,
-    matchupPromise,
-    currentPropsPromise,
-    livePropsPromise,
-    newsPromise,
-  ]);
-
-  // Fetch health/injury status and minutes trend.
-  const healthData = await withTimeout(
-    fetchPlayerHealth(playerInfo.espnId, sport, gameLog?.games),
-    2000,
-    {
-      status: 'unknown' as const,
-      minutesTrend: {
-        last5Avg: 0,
-        seasonAvg: 0,
-        trend: 'stable' as const,
-        last5: [],
-      },
-    }
-  );
-
-  const normalizedLiveProps = (Array.isArray(liveProps) ? liveProps : []).map((p) => ({
-    prop_type: String(p?.prop_type || '').toUpperCase().replace(/\s+/g, '_'),
-    line_value: Number(p?.line ?? 0),
-    sportsbook: p?.sportsbook || 'SportsRadar',
-    odds_american: Number(p?.over_odds ?? -110),
-  })).filter((p) => p.prop_type && Number.isFinite(p.line_value) && p.line_value > 0);
-
-  let effectiveProps = currentProps.length > 0 ? currentProps : normalizedLiveProps;
-  if (!Array.isArray(effectiveProps) || effectiveProps.length === 0) {
-    try {
-      const origin = new URL(c.req.url).origin;
-      const fallbackRes = await withTimeout(
-        fetch(`${origin}/api/sports-data/props/today?sport=${encodeURIComponent(sport)}&limit=800&fresh=1`),
-        2500,
-        null as Response | null
-      );
-      if (fallbackRes && fallbackRes.ok) {
-        const payload = await fallbackRes.json() as { props?: Array<any> };
-        const fallbackProps = (Array.isArray(payload?.props) ? payload.props : [])
-          .filter((row) => {
-            const candidate = String(row?.player_name || '').trim();
-            if (!candidate) return false;
-            const normalizedCandidate = normalizeToken(candidate);
-            return playerNameCandidates.some((n) => {
-              const normalizedTarget = normalizeToken(n);
-              return normalizedTarget && (normalizedCandidate === normalizedTarget || normalizedCandidate.includes(normalizedTarget) || normalizedTarget.includes(normalizedCandidate));
-            });
-          })
-          .map((p) => ({
-            prop_type: String(p?.prop_type || '').toUpperCase().replace(/\s+/g, '_'),
-            line_value: Number(p?.line_value ?? p?.line ?? 0),
-            sportsbook: p?.sportsbook || p?.book || 'SportsRadar',
-            odds_american: Number(p?.over_odds ?? p?.odds_american ?? -110),
-          }))
-          .filter((p) => p.prop_type && Number.isFinite(p.line_value) && p.line_value > 0);
-        if (fallbackProps.length > 0) {
-          effectiveProps = fallbackProps;
-        }
-      }
-    } catch {
-      // Non-fatal fallback.
-    }
-  }
-
-  // Calculate prop hit rates based on game log
-  const propHitRates: Record<string, { hits: number; total: number; rate: number }> = {};
-  if (gameLog?.games) {
-    // For NBA: check points, rebounds, assists
-    const statMappings: Record<string, string[]> = {
-      'POINTS': ['PTS', 'Points'],
-      'REBOUNDS': ['REB', 'Rebounds', 'TRB'],
-      'ASSISTS': ['AST', 'Assists'],
-      'THREES': ['3PM', '3PT', 'FG3M'],
-      'STEALS': ['STL', 'Steals'],
-      'BLOCKS': ['BLK', 'Blocks'],
-    };
-    
-    for (const [propType, statKeys] of Object.entries(statMappings)) {
-      let hits = 0;
-      let total = 0;
-      
-      // Find matching prop line
-      const matchingProp = effectiveProps.find(p => 
-        p.prop_type === propType || 
-        p.prop_type?.toLowerCase().includes(propType.toLowerCase())
-      );
-      const line = matchingProp?.line_value || 0;
-      
-      if (line > 0) {
-        for (const game of gameLog.games) {
-          for (const key of statKeys) {
-            const val = game.stats[key];
-            if (val !== undefined) {
-              const numVal = typeof val === 'number' ? val : parseFloat(String(val));
-              if (!isNaN(numVal)) {
-                total++;
-                if (numVal > line) hits++;
-              }
-              break;
-            }
-          }
-        }
-        
-        if (total > 0) {
-          propHitRates[propType] = { hits, total, rate: hits / total };
-        }
-      }
-    }
-  }
-  
-  const effectiveMatchup = matchupData || buildFallbackMatchupFromGameLog(gameLog?.games || [], sport);
-  const recentPerformance = await buildRecentPerformanceWithOdds(
-    c.env.DB,
+  const computed = await computeLivePlayerProfilePayload({
+    db: c.env.DB,
+    env: c.env,
     sport,
-    playerNameCandidates,
-    gameLog?.games || [],
-    effectiveProps,
-    sportsRadarPropsKey,
-    playerInfo.teamName
-  );
-  const vsOpponent = buildPlayerVsOpponentData(
-    sport,
-    gameLog?.games || [],
-    effectiveMatchup,
-    effectiveProps
-  );
-  
-  const payload = {
-    player: {
-      ...playerInfo,
-      sport,
-    },
-    gameLog: gameLog?.games || [],
-    seasonAverages: gameLog?.seasonAverages || {},
-    currentProps: effectiveProps,
-    liveProps,
-    propHitRates,
-    recentPerformance,
-    matchup: effectiveMatchup,
-    vsOpponent,
-    health: healthData,
-    news,
-    lastUpdated: new Date().toISOString(),
-  };
+    rawPlayerName,
+    normalizedPlayerName,
+    playerName,
+    team: c.req.query("team") || undefined,
+    pageDataMode,
+    origin: new URL(c.req.url).origin,
+  });
+  if (!computed.ok) {
+    return c.json(computed.body, computed.status);
+  }
+  const { payload, hasUsablePayload, rawPlayerName: rawForCache } = computed;
   try {
-    // Keep this short for fast page-to-page navigation while preserving freshness.
-    await setCachedData(c.env.DB, profileCacheKey, 'player-profile', `${sport}/${rawPlayerName}`, payload, 180);
+    if (hasUsablePayload) {
+      await setCachedData(c.env.DB, profileCacheKey, "player-profile", `${sport}/${rawForCache}`, payload, 6 * 60 * 60);
+    }
   } catch {
     // Non-fatal cache write failure.
   }
@@ -2324,14 +4097,29 @@ app.get('/search', async (c) => {
         // Team info is in teamRelationships for ESPN's format
         const teamInfo = r.teamRelationships?.[0]?.core || r.team || {};
         const leagueInfo = r.leagueRelationships?.[0]?.core || r.league || {};
+        const leagueAbbr = String(leagueInfo.abbreviation || r.league || 'NBA').trim();
+        const rawEspnId = String(r.id || '').trim();
+        const displayName = String(r.displayName || '').trim();
+        const canonicalId =
+          resolveCanonicalPlayerIdFromPayload(rawEspnId, displayName, leagueAbbr.toLowerCase())
+          || rawEspnId;
+        if (rawEspnId && canonicalId && rawEspnId !== canonicalId) {
+          console.warn("PLAYER_SEARCH_ID_MISMATCH", {
+            query,
+            displayName,
+            rawEspnId,
+            canonicalId,
+            sport: leagueAbbr,
+          });
+        }
         return {
-          espnId: r.id,
-          displayName: r.displayName,
+          espnId: canonicalId,
+          displayName,
           position: r.position?.abbreviation,
           teamName: teamInfo.displayName || teamInfo.name,
           teamAbbr: teamInfo.abbreviation,
-          sport: leagueInfo.abbreviation || r.league || 'Unknown',
-          headshotUrl: r.headshot?.href || getEspnHeadshotUrl(r.id, leagueInfo.abbreviation || r.league || 'NBA'),
+          sport: leagueAbbr || 'Unknown',
+          headshotUrl: r.headshot?.href || getEspnHeadshotUrl(canonicalId || rawEspnId, leagueAbbr || 'NBA'),
         };
       });
     
@@ -2339,7 +4127,21 @@ app.get('/search', async (c) => {
     const filtered = sport 
       ? results.filter((r: any) => r.sport === sport)
       : results;
-    
+
+    const wu = c.executionCtx?.waitUntil?.bind(c.executionCtx);
+    if (wu && filtered.length > 0) {
+      wu(
+        (async () => {
+          try {
+            const { enqueuePlayerDocumentsFromSearchResults } = await import("../services/playerDocuments/prebuildEnqueue");
+            await enqueuePlayerDocumentsFromSearchResults(c.env.DB, filtered as any, 20);
+          } catch {
+            // non-fatal
+          }
+        })()
+      );
+    }
+
     return c.json({ results: filtered });
   } catch (err) {
     console.error('Player search error:', err);

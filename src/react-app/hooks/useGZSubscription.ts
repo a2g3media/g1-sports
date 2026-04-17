@@ -108,54 +108,174 @@ const ANONYMOUS_SUBSCRIPTION: UserSubscription = {
   downgradeToProductKey: null,
 };
 
+// Non-blocking fallback for authenticated users when subscription endpoint fails.
+const FREE_FALLBACK_FEATURES: FeatureAccess = {
+  ...ANONYMOUS_FEATURES,
+  canViewPools: true,
+};
+
+const REFRESH_COOLDOWN_MS = 30_000;
+const FAILURE_BACKOFF_BASE_MS = 15_000;
+const FAILURE_BACKOFF_MAX_MS = 5 * 60_000;
+const SUBSCRIPTION_FETCH_TIMEOUT_MS = 2_500;
+
+type SharedSubscriptionState = {
+  subscription: UserSubscription;
+  features: FeatureAccess;
+  isLoading: boolean;
+  error: string | null;
+  activeUserId: string;
+  failureCount: number;
+  lastAttemptAtMs: number;
+};
+
+const sharedSubscriptionState: SharedSubscriptionState = {
+  subscription: ANONYMOUS_SUBSCRIPTION,
+  features: ANONYMOUS_FEATURES,
+  isLoading: false,
+  error: null,
+  activeUserId: "",
+  failureCount: 0,
+  lastAttemptAtMs: 0,
+};
+
+const subscriptionListeners = new Set<(next: SharedSubscriptionState) => void>();
+let subscriptionInflight: Promise<void> | null = null;
+
+function emitSubscriptionState(): void {
+  for (const listener of subscriptionListeners) {
+    listener({ ...sharedSubscriptionState });
+  }
+}
+
+function buildFreeFallbackSubscription(userId: string): UserSubscription {
+  return {
+    userId,
+    tier: 'free',
+    productKey: null,
+    billingPeriod: null,
+    status: 'active',
+    isTrialing: false,
+    trialEndsAt: null,
+    currentPeriodEnd: null,
+    cancelAtPeriodEnd: false,
+    downgradeToProductKey: null,
+  };
+}
+
+async function readSubscriptionFromApi(): Promise<{ subscription: UserSubscription; features: FeatureAccess }> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), SUBSCRIPTION_FETCH_TIMEOUT_MS);
+  try {
+    const res = await fetch("/api/subscription", {
+      credentials: "include",
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      throw new Error(`Failed to fetch subscription (HTTP ${res.status})`);
+    }
+    const data = await res.json();
+    return {
+      subscription: data.subscription as UserSubscription,
+      features: data.features as FeatureAccess,
+    };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 export function useGZSubscription(): SubscriptionData {
   const { user } = useDemoAuth();
-  const [subscription, setSubscription] = useState<UserSubscription>(ANONYMOUS_SUBSCRIPTION);
-  const [features, setFeatures] = useState<FeatureAccess>(ANONYMOUS_FEATURES);
-  const [isLoading, setIsLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const [subscription, setSubscription] = useState<UserSubscription>(sharedSubscriptionState.subscription);
+  const [features, setFeatures] = useState<FeatureAccess>(sharedSubscriptionState.features);
+  const [isLoading, setIsLoading] = useState(sharedSubscriptionState.isLoading);
+  const [error, setError] = useState<string | null>(sharedSubscriptionState.error);
 
   const fetchSubscription = useCallback(async () => {
     if (!user) {
-      setSubscription(ANONYMOUS_SUBSCRIPTION);
-      setFeatures(ANONYMOUS_FEATURES);
-      setIsLoading(false);
+      sharedSubscriptionState.subscription = ANONYMOUS_SUBSCRIPTION;
+      sharedSubscriptionState.features = ANONYMOUS_FEATURES;
+      sharedSubscriptionState.isLoading = false;
+      sharedSubscriptionState.error = null;
+      sharedSubscriptionState.activeUserId = "";
+      sharedSubscriptionState.failureCount = 0;
+      sharedSubscriptionState.lastAttemptAtMs = Date.now();
+      emitSubscriptionState();
       return;
     }
 
-    try {
-      setError(null);
-      const res = await fetch("/api/subscription", {
-        credentials: "include",
-      });
+    const userId = String(user.id || "").trim();
+    const nowMs = Date.now();
+    const backoffMs = Math.min(
+      FAILURE_BACKOFF_MAX_MS,
+      FAILURE_BACKOFF_BASE_MS * Math.max(1, sharedSubscriptionState.failureCount || 1)
+    );
+    const minIntervalMs = sharedSubscriptionState.failureCount > 0
+      ? Math.max(REFRESH_COOLDOWN_MS, backoffMs)
+      : REFRESH_COOLDOWN_MS;
+    const sameUser = sharedSubscriptionState.activeUserId === userId;
+    if (
+      sameUser
+      && sharedSubscriptionState.lastAttemptAtMs > 0
+      && nowMs - sharedSubscriptionState.lastAttemptAtMs < minIntervalMs
+    ) {
+      return;
+    }
+    if (subscriptionInflight) {
+      await subscriptionInflight;
+      return;
+    }
 
-      if (res.ok) {
-        const data = await res.json();
-        setSubscription(data.subscription);
-        setFeatures(data.features);
-      } else {
-        throw new Error("Failed to fetch subscription");
-      }
+    const firstLoadForUser = !sameUser;
+    sharedSubscriptionState.activeUserId = userId;
+    sharedSubscriptionState.lastAttemptAtMs = nowMs;
+    sharedSubscriptionState.isLoading = firstLoadForUser;
+    emitSubscriptionState();
+
+    subscriptionInflight = (async () => {
+    try {
+      const data = await readSubscriptionFromApi();
+      sharedSubscriptionState.subscription = data.subscription;
+      sharedSubscriptionState.features = data.features;
+      sharedSubscriptionState.error = null;
+      sharedSubscriptionState.failureCount = 0;
     } catch (err) {
-      console.error("Failed to fetch subscription:", err);
-      setError(err instanceof Error ? err.message : "Unknown error");
-      // Fallback to free tier on error
-      setSubscription({
-        userId: user.id,
-        tier: 'free',
-        productKey: null,
-        billingPeriod: null,
-        status: 'active',
-        isTrialing: false,
-        trialEndsAt: null,
-        currentPeriodEnd: null,
-        cancelAtPeriodEnd: false,
-        downgradeToProductKey: null,
+      const message = err instanceof Error ? err.message : "Unknown error";
+      sharedSubscriptionState.error = message;
+      sharedSubscriptionState.failureCount = Math.min(8, (sharedSubscriptionState.failureCount || 0) + 1);
+      // Safe fallback: page render should continue regardless of subscription endpoint health.
+      sharedSubscriptionState.subscription = buildFreeFallbackSubscription(userId);
+      sharedSubscriptionState.features = FREE_FALLBACK_FEATURES;
+      console.warn("[subscription] non-blocking fallback applied", {
+        userId,
+        failureCount: sharedSubscriptionState.failureCount,
+        message,
       });
     } finally {
-      setIsLoading(false);
+      sharedSubscriptionState.isLoading = false;
+      emitSubscriptionState();
+    }
+    })();
+    try {
+      await subscriptionInflight;
+    } finally {
+      subscriptionInflight = null;
     }
   }, [user]);
+
+  useEffect(() => {
+    const onChange = (next: SharedSubscriptionState) => {
+      setSubscription(next.subscription);
+      setFeatures(next.features);
+      setIsLoading(next.isLoading);
+      setError(next.error);
+    };
+    subscriptionListeners.add(onChange);
+    onChange({ ...sharedSubscriptionState });
+    return () => {
+      subscriptionListeners.delete(onChange);
+    };
+  }, []);
 
   useEffect(() => {
     fetchSubscription();

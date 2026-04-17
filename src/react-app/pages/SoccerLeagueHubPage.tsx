@@ -14,6 +14,7 @@ import { Trophy, Users, Calendar, Pin, PinOff, Sparkles } from "lucide-react";
 import { getSoccerLeagueMeta } from "@/react-app/lib/soccerLeagueMeta";
 import { buildSoccerTeamUrl, buildSoccerMatchUrl, buildSoccerPlayerUrl } from "@/react-app/hooks/useSoccerBackNavigation";
 import { fetchPlayerPhotos } from "@/react-app/lib/espnSoccer";
+import { fetchJsonCached } from "@/react-app/lib/fetchCache";
 import TeamCrest from "@/react-app/components/soccer/TeamCrest";
 import { CoachGPanel } from "@/react-app/components/soccer/CoachGPanel";
 import { CoachCommandCard } from "@/react-app/components/hub/CoachCommandCard";
@@ -92,9 +93,13 @@ export default function SoccerLeagueHubPage() {
         // Fetch schedule to find hero game and today's matches
         // Backend expects: /api/soccer/schedule/:competitionKey
         // Fetch all matches (not just upcoming) so Recent filter works
-        const scheduleRes = await fetch(`/api/soccer/schedule/${leagueId}?filter=all`, { cache: "no-store" });
-        if (scheduleRes.ok) {
-          const scheduleData = await scheduleRes.json();
+        const scheduleData = await fetchJsonCached<any>(`/api/soccer/schedule/${leagueId}?filter=all`, {
+          cacheKey: `soccer-league-schedule:${leagueId}:all`,
+          ttlMs: 30_000,
+          timeoutMs: 4_500,
+          init: { credentials: "include" },
+        }).catch(() => null);
+        if (scheduleData) {
           const matches = scheduleData.matches || [];
           const liveStatuses = new Set(['inprogress', 'live', 'halftime']);
           const finalStatuses = new Set(['closed', 'ended', 'finished', 'ft', 'full_time', 'complete', 'completed']);
@@ -203,9 +208,13 @@ export default function SoccerLeagueHubPage() {
         }
 
         // Fetch standings - backend expects: /api/soccer/standings/:competitionKey
-        const standingsRes = await fetch(`/api/soccer/standings/${leagueId}`, { cache: "no-store" });
-        if (standingsRes.ok) {
-          const standingsData = await standingsRes.json();
+        const standingsData = await fetchJsonCached<any>(`/api/soccer/standings/${leagueId}`, {
+          cacheKey: `soccer-league-standings:${leagueId}`,
+          ttlMs: 30_000,
+          timeoutMs: 4_500,
+          init: { credentials: "include" },
+        }).catch(() => null);
+        if (standingsData) {
           // Transform standings to our format
           const transformedStandings: StandingsTeam[] = (standingsData.standings || []).map((t: any) => ({
             id: t.id || t.teamId || '',
@@ -228,9 +237,13 @@ export default function SoccerLeagueHubPage() {
           ? `/api/soccer/espn-leaders/${leagueId}`
           : `/api/soccer/leaders/${leagueId}`;
         console.log('[SoccerLeagueHub] Fetching leaders from:', leadersEndpoint);
-        const leadersRes = await fetch(leadersEndpoint, { cache: "no-store" });
-        if (leadersRes.ok) {
-          const leadersData = await leadersRes.json();
+        const leadersData = await fetchJsonCached<any>(leadersEndpoint, {
+          cacheKey: `soccer-league-leaders:${leagueId}:${leadersEndpoint.includes('espn-leaders') ? 'espn' : 'sr'}`,
+          ttlMs: 30_000,
+          timeoutMs: 4_500,
+          init: { credentials: "include" },
+        }).catch(() => null);
+        if (leadersData) {
           // Transform scorers
           const scorers: LeaderPlayer[] = (leadersData.topScorers || []).map((p: any) => ({
             id: p.playerId || p.id || '',

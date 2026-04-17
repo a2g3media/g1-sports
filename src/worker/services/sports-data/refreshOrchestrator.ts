@@ -31,6 +31,8 @@ import {
   sdioDateToISO,
   ActiveSlateResult
 } from './activeSlateService';
+import { resolveCanonicalPlayerIdFromPayload } from '../../../shared/espnAthleteIdLookup';
+import { insertHistoricalPropSnapshot } from '../historicalLines/snapshotStore';
 
 // Production pipeline only - NO demo data
 
@@ -280,6 +282,41 @@ async function upsertProp(
   let historyRecorded = false;
   
   try {
+    const gameCtx = await db
+      .prepare(`
+        SELECT provider_game_id, sport, league, home_team_name, away_team_name, home_team, away_team, start_time
+        FROM sdio_games
+        WHERE id = ?
+      `)
+      .bind(gameId)
+      .first<{
+        provider_game_id: string | null;
+        sport: string | null;
+        league: string | null;
+        home_team_name: string | null;
+        away_team_name: string | null;
+        home_team: string | null;
+        away_team: string | null;
+        start_time: string | null;
+      }>();
+    await insertHistoricalPropSnapshot(db, {
+      sport: String(gameCtx?.sport || "").toUpperCase() || "NBA",
+      league: gameCtx?.league || null,
+      eventId: gameCtx?.provider_game_id || null,
+      gameId: gameCtx?.provider_game_id || String(gameId),
+      gameStartTime: gameCtx?.start_time || null,
+      playerName: prop.playerName,
+      playerProviderId: resolveCanonicalPlayerIdFromPayload(prop.playerName, String(gameCtx?.sport || "").toUpperCase() || "NBA"),
+      teamName: prop.team || gameCtx?.home_team_name || gameCtx?.home_team || null,
+      opponentTeamName: gameCtx?.away_team_name || gameCtx?.away_team || null,
+      statType: prop.propType,
+      marketType: prop.propType,
+      lineValue: prop.lineValue,
+      capturedAt: now,
+      rawPayload: prop,
+      sportsbook: "consensus",
+    });
+
     // Get current prop
     const current = await db
       .prepare('SELECT * FROM sdio_props_current WHERE game_id = ? AND player_name = ? AND prop_type = ?')

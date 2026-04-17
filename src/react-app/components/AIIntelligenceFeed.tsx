@@ -104,6 +104,52 @@ function normalizeDisplayText(value: unknown): string {
     .trim();
 }
 
+const COACH_G_PLACEHOLDER_TOKENS = [
+  "safe fallback",
+  "pre-game signals syncing",
+  "signals syncing",
+  "syncing",
+  "fallback",
+];
+
+function isPlaceholderCoachGText(value: unknown): boolean {
+  const normalized = normalizeDisplayText(value).toLowerCase();
+  if (!normalized) return true;
+  return COACH_G_PLACEHOLDER_TOKENS.some((token) => normalized.includes(token));
+}
+
+function isInvalidZeroSignalText(value: unknown): boolean {
+  const normalized = normalizeDisplayText(value).toLowerCase();
+  if (!normalized) return false;
+  const hasZeroLine =
+    normalized.includes("0.0 -> 0.0")
+    || normalized.includes("0 -> 0")
+    || normalized.includes("0.0 → 0.0")
+    || normalized.includes("0 → 0");
+  const hasZeroConfidence =
+    normalized.includes("0% confidence")
+    || normalized.includes("0% conf")
+    || normalized.includes("(0%)");
+  const hasEdgeZero = normalized.includes("edge 0");
+  return hasZeroLine || hasZeroConfidence || hasEdgeZero;
+}
+
+function isValidPositiveMetric(value: unknown): value is number {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0;
+}
+
+function hasStrictValidLinePrediction(
+  linePrediction?: { currentLine: number | null; projectedLine: number | null; confidence: number } | null
+): linePrediction is { currentLine: number; projectedLine: number; confidence: number } {
+  if (!linePrediction) return false;
+  return (
+    isValidPositiveMetric(linePrediction.currentLine)
+    && isValidPositiveMetric(linePrediction.projectedLine)
+    && isValidPositiveMetric(linePrediction.confidence)
+  );
+}
+
 function isGenericProfileScopeMessage(text: string): boolean {
   const normalized = text.toLowerCase();
   const hasFollowPrompt =
@@ -194,43 +240,12 @@ export function AIIntelligenceFeed({ games, className }: AIIntelligenceFeedProps
     return canonical || null;
   }, []);
 
-  const friendlyFallbackReason = useCallback((reason: string | undefined, isLive: boolean): string => {
-    const normalized = String(reason || "").toLowerCase();
-    if (!normalized) {
-      return isLive
-        ? "Temporary live-data delay. Coach G is retrying automatically."
-        : "Coach G is syncing pre-game intel now.";
-    }
-    if (normalized.includes("unavailable") || normalized.includes("fallback")) {
-      return "Temporary provider delay. Showing safe intel while Coach G retries.";
-    }
-    if (normalized.includes("fetching") || normalized.includes("warming") || normalized.includes("sync")) {
-      return isLive
-        ? "Coach G is syncing live context now."
-        : "Coach G is syncing pre-game context now.";
-    }
-    return String(reason || "");
-  }, []);
-
   const toFallbackContext = useCallback((game: LiveGame, reason?: string): GameContext => {
-    const isLive = game.status === 'IN_PROGRESS';
-    const statusLine = isLive
-      ? `Tracking ${game.awayTeam.abbreviation} @ ${game.homeTeam.abbreviation} live.`
-      : `Preparing intel for ${game.awayTeam.abbreviation} @ ${game.homeTeam.abbreviation}.`;
-    const friendlyReason = friendlyFallbackReason(reason, isLive);
     return {
       gameId: game.id,
       sport: game.sport,
-      signals: [
-        {
-          type: 'market_monitor',
-          label: 'Market Monitor',
-          value: isLive ? 'Live market updating' : 'Pre-game signals syncing',
-          importance: 'medium',
-          icon: isLive ? '📡' : '🧠',
-        },
-      ],
-      coachGNote: `${statusLine} ${friendlyReason}`,
+      signals: [],
+      coachGNote: "Analyzing matchup...",
       headline: `${game.awayTeam.abbreviation} @ ${game.homeTeam.abbreviation}`,
       edgeScore: 0,
       linePrediction: null,
@@ -240,7 +255,7 @@ export function AIIntelligenceFeed({ games, className }: AIIntelligenceFeedProps
         : 'fallback',
       updatedAt: new Date().toISOString(),
     };
-  }, [friendlyFallbackReason]);
+  }, []);
 
   const normalizeCoachGContext = useCallback((game: LiveGame, data: CoachGIntelligenceResponse): GameContext => {
     const sharpSignals: GameContextSignal[] = Array.isArray(data.sharp_radar)
@@ -254,6 +269,7 @@ export function AIIntelligenceFeed({ games, className }: AIIntelligenceFeedProps
             importance: s.importance === 'high' || s.importance === 'low' ? s.importance : 'medium',
             icon: s.icon || undefined,
           }))
+          .filter((s) => !isPlaceholderCoachGText(s.value) && !isInvalidZeroSignalText(s.value))
       : [];
 
     const bestProp = (Array.isArray(data.player_prop_edges) ? [...data.player_prop_edges] : [])
@@ -265,42 +281,51 @@ export function AIIntelligenceFeed({ games, className }: AIIntelligenceFeedProps
     const coachNote = normalizeDisplayText(actionable[0] || summaryText);
 
     const fallbackContext = toFallbackContext(game, 'Coach G data is warming up.');
-    const edgeRounded = Math.max(0, Math.round(Number(data.edge_score || 0)));
+    const edgeScoreValue = Number(data.edge_score);
+    const hasValidEdgeScore = isValidPositiveMetric(edgeScoreValue);
+    const edgeRounded = hasValidEdgeScore ? Math.round(edgeScoreValue) : null;
+    const lineCurrent = Number(data.line_prediction?.current_line);
+    const lineProjected = Number(data.line_prediction?.projected_line);
+    const lineConfidence = Number(data.line_prediction?.confidence);
+    const hasValidLine = isValidPositiveMetric(lineCurrent)
+      && isValidPositiveMetric(lineProjected)
+      && isValidPositiveMetric(lineConfidence);
     const liveScore = game.status === 'IN_PROGRESS'
       ? `Score ${game.awayTeam.abbreviation} ${game.awayTeam.score ?? 0}-${game.homeTeam.score ?? 0} ${game.homeTeam.abbreviation}.`
       : '';
-    const lineShiftText =
-      data.line_prediction?.current_line !== undefined &&
-      data.line_prediction?.current_line !== null &&
-      data.line_prediction?.projected_line !== undefined &&
-      data.line_prediction?.projected_line !== null
-        ? `Line ${Number(data.line_prediction.current_line).toFixed(1)} -> ${Number(data.line_prediction.projected_line).toFixed(1)} (${Math.round(Number(data.line_prediction.confidence || 0))}% confidence).`
-        : '';
-    const topSignalText = sharpSignals[0]?.value ? `Signal: ${sharpSignals[0].value}.` : '';
-    const topPropText = bestProp
-      ? `Top prop: ${String(bestProp.player || 'Player')} ${String(bestProp.prop || 'Prop')} ${Number(bestProp.line || 0)} (edge ${Math.round(Number(bestProp.edge_score || 0))}).`
+    const lineShiftText = hasValidLine
+      ? `Line ${lineCurrent.toFixed(1)} -> ${lineProjected.toFixed(1)} (${Math.round(lineConfidence)}% confidence).`
       : '';
-    const generatedOperationalNote = [
-      game.status === 'IN_PROGRESS'
-        ? `Live read: ${game.awayTeam.abbreviation} @ ${game.homeTeam.abbreviation} (Edge ${edgeRounded}).`
-        : `Pre-game read: ${game.awayTeam.abbreviation} @ ${game.homeTeam.abbreviation} (Edge ${edgeRounded}).`,
-      liveScore,
-      topSignalText,
-      lineShiftText,
-      topPropText,
-    ]
-      .map((s) => normalizeDisplayText(s))
-      .filter(Boolean)
-      .join(' ');
+    const topSignalText = sharpSignals[0]?.value ? `Signal: ${sharpSignals[0].value}.` : '';
+    const topPropEdgeScore = Number(bestProp?.edge_score);
+    const hasValidTopProp = Boolean(bestProp)
+      && isValidPositiveMetric(topPropEdgeScore)
+      && !isPlaceholderCoachGText(bestProp?.player)
+      && !isPlaceholderCoachGText(bestProp?.prop);
+    const topPropText = hasValidTopProp
+      ? `Top prop: ${String(bestProp?.player)} ${String(bestProp?.prop)} ${Number(bestProp?.line || 0)} (edge ${Math.round(topPropEdgeScore)}).`
+      : '';
+    const hasAnyValidSignal = hasValidEdgeScore || hasValidLine || hasValidTopProp;
+    const matchupInsight = `Matchup Insight: ${game.awayTeam.abbreviation} vs ${game.homeTeam.abbreviation}`;
+    const generatedOperationalNote = hasAnyValidSignal
+      ? [matchupInsight, liveScore, topSignalText, lineShiftText, topPropText]
+          .map((s) => normalizeDisplayText(s))
+          .filter(Boolean)
+          .join(" ")
+      : "";
 
-    const sanitizedCoachNote = isActionableModelNote(coachNote, game)
-      ? coachNote
-      : generatedOperationalNote || fallbackContext.coachGNote;
+    const sanitizedCoachNote = hasAnyValidSignal
+      ? (
+        isActionableModelNote(coachNote, game) && !isPlaceholderCoachGText(coachNote) && !isInvalidZeroSignalText(coachNote)
+          ? coachNote
+          : generatedOperationalNote || matchupInsight
+      )
+      : "Analyzing matchup...";
 
     return {
       ...fallbackContext,
-      signals: sharpSignals.length > 0 ? sharpSignals : fallbackContext.signals,
-      coachGNote: sanitizedCoachNote || fallbackContext.coachGNote,
+      signals: sharpSignals,
+      coachGNote: sanitizedCoachNote || "Analyzing matchup...",
       headline: summaryText ? `${game.awayTeam.abbreviation} @ ${game.homeTeam.abbreviation}` : fallbackContext.headline,
       edgeScore: Number(data.edge_score || 0),
       linePrediction: data.line_prediction
@@ -478,7 +503,7 @@ export function AIIntelligenceFeed({ games, className }: AIIntelligenceFeedProps
           </div>
           <div>
             <h2 className="text-sm sm:text-[15px] font-black text-white uppercase tracking-wider flex items-center gap-2">
-              AI Game Intelligence
+              Game Intelligence
               {loading && (
                 <span className="inline-block w-2 h-2 rounded-full bg-cyan-400 animate-pulse" />
               )}
@@ -541,29 +566,26 @@ function IntelligenceCard({
 }) {
   const isLive = game.status === 'IN_PROGRESS';
   const cleanedCoachNote = normalizeDisplayText(context?.coachGNote);
-  const summaryText = cleanedCoachNote || "Coach G is monitoring this matchup and syncing fresh context.";
-  const topSignals = context?.signals?.slice(0, 3) || [];
-  const linePredictionText =
-    context?.linePrediction &&
-    context.linePrediction.currentLine !== null &&
-    context.linePrediction.projectedLine !== null
-      ? `${context.linePrediction.currentLine.toFixed(1)} -> ${context.linePrediction.projectedLine.toFixed(1)}`
-      : null;
-  const status = context?.dataStatus || 'syncing';
-  const statusChip = status === 'live'
-    ? {
-        label: 'Live intel',
-        className: 'bg-emerald-500/18 border-emerald-400/35 text-emerald-200',
-      }
-    : status === 'fallback'
-      ? {
-          label: 'Safe fallback',
-          className: 'bg-amber-500/18 border-amber-400/35 text-amber-200',
-        }
-      : {
-          label: 'Syncing',
-          className: 'bg-sky-500/18 border-sky-400/35 text-sky-200',
-        };
+  const summaryText = cleanedCoachNote && !isPlaceholderCoachGText(cleanedCoachNote)
+    ? cleanedCoachNote
+    : "Analyzing matchup...";
+  const topSignals = (context?.signals || [])
+    .filter((signal) => !isPlaceholderCoachGText(signal.value) && !isInvalidZeroSignalText(signal.value))
+    .slice(0, 3);
+  const edgeValue = Number(context?.edgeScore);
+  const hasEdgeMetric = isValidPositiveMetric(edgeValue);
+  const hasLineMetric = hasStrictValidLinePrediction(context?.linePrediction);
+  const confidenceValue = Number(context?.linePrediction?.confidence);
+  const topPropEdgeScore = Number(context?.topPropEdge?.edgeScore);
+  const hasPropMetric = Boolean(context?.topPropEdge)
+    && isValidPositiveMetric(topPropEdgeScore)
+    && !isPlaceholderCoachGText(context?.topPropEdge?.player)
+    && !isPlaceholderCoachGText(context?.topPropEdge?.prop);
+  const linePredictionText = hasLineMetric
+    ? `${context.linePrediction.currentLine.toFixed(1)} -> ${context.linePrediction.projectedLine.toFixed(1)} (${Math.round(context.linePrediction.confidence)}% conf)`
+    : null;
+  const hasAnyValidMetric = hasEdgeMetric || hasLineMetric || hasPropMetric;
+  const primaryLineText = hasAnyValidMetric ? summaryText : "Analyzing matchup...";
   const lastUpdatedLabel = formatUpdatedTime(context?.updatedAt);
   
   return (
@@ -654,20 +676,15 @@ function IntelligenceCard({
         </div>
       </div>
       
-      {/* Context Signals Row */}
-      <div className="mb-2 flex flex-wrap items-center gap-2">
-        <span className={cn(
-          "inline-flex items-center rounded-full border px-2 py-0.5 text-[10px] font-semibold",
-          statusChip.className
-        )}>
-          {statusChip.label}
-        </span>
-        <span className="text-[10px] text-white/45">
-          Updated {lastUpdatedLabel}
-        </span>
-      </div>
+      {hasAnyValidMetric && (
+        <div className="mb-2 flex flex-wrap items-center gap-2">
+          <span className="text-[10px] text-white/45">
+            Updated {lastUpdatedLabel}
+          </span>
+        </div>
+      )}
 
-      {topSignals.length > 0 && (
+      {hasAnyValidMetric && topSignals.length > 0 && (
         <div className="flex flex-wrap gap-1.5 sm:gap-2 mb-3 sm:mb-3.5">
           {topSignals.map((signal, idx) => (
             <SignalPill key={`${signal.type}-${idx}`} signal={signal} />
@@ -676,17 +693,19 @@ function IntelligenceCard({
       )}
 
       {/* Metrics */}
-      {(context?.edgeScore || linePredictionText || context?.topPropEdge) && (
+      {hasAnyValidMetric && (
         <div className="mb-3 sm:mb-3.5 flex flex-wrap gap-1.5 sm:gap-2">
-          <span className="inline-flex items-center rounded-full border border-violet-400/30 bg-violet-500/15 px-2 py-0.5 text-[10px] font-semibold text-violet-200">
-            Edge {Math.max(0, Math.round(context?.edgeScore || 0))}
-          </span>
+          {hasEdgeMetric && (
+            <span className="inline-flex items-center rounded-full border border-violet-400/30 bg-violet-500/15 px-2 py-0.5 text-[10px] font-semibold text-violet-200">
+              Edge {Math.round(edgeValue)}
+            </span>
+          )}
           {linePredictionText && (
             <span className="inline-flex items-center rounded-full border border-cyan-400/30 bg-cyan-500/15 px-2 py-0.5 text-[10px] font-semibold text-cyan-200">
               Line {linePredictionText}
             </span>
           )}
-          {context?.topPropEdge && (
+          {hasPropMetric && context?.topPropEdge && (
             <span className="inline-flex items-center rounded-full border border-emerald-400/30 bg-emerald-500/15 px-2 py-0.5 text-[10px] font-semibold text-emerald-200">
               Prop {context.topPropEdge.player} {context.topPropEdge.prop}
             </span>
@@ -703,7 +722,7 @@ function IntelligenceCard({
               <Sparkles className="w-3 h-3 text-violet-400/50" />
             </div>
             <p className="text-xs text-white/80 leading-relaxed line-clamp-2">
-              {summaryText}
+              {primaryLineText}
             </p>
           </div>
       </div>

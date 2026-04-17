@@ -7,7 +7,7 @@ import { memo, useEffect, useState } from 'react';
 import { TeamLogo } from '@/react-app/components/TeamLogo';
 import { PlayerPhoto } from '@/react-app/components/PlayerPhoto';
 import { cn } from '@/react-app/lib/utils';
-import { fetchJsonCached } from '@/react-app/lib/fetchCache';
+import { prefetch } from '@/react-app/components/LazyRoute';
 import { GameContextChip } from './GameContextChip';
 import { getMarketPeriodLabels } from '@/react-app/lib/marketPeriodLabels';
 
@@ -32,6 +32,8 @@ export interface CompactGameTileGame {
   ml1HHome?: number | null;
   ml1HAway?: number | null;
   isOvertime?: boolean;
+  probableAwayPitcher?: { name: string; record?: string };
+  probableHomePitcher?: { name: string; record?: string };
 }
 
 interface CompactGameTileProps {
@@ -52,44 +54,15 @@ const videoJobCache = new Map<string, VideoJobSummary | null>();
 
 const prefetchedGameResources = new Set<string>();
 
-const prefetchGameResources = async (gameId: string, sport: string) => {
+const prefetchGameResources = (gameId: string, _sport: string) => {
   const id = String(gameId || '').trim();
   if (!id || prefetchedGameResources.has(id)) return;
   prefetchedGameResources.add(id);
 
-  // Warm route chunks and key APIs for instant navigation.
-  void import('@/react-app/pages/GameDetailPage');
-  void import('@/react-app/pages/OddsGamePage');
-
-  const encodedId = encodeURIComponent(id);
-  const lowerSport = String(sport || '').toLowerCase();
-  await Promise.allSettled([
-    fetchJsonCached(`/api/games/${encodedId}?lite=1`, {
-      cacheKey: `tile:game-lite:${id}`,
-      ttlMs: 10000,
-      timeoutMs: 8000,
-      init: { credentials: 'include' },
-    }),
-    fetchJsonCached(`/api/odds/summary/${encodedId}?scope=PROD`, {
-      cacheKey: `tile:odds-summary:${id}`,
-      ttlMs: 10000,
-      timeoutMs: 8000,
-      init: { credentials: 'include' },
-    }),
-    fetchJsonCached(`/api/games/${encodedId}/odds`, {
-      cacheKey: `tile:game-odds:${id}`,
-      ttlMs: 10000,
-      timeoutMs: 10000,
-      init: { credentials: 'include' },
-    }),
-    lowerSport
-      ? fetchJsonCached(`/api/games?sport=${encodeURIComponent(lowerSport)}&includeOdds=0`, {
-          cacheKey: `tile:sport-list:${lowerSport}`,
-          ttlMs: 7000,
-          timeoutMs: 6000,
-        })
-      : Promise.resolve(null),
-  ]);
+  // Route chunk prewarm only. Keep API/data loading on destination pages.
+  prefetch(() => import('@/react-app/pages/GameDetailPage'));
+  prefetch(() => import('@/react-app/pages/OddsGamePage'));
+  prefetch(() => import('@/react-app/pages/PlayerProfilePage'));
 };
 
 const EASTERN_TZ = 'America/New_York';
@@ -109,18 +82,20 @@ const formatGameTime = (startTime: string | undefined): string => {
     const now = new Date();
     const isTodayEt = toEasternDateKey(date) === toEasternDateKey(now);
     
+    const timeLabel = date.toLocaleTimeString('en-US', {
+      hour: 'numeric',
+      minute: '2-digit',
+      timeZone: EASTERN_TZ,
+    });
     if (isTodayEt) {
-      return date.toLocaleTimeString('en-US', {
-        hour: 'numeric',
-        minute: '2-digit',
-        timeZone: EASTERN_TZ,
-      });
+      return timeLabel;
     }
-    return date.toLocaleDateString('en-US', {
+    const dateLabel = date.toLocaleDateString('en-US', {
       month: 'short',
       day: 'numeric',
       timeZone: EASTERN_TZ,
     });
+    return `${dateLabel} • ${timeLabel}`;
   } catch {
     return '';
   }
@@ -159,10 +134,18 @@ const formatMoneyline = (value: number | null | undefined): string => {
   return rounded > 0 ? `+${rounded}` : `${rounded}`;
 };
 
+const formatPitcherLine = (pitcher: { name: string; record?: string } | undefined): string => {
+  const name = String(pitcher?.name || '').trim();
+  if (!name) return '';
+  const record = String(pitcher?.record || '').trim();
+  return record ? `${name} (${record})` : name;
+};
+
 const CompactGameTileComponent = ({ game, onClick, isInWatchboard, isFavorite }: CompactGameTileProps) => {
   const isLive = game.status === 'live' || game.status === 'in_progress' || game.status === 'LIVE' || game.status === 'IN_PROGRESS';
   const isFinal = game.status === 'final' || game.status === 'FINAL' || game.status === 'closed';
   const isScheduled = !isLive && !isFinal;
+  const isMlb = String(game.sport || '').toUpperCase() === 'MLB';
   
   const homeAbbr = getTeamAbbr(game.homeTeam);
   const awayAbbr = getTeamAbbr(game.awayTeam);
@@ -180,6 +163,9 @@ const CompactGameTileComponent = ({ game, onClick, isInWatchboard, isFavorite }:
   const hasScores = homeScore !== null && awayScore !== null;
   const homeWinning = hasScores && homeScore > awayScore;
   const awayWinning = hasScores && awayScore > homeScore;
+  const awayPitcherLine = formatPitcherLine(game.probableAwayPitcher);
+  const homePitcherLine = formatPitcherLine(game.probableHomePitcher);
+  const showPitcherMatchup = isScheduled && isMlb && Boolean(awayPitcherLine || homePitcherLine);
 
   useEffect(() => {
     let cancelled = false;
@@ -421,6 +407,28 @@ const CompactGameTileComponent = ({ game, onClick, isInWatchboard, isFavorite }:
           </div>
         )}
 
+        {showPitcherMatchup && (
+          <div className="mt-2.5 rounded-[10px] border border-cyan-400/35 bg-gradient-to-r from-cyan-500/14 via-sky-500/10 to-violet-500/12 px-2.5 py-2 shadow-[0_0_20px_rgba(56,189,248,0.12)]">
+            <div className="mb-1.5 flex items-center gap-1.5 text-[9px] uppercase tracking-wide text-cyan-100/95">
+              <span className="text-[10px]">⚾</span>
+              <span className="font-semibold">Probable Pitcher Duel</span>
+              <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-cyan-300/80" />
+            </div>
+            {awayPitcherLine && (
+              <div className="mb-1 truncate rounded-md border border-cyan-300/20 bg-cyan-500/10 px-2 py-1 text-[10px] font-medium text-slate-100">
+                <span className="mr-1 text-[9px] uppercase text-cyan-300">Away</span>
+                {awayPitcherLine}
+              </div>
+            )}
+            {homePitcherLine && (
+              <div className="truncate rounded-md border border-violet-300/20 bg-violet-500/10 px-2 py-1 text-[10px] font-medium text-slate-100">
+                <span className="mr-1 text-[9px] uppercase text-violet-300">Home</span>
+                {homePitcherLine}
+              </div>
+            )}
+          </div>
+        )}
+
         {videoJob && (
           <div className="mt-2 flex items-center justify-between rounded-md border border-violet-500/20 bg-violet-500/10 px-2 py-1.5">
             <span className="text-[10px] font-semibold uppercase tracking-wide text-violet-200/90">
@@ -459,6 +467,11 @@ export const CompactGameTile = memo(CompactGameTileComponent, (prevProps, nextPr
     prevProps.game.total1H === nextProps.game.total1H &&
     prevProps.game.ml1HHome === nextProps.game.ml1HHome &&
     prevProps.game.ml1HAway === nextProps.game.ml1HAway &&
+    prevProps.game.startTime === nextProps.game.startTime &&
+    prevProps.game.probableAwayPitcher?.name === nextProps.game.probableAwayPitcher?.name &&
+    prevProps.game.probableAwayPitcher?.record === nextProps.game.probableAwayPitcher?.record &&
+    prevProps.game.probableHomePitcher?.name === nextProps.game.probableHomePitcher?.name &&
+    prevProps.game.probableHomePitcher?.record === nextProps.game.probableHomePitcher?.record &&
     prevProps.isInWatchboard === nextProps.isInWatchboard
   );
 });

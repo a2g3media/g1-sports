@@ -148,7 +148,7 @@ export async function selectFeaturedGamesBySport(input: FeaturedGameSelectionInp
       AND DATE(g.start_time, 'localtime') = DATE('now', 'localtime')
     ORDER BY g.start_time ASC
     LIMIT 500
-  `).all<QueryResults<CandidateRow>>();
+  `).all<CandidateRow>();
 
   const fallbackUpcoming = await db.prepare(`
     SELECT
@@ -193,7 +193,7 @@ export async function selectFeaturedGamesBySport(input: FeaturedGameSelectionInp
       AND g.start_time <= datetime('now', '+36 hours')
     ORDER BY g.start_time ASC
     LIMIT 500
-  `).all<QueryResults<CandidateRow>>();
+  `).all<CandidateRow>();
 
   const recentFallback = await db.prepare(`
     SELECT
@@ -236,7 +236,7 @@ export async function selectFeaturedGamesBySport(input: FeaturedGameSelectionInp
     WHERE g.provider_game_id IS NOT NULL
     ORDER BY g.start_time DESC
     LIMIT 300
-  `).all<QueryResults<CandidateRow>>();
+  `).all<CandidateRow>();
 
   const preferredSet = (localToday.results || []).length > 0
     ? (localToday.results || [])

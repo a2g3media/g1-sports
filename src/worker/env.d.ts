@@ -5,10 +5,12 @@ declare global {
   interface Env {
     [key: string]: unknown;
     DB?: D1Database;
+    HISTORICAL_INGESTION_LOOP?: DurableObjectNamespace;
     OPENAI_API_KEY?: string;
     OPENAI_COACHG_MODEL?: string;
     MOCHA_USERS_SERVICE_API_URL?: string;
     MOCHA_USERS_SERVICE_API_KEY?: string;
+    PAGE_DATA_WARM_BYPASS_KEY?: string;
     FIRECRAWL_API_KEY?: string;
     SPORTSRADAR_ODDS_KEY?: string;
     SPORTSRADAR_API_KEY?: string;

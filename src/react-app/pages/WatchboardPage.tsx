@@ -49,7 +49,9 @@ import { getTeamColors } from "@/react-app/data/team-colors";
 import { useSoundEffects, type SoundType } from "@/react-app/hooks/useSoundEffects";
 import { useDataHubWatchboards } from "@/react-app/hooks/useDataHub";
 import { toGameDetailPath } from "@/react-app/lib/gameRoutes";
-import { buildPlayerRoute, logPlayerNavigation } from "@/react-app/lib/navigationRoutes";
+import { canonicalPlayerIdQueryParam, logPlayerNavigation } from "@/react-app/lib/navigationRoutes";
+import { navigateToPlayerProfile } from "@/react-app/lib/playerProfileNavigation";
+import { prefetchFullPlayerProfileSnapshot } from "@/react-app/lib/playerProfileSnapshotPrewarm";
 
 // =====================================================
 // BOARD COLOR PALETTE
@@ -1056,6 +1058,15 @@ interface PlayerTileProps {
 
 function PlayerTile({ player, onRemove, onClick }: PlayerTileProps) {
   const teamColors = getTeamColors(player.team_abbr || player.team || "");
+  const rawSourcePlayerId = String(
+    canonicalPlayerIdQueryParam(player.player_id)
+    || canonicalPlayerIdQueryParam((player as any).playerId)
+    || canonicalPlayerIdQueryParam((player as any).espn_id)
+    || canonicalPlayerIdQueryParam((player as any).espnId)
+    || ""
+  ).trim();
+  const pid = canonicalPlayerIdQueryParam(rawSourcePlayerId) || "";
+  const canNavigate = Boolean(pid);
   
   // Format sport display
   const formatSport = (sport: string) => {
@@ -1064,8 +1075,22 @@ function PlayerTile({ player, onRemove, onClick }: PlayerTileProps) {
 
   return (
     <div
-      onClick={onClick}
-      className="relative group rounded-xl border border-white/10 bg-slate-900/80 backdrop-blur-sm p-4 hover:border-purple-500/30 hover:bg-slate-800/90 transition-all cursor-pointer"
+      onClick={canNavigate ? onClick : undefined}
+      onMouseEnter={() => {
+        if (!pid) return;
+        void prefetchFullPlayerProfileSnapshot({
+          sport: player.sport,
+          playerId: pid,
+          timeoutMs: 22_000,
+        });
+      }}
+      className={cn(
+        "relative group rounded-xl border border-white/10 bg-slate-900/80 backdrop-blur-sm p-4 transition-all",
+        canNavigate
+          ? "hover:border-purple-500/30 hover:bg-slate-800/90 cursor-pointer"
+          : "opacity-70 cursor-default"
+      )}
+      title={canNavigate ? undefined : "Player profile unavailable"}
     >
       {/* Team color accent bar */}
       <div
@@ -1886,8 +1911,18 @@ export function WatchboardPage() {
   };
 
   const handlePlayerClick = (player: WatchboardPlayer) => {
-    logPlayerNavigation(player.player_name, player.sport);
-    navigate(buildPlayerRoute(player.sport, player.player_name));
+    const rawSourcePlayerId = String(
+      canonicalPlayerIdQueryParam(player.player_id)
+      || canonicalPlayerIdQueryParam((player as any).playerId)
+      || canonicalPlayerIdQueryParam((player as any).espn_id)
+      || canonicalPlayerIdQueryParam((player as any).espnId)
+      || ""
+    ).trim();
+    logPlayerNavigation(rawSourcePlayerId || player.player_name, player.sport);
+    void navigateToPlayerProfile(navigate, player.sport, rawSourcePlayerId, {
+      displayName: player.player_name,
+      source: "WatchboardPlayerTile",
+    });
   };
 
   // Drag and drop handlers

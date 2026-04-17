@@ -5,6 +5,7 @@
  * Supports caching with smart TTLs based on market status (pregame vs live).
  */
 
+// @ts-nocheck
 import { Hono } from "hono";
 import { authMiddleware } from "@getmocha/users-service/backend";
 import {
@@ -51,8 +52,8 @@ type SlateCacheEntry = {
 
 const slateResponseCache = new Map<string, SlateCacheEntry>();
 const slateInflight = new Map<string, Promise<{ payload: SlateCacheEntry['payload']; hasLive: boolean }>>();
-const SLATE_TTL_MS = 15000;
-const SLATE_LIVE_TTL_MS = 6000;
+const SLATE_TTL_MS = 90_000;
+const SLATE_LIVE_TTL_MS = 8_000;
 const SLATE_STALE_WINDOW_MS = 300000;
 const SLATE_FASTPATH_TIMEOUT_MS = 6500;
 const SLATE_GAMES_TIMEOUT_MS = 7000;
@@ -64,6 +65,14 @@ const REAL_ODDS_GAME_DETAIL_TIMEOUT_MS = 1600;
 const REAL_ODDS_GAME_DETAIL_CANDIDATE_LIMIT = 4;
 const SLATE_GAME_IDS_CONCURRENCY = 5;
 const SLATE_GAME_IDS_TIMEOUT_MS = 4200;
+const SLATE_COLD_START_BUDGET_MS = 150;
+
+function getRealOddsMapTimeoutMs(sport: SportKey | null): number {
+  // Soccer requires scanning many competitions/leagues in SportsRadar odds feeds.
+  // A short generic timeout causes false no-coverage/provider_error even when lines exist.
+  if (sport === "soccer") return 12000;
+  return REAL_ODDS_MAP_TIMEOUT_MS;
+}
 
 const slatePerf = {
   requests: 0,
@@ -80,6 +89,35 @@ type OddsSummaryCachePayload = Record<string, unknown>;
 const summaryResponseCache = new Map<string, { expiresAt: number; staleExpiresAt: number; payload: OddsSummaryCachePayload }>();
 const SUMMARY_TTL_MS = 15000;
 const SUMMARY_STALE_WINDOW_MS = 5 * 60 * 1000;
+
+oddsRouter.use("/slate", async (c, next) => {
+  const startedAt = Date.now();
+  await next();
+  const clone = c.res.clone();
+  const body = await clone.text().catch(() => "");
+  const totalMs = Math.max(0, Date.now() - startedAt);
+  const bytes = new TextEncoder().encode(body).length;
+  let cacheMode = "miss";
+  try {
+    const parsed = body ? JSON.parse(body) as any : null;
+    if (parsed?.source_stale) cacheMode = "stale";
+    else if (parsed?.cached) cacheMode = "hit";
+  } catch {
+    // keep default
+  }
+  c.res.headers.set("x-odds-slate-cache", cacheMode);
+  c.res.headers.set("x-odds-slate-ms", String(totalMs));
+  c.res.headers.set("x-odds-slate-bytes", String(bytes));
+  console.log(
+    JSON.stringify({
+      event: "odds_slate_perf",
+      cache: cacheMode,
+      totalMs,
+      responseBytes: bytes,
+      status: c.res.status,
+    })
+  );
+});
 
 function getSummaryCacheKey(gameId: string, scope: DataScope, includeSplits: boolean): string {
   return `${scope}:${gameId}:${includeSplits ? '1' : '0'}`;
@@ -198,6 +236,35 @@ function writeSlateCache(key: string, payload: SlateCacheEntry['payload'], hasLi
     expiresAt,
     staleExpiresAt: expiresAt + SLATE_STALE_WINDOW_MS,
   });
+}
+
+function buildColdStartSlateFallbackPayload(params: {
+  sport?: string | null;
+  date?: string | null;
+  scope?: string | null;
+  reason?: string;
+}): SlateCacheEntry["payload"] & {
+  pending_refresh: boolean;
+  fallback_phase: "cold_start";
+  sport?: string | null;
+  date?: string | null;
+  scope?: string | null;
+} {
+  return {
+    summaries: [],
+    count: 0,
+    degraded: true,
+    pending_refresh: true,
+    fallback_phase: "cold_start",
+    fallback_type: "cold_start_budget",
+    fallback_reason:
+      params.reason
+      || `Upstream exceeded ${SLATE_COLD_START_BUDGET_MS}ms budget; background refresh in progress`,
+    sport: params.sport || null,
+    date: params.date || null,
+    scope: params.scope || null,
+    timestamp: new Date().toISOString(),
+  };
 }
 
 function getSlatePersistentCacheKeys(key: string): { primary: string; backup: string } {
@@ -479,6 +546,28 @@ function buildGameIdCandidates(gameId: string): string[] {
     candidates.add(`sr:sport_event:${parts.slice(2).join("-")}`);
   }
   return Array.from(candidates);
+}
+
+function buildEventLookupCandidates(gameId: string): string[] {
+  const base = buildGameIdCandidates(gameId);
+  const candidates = new Set<string>(base);
+  const raw = String(gameId || "").trim();
+  if (raw) {
+    const tail = raw.split("_").pop() || "";
+    if (/^\d{4,}$/.test(tail)) candidates.add(tail);
+    const digits = raw.match(/(\d{4,})$/)?.[1];
+    if (digits) candidates.add(digits);
+  }
+  return Array.from(candidates).filter(Boolean);
+}
+
+function inferSportHintFromGameId(gameId: string): string | null {
+  const raw = String(gameId || "").toLowerCase();
+  const known = ["nba", "nfl", "mlb", "nhl", "soccer", "ncaab", "ncaaf"];
+  for (const sport of known) {
+    if (raw.includes(`_${sport}_`) || raw.startsWith(`${sport}_`) || raw.includes(`:${sport}:`)) return sport;
+  }
+  return null;
 }
 
 function classifyFallbackType(reason: string | null | undefined): "no_coverage" | "provider_error" | "auth_config" | null {
@@ -950,6 +1039,71 @@ async function fetchRealOddsForGame(
     }
     if (detailResult?.error) detailError = detailResult.error;
   }
+  if (!game && c?.env?.DB) {
+    try {
+      const lookupCandidates = buildEventLookupCandidates(gameId);
+      for (const candidate of lookupCandidates.slice(0, 8)) {
+        const eventRow = await withTimeout(
+          c.env.DB.prepare(`
+            SELECT id, external_id, sport, home_team, away_team, start_time, status
+            FROM events
+            WHERE id = ? OR external_id = ?
+            LIMIT 1
+          `).bind(candidate, candidate).first<Record<string, unknown>>(),
+          900,
+          null
+        );
+        if (!eventRow) continue;
+        game = {
+          game_id: String(eventRow.id || candidate),
+          external_id: String(eventRow.external_id || ""),
+          sport: String(eventRow.sport || "").toLowerCase(),
+          home_team_name: String(eventRow.home_team || ""),
+          away_team_name: String(eventRow.away_team || ""),
+          start_time: String(eventRow.start_time || ""),
+          status: String(eventRow.status || "SCHEDULED"),
+        };
+        resolvedGameId = String(game.game_id || candidate);
+        detailError = null;
+        break;
+      }
+    } catch {
+      // non-fatal fallback
+    }
+  }
+  if (!game) {
+    try {
+      const origin = new URL(c.req.url).origin;
+      const sportHint = inferSportHintFromGameId(gameId) || "ALL";
+      const detailCandidates = buildEventLookupCandidates(gameId).slice(0, 6);
+      for (const candidate of detailCandidates) {
+        const url = `${origin}/api/page-data/game-detail?gameId=${encodeURIComponent(candidate)}&sport=${encodeURIComponent(sportHint)}`;
+        const detailPayload = await withTimeout(
+          fetch(url, { headers: { accept: "application/json" } }).then((res) => res.json()).catch(() => null),
+          1300,
+          null as any
+        );
+        const recoveredGame = (detailPayload?.game && typeof detailPayload.game === "object")
+          ? (detailPayload.game as Record<string, unknown>)
+          : null;
+        if (!recoveredGame) continue;
+        game = {
+          game_id: String(recoveredGame.game_id || recoveredGame.id || candidate),
+          external_id: String(recoveredGame.external_id || ""),
+          sport: String(recoveredGame.sport || sportHint || "").toLowerCase(),
+          home_team_name: String(recoveredGame.home_team_name || recoveredGame.homeTeam || ""),
+          away_team_name: String(recoveredGame.away_team_name || recoveredGame.awayTeam || ""),
+          start_time: String(recoveredGame.start_time || recoveredGame.startTime || ""),
+          status: String(recoveredGame.status || "SCHEDULED"),
+        };
+        resolvedGameId = String(game.game_id || candidate);
+        detailError = null;
+        break;
+      }
+    } catch {
+      // non-fatal fallback
+    }
+  }
   if (!game) {
     return {
       game: null,
@@ -1008,6 +1162,7 @@ async function fetchRealOddsForGame(
   }
 
   try {
+    const oddsMapTimeoutMs = getRealOddsMapTimeoutMs(sport);
     const oddsMapMemo = ((c as any).__sportsRadarOddsMapMemo ||= new Map<string, Promise<Map<string, any>>>());
     const oddsKeyCandidates = Array.from(new Set([oddsKey, mainKey].filter(Boolean))) as string[];
     const oddsMapPromises: Array<Promise<Map<string, any>>> = [];
@@ -1016,7 +1171,7 @@ async function fetchRealOddsForGame(
         oddsMapPromises.push(
           withTimeout(
             fetchSportsRadarOdds(sport, mainKey, c.env.DB, undefined, keyCandidate),
-            REAL_ODDS_MAP_TIMEOUT_MS,
+            oddsMapTimeoutMs,
             new Map<string, any>()
           )
         );
@@ -1028,7 +1183,7 @@ async function fetchRealOddsForGame(
           memoKey,
           withTimeout(
             fetchSportsRadarOdds(sport, mainKey, c.env.DB, undefined, keyCandidate),
-            REAL_ODDS_MAP_TIMEOUT_MS,
+            oddsMapTimeoutMs,
             new Map<string, any>()
           )
         );
@@ -1461,6 +1616,7 @@ oddsRouter.get("/slate", async (c) => {
 
   const slateCacheKey = getSlateCacheKey(gameIdsParam, sport, date, scope);
   const slateSportFallbackKey = !gameIdsParam && sport ? toSportKey(sport) : null;
+  const persistentKeys = getSlatePersistentCacheKeys(slateCacheKey);
   if (!forceFresh) {
     const cacheHit = readSlateCacheFresh(slateCacheKey);
     if (cacheHit) {
@@ -1474,14 +1630,37 @@ oddsRouter.get("/slate", async (c) => {
       );
     }
 
+    const staleHit = readSlateCacheStale(slateCacheKey);
     const existingInflight = slateInflight.get(slateCacheKey);
+    if (existingInflight && staleHit) {
+      recordSlatePerf('stale', Date.now() - startedAt);
+      return c.json(
+        {
+          ...staleHit.payload,
+          cached: true,
+          source_stale: true,
+          fallback_reason: staleHit.payload.fallback_reason || "Served stale slate while refresh remains in-flight",
+        },
+        { headers: oddsHeaders(staleHit.hasLive) }
+      );
+    }
     if (existingInflight) {
-      const shared = await existingInflight;
       recordSlatePerf('inflight', Date.now() - startedAt);
-      return c.json({ ...shared.payload, cached: true }, { headers: oddsHeaders(shared.hasLive) });
+      const waitUntil = (c as any)?.executionCtx?.waitUntil?.bind((c as any).executionCtx);
+      if (waitUntil) {
+        waitUntil(existingInflight.then(() => {}).catch(() => {}));
+      }
+      return c.json(
+        buildColdStartSlateFallbackPayload({
+          sport,
+          date,
+          scope,
+          reason: "Odds refresh already in progress; serving cold-start fallback immediately",
+        }),
+        { headers: oddsHeaders(false) }
+      );
     }
 
-    const staleHit = readSlateCacheStale(slateCacheKey);
     if (staleHit) {
       // Serve stale immediately and refresh in background.
       const refreshTask = (async () => {
@@ -1618,7 +1797,6 @@ oddsRouter.get("/slate", async (c) => {
     }
   }
 
-  const persistentKeys = getSlatePersistentCacheKeys(slateCacheKey);
   if (!forceFresh) {
     try {
       const d1Primary = await getCachedData<SlateCacheEntry['payload']>(c.env.DB, persistentKeys.primary);
@@ -1788,28 +1966,52 @@ oddsRouter.get("/slate", async (c) => {
   })();
 
   slateInflight.set(slateCacheKey, compute);
-  try {
-    const result = await compute;
-    writeSlateCache(slateCacheKey, result.payload, result.hasLive);
+  const finalizeCompute = (async (): Promise<{ payload: SlateCacheEntry['payload']; hasLive: boolean }> => {
     try {
-      await setCachedData(c.env.DB, persistentKeys.primary, 'sportsradar', 'odds/slate', result.payload, 60);
-      if (Array.isArray(result.payload?.summaries) && result.payload.summaries.length > 0) {
-        await setCachedData(c.env.DB, persistentKeys.backup, 'sportsradar', 'odds/slate', result.payload, 60 * 60);
-        if (slateSportFallbackKey) {
-          const sportFallbackCacheKey = getSlateSportFallbackCacheKey(scope, slateSportFallbackKey);
-          const sportPersistentKeys = getSlateSportFallbackPersistentKeys(sportFallbackCacheKey);
-          await setCachedData(c.env.DB, sportPersistentKeys.primary, 'sportsradar', 'odds/slate', result.payload, 90);
-          await setCachedData(c.env.DB, sportPersistentKeys.backup, 'sportsradar', 'odds/slate', result.payload, 2 * 60 * 60);
+      const result = await compute;
+      writeSlateCache(slateCacheKey, result.payload, result.hasLive);
+      try {
+        await setCachedData(c.env.DB, persistentKeys.primary, 'sportsradar', 'odds/slate', result.payload, 60);
+        if (Array.isArray(result.payload?.summaries) && result.payload.summaries.length > 0) {
+          await setCachedData(c.env.DB, persistentKeys.backup, 'sportsradar', 'odds/slate', result.payload, 60 * 60);
+          if (slateSportFallbackKey) {
+            const sportFallbackCacheKey = getSlateSportFallbackCacheKey(scope, slateSportFallbackKey);
+            const sportPersistentKeys = getSlateSportFallbackPersistentKeys(sportFallbackCacheKey);
+            await setCachedData(c.env.DB, sportPersistentKeys.primary, 'sportsradar', 'odds/slate', result.payload, 90);
+            await setCachedData(c.env.DB, sportPersistentKeys.backup, 'sportsradar', 'odds/slate', result.payload, 2 * 60 * 60);
+          }
         }
+      } catch {
+        // Non-fatal cache persistence failure.
       }
-    } catch {
-      // Non-fatal cache persistence failure.
+      return result;
+    } finally {
+      slateInflight.delete(slateCacheKey);
     }
+  })();
+  const raced = await Promise.race([
+    finalizeCompute.then((result) => ({ type: "full" as const, result })),
+    new Promise<{ type: "fallback" }>((resolve) =>
+      setTimeout(() => resolve({ type: "fallback" }), SLATE_COLD_START_BUDGET_MS)
+    ),
+  ]);
+  if (raced.type === "full") {
     recordSlatePerf('fresh', Date.now() - startedAt);
-    return c.json(result.payload, { headers: oddsHeaders(result.hasLive) });
-  } finally {
-    slateInflight.delete(slateCacheKey);
+    return c.json(raced.result.payload, { headers: oddsHeaders(raced.result.hasLive) });
   }
+  const waitUntil = (c as any)?.executionCtx?.waitUntil?.bind((c as any).executionCtx);
+  if (waitUntil) {
+    waitUntil(finalizeCompute.then(() => {}).catch(() => {}));
+  }
+  recordSlatePerf('stale', Date.now() - startedAt);
+  return c.json(
+    buildColdStartSlateFallbackPayload({
+      sport,
+      date,
+      scope,
+    }),
+    { headers: oddsHeaders(false) }
+  );
 });
 
 

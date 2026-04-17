@@ -92,10 +92,15 @@
     "smoke:quick": "bash scripts/smoke-quick.sh",
     "test:nascar-live-snapshot": "npx tsx scripts/test-nascar-live-snapshot.ts",
     "qa:hardening": "npx tsx scripts/qa-hardening-tests.ts",
+    "qa:historical:archive": "npx tsx scripts/qa-historical-line-archive.ts",
+    "qa:player:rolling": "npx tsx scripts/qa-player-rolling-audit.ts --base ${QA_BASE:-http://localhost:5173} --sample-size 60 --interval-sec 180 --concurrency 4 --timeout-ms 12000",
+    "qa:launch:mode": "npx tsx scripts/qa-launch-mode.ts",
     "migrate:local": "wrangler d1 execute 019ce56b-b0ff-7056-a2d5-613f9cde7650 --local --file=migrations/91.sql",
     "migrate:remote": "wrangler d1 execute 019ce56b-b0ff-7056-a2d5-613f9cde7650 --remote --file=migrations/91.sql --config=wrangler.d1.migrations.json",
     "migrate:local:92": "wrangler d1 execute 019ce56b-b0ff-7056-a2d5-613f9cde7650 --local --file=migrations/92.sql",
     "migrate:remote:92": "wrangler d1 execute 019ce56b-b0ff-7056-a2d5-613f9cde7650 --remote --file=migrations/92.sql --config=wrangler.d1.migrations.json",
+    "migrate:local:93": "wrangler d1 execute 019ce56b-b0ff-7056-a2d5-613f9cde7650 --local --file=migrations/93.sql",
+    "migrate:remote:93": "wrangler d1 execute 019ce56b-b0ff-7056-a2d5-613f9cde7650 --remote --file=migrations/93.sql --config=wrangler.d1.migrations.json",
     "qa:warroom:perf": "npx tsx scripts/qa-warroom-perf.ts"
   }
 }

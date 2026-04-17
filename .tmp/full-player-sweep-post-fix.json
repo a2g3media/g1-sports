@@ -1,0 +1,10 @@
+{
+  "ts": "2026-04-12T05:47:08.304Z",
+  "base": "http://localhost:5173",
+  "total": 226,
+  "counts": {
+    "pass_usable": 35,
+    "pass_pending": 191
+  },
+  "failures": []
+}

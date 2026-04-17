@@ -1,3 +1,5 @@
+import { normalizeSoccerRouteId } from "@/shared/canonicalSoccerId";
+
 function inferSportFromGameId(gameId: string): string | null {
   if (!gameId) return null;
   const id = gameId.toLowerCase();
@@ -15,6 +17,11 @@ function inferSportFromGameId(gameId: string): string | null {
   return null;
 }
 
+export function normalizeSoccerDetailId(rawId: string): string {
+  const normalized = normalizeSoccerRouteId(rawId);
+  return normalized || String(rawId || "").trim();
+}
+
 export function toGameDetailPath(sportKey: string | null | undefined, gameId: string | null | undefined): string {
   let normalizedId = String(gameId || "").trim();
   if (normalizedId.startsWith("soccer_sr:sport_event:")) {
@@ -23,7 +30,11 @@ export function toGameDetailPath(sportKey: string | null | undefined, gameId: st
   if (!normalizedId) return "/games";
 
   const normalizedSport = String(sportKey || "").trim().toLowerCase() || inferSportFromGameId(normalizedId) || "nba";
+  if (normalizedSport === "golf") {
+    return "/sports/golf";
+  }
   if (normalizedSport === "soccer") {
+    normalizedId = normalizeSoccerDetailId(normalizedId);
     return `/sports/soccer/match/${encodeURIComponent(normalizedId)}`;
   }
   return `/games/${normalizedSport}/${encodeURIComponent(normalizedId)}`;
@@ -37,5 +48,8 @@ export function toOddsGamePath(sportKey: string | null | undefined, gameId: stri
   if (!normalizedId) return "/odds";
 
   const normalizedSport = String(sportKey || "").trim().toLowerCase() || inferSportFromGameId(normalizedId) || "nba";
+  if (normalizedSport === "golf") {
+    return "/sports/golf";
+  }
   return `/sports/${normalizedSport}/odds/${encodeURIComponent(normalizedId)}`;
 }

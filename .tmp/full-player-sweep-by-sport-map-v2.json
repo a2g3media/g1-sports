@@ -1,0 +1,50 @@
+{
+  "ts": "2026-04-12T05:31:33.130Z",
+  "base": "http://localhost:5173",
+  "total": 218,
+  "counts": {
+    "pass_usable": 28,
+    "pass_pending": 187,
+    "fail_http": 1,
+    "fail_identity": 2
+  },
+  "failuresBySport": {
+    "NCAAB": 3
+  },
+  "failures": [
+    {
+      "sport": "NCAAB",
+      "name": "tiger woods",
+      "expectedId": "462",
+      "verdict": "fail_http",
+      "pageDataId": null,
+      "partialReason": null,
+      "gameLog": 0,
+      "seasonKeys": 0,
+      "props": 0,
+      "err": "status=400"
+    },
+    {
+      "sport": "NCAAB",
+      "name": "viktor hovland",
+      "expectedId": "10592",
+      "verdict": "fail_identity",
+      "pageDataId": "4364873",
+      "partialReason": "document_pending",
+      "gameLog": 0,
+      "seasonKeys": 0,
+      "props": 0
+    },
+    {
+      "sport": "NCAAB",
+      "name": "xander schauffele",
+      "expectedId": "9521",
+      "verdict": "fail_identity",
+      "pageDataId": "10140",
+      "partialReason": "profile_incomplete",
+      "gameLog": 1,
+      "seasonKeys": 0,
+      "props": 0
+    }
+  ]
+}

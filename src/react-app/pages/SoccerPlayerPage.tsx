@@ -13,6 +13,7 @@
 
 import { useParams, Link, useSearchParams } from "react-router-dom";
 import { useEffect, useState } from "react";
+import { fetchJsonCached } from "@/react-app/lib/fetchCache";
 import { 
   User, Calendar, Target, TrendingUp, 
   Loader2, ChevronRight, Activity, Trophy
@@ -43,6 +44,18 @@ interface PlayerData {
     id: string;
     name: string;
   } | null;
+  photoUrl?: string | null;
+}
+
+interface SoccerPlayerApiResponse {
+  player?: PlayerData | null;
+  stats?: SeasonStats | null;
+  recentMatches?: RecentMatch[];
+  found?: boolean;
+  status?: "ok" | "degraded" | "not_found";
+  pending_refresh?: boolean;
+  degraded?: boolean;
+  reason?: string;
 }
 
 interface SeasonStats {
@@ -121,16 +134,17 @@ function PlayerPhoto({
 export default function SoccerPlayerPage() {
   const { playerId } = useParams<{ playerId: string }>();
   const [searchParams] = useSearchParams();
+  const playerNameHint = String(searchParams.get("playerName") || searchParams.get("name") || "").trim();
   const fromTeamId = searchParams.get("fromTeamId");
   const [player, setPlayer] = useState<PlayerData | null>(null);
   const [stats, setStats] = useState<SeasonStats | null>(null);
   const [recentMatches, setRecentMatches] = useState<RecentMatch[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [degraded, setDegraded] = useState<{ pendingRefresh: boolean; reason?: string } | null>(null);
   const [playerPhotoUrl, setPlayerPhotoUrl] = useState<string | null>(null);
 
   useEffect(() => {
-    const controller = new AbortController();
     let mounted = true;
 
     async function fetchPlayer() {
@@ -138,43 +152,49 @@ export default function SoccerPlayerPage() {
 
       setLoading(true);
       setError(null);
+      setDegraded(null);
 
       try {
-        // Add 10 second timeout to fail fast instead of hanging
-        const timeoutId = setTimeout(() => controller.abort(), 10000);
-        
-        const res = await fetch(`/api/soccer/player/${playerId}`, {
-          signal: controller.signal
+        const data = await fetchJsonCached<SoccerPlayerApiResponse>(`/api/soccer/player/${playerId}`, {
+          cacheKey: `soccer-player:v2:${playerId}`,
+          ttlMs: 45_000,
+          timeoutMs: 5_000,
+          init: { credentials: "include" },
         });
-        
-        clearTimeout(timeoutId);
-        
-        if (!res.ok) {
-          if (mounted) {
-            setError('Unable to load player profile');
-            setPlayer(null);
-            setStats(null);
-            setRecentMatches([]);
-          }
-          return;
-        }
-
-        const data = await res.json();
         
         if (!mounted) return; // Don't update state if unmounted
         
-        // Check if player was actually found - API returns found:false for unknown players
-        if (!data.found) {
+        const isDegraded = data?.status === "degraded" || data?.pending_refresh === true || data?.degraded === true;
+        // Only hard-fail when endpoint explicitly says this is a true not-found.
+        if (!isDegraded && data?.found === false) {
           setError('Player not found in our database');
           setPlayer(null);
           setStats(null);
           setRecentMatches([]);
           return;
         }
-        
-        setPlayer(data.player);
-        setStats(data.stats || null);
-        setRecentMatches(data.recentMatches || []);
+
+        const fallbackPlayer: PlayerData = {
+          id: String(playerId || ""),
+          name: playerNameHint || "Soccer Player",
+          nationality: "",
+          dateOfBirth: null,
+          height: null,
+          weight: null,
+          position: "Unknown",
+          jerseyNumber: null,
+          team: null,
+          competition: null,
+        };
+        setPlayer((data.player as PlayerData) || fallbackPlayer);
+        setStats((data.stats as SeasonStats) || null);
+        setRecentMatches(Array.isArray(data.recentMatches) ? data.recentMatches : []);
+        if (isDegraded) {
+          setDegraded({
+            pendingRefresh: data?.pending_refresh === true,
+            reason: data?.reason || undefined,
+          });
+        }
         // Use API's photoUrl if available
         if (data.player?.photoUrl) {
           setPlayerPhotoUrl(data.player.photoUrl);
@@ -182,8 +202,20 @@ export default function SoccerPlayerPage() {
       } catch (err: any) {
         if (err.name === 'AbortError') {
           if (mounted) {
-            setError('Request timed out - player data is taking too long to load');
-            setPlayer(null);
+            setError(null);
+            setDegraded({ pendingRefresh: true, reason: 'request_timeout' });
+            setPlayer({
+              id: String(playerId || ""),
+              name: playerNameHint || "Soccer Player",
+              nationality: "",
+              dateOfBirth: null,
+              height: null,
+              weight: null,
+              position: "Unknown",
+              jerseyNumber: null,
+              team: null,
+              competition: null,
+            });
             setStats(null);
             setRecentMatches([]);
           }
@@ -192,8 +224,20 @@ export default function SoccerPlayerPage() {
         
         console.error('Player fetch error:', err);
         if (mounted) {
-          setError('Unable to load player profile');
-          setPlayer(null);
+          setError(null);
+          setDegraded({ pendingRefresh: true, reason: 'player_fetch_error' });
+          setPlayer({
+            id: String(playerId || ""),
+            name: playerNameHint || "Soccer Player",
+            nationality: "",
+            dateOfBirth: null,
+            height: null,
+            weight: null,
+            position: "Unknown",
+            jerseyNumber: null,
+            team: null,
+            competition: null,
+          });
           setStats(null);
           setRecentMatches([]);
         }
@@ -208,7 +252,6 @@ export default function SoccerPlayerPage() {
 
     return () => {
       mounted = false;
-      controller.abort();
     };
   }, [playerId]);
 
@@ -252,7 +295,7 @@ export default function SoccerPlayerPage() {
     );
   }
 
-  if (error || !player) {
+  if (error || (!player && !degraded)) {
     return (
       <div className="min-h-screen bg-[#0a0a0a] text-white">
         <SoccerPageHeader
@@ -276,6 +319,27 @@ export default function SoccerPlayerPage() {
     );
   }
 
+  if (!player) {
+    return (
+      <div className="min-h-screen bg-[#0a0a0a] text-white">
+        <SoccerPageHeader
+          breadcrumbs={[{ label: 'Player' }]}
+          title={playerNameHint || "Soccer Player"}
+          subtitle="Profile temporarily limited"
+          onBack={goBack}
+        />
+        <div className="max-w-7xl mx-auto px-4 py-6">
+          <section className="rounded-xl border border-amber-400/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-100">
+            <p className="font-medium">Player data is temporarily degraded.</p>
+            <p className="text-amber-200/80 text-xs mt-1">
+              Showing available identity data while background refresh continues.
+            </p>
+          </section>
+        </div>
+      </div>
+    );
+  }
+
   const age = getAge(player.dateOfBirth);
 
   return (
@@ -294,6 +358,15 @@ export default function SoccerPlayerPage() {
       />
 
       <div className="max-w-7xl mx-auto px-4 py-6 space-y-6">
+        {degraded && (
+          <section className="rounded-xl border border-amber-400/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-100">
+            <p className="font-medium">Player data is temporarily degraded.</p>
+            <p className="text-amber-200/80 text-xs mt-1">
+              Showing available identity data while background refresh continues.
+            </p>
+          </section>
+        )}
+
         {/* Player Hero Card */}
         <section className="rounded-2xl bg-gradient-to-br from-white/5 to-white/[0.02] border border-white/10 overflow-hidden">
           <div className="p-6 md:p-8">

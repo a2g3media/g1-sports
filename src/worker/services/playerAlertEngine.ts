@@ -13,6 +13,13 @@
 import { D1Database } from '@cloudflare/workers-types';
 import { sendTicketAlertPush } from './webPushService';
 
+function propsPlayerDeepLink(sport: string, _playerName: string, rawPlayerId: string | null | undefined): string {
+  const id = String(rawPlayerId ?? "").trim();
+  if (!/^\d{4,}$/.test(id)) return "/props";
+  const s = String(sport || "nba").toLowerCase();
+  return `/props/player/${s}/${encodeURIComponent(id)}`;
+}
+
 // ============================================================================
 // TYPES
 // ============================================================================
@@ -533,7 +540,7 @@ async function evaluateFollowedPlayer(
         priority: PRIORITY_MAP[alertType],
         title: `🏀 ${player.player_name}'s game is live!`,
         message: `${game.away_team} @ ${game.home_team} has started`,
-        deep_link: `/props/player/${player.sport.toLowerCase()}/${encodeURIComponent(player.player_name)}`,
+        deep_link: propsPlayerDeepLink(player.sport, player.player_name, player.player_id),
         player_id: playerId,
         player_name: player.player_name,
         event_id: eventId,
@@ -577,7 +584,7 @@ async function evaluateFollowedPlayer(
         priority: PRIORITY_MAP[alertType],
         title: `🎯 ${player.player_name} HIT ${player.prop_type}!`,
         message: `${currentValue} ${player.prop_type.toLowerCase()} (line was ${player.prop_line})`,
-        deep_link: `/props/player/${player.sport.toLowerCase()}/${encodeURIComponent(player.player_name)}`,
+        deep_link: propsPlayerDeepLink(player.sport, player.player_name, player.player_id),
         player_id: playerId,
         player_name: player.player_name,
         event_id: eventId,
@@ -606,7 +613,7 @@ async function evaluateFollowedPlayer(
           priority: PRIORITY_MAP[alertType],
           title: `🔥 ${player.player_name} CRUSHING IT!`,
           message: `${currentValue} ${player.prop_type.toLowerCase()} — ${exceededBy.toFixed(0)} over the line!`,
-          deep_link: `/props/player/${player.sport.toLowerCase()}/${encodeURIComponent(player.player_name)}`,
+          deep_link: propsPlayerDeepLink(player.sport, player.player_name, player.player_id),
           player_id: playerId,
           player_name: player.player_name,
           event_id: eventId,
@@ -668,7 +675,7 @@ async function evaluateFollowedPlayer(
             priority: PRIORITY_MAP[alertType],
             title: `${emoji} ${player.player_name} ${verb}`,
             message: `${currentValue} ${player.prop_type.toLowerCase()} — projected ${pace.projected.toFixed(0)} (line: ${player.prop_line})`,
-            deep_link: `/props/player/${player.sport.toLowerCase()}/${encodeURIComponent(player.player_name)}`,
+            deep_link: propsPlayerDeepLink(player.sport, player.player_name, player.player_id),
             player_id: playerId,
             player_name: player.player_name,
             event_id: eventId,
@@ -707,7 +714,7 @@ async function evaluateFollowedPlayer(
         priority: PRIORITY_MAP[alertType],
         title: `👑 TRIPLE-DOUBLE! ${player.player_name}`,
         message: `${currentStats.points}pts / ${currentStats.rebounds}reb / ${currentStats.assists}ast`,
-        deep_link: `/props/player/${player.sport.toLowerCase()}/${encodeURIComponent(player.player_name)}`,
+        deep_link: propsPlayerDeepLink(player.sport, player.player_name, player.player_id),
         player_id: playerId,
         player_name: player.player_name,
         event_id: eventId,
@@ -729,7 +736,7 @@ async function evaluateFollowedPlayer(
         priority: PRIORITY_MAP[alertType],
         title: `🏅 Double-Double! ${player.player_name}`,
         message: `${currentStats.points}pts / ${currentStats.rebounds}reb / ${currentStats.assists}ast`,
-        deep_link: `/props/player/${player.sport.toLowerCase()}/${encodeURIComponent(player.player_name)}`,
+        deep_link: propsPlayerDeepLink(player.sport, player.player_name, player.player_id),
         player_id: playerId,
         player_name: player.player_name,
         event_id: eventId,
