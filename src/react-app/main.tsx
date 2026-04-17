@@ -8,9 +8,42 @@ import { FeatureFlagsProvider } from "@/react-app/hooks/useFeatureFlags";
 import { OddsFormatProvider } from "@/react-app/hooks/useOddsFormat";
 
 const isLocalDevHost = ["localhost", "127.0.0.1", "::1"].includes(window.location.hostname);
+const APP_BUILD_ID = String(__APP_BUILD_ID__ || "dev");
+const SERVICE_WORKER_URL = `/sw.js?v=${encodeURIComponent(APP_BUILD_ID)}`;
 
 // Service Worker update handler - production only.
 if ("serviceWorker" in navigator && !isLocalDevHost) {
+  const ensureLatestServiceWorker = async () => {
+    let registration = await navigator.serviceWorker.getRegistration();
+    const knownScriptUrl =
+      registration?.active?.scriptURL ||
+      registration?.waiting?.scriptURL ||
+      registration?.installing?.scriptURL ||
+      "";
+    const hasCurrentBuild = knownScriptUrl.includes(`v=${encodeURIComponent(APP_BUILD_ID)}`)
+      || knownScriptUrl.includes(`v=${APP_BUILD_ID}`);
+
+    if (!registration || !hasCurrentBuild) {
+      registration = await navigator.serviceWorker.register(SERVICE_WORKER_URL, { scope: "/" });
+      console.log("[SW] Registered build-scoped worker:", APP_BUILD_ID);
+    }
+
+    registration?.update().catch(() => {});
+
+    if (registration?.waiting) {
+      registration.waiting.postMessage({ type: "SKIP_WAITING" });
+    }
+
+    registration?.addEventListener("updatefound", () => {
+      const newWorker = registration?.installing;
+      newWorker?.addEventListener("statechange", () => {
+        if (newWorker.state === "installed" && navigator.serviceWorker.controller) {
+          newWorker.postMessage({ type: "SKIP_WAITING" });
+        }
+      });
+    });
+  };
+
   // Listen for messages from SW
   navigator.serviceWorker.addEventListener("message", (event) => {
     if (event.data?.type === "SW_UPDATED") {
@@ -27,28 +60,7 @@ if ("serviceWorker" in navigator && !isLocalDevHost) {
     }
   });
 
-  // Force SW update check on page load
-  navigator.serviceWorker.ready.then((registration) => {
-    registration.update().catch(() => {});
-  });
-
-  // Check for waiting SW and skip waiting
-  navigator.serviceWorker.getRegistration().then((registration) => {
-    if (registration?.waiting) {
-      registration.waiting.postMessage({ type: "SKIP_WAITING" });
-    }
-    
-    // Listen for new SW installing
-    registration?.addEventListener("updatefound", () => {
-      const newWorker = registration.installing;
-      newWorker?.addEventListener("statechange", () => {
-        if (newWorker.state === "installed" && navigator.serviceWorker.controller) {
-          // New SW installed, skip waiting and reload
-          newWorker.postMessage({ type: "SKIP_WAITING" });
-        }
-      });
-    });
-  });
+  void ensureLatestServiceWorker();
 }
 
 const queryClient = new QueryClient({

@@ -8255,6 +8255,38 @@ let providersInitialized = false;
 export default {
   fetch: async (request: Request, env: Env, ctx: ExecutionContext) => {
     const url = new URL(request.url);
+    const applyAssetCachePolicy = (
+      response: Response,
+      opts: { path: string; isDocumentRequest: boolean; hasFileExtension: boolean }
+    ): Response => {
+      const { path, isDocumentRequest, hasFileExtension } = opts;
+      const isServiceWorker = path === "/sw.js";
+      const isManifest = path === "/manifest.json";
+      const isHtmlShell =
+        (isDocumentRequest && !hasFileExtension) || path === "/" || path.endsWith(".html");
+      const isFingerprintedAsset = path.startsWith("/assets/");
+
+      if (!isServiceWorker && !isManifest && !isHtmlShell && !isFingerprintedAsset) {
+        return response;
+      }
+
+      const headers = new Headers(response.headers);
+      if (isServiceWorker || isManifest || isHtmlShell) {
+        headers.set("cache-control", "no-store, no-cache, must-revalidate");
+        headers.set("pragma", "no-cache");
+        headers.set("expires", "0");
+      } else if (isFingerprintedAsset) {
+        headers.set("cache-control", "public, max-age=31536000, immutable");
+      }
+      if (isServiceWorker) {
+        headers.set("service-worker-allowed", "/");
+      }
+      return new Response(response.body, {
+        status: response.status,
+        statusText: response.statusText,
+        headers,
+      });
+    };
     
     // Initialize providers with API keys and database from env on each request
     // (workers may be cold-started, so we need to ensure providers are ready)
@@ -8303,7 +8335,11 @@ export default {
       try {
         const assetResponse = await assets.fetch(request);
         if (assetResponse.status !== 404) {
-          return assetResponse;
+          return applyAssetCachePolicy(assetResponse, {
+            path: url.pathname,
+            isDocumentRequest,
+            hasFileExtension,
+          });
         }
 
         // Production SPA deep-link fallback:
@@ -8313,7 +8349,11 @@ export default {
           const rootRequest = new Request(rootUrl.toString(), request);
           const rootResponse = await assets.fetch(rootRequest);
           if (rootResponse.ok) {
-            return rootResponse;
+            return applyAssetCachePolicy(rootResponse, {
+              path: "/",
+              isDocumentRequest: true,
+              hasFileExtension: false,
+            });
           }
         }
 

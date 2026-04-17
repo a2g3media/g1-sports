@@ -1,5 +1,6 @@
-const CACHE_NAME = 'gz-sports-v9';
-const APP_VERSION = '2026.02.22.1'; // Update this with each release
+const SW_SELF_URL = new URL(self.location.href);
+const APP_VERSION = SW_SELF_URL.searchParams.get('v') || 'legacy';
+const CACHE_NAME = `gz-sports-${APP_VERSION}`;
 const STATIC_ASSETS = [
   '/manifest.json',
 ];
