@@ -1,30 +1,95 @@
+/**
+ * HOMEPAGE LOCKED
+ * Do not change behavior/order/render rules without explicit approval.
+ * Homepage stability rules:
+ * - exactly 3 Games Today cards
+ * - soccer + White Sox logo stability
+ * - static sport icon row behavior
+ * - watchboards render immediately and stay synced on Home
+ * - no flicker / no late visual swapping
+ */
+import React from "react";
 import { Link } from "react-router-dom";
-import { useEffect, useMemo, useState } from "react";
 import { cn } from "@/react-app/lib/utils";
 import {
-  Activity,
-  Calendar,
-  Flame,
-  Shield,
-  Target,
-  Trophy,
-  Users,
-  Zap,
-} from "lucide-react";
-import { getSportAvatarConfig } from "@/react-app/lib/sportAvatars";
+  HOMEPAGE_ICON_ROW_STATIC,
+  HOMEPAGE_NO_RUNTIME_ICON_SWAP,
+  HOMEPAGE_STATIC_ICON_SOURCES,
+} from "@/react-app/lib/homeLockRules";
 
-// Homepage quick-access chips with realistic sport avatar treatment.
+// Homepage quick-access chips with premium sport avatars.
 const SPORTS = [
-  { key: "nba", label: "NBA", fallbackIcon: Zap, accent: "text-orange-300", border: "border-orange-400/35", bg: "from-orange-500/18 via-orange-500/8 to-orange-500/4" },
-  { key: "nfl", label: "NFL", fallbackIcon: Shield, accent: "text-green-300", border: "border-green-400/35", bg: "from-green-500/18 via-green-500/8 to-green-500/4" },
-  { key: "mlb", label: "MLB", fallbackIcon: Target, accent: "text-red-300", border: "border-red-400/35", bg: "from-red-500/18 via-red-500/8 to-red-500/4" },
-  { key: "nhl", label: "NHL", fallbackIcon: Shield, accent: "text-cyan-300", border: "border-cyan-400/35", bg: "from-cyan-500/18 via-cyan-500/8 to-cyan-500/4" },
-  { key: "ncaaf", label: "NCAAF", fallbackIcon: Calendar, accent: "text-amber-300", border: "border-amber-400/35", bg: "from-amber-500/18 via-amber-500/8 to-amber-500/4" },
-  { key: "ncaab", label: "NCAAB", fallbackIcon: Activity, accent: "text-blue-300", border: "border-blue-400/35", bg: "from-blue-500/18 via-blue-500/8 to-blue-500/4" },
-  { key: "soccer", label: "Soccer", fallbackIcon: Users, accent: "text-emerald-300", border: "border-emerald-400/35", bg: "from-emerald-500/18 via-emerald-500/8 to-emerald-500/4" },
-  { key: "golf", label: "Golf", fallbackIcon: Trophy, accent: "text-teal-300", border: "border-teal-400/35", bg: "from-teal-500/18 via-teal-500/8 to-teal-500/4" },
-  { key: "mma", label: "MMA", fallbackIcon: Flame, accent: "text-rose-300", border: "border-rose-400/35", bg: "from-rose-500/18 via-rose-500/8 to-rose-500/4" },
+  { key: "nba", label: "NBA", accent: "text-orange-300" },
+  { key: "nfl", label: "NFL", accent: "text-green-300" },
+  { key: "mlb", label: "MLB", accent: "text-red-300" },
+  { key: "nhl", label: "NHL", accent: "text-cyan-300" },
+  { key: "ncaaf", label: "NCAAF", accent: "text-amber-300" },
+  { key: "ncaab", label: "NCAAB", accent: "text-blue-300" },
+  { key: "soccer", label: "Soccer", accent: "text-emerald-300" },
+  { key: "golf", label: "Golf", accent: "text-teal-300" },
+  { key: "mma", label: "MMA", accent: "text-rose-300" },
 ];
+
+const STATIC_HOME_SPORT_CHIPS = SPORTS.map((sport) => ({
+  ...sport,
+  avatarSrc: HOMEPAGE_STATIC_ICON_SOURCES[sport.key as keyof typeof HOMEPAGE_STATIC_ICON_SOURCES] || "",
+  avatarAlt: `${sport.label} icon`,
+}));
+
+function StaticSportChipIcon({
+  src,
+  alt,
+  label,
+}: {
+  src: string;
+  alt: string;
+  label: string;
+}) {
+  const defaultSrc = "/assets/sports/default-ball-ai.svg?v=20260422";
+  const [currentSrc, setCurrentSrc] = React.useState(src);
+  const [fallbackTried, setFallbackTried] = React.useState(false);
+  const [renderTextFallback, setRenderTextFallback] = React.useState(false);
+
+  React.useEffect(() => {
+    setCurrentSrc(src);
+    setFallbackTried(false);
+    setRenderTextFallback(false);
+  }, [src]);
+
+  if (renderTextFallback) {
+    return (
+      <div
+        className="h-full w-full rounded-full border border-white/20 bg-white/10 flex items-center justify-center text-[10px] font-bold uppercase text-white/75"
+        aria-label={`${label} fallback icon`}
+      >
+        {label.slice(0, 3)}
+      </div>
+    );
+  }
+
+  return (
+    <img
+      src={currentSrc}
+      alt={alt}
+      loading="eager"
+      decoding="async"
+      fetchPriority="high"
+      onError={() => {
+        if (!fallbackTried && currentSrc !== defaultSrc) {
+          setFallbackTried(true);
+          setCurrentSrc(defaultSrc);
+          return;
+        }
+        setRenderTextFallback(true);
+      }}
+      data-home-icon-static={HOMEPAGE_ICON_ROW_STATIC ? "true" : "false"}
+      data-home-icon-runtime-swap={HOMEPAGE_NO_RUNTIME_ICON_SWAP ? "disabled" : "enabled"}
+      width={96}
+      height={96}
+      className="h-full w-full object-contain"
+    />
+  );
+}
 
 function normalizeSportKey(value: string | null | undefined): string {
   const key = String(value || "").toLowerCase().trim();
@@ -34,78 +99,39 @@ function normalizeSportKey(value: string | null | undefined): string {
 }
 
 export function SportQuickAccess({ activeSportKey }: { activeSportKey?: string | null }) {
-  const [avatarFailures, setAvatarFailures] = useState<Record<string, number>>({});
   const activeKey = normalizeSportKey(activeSportKey);
-
-  const avatarData = useMemo(
-    () =>
-      SPORTS.map((sport) => ({
-        ...sport,
-        avatar: getSportAvatarConfig(sport.key),
-      })),
-    []
-  );
-
-  useEffect(() => {
-    // Warm photo avatars immediately so pills paint fast.
-    for (const sport of avatarData) {
-      const primary = new Image();
-      primary.decoding = 'async';
-      primary.src = sport.avatar.src;
-    }
-  }, [avatarData]);
-
-  const markAvatarFailure = (sportKey: string) => {
-    setAvatarFailures((current) => ({
-      ...current,
-      [sportKey]: (current[sportKey] ?? 0) + 1,
-    }));
-  };
+  const chips = STATIC_HOME_SPORT_CHIPS;
 
   return (
     <section className="mb-5 lg:mb-6">
       <div className="flex gap-4 overflow-x-auto scrollbar-hide pb-1 -mx-1 px-1 md:flex md:flex-wrap md:justify-center md:gap-5 lg:gap-6">
-        {avatarData.map((sport) => {
+        {chips.map((sport) => {
           const isActive = activeKey === sport.key;
-          const failureCount = avatarFailures[sport.key] ?? 0;
-          const showFallbackIcon = failureCount > 0;
-          const imageSrc = sport.avatar.src;
           const sportHref = sport.key === "golf" ? "/sports" : `/sports/${sport.key}`;
-          const FallbackIcon = sport.fallbackIcon;
 
           return (
             <Link
               key={sport.key}
               to={sportHref}
               className={cn(
-                "group flex-shrink-0 flex flex-col items-center gap-2",
+                "group relative flex-shrink-0 flex flex-col items-center gap-2 pb-1",
                 "min-w-[72px] md:min-w-0",
-                "hover:-translate-y-0.5 active:translate-y-0 transition-transform duration-200",
-                isActive && "-translate-y-0.5"
+                "hover:-translate-y-0.5 active:translate-y-0 transition-all duration-300 ease-out",
+                isActive && "-translate-y-0.5 after:absolute after:left-1/2 after:-translate-x-1/2 after:-bottom-0.5 after:h-[2px] after:w-8 after:rounded-full after:bg-gradient-to-r after:from-cyan-300 after:to-blue-500 after:shadow-[0_0_12px_rgba(56,189,248,0.35)]"
               )}
             >
               <div
                 className={cn(
                   "relative flex h-20 w-20 md:h-24 md:w-24 items-center justify-center rounded-full",
-                  "group-hover:scale-[1.06] transition-transform duration-200",
-                  isActive && "scale-[1.08] bg-white/[0.04] ring-2 ring-primary/50 shadow-[0_0_26px_rgba(59,130,246,0.25)]"
+                  "group-hover:scale-[1.03] transition-transform duration-300 ease-out",
+                  isActive && "scale-[1.04] bg-white/[0.04]"
                 )}
               >
-                {!showFallbackIcon ? (
-                  <img
-                    src={imageSrc}
-                    alt={sport.avatar.alt}
-                    loading="eager"
-                    decoding="async"
-                    fetchPriority="high"
-                    width={96}
-                    height={96}
-                    className="h-full w-full object-contain"
-                    onError={() => markAvatarFailure(sport.key)}
-                  />
-                ) : (
-                  <FallbackIcon className={cn("h-10 w-10 md:h-12 md:w-12", sport.accent)} />
-                )}
+                <StaticSportChipIcon
+                  src={sport.avatarSrc}
+                  alt={sport.avatarAlt}
+                  label={sport.label}
+                />
               </div>
               <span
                 className={cn(
@@ -123,3 +149,5 @@ export function SportQuickAccess({ activeSportKey }: { activeSportKey?: string |
     </section>
   );
 }
+
+export default React.memo(SportQuickAccess);

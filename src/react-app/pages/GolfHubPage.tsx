@@ -1,7 +1,7 @@
 import { useState, useEffect, useMemo } from "react";
 import { useNavigate } from "react-router-dom";
 import { motion, AnimatePresence } from "framer-motion";
-import { Trophy, Calendar, Users, Sparkles, MapPin, Flag, Clock, DollarSign, ChevronRight, AlertCircle, Star, TrendingUp, Zap, Target, ArrowLeft, Award, Crown, Search, User, X, BarChart3, Globe, Check } from "lucide-react";
+import { Trophy, Calendar, Users, Sparkles, MapPin, Flag, Clock, DollarSign, ChevronRight, Star, TrendingUp, Zap, Target, ArrowLeft, Award, Crown, Search, User, X, BarChart3, Globe, Check } from "lucide-react";
 import { GolfLeaderboard } from "@/react-app/components/hub/GolfLeaderboard";
 import { CoachCommandCard } from "@/react-app/components/hub/CoachCommandCard";
 
@@ -407,7 +407,6 @@ export function GolfHubPage() {
   const [selectedTab, setSelectedTab] = useState<'leaderboard' | 'schedule' | 'results' | 'players'>('leaderboard');
   const [scheduleData, setScheduleData] = useState<GolfScheduleData | null>(null);
   const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
   const [selectedTournamentId, setSelectedTournamentId] = useState<string | null>(null);
   const [selectedResult, setSelectedResult] = useState<GolfScheduleData['completed'][0] | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
@@ -433,7 +432,6 @@ export function GolfHubPage() {
   async function fetchSchedule() {
     try {
       setLoading(true);
-      setError(null);
       
       const response = await fetch('/api/golf/schedule');
       
@@ -452,7 +450,6 @@ export function GolfHubPage() {
       console.warn('[GolfHubPage] schedule unavailable, using launch placeholder UI', err);
       setScheduleData(null);
       setSelectedTournamentId(null);
-      setError('Golf data coming soon');
     } finally {
       setLoading(false);
     }

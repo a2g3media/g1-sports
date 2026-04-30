@@ -1,17 +1,12 @@
 /**
- :no_entry_sign: HOME LOCKED — DO NOT MODIFY :no_entry_sign:
- *
- * This page is production-stable.
- * Any change must go through explicit override and review.
- *
- * Rules enforced:
- * - schedule-only data
- * - 3-card fallback rule (LIVE → FINAL → UPCOMING)
- * - no stale/yesterday data
- * - no fallback injection
- *
- * If you need to change Home:
- * you MUST disable HOME_LOCKED and document why.
+ * HOMEPAGE LOCKED
+ * Do not change behavior/order/render rules without explicit approval.
+ * Homepage stability rules:
+ * - exactly 3 Games Today cards
+ * - soccer + White Sox logo stability
+ * - static sport icon row behavior
+ * - watchboards render immediately and stay synced on Home
+ * - no flicker / no late visual swapping
  */
 import { useState, useEffect, useCallback, memo, useRef, useMemo } from "react";
 import { useDocumentTitle } from "@/react-app/hooks/useDocumentTitle";
@@ -35,6 +30,14 @@ import { Component, type ReactNode, type ErrorInfo } from "react";
 import { toGameDetailPath } from "@/react-app/lib/gameRoutes";
 import { useFeatureFlags } from "@/react-app/hooks/useFeatureFlags";
 import { prefetch } from "@/react-app/components/LazyRoute";
+import {
+  HOMEPAGE_GAME_FILL_ORDER,
+  HOMEPAGE_MAX_GAMES,
+  buildHomeCards,
+  getHomeStableGameId,
+  homeLockDevLog,
+  isHomeLockDevRuntime,
+} from "@/react-app/lib/homeLockRules";
 
 let launchRouteChunksPrefetched = false;
 const HOME_LOCKED = true;
@@ -622,58 +625,13 @@ function FeaturedGamesCarousel({
     return period.includes("HALF") || period.includes("LIVE") || clock.includes("LIVE");
   }, []);
 
-  const isFinalLikeStatus = useCallback((game: LiveGame): boolean => {
-    const status = String(game.status || "").toUpperCase();
-    return status === "FINAL" || status === "COMPLETED" || status === "CLOSED";
-  }, []);
-
-  const isUpcomingLikeStatus = useCallback((game: LiveGame): boolean => {
-    if (isLiveLikeStatus(game) || isFinalLikeStatus(game)) return false;
-    const status = String(game.status || "").toUpperCase();
-    return status === "SCHEDULED" || status === "NOT_STARTED" || status === "PRE_GAME" || status === "PREGAME";
-  }, [isFinalLikeStatus, isLiveLikeStatus]);
-
-  const toTime = useCallback((game: LiveGame, fallback: number): number => {
-    const parsed = parseDateSafe(game.startTime);
-    return parsed ? parsed.getTime() : fallback;
-  }, [parseDateSafe]);
-
-  const selectHomeSportCards = useCallback((sportGames: LiveGame[]): LiveGame[] => {
+  const selectHomeSportCards = useCallback((sport: string, sportGames: LiveGame[]): LiveGame[] => {
     const selected = runHomeDisplayMutation("select-home-sport-cards", true, () => {
-      const todayStartTimeGames = sportGames.filter((game) => {
-        const parsed = parseDateSafe(game.startTime);
-        return parsed ? isTodayLocalOrUtc(parsed) : false;
-      });
-      const byLive = [...sportGames]
-        .filter((game) => isLiveLikeStatus(game))
-        .sort((a, b) => toTime(b, Number.NEGATIVE_INFINITY) - toTime(a, Number.NEGATIVE_INFINITY));
-      const byFinal = [...sportGames]
-        .filter((game) => isFinalLikeStatus(game))
-        .sort((a, b) => toTime(b, Number.NEGATIVE_INFINITY) - toTime(a, Number.NEGATIVE_INFINITY));
-      const byUpcoming = [...todayStartTimeGames]
-        .filter((game) => isUpcomingLikeStatus(game))
-        .sort((a, b) => toTime(a, Number.POSITIVE_INFINITY) - toTime(b, Number.POSITIVE_INFINITY));
-
-      const selectedGames: LiveGame[] = [];
-      const seenIds = new Set<string>();
-      const pushFromBucket = (bucket: LiveGame[]) => {
-        for (const game of bucket) {
-          if (selectedGames.length >= 3) break;
-          const key = String(game.id || "").trim();
-          if (!key || seenIds.has(key)) continue;
-          seenIds.add(key);
-          selectedGames.push(game);
-        }
-      };
-
-      // Hard Home display rule: LIVE first, then FINAL, then UPCOMING.
-      pushFromBucket(byLive);
-      pushFromBucket(byFinal);
-      pushFromBucket(byUpcoming);
-      return selectedGames;
+      const cards = buildHomeCards(sportGames, sport);
+      return cards.slice(0, HOMEPAGE_MAX_GAMES);
     });
     return maybeFreezeHomeDataStructure(selected || []);
-  }, [isFinalLikeStatus, isLiveLikeStatus, isTodayLocalOrUtc, isUpcomingLikeStatus, parseDateSafe, toTime]);
+  }, []);
   
   const sportGroups = useMemo(() => {
     const groups = runHomeDisplayMutation("build-home-sport-groups", true, () => {
@@ -685,7 +643,7 @@ function FeaturedGamesCarousel({
       }
 
       const nextGroups = Array.from(grouped.entries()).map(([sport, sportGames]) => {
-        const selectedGames = selectHomeSportCards(sportGames);
+        const selectedGames = selectHomeSportCards(sport, sportGames);
         const liveCount = selectedGames.filter((g) => isLiveLikeStatus(g)).length;
         const earliestStart = selectedGames.reduce((earliest, game) => {
           const next = game.startTime ? new Date(game.startTime).getTime() : Number.POSITIVE_INFINITY;
@@ -717,8 +675,9 @@ function FeaturedGamesCarousel({
   }, [games, getQuickAccessOrder, isLiveLikeStatus, normalizeSportKey, selectHomeSportCards]);
 
   const activeGroup = sportGroups[activeSportIndex] || null;
-  const visibleGames = (activeGroup?.games || games).slice(0, 3);
+  const visibleGames = (activeGroup?.games || games).slice(0, HOMEPAGE_MAX_GAMES);
   const isLive = activeGroup ? activeGroup.hasLive : games.some(g => g.status === 'IN_PROGRESS');
+  const homeSoccerDebugLoggedRef = useRef(false);
 
   useEffect(() => {
     if (homeDashboardLockSelfTestRan) return;
@@ -727,17 +686,42 @@ function FeaturedGamesCarousel({
   }, []);
 
   useEffect(() => {
-    const groupSports = sportGroups.map((group) => String(group.sport || "").toUpperCase());
-    const visibleSports = visibleGames.map((game) => normalizeSportKey(game.sport, game.league));
-    console.info("[Home][soccer-debug] final-render", {
-      sportGroups: groupSports,
-      activeSport: activeGroup?.sport || null,
-      visibleSports,
-      hasSoccerGroup: groupSports.includes("SOCCER"),
+    if (!isHomeLockDevRuntime()) return;
+    const selectedSport = String(activeGroup?.sport || "none").toUpperCase();
+    const visibleIds = visibleGames.map((game) => getHomeStableGameId({
+      id: game.id,
+      gameId: game.gameId,
+      eventId: game.eventId,
+      status: game.status,
+      startTime: game.startTime,
+      league: game.league,
+      homeTeam: game.homeTeam,
+      awayTeam: game.awayTeam,
+    }, selectedSport));
+    homeLockDevLog("selected sport", { selectedSport, fillOrder: HOMEPAGE_GAME_FILL_ORDER });
+    homeLockDevLog("visible game ids", { ids: visibleIds });
+    homeLockDevLog("visible count", { count: visibleGames.length, max: HOMEPAGE_MAX_GAMES });
+  }, [activeGroup?.sport, visibleGames]);
+
+  useEffect(() => {
+    if (!isHomeLockDevRuntime()) return;
+    if (homeSoccerDebugLoggedRef.current) return;
+    const selectedSport = String(activeGroup?.sport || "").toLowerCase();
+    if (normalizeSportKey(selectedSport) !== "SOCCER") return;
+    const soccerGroup = sportGroups.find((group) => normalizeSportKey(group.sport) === "SOCCER");
+    const soccerGames = soccerGroup?.games || [];
+    const featuredGames = visibleGames || [];
+    homeLockDevLog("logo path chosen for soccer/white sox", {
+      selectedSport,
+      totalSoccerGames: soccerGames.length,
+      featuredCount: featuredGames.length,
+      ids: featuredGames.map((g) => (g as any)?.id || (g as any)?.gameId || (g as any)?.eventId),
     });
+    homeSoccerDebugLoggedRef.current = true;
   }, [activeGroup?.sport, normalizeSportKey, sportGroups, visibleGames]);
 
   useEffect(() => {
+    if (!isHomeLockDevRuntime()) return;
     const violations: Array<Record<string, unknown>> = [];
     const seenIds = new Set<string>();
     const hasData = games.length > 0;
@@ -788,7 +772,7 @@ function FeaturedGamesCarousel({
     }
 
     if (violations.length > 0) {
-      console.error("[Home][render-assertions] violation detected", {
+      console.error("[HOME LOCK] render assertions violation detected", {
         totalGames: games.length,
         sportGroups: sportGroups.length,
         violations,
@@ -1354,7 +1338,7 @@ const RivalAlert = memo(function RivalAlert({
 // ============================================
 // LOADING SKELETON
 // ============================================
-function HomeSkeleton() {
+export function HomeSkeleton() {
   return (
     <div className="relative min-h-screen -mx-4 -mt-2 px-4 pt-2 pb-8 md:-mx-6 md:px-6 lg:-mx-8 lg:px-8 lg:pt-2 lg:pb-10">
       <CinematicBackground />
@@ -1410,8 +1394,12 @@ function DashboardInner() {
   const [skeletonExpired, setSkeletonExpired] = useState(false);
   
   // Get games from consolidated DataHub
-  const { games: liveGames, gamesLoading, gamesError: error } = useDataHub();
-  const displayGames: LiveGame[] = liveGames || [];
+  const { games: homeGames, gamesLoading, gamesError: error } = useDataHub();
+  const displayGames: LiveGame[] = homeGames || [];
+  const liveGames = useMemo(
+    () => displayGames.filter((game) => String(game.status || "").toUpperCase() === "IN_PROGRESS"),
+    [displayGames]
+  );
   
   // Smart title based on game status
   const carouselTitle = "Games Today";
@@ -1436,6 +1424,53 @@ function DashboardInner() {
     }, 250);
     return () => window.clearTimeout(timer);
   }, []);
+
+  const normalizeLeagueSportKey = useCallback((raw: string | null | undefined): string => {
+    const upper = String(raw || "").toUpperCase();
+    if (upper === "CBB" || upper === "NCAAM") return "NCAAB";
+    if (upper === "CFB" || upper === "NCAAFB") return "NCAAF";
+    return upper;
+  }, []);
+
+  const liveGamesBySport = useMemo(() => {
+    const map = new Map<string, number>();
+    for (const game of liveGames) {
+      const key = normalizeLeagueSportKey(game.sport);
+      if (!key) continue;
+      map.set(key, (map.get(key) || 0) + 1);
+    }
+    return map;
+  }, [liveGames, normalizeLeagueSportKey]);
+
+  const livePoolLeagues = useMemo(
+    () =>
+      leagues.filter((league) => {
+        const sportKey = normalizeLeagueSportKey(league.sport_key);
+        return (liveGamesBySport.get(sportKey) || 0) > 0;
+      }),
+    [leagues, liveGamesBySport, normalizeLeagueSportKey]
+  );
+
+  const showLivePools = livePoolLeagues.length > 0;
+  const totalLivePoolMembers = useMemo(
+    () => livePoolLeagues.reduce((sum, league) => sum + Number(league.member_count || 0), 0),
+    [livePoolLeagues]
+  );
+  const rivalActivities = useMemo(() => {
+    if (!showLivePools) return [];
+    return liveGames.slice(0, 3).map((game) => {
+      const leagueForSport = livePoolLeagues.find(
+        (league) => normalizeLeagueSportKey(league.sport_key) === normalizeLeagueSportKey(game.sport)
+      );
+      return {
+        id: String(game.id || ""),
+        rivalName: String(game.awayTeam?.name || game.awayTeam?.abbreviation || game.awayTeam || "Rival"),
+        action: "is active right now",
+        poolName: leagueForSport?.name || `${normalizeLeagueSportKey(game.sport)} Pool`,
+        timeAgo: "Live now",
+      };
+    });
+  }, [liveGames, livePoolLeagues, normalizeLeagueSportKey, showLivePools]);
   
   const handleNavigateToGame = useCallback((game: LiveGame) => {
     const sport = String(game.sport || "").toLowerCase();
@@ -1481,8 +1516,6 @@ function DashboardInner() {
     );
   }
 
-  const hasLeagues = leagues.length > 0;
-
   return (
     <div className="relative min-h-screen -mx-4 -mt-2 px-4 pt-2 pb-8 md:-mx-6 md:px-6 lg:-mx-8 lg:px-8 lg:pt-2 lg:pb-10">
       <CinematicBackground />
@@ -1493,11 +1526,8 @@ function DashboardInner() {
         
         {/* 2. SPORTS NAVIGATION */}
         <SportQuickAccess activeSportKey={activeCarouselSport} />
-        
-        {/* 2.5 FAVORITES RAIL */}
-        {flags.HOME_FAVORITES_RAIL_ENABLED && <FavoritesRail />}
-        
-        {/* 3. COACH G INTELLIGENCE + GAMES TODAY */}
+
+        {/* 3. GAME CARDS */}
         <section className="space-y-3">
           {displayGames.length > 0 ? (
             <>
@@ -1507,7 +1537,6 @@ function DashboardInner() {
                 onActiveSportChange={setActiveCarouselSport}
                 title={carouselTitle}
               />
-              <AIIntelligenceFeed games={displayGames} />
             </>
           ) : gamesLoading ? (
             <section>
@@ -1544,121 +1573,84 @@ function DashboardInner() {
             </section>
           )}
         </section>
-        
-        {/* 5. YOUR WATCHBOARDS */}
+
+        {/* 4. WATCH BOARD */}
         <SafeWatchboardPreview />
-        
-        {/* 6. POOL COMMAND CENTER - Always visible with demo data */}
-        <>
-          {/* Rank Hero */}
+
+        {/* 5. GAME INTELLIGENCE */}
+        {displayGames.length > 0 && (
           <section>
-            <SectionHeader title="Pool Command Center" linkTo="/pools" linkText="View All" />
-            <RankHeroSection 
-              {...MOCK_POOL_STATS}
-              onClick={() => navigate('/pools')}
-            />
+            <AIIntelligenceFeed games={displayGames} />
           </section>
-          
-          {/* Your Pools */}
-          <section>
-            <SectionHeader title="Your Pools" linkTo="/pools" count={hasLeagues ? leagues.length : 2} />
-            <div className="space-y-2">
-              {hasLeagues ? (
-                leagues.slice(0, 3).map((league, index) => (
-                  <PoolCard
-                    key={league.id}
-                    league={league}
-                    stats={{
-                      rank: Math.floor(Math.random() * 5) + 1,
-                      lastWeekRank: Math.floor(Math.random() * 8) + 1,
-                      gapToNext: Math.floor(Math.random() * 15) + 3,
-                      liveGames: Math.random() > 0.5 ? Math.floor(Math.random() * 3) + 1 : 0,
-                      movement: Math.floor(Math.random() * 5) - 2,
-                      progress: Math.floor(Math.random() * 80) + 20,
-                      totalPlayers: league.member_count || 12,
-                      projectedMovement: Math.random() > 0.5 ? "+2 projected by end of week" : "",
-                    }}
-                    onClick={() => navigate(`/pools/${league.id}`)}
-                    index={index}
-                  />
-                ))
-              ) : (
-                <>
-                  <PoolCard
-                    league={{ id: 1, name: "Office NFL Pool", sport: "nfl", member_count: 12, code: "DEMO1" } as any}
-                    stats={{
-                      rank: 3,
-                      lastWeekRank: 5,
-                      gapToNext: 8,
-                      liveGames: 2,
-                      movement: 2,
-                      progress: 65,
-                      totalPlayers: 12,
-                      projectedMovement: "+2 projected by end of week",
-                    }}
-                    onClick={() => navigate('/pools')}
-                    index={0}
-                  />
-                  <PoolCard
-                    league={{ id: 2, name: "Fantasy Basketball", sport: "nba", member_count: 8, code: "DEMO2" } as any}
-                    stats={{
-                      rank: 1,
-                      lastWeekRank: 2,
-                      gapToNext: 0,
-                      liveGames: 1,
-                      movement: 1,
-                      progress: 88,
-                      totalPlayers: 8,
-                      projectedMovement: "",
-                    }}
-                    onClick={() => navigate('/pools')}
-                    index={1}
-                  />
-                </>
-              )}
-            </div>
-          </section>
-          
-          {/* Rival Alerts */}
-          <section>
-            <SectionHeader title="Rival Activity" />
-            <div className="space-y-2">
-              <RivalAlert
-                rivalName="Mike S."
-                action="moved up 2 spots"
-                poolName="Office NFL Pool"
-                timeAgo="2 hours ago"
-                onClick={() => navigate('/pools')}
-              />
-              <RivalAlert
-                rivalName="Sarah K."
-                action="is now 3 pts ahead"
-                poolName="Fantasy Football"
-                timeAgo="5 hours ago"
-                onClick={() => navigate('/pools')}
-              />
-            </div>
-          </section>
-          
-          {/* Join/Create CTA */}
-          {!hasLeagues && (
+        )}
+
+        {/* 6. POOLS (LIVE ONLY) */}
+        {showLivePools && (
+          <>
             <section>
-              {/* CTA buttons - 44px+ touch targets */}
-              <div className="flex gap-2 sm:gap-3">
-                <Link to={ROUTES.JOIN_LEAGUE} className="flex-1">
-                  <button className="w-full text-sm sm:text-xs px-4 py-3.5 sm:py-3 min-h-[44px] rounded-xl font-semibold bg-white/[0.04] hover:bg-white/[0.08] text-white/60 hover:text-white/80 border border-white/[0.08] transition-all active:scale-[0.98]">
-                    Join a Pool
-                  </button>
-                </Link>
-                <Link to={ROUTES.CREATE_LEAGUE} className="flex-1">
-                  <button className="w-full text-sm sm:text-xs px-4 py-3.5 sm:py-3 min-h-[44px] rounded-xl font-semibold bg-primary hover:bg-primary/90 text-white transition-all active:scale-[0.98]">
-                    Create Pool
-                  </button>
-                </Link>
+              <SectionHeader title="Pool Command Center" linkTo="/pools" linkText="View All" />
+              <div className="grid grid-cols-3 gap-2.5 rounded-2xl border border-white/[0.08] bg-white/[0.03] p-4">
+                <div className="rounded-lg border border-white/10 bg-white/[0.03] px-3 py-2">
+                  <p className="text-[10px] uppercase tracking-wide text-white/45">Live Pools</p>
+                  <p className="text-base font-bold text-white">{livePoolLeagues.length}</p>
+                </div>
+                <div className="rounded-lg border border-white/10 bg-white/[0.03] px-3 py-2">
+                  <p className="text-[10px] uppercase tracking-wide text-white/45">Live Games</p>
+                  <p className="text-base font-bold text-white">{liveGames.length}</p>
+                </div>
+                <div className="rounded-lg border border-white/10 bg-white/[0.03] px-3 py-2">
+                  <p className="text-[10px] uppercase tracking-wide text-white/45">Members</p>
+                  <p className="text-base font-bold text-white">{totalLivePoolMembers}</p>
+                </div>
               </div>
             </section>
-          )}
-        </>
+
+            <section>
+              <SectionHeader title="Your Pools" linkTo="/pools" count={livePoolLeagues.length} />
+              <div className="space-y-2">
+                {livePoolLeagues.slice(0, 4).map((league) => {
+                  const sportKey = normalizeLeagueSportKey(league.sport_key);
+                  const activeGames = liveGamesBySport.get(sportKey) || 0;
+                  return (
+                    <button
+                      key={league.id}
+                      onClick={() => navigate(`/pools/${league.id}`)}
+                      className="w-full text-left rounded-xl border border-white/[0.08] bg-white/[0.03] px-4 py-3 hover:bg-white/[0.06] transition-colors"
+                    >
+                      <div className="flex items-center justify-between gap-3">
+                        <div>
+                          <p className="text-sm font-semibold text-white">{league.name}</p>
+                          <p className="text-[11px] text-white/45">{sportKey} • {league.member_count} members</p>
+                        </div>
+                        <span className="rounded-full border border-emerald-400/30 bg-emerald-500/15 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-emerald-200">
+                          {activeGames} live
+                        </span>
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
+            </section>
+
+            {rivalActivities.length > 0 && (
+              <section>
+                <SectionHeader title="Rival Activity" />
+                <div className="space-y-2">
+                  {rivalActivities.map((entry) => (
+                    <RivalAlert
+                      key={entry.id}
+                      rivalName={entry.rivalName}
+                      action={entry.action}
+                      poolName={entry.poolName}
+                      timeAgo={entry.timeAgo}
+                      onClick={() => navigate('/pools')}
+                    />
+                  ))}
+                </div>
+              </section>
+            )}
+          </>
+        )}
       </div>
     </div>
   );

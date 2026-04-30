@@ -149,7 +149,7 @@ function hasUsableSummary(payload: unknown): boolean {
   const fhMoneyline = (fh?.moneyline && typeof fh.moneyline === 'object') ? fh.moneyline as Record<string, unknown> : null;
 
   const hasMain =
-    n(spread?.home_line) || n(spread?.away_line) ||
+    n(spread?.home_line) || n(spread?.away_line) || n(spread?.line) ||
     n(total?.line) ||
     n(moneyline?.home_price) || n(moneyline?.away_price);
 
@@ -281,6 +281,7 @@ function toFinite(value: unknown): number | null {
 
 function buildSyntheticSlateSummary(game: any): any | null {
   const spread = toFinite(game?.spread ?? game?.spread_home ?? game?.spreadHome);
+  const spreadAway = spread !== null ? -spread : null;
   const total = toFinite(game?.overUnder ?? game?.total ?? game?.over_under);
   const mlHome = toFinite(game?.moneylineHome ?? game?.moneyline_home ?? game?.ml_home);
   const mlAway = toFinite(game?.moneylineAway ?? game?.moneyline_away ?? game?.ml_away);
@@ -301,7 +302,7 @@ function buildSyntheticSlateSummary(game: any): any | null {
 
   return {
     game_id: gameId,
-    spread: spread !== null ? { line: spread } : null,
+    spread: spread !== null ? { home_line: spread, away_line: spreadAway, line: spread } : null,
     total: total !== null ? { line: total } : null,
     moneyline: (mlHome !== null || mlAway !== null) ? { home_price: mlHome, away_price: mlAway } : null,
     opening_spread: toFinite(game?.openSpread ?? game?.open_spread),
@@ -608,6 +609,30 @@ function buildOddsLookupKeys(game: any): string[] {
   ].filter(Boolean);
 }
 
+function parseSrDebugIds(raw: string | undefined): Set<string> {
+  const values = String(raw || "")
+    .split(",")
+    .map((value) => value.trim().toLowerCase())
+    .filter(Boolean);
+  return new Set(values);
+}
+
+function shouldDebugSrOdds(c: any, gameId: string, resolvedGameId: string | null): { enabled: boolean; sampleKey: string } {
+  const debugFlag = String(c?.req?.query?.("sr_debug") || "").toLowerCase();
+  const enabled = debugFlag === "1" || debugFlag === "true" || debugFlag === "yes";
+  if (!enabled) return { enabled: false, sampleKey: "" };
+  const ids = parseSrDebugIds(c?.req?.query?.("sr_debug_ids"));
+  if (ids.size === 0) return { enabled: true, sampleKey: String(gameId || resolvedGameId || "sr-debug") };
+  const candidates = new Set<string>([
+    String(gameId || "").toLowerCase(),
+    String(resolvedGameId || "").toLowerCase(),
+  ]);
+  for (const candidate of candidates) {
+    if (ids.has(candidate)) return { enabled: true, sampleKey: candidate };
+  }
+  return { enabled: false, sampleKey: "" };
+}
+
 function decimalToAmerican(decimal: number): number {
   if (!decimal || decimal <= 1) return 100;
   if (decimal >= 2) {
@@ -754,6 +779,7 @@ function toOddsQuotesFromSportsRadar(
   gameId: string,
   odds: {
     spread?: number | null;
+    spreadHome?: number | null;
     total?: number | null;
     moneylineHome?: number | null;
     moneylineAway?: number | null;
@@ -767,8 +793,9 @@ function toOddsQuotesFromSportsRadar(
 ): OddsQuote[] {
   const quotes: OddsQuote[] = [];
 
-  if (odds.spread !== undefined && odds.spread !== null) {
-    const spread = Number(odds.spread);
+  const resolvedSpread = odds.spread ?? odds.spreadHome ?? null;
+  if (resolvedSpread !== undefined && resolvedSpread !== null) {
+    const spread = Number(resolvedSpread);
     quotes.push({
       data_scope: scope,
       game_id: gameId,
@@ -1118,6 +1145,7 @@ async function fetchRealOddsForGame(
   const sport = toSportKey(game.sport);
   const mainKey = c.env.SPORTSRADAR_API_KEY;
   const oddsKey = c.env.SPORTSRADAR_ODDS_KEY || c.env.SPORTSRADAR_API_KEY;
+  const debugContext = shouldDebugSrOdds(c, gameId, resolvedGameId);
 
   if (!sport || !mainKey) {
     return {
@@ -1148,6 +1176,16 @@ async function fetchRealOddsForGame(
   if (!forceRefresh) {
     for (const candidateId of resolutionCandidates) {
       const cacheHit = getCachedOdds(candidateId, scope);
+      if (debugContext.enabled) {
+        console.log("[SR_ODDS_CACHE]", {
+          sample: debugContext.sampleKey,
+          stage: "memory_read",
+          candidateId,
+          hit: Boolean(cacheHit && cacheHit.length > 0),
+          sportsradarQuotes: Boolean(cacheHit && cacheHit.some((q) => q.source_provider === "sportsradar")),
+          quoteCount: cacheHit?.length || 0,
+        });
+      }
       if (cacheHit && cacheHit.length > 0 && cacheHit.some((q) => q.source_provider === "sportsradar")) {
         return {
           game,
@@ -1170,7 +1208,11 @@ async function fetchRealOddsForGame(
       if (forceRefresh) {
         oddsMapPromises.push(
           withTimeout(
-            fetchSportsRadarOdds(sport, mainKey, c.env.DB, undefined, keyCandidate),
+            fetchSportsRadarOdds(sport, mainKey, c.env.DB, undefined, keyCandidate, debugContext.enabled ? {
+              enabled: true,
+              sampleKey: debugContext.sampleKey,
+              requestedGameId: gameId,
+            } : undefined),
             oddsMapTimeoutMs,
             new Map<string, any>()
           )
@@ -1182,7 +1224,11 @@ async function fetchRealOddsForGame(
         oddsMapMemo.set(
           memoKey,
           withTimeout(
-            fetchSportsRadarOdds(sport, mainKey, c.env.DB, undefined, keyCandidate),
+            fetchSportsRadarOdds(sport, mainKey, c.env.DB, undefined, keyCandidate, debugContext.enabled ? {
+              enabled: true,
+              sampleKey: debugContext.sampleKey,
+              requestedGameId: gameId,
+            } : undefined),
             oddsMapTimeoutMs,
             new Map<string, any>()
           )
@@ -1197,6 +1243,17 @@ async function fetchRealOddsForGame(
       ...buildOddsLookupKeys(game),
       ...Array.from(resolutionCandidates),
     ]));
+    if (debugContext.enabled) {
+      console.log("[SR_ODDS_JOIN]", {
+        sample: debugContext.sampleKey,
+        stage: "pre_join",
+        requestedGameId: gameId,
+        resolvedGameId,
+        sport,
+        oddsMapSize: oddsMap.size,
+        lookupKeys: keys.slice(0, 12),
+      });
+    }
     let matched = null as any;
     for (const key of keys) {
       matched = oddsMap.get(key);
@@ -1221,6 +1278,25 @@ async function fetchRealOddsForGame(
     if (matched) {
       const resolvedOddsGameId = String(matched.gameId || canonicalGameId);
       const quotes = toOddsQuotesFromSportsRadar(resolvedOddsGameId, matched, scope);
+      if (debugContext.enabled) {
+        console.log("[SR_ODDS_JOIN]", {
+          sample: debugContext.sampleKey,
+          stage: "matched",
+          requestedGameId: gameId,
+          resolvedOddsGameId,
+          matchedBy: "lookup_or_fuzzy",
+          matchedSummary: {
+            gameId: matched.gameId,
+            awayTeam: matched.awayTeam,
+            homeTeam: matched.homeTeam,
+            spread: matched.spread,
+            total: matched.total,
+            moneylineHome: matched.moneylineHome,
+            moneylineAway: matched.moneylineAway,
+          },
+          quotesCount: quotes.length,
+        });
+      }
       setCachedOdds(resolvedOddsGameId, scope, quotes, game.status === "IN_PROGRESS");
       return {
         game,
@@ -1254,6 +1330,21 @@ async function fetchRealOddsForGame(
         );
         if (directOdds) {
           const quotes = toOddsQuotesFromSportsRadar(srEventId, directOdds, scope);
+          if (debugContext.enabled) {
+            console.log("[SR_ODDS_JOIN]", {
+              sample: debugContext.sampleKey,
+              stage: "matched_direct_lookup",
+              requestedGameId: gameId,
+              srEventId,
+              quotesCount: quotes.length,
+              directOdds: {
+                spread: directOdds.spread,
+                total: directOdds.total,
+                moneylineHome: directOdds.moneylineHome,
+                moneylineAway: directOdds.moneylineAway,
+              },
+            });
+          }
           setCachedOdds(srEventId, scope, quotes, game.status === "IN_PROGRESS");
           return {
             game,
@@ -1277,6 +1368,17 @@ async function fetchRealOddsForGame(
       fallbackReason: `SportsRadar odds fetch failed: ${String(err)}`,
       fallbackType: "provider_error",
     };
+  }
+
+  if (debugContext.enabled) {
+    console.log("[SR_ODDS_JOIN]", {
+      sample: debugContext.sampleKey,
+      stage: "no_match",
+      requestedGameId: gameId,
+      resolvedGameId: canonicalGameId,
+      fallbackReason: "No SportsRadar odds match for game",
+      fallbackType: "no_coverage",
+    });
   }
 
   return {

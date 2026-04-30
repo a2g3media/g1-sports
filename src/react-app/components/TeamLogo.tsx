@@ -7,6 +7,7 @@
 import { useEffect, useState } from 'react';
 import { getTeamOrCountryLogoUrl } from '@/react-app/lib/teamLogos';
 import { getEspnTeamLogo } from '@/react-app/lib/espnSoccer';
+import { getSportAvatarConfig } from '@/react-app/lib/sportAvatars';
 import { cn } from '@/react-app/lib/utils';
 
 // Fallback team icon when logo fails to load
@@ -71,7 +72,7 @@ export function TeamLogo({
   const [failed, setFailed] = useState(false);
   
   // Get logo URL (club logo or country flag for WBC/World Cup)
-  const primaryLogoUrl = getTeamOrCountryLogoUrl(teamCode, sport, league);
+  const primaryLogoUrl = getTeamOrCountryLogoUrl(teamCode, sport, league, { teamName });
   const isSoccer = String(sport || '').toUpperCase() === 'SOCCER';
   const soccerFallbackLogo = isSoccer
     ? (() => {
@@ -79,8 +80,16 @@ export function TeamLogo({
         return byName.includes('default-team-logo') ? null : byName;
       })()
     : null;
-  const logoUrl = primaryLogoUrl || soccerFallbackLogo;
+  const primaryIsSyntheticFallback = Boolean(primaryLogoUrl && primaryLogoUrl.startsWith('data:image/'));
+  const logoUrl = (isSoccer && primaryIsSyntheticFallback && soccerFallbackLogo)
+    ? soccerFallbackLogo
+    : (primaryLogoUrl || soccerFallbackLogo);
+  const fallbackBadge = getSportAvatarConfig(String(sport || "").toLowerCase()).src;
   const shouldEagerLoad = size <= 40;
+
+  useEffect(() => {
+    setFailed(false);
+  }, [logoUrl, teamCode, sport, league, teamName]);
 
   useEffect(() => {
     if (!logoUrl || failed || !shouldEagerLoad) return;
@@ -114,7 +123,16 @@ export function TeamLogo({
         className
       )}
       style={{ width: size, height: size }}
-      onError={() => setFailed(true)}
+      onError={(event) => {
+        const img = event.currentTarget;
+        const fallbackSrc = String(fallbackBadge || "").trim();
+        if (fallbackSrc && img.dataset.fallbackApplied !== "true" && img.src !== fallbackSrc) {
+          img.dataset.fallbackApplied = "true";
+          img.src = fallbackSrc;
+          return;
+        }
+        setFailed(true);
+      }}
       loading={shouldEagerLoad ? "eager" : "lazy"}
       decoding="async"
       fetchPriority={shouldEagerLoad ? "high" : "auto"}

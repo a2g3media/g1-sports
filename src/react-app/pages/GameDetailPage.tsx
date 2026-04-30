@@ -919,7 +919,6 @@ const GameHeroPanel = memo(function GameHeroPanel({
 
   const spreadLabel = game.odds?.spread !== undefined ? `${homeName} ${formatSpread(game.odds.spread)}` : "-";
   const totalLabel = game.odds?.total !== undefined ? String(game.odds.total) : "-";
-  const isSoccer = String(game.sport || "").toUpperCase() === "SOCCER";
   const isMlb = String(game.sport || "").toUpperCase() === "MLB";
   const isScheduled = game.status === "SCHEDULED";
   const awayMlbProbable = game.mlbPregameState?.probableAwayPitcher ?? null;
@@ -957,6 +956,7 @@ const GameHeroPanel = memo(function GameHeroPanel({
     (game.odds?.mlAway !== undefined || game.odds?.mlHome !== undefined) ? { label: "Moneyline", value: moneylineLabel } : null,
   ].filter(Boolean) as Array<{ label: string; value: string }>;
   const statusChip = game.status === "LIVE" ? "LIVE" : game.status === "FINAL" ? "FINAL" : "UPCOMING";
+  const isSoccer = String(game.sport || "").toUpperCase() === "SOCCER";
   const heroLogoSize = isSoccer ? 84 : 96;
 
   return (
@@ -4382,7 +4382,6 @@ const LiveHeroScoreboard = memo(function LiveHeroScoreboard({
   const possession = derivePossessionSide(game, homeDisplay, awayDisplay, lastPlay);
   const spreadLabel = game.odds?.spread !== undefined ? `${homeDisplay} ${formatSpread(game.odds.spread)}` : "-";
   const totalLabel = game.odds?.total !== undefined ? String(game.odds.total) : "-";
-  const isSoccer = String(game.sport || "").toUpperCase() === "SOCCER";
   const mlLabel = game.odds?.mlAway !== undefined || game.odds?.mlHome !== undefined
     ? `${game.odds?.mlAway !== undefined ? formatMoneylineValue(game.odds.mlAway) : "-"} / ${game.odds?.mlHome !== undefined ? formatMoneylineValue(game.odds.mlHome) : "-"}`
     : "-";
@@ -6867,8 +6866,9 @@ export function GameDetailPage() {
     
     const info = isHome ? teamInfo?.home : teamInfo?.away;
     if (info?.fullName) return info.fullName;
-    if ((info as { displayName?: string } | undefined)?.displayName) return (info as { displayName: string }).displayName;
-    if ((info as { name?: string } | undefined)?.name) return (info as { name: string }).name;
+    const infoWithAltNames = info as { displayName?: string; name?: string } | undefined;
+    if (infoWithAltNames?.displayName) return infoWithAltNames.displayName;
+    if (infoWithAltNames?.name) return infoWithAltNames.name;
     
     const abbr = isHome ? game?.homeTeam : game?.awayTeam;
     return abbr || (isHome ? 'HOME' : 'AWAY');
@@ -6892,10 +6892,10 @@ export function GameDetailPage() {
       const meta = getSoccerLeagueMeta(fromLeagueIdParam);
       if (meta?.name) return meta.name;
     }
-    const leagueLabel = String(game?.league || "").trim();
+    const leagueLabel = String((game as any)?.league || "").trim();
     if (leagueLabel && leagueLabel.toUpperCase() !== "SOCCER") return leagueLabel;
     return "Soccer";
-  }, [isSoccerContext, fromLeagueIdParam, game?.league]);
+  }, [isSoccerContext, fromLeagueIdParam, game]);
   const hasPropsTab = true;
   const viewMode = useMemo<ViewMode>(() => deriveViewMode(game?.status || "SCHEDULED"), [game?.status]);
   const previousModeRef = useRef<ViewMode | null>(null);

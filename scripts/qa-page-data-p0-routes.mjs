@@ -49,6 +49,99 @@ function round1(n) {
   return Math.round(toNum(n) * 10) / 10;
 }
 
+async function fetchJsonWithTimeout({ url, method = "GET", headers = {}, body, timeoutMs = 10000 }) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, {
+      method,
+      headers,
+      body: body === undefined ? undefined : JSON.stringify(body),
+      signal: controller.signal,
+    });
+    const json = await res.json().catch(() => ({}));
+    return { ok: res.ok, status: res.status, json };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function runWatchboardSmoke({
+  base,
+  userId,
+  gameId,
+  timeoutMs,
+  maxCreateMs,
+  strict,
+  failures,
+}) {
+  const names = [
+    `QA Smoke Board A ${Date.now()}`,
+    `QA Smoke Board B ${Date.now() + 1}`,
+  ];
+  const createdIds = [];
+  const createdLatencies = [];
+  const commonHeaders = {
+    accept: "application/json",
+    "content-type": "application/json",
+    "x-user-id": userId,
+  };
+
+  try {
+    for (let i = 0; i < names.length; i += 1) {
+      const started = Date.now();
+      const createRes = await fetchJsonWithTimeout({
+        url: `${base}/api/watchboards/create-with-game`,
+        method: "POST",
+        headers: commonHeaders,
+        body: {
+          name: names[i],
+          game_id: gameId,
+          added_from: "qa-watchboard-smoke",
+          client_mutation_id: `qa-smoke-${Date.now()}-${i}`,
+        },
+        timeoutMs,
+      });
+      const elapsed = Date.now() - started;
+      createdLatencies.push(elapsed);
+      const boardId = Number(createRes?.json?.boardId || createRes?.json?.board?.id || 0) || null;
+      const ok = Boolean(createRes.ok && createRes?.json?.success && boardId);
+      console.log(`[p0-metrics][watchboard-smoke] create_${i + 1} ok=${ok} status=${createRes.status} latencyMs=${elapsed} boardId=${boardId || "n/a"}`);
+      if (!ok) {
+        failures.push(`watchboard-smoke.create_${i + 1} failed status=${createRes.status}`);
+        return;
+      }
+      createdIds.push(boardId);
+      if (strict && elapsed > maxCreateMs) {
+        failures.push(`watchboard-smoke.create_${i + 1} latency ${elapsed}ms above ${maxCreateMs}ms`);
+      }
+    }
+
+    const previewRes = await fetchJsonWithTimeout({
+      url: `${base}/api/watchboards/home-preview?fast=1`,
+      method: "GET",
+      headers: { accept: "application/json", "x-user-id": userId },
+      timeoutMs,
+    });
+    const boards = Array.isArray(previewRes?.json?.boards) ? previewRes.json.boards : [];
+    const namesLower = new Set(boards.map((b) => String(b?.name || "").trim().toLowerCase()));
+    const foundAll = names.every((name) => namesLower.has(name.trim().toLowerCase()));
+    console.log(`[p0-metrics][watchboard-smoke] verify boardsFound=${foundAll} totalBoards=${boards.length}`);
+    if (!foundAll) {
+      failures.push("watchboard-smoke verification failed: newly created boards missing from home-preview");
+    }
+  } finally {
+    for (const boardId of createdIds) {
+      await fetchJsonWithTimeout({
+        url: `${base}/api/watchboards/${boardId}`,
+        method: "DELETE",
+        headers: { accept: "application/json", "x-user-id": userId },
+        timeoutMs,
+      }).catch(() => {});
+    }
+  }
+}
+
 async function fetchMetrics({ url, cookie, bearer, timeoutMs }) {
   const headers = { accept: "application/json" };
   if (cookie) headers.cookie = cookie;
@@ -88,6 +181,10 @@ async function main() {
   const metricsUrl = parseArg("--metrics-url", `${base}/api/page-data/metrics`);
   const routeListRaw = parseArg("--routes", DEFAULT_ROUTES.join(","));
   const jsonOut = parseArg("--json-out", "").trim();
+  const watchboardSmoke = hasFlag("--watchboard-smoke");
+  const watchboardUserId = parseArg("--watchboard-user-id", process.env.QA_WATCHBOARD_USER_ID || "demo-user-001");
+  const watchboardGameId = parseArg("--watchboard-game-id", process.env.QA_WATCHBOARD_GAME_ID || "sr_nba_ff04675a-96e4-41eb-9fec-7d0bfd20057e");
+  const maxWatchboardCreateMs = Math.max(500, toNum(parseArg("--max-watchboard-create-ms", "8000")));
   const routes = routeListRaw
     .split(",")
     .map((r) => r.trim().toLowerCase())
@@ -105,13 +202,23 @@ async function main() {
   console.log(
     `[p0-metrics] base=${base} metrics=${metricsUrl} routes=${routes.join(",")} strict=${strict ? "on" : "off"}`
   );
-  const snapshot = await fetchMetrics({ url: metricsUrl, cookie, bearer, timeoutMs });
+  let snapshot = null;
+  try {
+    snapshot = await fetchMetrics({ url: metricsUrl, cookie, bearer, timeoutMs });
+  } catch (error) {
+    const message = String(error);
+    console.warn(`[p0-metrics] metrics fetch failed: ${message}`);
+    if (!watchboardSmoke || strict) {
+      throw error;
+    }
+  }
   const routeMetrics = snapshot?.routes || {};
 
   const missing = [];
   const failures = [];
   const routeSummaries = {};
   for (const route of routes) {
+    if (!snapshot) break;
     const m = routeMetrics[route];
     if (!m) {
       missing.push(route);
@@ -150,16 +257,30 @@ async function main() {
   const derived = snapshot?.derived || {};
   const combinedHitRate = round1(toNum(derived.l1HitRatePct) + toNum(derived.l2HitRatePct));
   const coldPathPct = round1(derived.coldPathPct);
-  console.log(
-    `[p0-metrics] global combinedHitRate=${combinedHitRate}% coldPath=${coldPathPct}%`
-  );
-  if (strict) {
+  if (snapshot) {
+    console.log(
+      `[p0-metrics] global combinedHitRate=${combinedHitRate}% coldPath=${coldPathPct}%`
+    );
+  }
+  if (strict && snapshot) {
     if (combinedHitRate < thresholds.minCombinedHitRatePct) {
       failures.push(`global.combinedHitRate ${combinedHitRate}% below ${thresholds.minCombinedHitRatePct}%`);
     }
     if (coldPathPct > thresholds.maxColdPathPct) {
       failures.push(`global.coldPath ${coldPathPct}% above ${thresholds.maxColdPathPct}%`);
     }
+  }
+
+  if (watchboardSmoke) {
+    await runWatchboardSmoke({
+      base,
+      userId: watchboardUserId,
+      gameId: watchboardGameId,
+      timeoutMs,
+      maxCreateMs: maxWatchboardCreateMs,
+      strict,
+      failures,
+    });
   }
 
   if (missing.length > 0) {

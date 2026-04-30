@@ -1,15 +1,12 @@
 /**
- * CompactGameTile - Lightweight tile for Command Center grid view
- * Designed for 2-column grid, minimal footprint, no heavy hooks
+ * CompactGameTile - clean mobile-first Games card.
  */
 
-import { memo, useEffect, useState } from 'react';
+import { memo } from 'react';
 import { TeamLogo } from '@/react-app/components/TeamLogo';
 import { PlayerPhoto } from '@/react-app/components/PlayerPhoto';
 import { cn } from '@/react-app/lib/utils';
 import { prefetch } from '@/react-app/components/LazyRoute';
-import { GameContextChip } from './GameContextChip';
-import { getMarketPeriodLabels } from '@/react-app/lib/marketPeriodLabels';
 
 export interface CompactGameTileGame {
   id: string;
@@ -31,26 +28,39 @@ export interface CompactGameTileGame {
   total1H?: number | null;
   ml1HHome?: number | null;
   ml1HAway?: number | null;
+  odds?: {
+    f5?: {
+      spread?: {
+        home?: number | null;
+        away?: number | null;
+      };
+      total?: number | null;
+      moneyline?: {
+        home?: number | null;
+        away?: number | null;
+      };
+    };
+  };
   isOvertime?: boolean;
   probableAwayPitcher?: { name: string; record?: string };
   probableHomePitcher?: { name: string; record?: string };
+  inningNumber?: number | null;
+  inningHalf?: string | null;
+  inningState?: string | null;
+  mlbLiveState?: {
+    inningNumber?: number | null;
+    inningHalf?: string | null;
+  } | null;
 }
 
 interface CompactGameTileProps {
   game: CompactGameTileGame;
   onClick?: () => void;
+  onCoachClick?: () => void;
   isInWatchboard?: boolean;
-  isFavorite?: boolean;
+  showQuickAction?: boolean;
+  onQuickWatchboard?: () => void;
 }
-
-type VideoJobSummary = {
-  status: 'queued' | 'submitted' | 'completed' | 'failed';
-  socialStatus?: 'not_requested' | 'queued' | 'published' | 'failed';
-  videoUrl?: string;
-  createdAt?: string;
-};
-
-const videoJobCache = new Map<string, VideoJobSummary | null>();
 
 const prefetchedGameResources = new Set<string>();
 
@@ -66,6 +76,7 @@ const prefetchGameResources = (gameId: string, _sport: string) => {
 };
 
 const EASTERN_TZ = 'America/New_York';
+const COACH_G_AVATAR = '/assets/coachg/coach-g-avatar.png';
 
 const toEasternDateKey = (date: Date): string =>
   new Intl.DateTimeFormat('en-CA', {
@@ -121,111 +132,270 @@ const formatGolfPlayerName = (name: string): string => {
   return `${firstInitial}. ${lastName}`;
 };
 
-const formatSpread = (value: number | null | undefined): string => {
-  if (value === null || value === undefined) return '-';
-  const snapped = Math.round(value * 2) / 2;
-  if (Object.is(snapped, -0) || snapped === 0) return 'PK';
-  return snapped > 0 ? `+${snapped}` : `${snapped}`;
+const ordinalSuffix = (value: number): string => {
+  const mod100 = value % 100;
+  if (mod100 >= 11 && mod100 <= 13) return `${value}th`;
+  const mod10 = value % 10;
+  if (mod10 === 1) return `${value}st`;
+  if (mod10 === 2) return `${value}nd`;
+  if (mod10 === 3) return `${value}rd`;
+  return `${value}th`;
 };
 
-const formatMoneyline = (value: number | null | undefined): string => {
-  if (value === null || value === undefined) return '-';
-  const rounded = Math.round(value);
-  return rounded > 0 ? `+${rounded}` : `${rounded}`;
+const normalizeMlbInningHalf = (value?: string | null): 'Top' | 'Bot' | 'Mid' | 'End' | null => {
+  const raw = String(value || '').trim().toLowerCase();
+  if (!raw) return null;
+  if (raw === 't' || raw === 'top' || raw.includes('top')) return 'Top';
+  if (raw === 'b' || raw === 'bot' || raw === 'bottom' || raw.includes('bottom')) return 'Bot';
+  if (raw === 'm' || raw === 'mid' || raw === 'middle' || raw.includes('mid')) return 'Mid';
+  if (raw === 'e' || raw === 'end' || raw.includes('end')) return 'End';
+  return null;
 };
 
-const formatPitcherLine = (pitcher: { name: string; record?: string } | undefined): string => {
-  const name = String(pitcher?.name || '').trim();
-  if (!name) return '';
-  const record = String(pitcher?.record || '').trim();
-  return record ? `${name} (${record})` : name;
+const parseMlbInningDisplay = (
+  period?: string,
+  clock?: string,
+  inningNumber?: number | null,
+  inningHalf?: string | null,
+  inningState?: string | null
+): string | null => {
+  const explicitInning = Number(
+    inningNumber ??
+      (Number.isFinite(Number(period)) ? Number(period) : NaN)
+  );
+  const explicitHalf = normalizeMlbInningHalf(inningState) || normalizeMlbInningHalf(inningHalf);
+  if (Number.isFinite(explicitInning) && explicitInning > 0 && explicitHalf) {
+    return `${explicitHalf} ${ordinalSuffix(explicitInning)}`;
+  }
+  if (Number.isFinite(explicitInning) && explicitInning > 0) {
+    return `${ordinalSuffix(explicitInning)} Inning`;
+  }
+
+  const raw = `${String(period || '').trim()} ${String(clock || '').trim()}`.trim();
+  if (!raw) return null;
+
+  const sideWithInning = raw.match(/\b(top|bot|bottom|mid|middle|end|t|b|m|e)\b(?:\s+of(?:\s+the)?|\s+the)?[\s:-]*(\d{1,2})(?:st|nd|rd|th)?/i);
+  if (sideWithInning) {
+    const sideRaw = sideWithInning[1].toLowerCase();
+    const inning = Number(sideWithInning[2]);
+    if (!Number.isFinite(inning) || inning <= 0) return null;
+    const side = sideRaw === 't' || sideRaw === 'top'
+      ? 'Top'
+      : sideRaw === 'm' || sideRaw === 'mid' || sideRaw === 'middle'
+        ? 'Mid'
+        : sideRaw === 'e' || sideRaw === 'end'
+          ? 'End'
+          : 'Bot';
+    return `${side} ${ordinalSuffix(inning)}`;
+  }
+
+  const shortCode = raw.match(/\b([TtBb])\s*[- ]?(\d{1,2})(?:st|nd|rd|th)?\b/);
+  if (shortCode) {
+    const side = shortCode[1].toUpperCase() === 'T' ? 'Top' : 'Bot';
+    const inning = Number(shortCode[2]);
+    if (!Number.isFinite(inning) || inning <= 0) return null;
+    return `${side} ${ordinalSuffix(inning)}`;
+  }
+
+  // Fallback when feed only provides inning number.
+  const inningOnly = raw.match(/\b(\d{1,2})(?:st|nd|rd|th)?\s*(?:inning|inn|in)?\b/i);
+  if (inningOnly) {
+    const inning = Number(inningOnly[1]);
+    if (Number.isFinite(inning) && inning > 0) {
+      return `${ordinalSuffix(inning)} Inning`;
+    }
+  }
+
+  return null;
 };
 
-const CompactGameTileComponent = ({ game, onClick, isInWatchboard, isFavorite }: CompactGameTileProps) => {
+const isZeroClockValue = (clock?: string): boolean => {
+  const raw = String(clock || '').trim().toLowerCase();
+  if (!raw) return false;
+  if (raw.includes('intermission')) return true;
+  const digitsOnly = raw.replace(/[^0-9]/g, '');
+  return digitsOnly.length > 0 && Number(digitsOnly) === 0;
+};
+
+const parseHockeyLiveLabel = (period?: string, clock?: string): string | null => {
+  if (!isZeroClockValue(clock)) return null;
+
+  const periodRaw = String(period || '').trim().toLowerCase();
+  const clockRaw = String(clock || '').trim().toLowerCase();
+  if (periodRaw.includes('intermission') || clockRaw.includes('intermission')) {
+    return 'Intermission';
+  }
+
+  const combined = `${periodRaw} ${clockRaw}`;
+  const periodMatch = combined.match(/\b(?:p(?:eriod)?)?\s*(\d{1,2})(?:st|nd|rd|th)?\b/i);
+  if (!periodMatch) return 'Intermission';
+
+  const periodNumber = Number(periodMatch[1]);
+  if (!Number.isFinite(periodNumber) || periodNumber <= 0) return 'Intermission';
+  return `End ${ordinalSuffix(periodNumber)}`;
+};
+
+const isValidClockValue = (clock?: string): boolean => {
+  const raw = String(clock || '').trim();
+  if (!raw) return false;
+  const lower = raw.toLowerCase();
+  if (lower === 'null' || lower === 'undefined' || lower.includes('null:null')) return false;
+  return true;
+};
+
+const parseSoccerLiveLabel = (period?: string, clock?: string): string | null => {
+  const combined = `${String(period || '')} ${String(clock || '')}`.toLowerCase();
+  if (/\bht\b|\bhalf[- ]?time\b|\bhalftime\b/.test(combined)) return 'HT';
+  if (/\bft\b|\bfull[- ]?time\b|\bfulltime\b/.test(combined)) return 'FT';
+
+  const minuteSource = String(clock || period || '').trim();
+  if (!minuteSource) return null;
+  const minuteMatch = minuteSource.match(/(\d{1,3})(?:\+(\d{1,2}))?(?:[:']\d{2})?/);
+  if (!minuteMatch) return null;
+  const baseMinute = Number(minuteMatch[1]);
+  if (!Number.isFinite(baseMinute) || baseMinute < 0) return null;
+  const extraRaw = minuteMatch[2];
+  const extraMinute = extraRaw != null ? Number(extraRaw) : null;
+  if (extraMinute != null && Number.isFinite(extraMinute) && extraMinute >= 0) {
+    return `${baseMinute}+${extraMinute}'`;
+  }
+  return `${baseMinute}'`;
+};
+
+const parseQuarterOrHalfLabel = (period?: string, sport?: string): string | null => {
+  const raw = String(period || '').trim();
+  if (!raw) return null;
+  const lower = raw.toLowerCase();
+
+  if (/\bhalftime\b|\bhalf[- ]?time\b/.test(lower)) return 'Halftime';
+  if (/\bot\b|\bovertime\b/.test(lower)) return 'OT';
+
+  const q = raw.match(/\b(?:q|quarter)\s*([1-9])\b/i) || raw.match(/\b([1-9])(?:st|nd|rd|th)?\s*q\b/i);
+  if (q) return `Q${q[1]}`;
+
+  const isCollegeBall = ['NCAAB', 'NCAAF'].includes(String(sport || '').toUpperCase());
+  const halfMatch = raw.match(/\b([12])(?:st|nd)?\s*half\b/i) || raw.match(/\b([12])h\b/i);
+  if (halfMatch && isCollegeBall) return `${halfMatch[1]}H`;
+  if (halfMatch && !isCollegeBall) return `Q${halfMatch[1]}`;
+
+  return null;
+};
+
+const parseHockeyPeriodLabel = (period?: string): string | null => {
+  const raw = String(period || '').trim();
+  if (!raw) return null;
+  const lower = raw.toLowerCase();
+  if (lower.includes('intermission')) return 'Intermission';
+  if (lower.includes('ot') || lower.includes('overtime')) return 'OT';
+  const match = raw.match(/\b(?:p|period)\s*([1-9])\b/i) || raw.match(/\b([1-9])(?:st|nd|rd|th)?\s*period\b/i);
+  if (match) return `P${match[1]}`;
+  return null;
+};
+
+const formatLiveStatusLabel = (
+  sport: string,
+  period?: string,
+  clock?: string,
+  mlbContext?: {
+    inningNumber?: number | null;
+    inningHalf?: string | null;
+    inningState?: string | null;
+  }
+): string => {
+  const sportUpper = String(sport || '').toUpperCase();
+  const periodRaw = String(period || '').trim();
+  const clockRaw = String(clock || '').trim();
+  const hasClock = isValidClockValue(clockRaw);
+  const hasPeriod = Boolean(periodRaw);
+
+  if (sportUpper === 'MLB') {
+    const mlb = parseMlbInningDisplay(
+      period,
+      clock,
+      mlbContext?.inningNumber ?? null,
+      mlbContext?.inningHalf ?? null,
+      mlbContext?.inningState ?? null
+    );
+    if (mlb) return mlb;
+    return hasPeriod ? periodRaw : (hasClock ? clockRaw : 'LIVE');
+  }
+
+  if (sportUpper === 'SOCCER') {
+    const soccer = parseSoccerLiveLabel(period, clock);
+    if (soccer) return soccer;
+    return hasClock ? clockRaw : (hasPeriod ? periodRaw : 'LIVE');
+  }
+
+  if (sportUpper === 'NHL' || sportUpper.includes('HOCKEY')) {
+    const hockeyBoundary = parseHockeyLiveLabel(period, clock);
+    if (hockeyBoundary) return hockeyBoundary === 'Intermission' ? 'Intermission' : hockeyBoundary.replace('End ', 'P');
+    const hockeyPeriod = parseHockeyPeriodLabel(period);
+    if (hockeyPeriod === 'Intermission') return 'Intermission';
+    if (hockeyPeriod && hasClock) return `${hockeyPeriod} ${clockRaw}`;
+    if (hockeyPeriod) return hockeyPeriod;
+    return hasClock ? clockRaw : (hasPeriod ? periodRaw : 'LIVE');
+  }
+
+  if (['NBA', 'WNBA', 'NFL', 'NCAAB', 'NCAAF', 'NCAAM'].includes(sportUpper)) {
+    const quarterOrHalf = parseQuarterOrHalfLabel(period, sportUpper);
+    if (quarterOrHalf === 'Halftime') return 'Halftime';
+    if (quarterOrHalf && hasClock) return `${quarterOrHalf} ${clockRaw}`;
+    if (quarterOrHalf) return quarterOrHalf;
+    if (hasPeriod && hasClock) return `${periodRaw} ${clockRaw}`;
+    return hasPeriod ? periodRaw : (hasClock ? clockRaw : 'LIVE');
+  }
+
+  if (hasPeriod && hasClock) return `${periodRaw} ${clockRaw}`;
+  return hasPeriod ? periodRaw : (hasClock ? clockRaw : 'LIVE');
+};
+
+const CompactGameTileComponent = ({
+  game,
+  onClick,
+  onCoachClick,
+  isInWatchboard,
+  showQuickAction = true,
+  onQuickWatchboard,
+}: CompactGameTileProps) => {
   const isLive = game.status === 'live' || game.status === 'in_progress' || game.status === 'LIVE' || game.status === 'IN_PROGRESS';
   const isFinal = game.status === 'final' || game.status === 'FINAL' || game.status === 'closed';
-  const isScheduled = !isLive && !isFinal;
   const isMlb = String(game.sport || '').toUpperCase() === 'MLB';
+  const isHockey = String(game.sport || '').toUpperCase() === 'NHL' || String(game.sport || '').toUpperCase().includes('HOCKEY');
   
   const homeAbbr = getTeamAbbr(game.homeTeam);
   const awayAbbr = getTeamAbbr(game.awayTeam);
   const homeName = getTeamName(game.homeTeam);
   const awayName = getTeamName(game.awayTeam);
-  const periodLabels = getMarketPeriodLabels(game.sport);
   const isGolf = String(game.sport || '').toUpperCase() === 'GOLF';
   const awayDisplayPrimary = isGolf ? formatGolfPlayerName(awayName) : awayAbbr;
   const homeDisplayPrimary = isGolf ? formatGolfPlayerName(homeName) : homeAbbr;
-  const [videoJob, setVideoJob] = useState<VideoJobSummary | null>(() => videoJobCache.get(game.id) ?? null);
   
-  // Don't default to 0 - preserve null to detect missing data
   const homeScore = game.homeScore ?? null;
   const awayScore = game.awayScore ?? null;
   const hasScores = homeScore !== null && awayScore !== null;
   const homeWinning = hasScores && homeScore > awayScore;
   const awayWinning = hasScores && awayScore > homeScore;
-  const awayPitcherLine = formatPitcherLine(game.probableAwayPitcher);
-  const homePitcherLine = formatPitcherLine(game.probableHomePitcher);
-  const showPitcherMatchup = isScheduled && isMlb && Boolean(awayPitcherLine || homePitcherLine);
 
-  useEffect(() => {
-    let cancelled = false;
-    const cached = videoJobCache.get(game.id);
-    if (cached !== undefined) {
-      setVideoJob(cached);
-      return;
-    }
-    const run = async () => {
-      try {
-        const viewerOffset = new Date().getTimezoneOffset();
-        const res = await fetch(`/api/coachg/video/jobs?game_id=${encodeURIComponent(game.id)}&limit=1&window_hours=24&viewer_tz_offset_min=${encodeURIComponent(String(viewerOffset))}`, {
-          credentials: 'include',
-        });
-        if (!res.ok) {
-          videoJobCache.set(game.id, null);
-          return;
-        }
-        const data = await res.json() as {
-          jobs?: Array<{
-            status?: 'queued' | 'submitted' | 'completed' | 'failed';
-            socialStatus?: 'not_requested' | 'queued' | 'published' | 'failed';
-            videoUrl?: string;
-            createdAt?: string;
-          }>;
-        };
-        const latest = data.jobs?.[0];
-        const normalized: VideoJobSummary | null = latest?.status
-          ? {
-              status: latest.status,
-              socialStatus: latest.socialStatus,
-              videoUrl: latest.videoUrl,
-              createdAt: latest.createdAt,
-            }
-          : null;
-        videoJobCache.set(game.id, normalized);
-        if (!cancelled) setVideoJob(normalized);
-      } catch {
-        videoJobCache.set(game.id, null);
-      }
-    };
-    run();
-    return () => {
-      cancelled = true;
-    };
-  }, [game.id]);
-  
-  // Logos now handled by centralized TeamLogo component
-  
-  // Status display
   const getStatusDisplay = () => {
     if (isLive) {
+      const liveLabel = formatLiveStatusLabel(
+        game.sport,
+        game.period != null ? String(game.period) : undefined,
+        game.clock != null ? String(game.clock) : undefined,
+        {
+          inningNumber: game.inningNumber ?? game.mlbLiveState?.inningNumber ?? null,
+          inningHalf: game.inningHalf ?? game.mlbLiveState?.inningHalf ?? null,
+          inningState: game.inningState ?? null,
+        }
+      );
       return (
-        <div className="inline-flex items-center gap-1.5 rounded-full border border-red-400/35 bg-red-500/10 px-2.5 py-0.5">
+        <div className="inline-flex items-center gap-1.5 rounded-full border border-red-300/35 bg-gradient-to-r from-red-500/20 via-orange-500/12 to-red-500/18 px-2.5 py-0.5 shadow-[0_0_14px_rgba(239,68,68,0.22)]">
           <div className="relative">
-            <div className="w-1.5 h-1.5 bg-red-500 rounded-full" />
-            <div className="absolute inset-0 w-1.5 h-1.5 bg-red-400 rounded-full animate-ping" />
+            <div className="h-1.5 w-1.5 rounded-full bg-red-400 shadow-[0_0_10px_rgba(248,113,113,0.8)]" />
+            <div className="absolute inset-0 h-1.5 w-1.5 rounded-full bg-red-300 animate-ping" />
           </div>
-          <span className="text-[10px] font-semibold text-red-300 uppercase tracking-[0.08em]">
-            {game.period || game.clock || 'LIVE'}
+          <span className="text-[10px] font-semibold uppercase tracking-[0.08em] text-red-100">
+            {liveLabel}
           </span>
         </div>
       );
@@ -238,13 +408,12 @@ const CompactGameTileComponent = ({ game, onClick, isInWatchboard, isFavorite }:
       );
     }
     return (
-      <span className="inline-flex rounded-full border border-cyan-400/25 bg-cyan-500/10 px-2.5 py-0.5 text-[10px] font-semibold tracking-[0.06em] text-cyan-200">
+      <span className="inline-flex rounded-full border border-cyan-400/25 bg-gradient-to-r from-cyan-500/14 to-sky-500/10 px-2.5 py-0.5 text-[10px] font-semibold tracking-[0.06em] text-cyan-100">
         {formatGameTime(game.startTime)}
       </span>
     );
   };
   
-  // Team row component - uses centralized TeamLogo
   const TeamRow = ({ 
     abbr, 
     primary,
@@ -261,10 +430,10 @@ const CompactGameTileComponent = ({ game, onClick, isInWatchboard, isFavorite }:
     isHome: boolean;
   }) => (
     <div className={cn(
-      "flex items-center gap-2.5 rounded-[10px] border border-white/[0.05] px-3 py-2",
+      "flex items-center gap-3 rounded-[10px] border border-white/[0.06] px-3.5 py-2.5 transition-colors duration-200",
       isHome
-        ? "mt-1 bg-gradient-to-r from-[#17212D] to-[#121821]"
-        : "bg-gradient-to-r from-[#141C26] to-[#121821]"
+        ? "mt-1 bg-gradient-to-r from-[#1A2532] to-[#121821]"
+        : "bg-gradient-to-r from-[#151E2A] to-[#121821]"
     )}>
       {isGolf ? (
         <PlayerPhoto
@@ -285,18 +454,21 @@ const CompactGameTileComponent = ({ game, onClick, isInWatchboard, isFavorite }:
       )}
       <div className="min-w-0 flex-1">
         <div className={cn(
-          "truncate text-xs font-semibold",
+          "truncate text-[13px] font-semibold leading-tight",
           isFinal && isWinning ? "text-white" : "text-slate-200"
         )}>
           {primary}
         </div>
-        <div className="truncate text-[10px] tracking-[0.01em] text-slate-500">{isGolf ? abbr : name}</div>
+        <div className="truncate text-[11px] tracking-[0.01em] text-slate-500">{isGolf ? abbr : name}</div>
       </div>
       {hasScores && score !== null && (
         <span className={cn(
-          "text-sm font-bold tabular-nums min-w-[24px] text-right",
-          isFinal && isWinning ? "text-white" : 
-          isLive && isWinning ? "text-emerald-400" : "text-slate-400"
+          "min-w-[30px] text-right text-[21px] font-extrabold leading-none tabular-nums tracking-tight transition-colors duration-200",
+          isFinal && isWinning
+            ? "text-white"
+            : isLive && isWinning
+              ? "text-emerald-300 drop-shadow-[0_0_10px_rgba(52,211,153,0.25)]"
+              : "text-slate-200"
         )}>
           {score}
         </span>
@@ -305,54 +477,59 @@ const CompactGameTileComponent = ({ game, onClick, isInWatchboard, isFavorite }:
   );
   
   return (
-    <button
-      onClick={onClick}
+    <div
+      role="button"
+      tabIndex={0}
+      onClick={(e) => {
+        const target = e.target as HTMLElement | null;
+        if (target?.closest('[data-interactive-control="true"]')) return;
+        onClick?.();
+      }}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          onClick?.();
+        }
+      }}
       onMouseEnter={() => { void prefetchGameResources(game.id, game.sport); }}
       onFocus={() => { void prefetchGameResources(game.id, game.sport); }}
       onTouchStart={() => { void prefetchGameResources(game.id, game.sport); }}
       className={cn(
-        "relative w-full overflow-hidden rounded-[14px] border text-left transition-all duration-200",
-        "min-h-[136px] border-white/[0.06] bg-[#121821] shadow-[0_12px_26px_rgba(0,0,0,0.32)]",
-        "hover:-translate-y-0.5 hover:border-cyan-400/25 hover:bg-[#16202B] hover:shadow-[0_18px_34px_rgba(0,0,0,0.36)] active:scale-[0.99]",
-        isLive && "ring-1 ring-red-500/30",
-        isLive && isFavorite && "ring-2 ring-amber-400/35 shadow-[0_0_26px_rgba(251,191,36,0.22)]",
-        isInWatchboard && "ring-1 ring-cyan-400/35"
+        "relative w-full overflow-hidden rounded-[14px] border text-left transition-all duration-200 ease-out",
+        "min-h-[136px] border-white/[0.08] bg-[#121821] shadow-[0_14px_28px_rgba(0,0,0,0.34)]",
+        "hover:-translate-y-0.5 hover:border-cyan-300/30 hover:bg-[#172230] hover:shadow-[0_22px_36px_rgba(0,0,0,0.4)] active:scale-[0.99]",
+        isLive && "ring-1 ring-red-400/35 shadow-[0_16px_32px_rgba(0,0,0,0.38),0_0_22px_rgba(239,68,68,0.16)]",
+        isInWatchboard && "ring-1 ring-cyan-300/40"
       )}
     >
-      <div className="pointer-events-none absolute inset-0 bg-gradient-to-b from-white/[0.02] to-transparent" />
-      <div className="pointer-events-none absolute inset-x-0 top-0 h-px bg-white/15" />
+      <div className="pointer-events-none absolute inset-0 bg-gradient-to-b from-white/[0.025] via-transparent to-transparent" />
+      <div className="pointer-events-none absolute inset-0 shadow-[inset_0_1px_0_rgba(255,255,255,0.05),inset_0_-1px_0_rgba(255,255,255,0.03)]" />
+      <div className="pointer-events-none absolute inset-x-0 top-0 h-px bg-white/20" />
       <div className="pointer-events-none absolute left-0 top-0 h-full w-[2px] bg-cyan-400/24" />
       {/* Live glow effect */}
       {isLive && (
-        <div className="pointer-events-none absolute inset-0 bg-gradient-to-br from-red-500/10 via-transparent to-transparent" />
+        <>
+          <div className="pointer-events-none absolute inset-0 bg-gradient-to-br from-red-500/14 via-transparent to-transparent" />
+          <div className="pointer-events-none absolute inset-0 animate-pulse bg-gradient-to-r from-red-500/[0.06] via-transparent to-orange-400/[0.04]" />
+        </>
       )}
-      {isLive && isFavorite && (
-        <div className="pointer-events-none absolute inset-0 bg-gradient-to-r from-amber-400/12 via-transparent to-amber-300/10" />
-      )}
-      
-      {/* Watchboard indicator */}
-      {isInWatchboard && (
-        <div className="absolute top-1 right-1 w-2 h-2 bg-cyan-500 rounded-full" />
-      )}
-      
-      {/* Context signal chip */}
-      <GameContextChip 
-        gameId={game.id} 
-        sport={game.sport}
-        homeTeam={getTeamName(game.homeTeam)}
-        awayTeam={getTeamName(game.awayTeam)}
-        className="absolute top-1 left-1" 
-      />
       
       <div className="relative z-10 p-3.5">
         {/* Status row */}
-        <div className="mb-2.5 flex items-center justify-between">
+        <div className="mb-3 flex items-center justify-between gap-2">
           {getStatusDisplay()}
-          {game.channel && (
-            <span className="max-w-[56px] truncate rounded-full border border-white/[0.08] bg-white/[0.03] px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-[0.1em] text-slate-400">
-              {game.channel}
-            </span>
-          )}
+          <button
+            type="button"
+            data-interactive-control="true"
+            onClick={(e) => {
+              e.stopPropagation();
+              onCoachClick?.();
+            }}
+            className="relative z-20 pointer-events-auto flex h-7 w-7 items-center justify-center rounded-full border border-emerald-400/35 bg-emerald-500/10 shadow-[0_0_12px_rgba(16,185,129,0.16)] transition-all hover:scale-105 hover:bg-emerald-500/20 active:scale-95"
+            aria-label="Open Coach G for this game"
+          >
+            <img src={COACH_G_AVATAR} alt="Coach G" className="h-5 w-5 rounded-full object-cover" />
+          </button>
         </div>
         
         {/* Away team (listed first, visitors) */}
@@ -375,81 +552,28 @@ const CompactGameTileComponent = ({ game, onClick, isInWatchboard, isFavorite }:
           isHome={true}
         />
         
-        {/* Odds preview for scheduled games */}
-        {isScheduled && (game.spread != null || game.overUnder != null || game.mlHome != null || game.mlAway != null || game.ml1HHome != null || game.ml1HAway != null || game.spread1H != null || game.total1H != null) && (
-          <div className="mt-2.5 border-t border-white/[0.06] pt-2.5">
-            <div className="grid grid-cols-3 gap-2">
-              <div className="rounded-[10px] border border-white/[0.05] bg-[#0F141B] px-2 py-1.5 text-center">
-                <div className="text-[9px] uppercase tracking-wide text-slate-500">Spread</div>
-                <div className="mt-0.5 text-[11px] font-mono font-semibold text-cyan-300">{formatSpread(game.spread)}</div>
-              </div>
-              <div className="rounded-[10px] border border-white/[0.05] bg-[#0F141B] px-2 py-1.5 text-center">
-                <div className="text-[9px] uppercase tracking-wide text-slate-500">Total</div>
-                <div className="mt-0.5 text-[11px] font-mono font-semibold text-emerald-300">
-                  {game.overUnder != null ? game.overUnder : "-"}
-                </div>
-              </div>
-              <div className="rounded-[10px] border border-white/[0.05] bg-[#0F141B] px-2 py-1.5 text-center">
-                <div className="text-[9px] uppercase tracking-wide text-slate-500">Moneyline</div>
-                <div className="mt-0.5 text-[10px] font-mono font-semibold text-amber-300">
-                  {`${formatMoneyline(game.mlAway ?? game.ml1HAway)} / ${formatMoneyline(game.mlHome ?? game.ml1HHome)}`}
-                </div>
-              </div>
-            </div>
-            {(game.spread1H != null || game.total1H != null) && (
-              <div className="mt-1.5 flex items-center justify-between rounded-[10px] border border-violet-400/25 bg-violet-500/10 px-2 py-1.5">
-                <span className="text-[9px] uppercase tracking-wide text-violet-200/90">{periodLabels.short}</span>
-                <span className="text-[10px] font-mono font-semibold text-violet-100">
-                  {`S ${formatSpread(game.spread1H)} • T ${game.total1H ?? "-"}`}
-                </span>
-              </div>
-            )}
-          </div>
-        )}
-
-        {showPitcherMatchup && (
-          <div className="mt-2.5 rounded-[10px] border border-cyan-400/35 bg-gradient-to-r from-cyan-500/14 via-sky-500/10 to-violet-500/12 px-2.5 py-2 shadow-[0_0_20px_rgba(56,189,248,0.12)]">
-            <div className="mb-1.5 flex items-center gap-1.5 text-[9px] uppercase tracking-wide text-cyan-100/95">
-              <span className="text-[10px]">⚾</span>
-              <span className="font-semibold">Probable Pitcher Duel</span>
-              <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-cyan-300/80" />
-            </div>
-            {awayPitcherLine && (
-              <div className="mb-1 truncate rounded-md border border-cyan-300/20 bg-cyan-500/10 px-2 py-1 text-[10px] font-medium text-slate-100">
-                <span className="mr-1 text-[9px] uppercase text-cyan-300">Away</span>
-                {awayPitcherLine}
-              </div>
-            )}
-            {homePitcherLine && (
-              <div className="truncate rounded-md border border-violet-300/20 bg-violet-500/10 px-2 py-1 text-[10px] font-medium text-slate-100">
-                <span className="mr-1 text-[9px] uppercase text-violet-300">Home</span>
-                {homePitcherLine}
-              </div>
-            )}
-          </div>
-        )}
-
-        {videoJob && (
-          <div className="mt-2 flex items-center justify-between rounded-md border border-violet-500/20 bg-violet-500/10 px-2 py-1.5">
-            <span className="text-[10px] font-semibold uppercase tracking-wide text-violet-200/90">
-              Coach G Video: {videoJob.status}
-              {videoJob.socialStatus === 'published' ? ' • Published' : ''}
-            </span>
-            {videoJob.status === 'completed' && videoJob.videoUrl && (
-              <a
-                href={videoJob.videoUrl}
-                target="_blank"
-                rel="noreferrer"
-                onClick={(e) => e.stopPropagation()}
-                className="rounded border border-emerald-400/30 bg-emerald-500/15 px-2 py-0.5 text-[10px] font-semibold text-emerald-200"
-              >
-                Watch Video
-              </a>
-            )}
+        {showQuickAction && (
+          <div className="mt-3 border-t border-white/[0.06] pt-2.5">
+            <button
+              type="button"
+              data-interactive-control="true"
+              onClick={(e) => {
+                e.stopPropagation();
+                onQuickWatchboard?.();
+              }}
+              className={cn(
+                "w-full rounded-[10px] border px-3 py-2 text-[11px] font-semibold tracking-wide transition-all duration-200 active:scale-[0.985]",
+                isInWatchboard
+                  ? "border-cyan-300/45 bg-gradient-to-r from-cyan-500/18 to-sky-500/14 text-cyan-50 shadow-[0_0_16px_rgba(34,211,238,0.18)] hover:from-cyan-500/22 hover:to-sky-500/18"
+                  : "border-white/[0.12] bg-white/[0.03] text-slate-100 hover:border-cyan-300/30 hover:bg-cyan-500/[0.08]"
+              )}
+            >
+              {isInWatchboard ? "In Watchboard • Add to another" : "Add to Watchboard"}
+            </button>
           </div>
         )}
       </div>
-    </button>
+    </div>
   );
 };
 
@@ -463,15 +587,18 @@ export const CompactGameTile = memo(CompactGameTileComponent, (prevProps, nextPr
     prevProps.game.awayScore === nextProps.game.awayScore &&
     prevProps.game.spread === nextProps.game.spread &&
     prevProps.game.overUnder === nextProps.game.overUnder &&
-    prevProps.game.spread1H === nextProps.game.spread1H &&
-    prevProps.game.total1H === nextProps.game.total1H &&
-    prevProps.game.ml1HHome === nextProps.game.ml1HHome &&
-    prevProps.game.ml1HAway === nextProps.game.ml1HAway &&
+    prevProps.game.odds?.f5?.spread?.home === nextProps.game.odds?.f5?.spread?.home &&
+    prevProps.game.odds?.f5?.spread?.away === nextProps.game.odds?.f5?.spread?.away &&
+    prevProps.game.odds?.f5?.total === nextProps.game.odds?.f5?.total &&
+    prevProps.game.odds?.f5?.moneyline?.home === nextProps.game.odds?.f5?.moneyline?.home &&
+    prevProps.game.odds?.f5?.moneyline?.away === nextProps.game.odds?.f5?.moneyline?.away &&
     prevProps.game.startTime === nextProps.game.startTime &&
     prevProps.game.probableAwayPitcher?.name === nextProps.game.probableAwayPitcher?.name &&
     prevProps.game.probableAwayPitcher?.record === nextProps.game.probableAwayPitcher?.record &&
     prevProps.game.probableHomePitcher?.name === nextProps.game.probableHomePitcher?.name &&
     prevProps.game.probableHomePitcher?.record === nextProps.game.probableHomePitcher?.record &&
-    prevProps.isInWatchboard === nextProps.isInWatchboard
+    prevProps.isInWatchboard === nextProps.isInWatchboard &&
+    Boolean(prevProps.onCoachClick) === Boolean(nextProps.onCoachClick) &&
+    prevProps.showQuickAction === nextProps.showQuickAction
   );
 });

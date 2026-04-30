@@ -43,6 +43,8 @@ import {
   fetchTeamProfileCached,
   fetchPropsCached,
   getSportsRadarProvider,
+  fetchDailySchedule,
+  SOCCER_COMPETITIONS,
 } from "../services/sports-data/sportsRadarProvider";
 import type { SportKey as DataSportKey } from "../services/sports-data/types";
 
@@ -137,6 +139,242 @@ function getEasternDateString(value: string | Date | null | undefined): string {
     month: "2-digit",
     day: "2-digit",
   }).format(parsed);
+}
+
+function normalizeSoccerScheduleStatus(rawStatus: unknown): Game["status"] {
+  const status = String(rawStatus || "").trim().toUpperCase();
+  if (
+    status === "LIVE" ||
+    status === "IN_PROGRESS" ||
+    status === "INPROGRESS" ||
+    status === "1ST_HALF" ||
+    status === "2ND_HALF" ||
+    status === "HALFTIME"
+  ) {
+    return "IN_PROGRESS";
+  }
+  if (
+    status === "FINAL" ||
+    status === "CLOSED" ||
+    status === "ENDED" ||
+    status === "COMPLETE" ||
+    status === "AFTER_PENALTIES"
+  ) {
+    return "FINAL";
+  }
+  if (status === "POSTPONED" || status === "DELAYED" || status === "SUSPENDED") {
+    return "POSTPONED";
+  }
+  if (status === "CANCELED" || status === "ABANDONED") {
+    return "CANCELED";
+  }
+  return "SCHEDULED";
+}
+
+function toTeamCode(name: string, fallback = "SOC"): string {
+  const normalized = String(name || "")
+    .replace(/[^A-Za-z0-9 ]/g, " ")
+    .trim();
+  if (!normalized) return fallback;
+  const words = normalized.split(/\s+/).filter(Boolean);
+  if (words.length >= 2) {
+    const code = `${words[0][0] || ""}${words[1][0] || ""}${words[2]?.[0] || ""}`.toUpperCase();
+    return code.slice(0, 3);
+  }
+  return normalized.slice(0, 3).toUpperCase();
+}
+
+function normalizeSoccerLeagueLabel(rawLeague: unknown): string {
+  const upper = String(rawLeague || "").trim().toUpperCase();
+  if (!upper) return "SOCCER";
+  if (upper === "PREMIER LEAGUE") return "EPL";
+  if (upper === "MAJOR LEAGUE SOCCER") return "MLS";
+  if (upper === "UEFA CHAMPIONS LEAGUE") return "UCL";
+  if (upper === "UEFA EUROPA LEAGUE") return "UEL";
+  if (upper === "UEFA CONFERENCE LEAGUE") return "UECL";
+  if (upper === "LALIGA" || upper === "LA LIGA") return "LA_LIGA";
+  if (upper === "SERIE A") return "SERIE_A";
+  if (upper === "BUNDESLIGA") return "BUNDESLIGA";
+  if (upper === "LIGUE 1") return "LIGUE_1";
+  if (upper === "LIGA MX") return "LIGA_MX";
+  return upper;
+}
+
+const SOCCER_LEAGUE_TEAM_HINTS: Record<"EPL" | "LA_LIGA" | "MLS" | "UCL", { codes: Set<string>; names: string[] }> = {
+  EPL: {
+    codes: new Set(["ARS", "AVL", "BHA", "BOU", "BRE", "BUR", "CHE", "CRY", "EVE", "FUL", "IPS", "LEE", "LEI", "LIV", "MCI", "MUN", "NEW", "NFO", "SOU", "TOT", "WHU", "WOL"]),
+    names: ["ARSENAL", "ASTON VILLA", "BRIGHTON", "BOURNEMOUTH", "BRENTFORD", "BURNLEY", "CHELSEA", "CRYSTAL PALACE", "EVERTON", "FULHAM", "IPSWICH", "LEEDS", "LEICESTER", "LIVERPOOL", "MANCHESTER CITY", "MANCHESTER UNITED", "NEWCASTLE", "NOTTINGHAM", "SOUTHAMPTON", "TOTTENHAM", "WEST HAM", "WOLVERHAMPTON"],
+  },
+  LA_LIGA: {
+    codes: new Set(["ALA", "ALV", "ATH", "ATM", "BAR", "BET", "CEL", "ESP", "GET", "GIR", "LEG", "LEV", "MLL", "OSA", "RAY", "RMA", "RSO", "SEV", "VAL", "VIL"]),
+    names: ["ALAVES", "ATHLETIC", "ATLETICO", "BARCELONA", "BETIS", "CELTA", "ESPANYOL", "GETAFE", "GIRONA", "LEGANES", "LEVANTE", "MALLORCA", "OSASUNA", "RAYO", "REAL MADRID", "REAL SOCIEDAD", "SEVILLA", "VALENCIA", "VILLARREAL"],
+  },
+  MLS: {
+    codes: new Set(["ATL", "ATX", "AUS", "CHI", "CIN", "CLB", "CLT", "COL", "DAL", "DC", "DCU", "HOU", "LAF", "LAG", "MIA", "MIN", "MTL", "NAS", "NE", "NER", "NYC", "NYRB", "ORL", "PHI", "POR", "RSL", "SEA", "SJE", "SKC", "STL", "TOR", "VAN"]),
+    names: ["ATLANTA UNITED", "AUSTIN", "CHICAGO FIRE", "CINCINNATI", "COLUMBUS CREW", "CHARLOTTE", "COLORADO RAPIDS", "FC DALLAS", "D.C. UNITED", "HOUSTON DYNAMO", "LAFC", "LOS ANGELES FC", "LA GALAXY", "INTER MIAMI", "MINNESOTA UNITED", "MONTREAL", "NASHVILLE", "NEW ENGLAND", "NEW YORK CITY", "NEW YORK RED BULLS", "ORLANDO CITY", "PHILADELPHIA UNION", "PORTLAND TIMBERS", "REAL SALT LAKE", "SEATTLE SOUNDERS", "SAN JOSE", "SPORTING KANSAS CITY", "ST. LOUIS CITY", "TORONTO FC", "VANCOUVER WHITECAPS"],
+  },
+  UCL: {
+    codes: new Set(["RMA", "BAR", "BAY", "PSG", "JUV", "INT", "ACM", "DOR", "BEN", "POR", "ATM", "AJA", "LIV", "MCI", "MUN", "ARS"]),
+    names: ["CHAMPIONS LEAGUE", "REAL MADRID", "BARCELONA", "BAYERN", "PARIS SAINT-GERMAIN", "JUVENTUS", "INTER", "MILAN", "DORTMUND", "BENFICA", "PORTO", "ATLETICO", "AJAX"],
+  },
+};
+
+function inferSoccerLeagueFromTeams(game: Partial<Game>): string | null {
+  const knownLeague = normalizeSoccerLeagueLabel(game.league || "");
+  if (knownLeague !== "SOCCER") return knownLeague;
+
+  const homeCode = String(game.home_team_code || "").toUpperCase().trim();
+  const awayCode = String(game.away_team_code || "").toUpperCase().trim();
+  const homeName = String(game.home_team_name || "").toUpperCase();
+  const awayName = String(game.away_team_name || "").toUpperCase();
+  if ((!homeCode && !homeName) || (!awayCode && !awayName)) return null;
+
+  const candidateLeagues = Object.entries(SOCCER_LEAGUE_TEAM_HINTS).filter(([league, hints]) => {
+    const homeCodeHit = homeCode && hints.codes.has(homeCode);
+    const awayCodeHit = awayCode && hints.codes.has(awayCode);
+    const homeNameHit = hints.names.some((token) => homeName.includes(token));
+    const awayNameHit = hints.names.some((token) => awayName.includes(token));
+    const homeHit = Boolean(homeCodeHit || homeNameHit);
+    const awayHit = Boolean(awayCodeHit || awayNameHit);
+    return homeHit && awayHit;
+  });
+
+  if (candidateLeagues.length === 1) {
+    return candidateLeagues[0][0];
+  }
+  return null;
+}
+
+async function fetchSoccerGamesFromSportsRadarDailySchedule(
+  dateYmd: string,
+  status?: Game["status"],
+  env?: Partial<Env>
+): Promise<{ games: Game[]; error?: string }> {
+  const scheduleApiKey = String(env?.SPORTSRADAR_PLAYER_PROPS_API_KEY || env?.SPORTSRADAR_API_KEY || "").trim();
+  const coreApiKey = String(env?.SPORTSRADAR_API_KEY || env?.SPORTSRADAR_PLAYER_PROPS_API_KEY || "").trim();
+  if (!scheduleApiKey && !coreApiKey) {
+    return { games: [], error: "SportsRadar API key missing for soccer schedule" };
+  }
+  const parsedDate = new Date(`${dateYmd}T12:00:00.000Z`);
+  const targetDate = Number.isNaN(parsedDate.getTime()) ? new Date() : parsedDate;
+  const schedule = scheduleApiKey
+    ? await fetchDailySchedule(scheduleApiKey, "SOCCER", targetDate)
+    : { events: [], errors: ["SportsRadar daily schedule key unavailable"] };
+  const seen = new Set<string>();
+  const games: Game[] = [];
+  const pushGame = (input: {
+    eventId: string;
+    league?: string | null;
+    status: unknown;
+    homeAbbr?: string | null;
+    awayAbbr?: string | null;
+    homeName: string;
+    awayName: string;
+    start: Date | string | null | undefined;
+    homeScore?: number | null;
+    awayScore?: number | null;
+  }) => {
+    const rawEventId = String(input.eventId || "").trim();
+    if (!rawEventId || seen.has(rawEventId)) return;
+    const normalizedStatus = normalizeSoccerScheduleStatus(input.status);
+    if (status && normalizedStatus !== status) return;
+    const startDate = input.start instanceof Date ? input.start : new Date(String(input.start || ""));
+    const startIso = Number.isNaN(startDate.getTime()) ? new Date().toISOString() : startDate.toISOString();
+    const eventId = rawEventId.startsWith("sr:sport_event:") ? rawEventId : `sr:sport_event:${rawEventId}`;
+    games.push({
+      game_id: eventId,
+      external_id: rawEventId.replace(/^sr:sport_event:/, ""),
+      sport: "soccer",
+      league: normalizeSoccerLeagueLabel(input.league || "SOCCER"),
+      start_time: startIso,
+      status: normalizedStatus,
+      home_team_code: String(input.homeAbbr || "").trim().toUpperCase() || toTeamCode(input.homeName, "HOM"),
+      home_team_name: input.homeName,
+      away_team_code: String(input.awayAbbr || "").trim().toUpperCase() || toTeamCode(input.awayName, "AWY"),
+      away_team_name: input.awayName,
+      home_score: typeof input.homeScore === "number" ? input.homeScore : undefined,
+      away_score: typeof input.awayScore === "number" ? input.awayScore : undefined,
+      last_updated_at: new Date().toISOString(),
+      source_provider: "sportsradar",
+    } as Game);
+    seen.add(rawEventId);
+  };
+
+  if (Array.isArray(schedule.events) && schedule.events.length > 0) {
+    for (const event of schedule.events) {
+      pushGame({
+        eventId: String(event?.eventId || ""),
+        league: "SOCCER",
+        status: event?.status,
+        homeName: String(event?.homeTeam || "Home"),
+        awayName: String(event?.awayTeam || "Away"),
+        start: event?.startTime,
+      });
+    }
+    if (games.length > 0) return { games };
+  }
+
+  // Fallback when odds-comparison daily schedule is unavailable for this key:
+  // pull daily fixtures across major SportsRadar soccer competitions.
+  if (!coreApiKey) {
+    return {
+      games: [],
+      error: schedule.errors[0] || "SportsRadar soccer schedule returned no events",
+    };
+  }
+
+  const provider = getSportsRadarProvider(coreApiKey, null);
+  const competitionKeys = [
+    "premier-league",
+    "la-liga",
+    "serie-a",
+    "bundesliga",
+    "ligue-1",
+    "eredivisie",
+    "primeira-liga",
+    "mls",
+    "liga-mx",
+    "brasileirao",
+    "argentina-primera",
+    "champions-league",
+    "europa-league",
+    "conference-league",
+  ].filter((key) => Boolean((SOCCER_COMPETITIONS as Record<string, unknown>)[key]));
+  const targetDateYmd = dateYmd;
+  const competitionResults = await Promise.allSettled(
+    competitionKeys.map((key) => provider.fetchSoccerSchedule(key, coreApiKey))
+  );
+  for (let i = 0; i < competitionResults.length; i += 1) {
+    const result = competitionResults[i];
+    if (result.status !== "fulfilled") continue;
+    const payload = result.value;
+    const leagueName = String(payload?.competition?.name || competitionKeys[i] || "SOCCER");
+    const matches = Array.isArray(payload?.matches) ? payload.matches : [];
+    for (const match of matches) {
+      const matchDateYmd = getEasternDateString(match?.startTime instanceof Date ? match.startTime : match?.startTime || "");
+      if (matchDateYmd !== targetDateYmd) continue;
+      pushGame({
+        eventId: String(match?.eventId || ""),
+        league: leagueName,
+        status: match?.status,
+        homeAbbr: String(match?.homeTeamAbbreviation || ""),
+        awayAbbr: String(match?.awayTeamAbbreviation || ""),
+        homeName: String(match?.homeTeamName || "Home"),
+        awayName: String(match?.awayTeamName || "Away"),
+        start: match?.startTime,
+        homeScore: match?.homeScore ?? null,
+        awayScore: match?.awayScore ?? null,
+      });
+    }
+  }
+
+  if (games.length > 0) {
+    return { games };
+  }
+  return {
+    games: [],
+    error: schedule.errors[0] || "SportsRadar soccer schedule returned no events",
+  };
 }
 
 async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, fallbackValue: T): Promise<T> {
@@ -907,9 +1145,14 @@ gamesRouter.get("/", async (c) => {
   const includeOdds = !["0", "false", "no"].includes(String(c.req.query("includeOdds") || "").toLowerCase());
   const forceFresh = ["1", "true", "yes"].includes(String(c.req.query("fresh") || "").toLowerCase());
   const includeDebug = ["1", "true", "yes"].includes(String(c.req.query("debug") || "").toLowerCase());
-  const listTimeoutMs = includeOdds ? 12000 : 4500;
+  const listTimeoutMs = includeOdds ? 12000 : (sport === "soccer" ? 12000 : 4500);
   const cacheKey = getScoreboardListCacheKey(sport, status, date, includeOdds);
   const persistentKeys = getGamesPersistentCacheKeys(cacheKey);
+  const isTodayFastScoreboardRequest =
+    !includeOdds &&
+    !status &&
+    date === getTodayEasternDateString() &&
+    sport !== "soccer";
   
   console.log("[Games API] GET / called", { sport, status, date });
   
@@ -927,7 +1170,9 @@ gamesRouter.get("/", async (c) => {
     }
   }
 
-  if (!includeOdds && !forceFresh) {
+  // For today's scoreboard views, prefer live fast-path over persistent DB cache
+  // so finished games don't linger in stale in-progress state.
+  if (!includeOdds && !forceFresh && !isTodayFastScoreboardRequest) {
     try {
       const persistent = await getCachedData<Record<string, unknown>>(c.env.DB, persistentKeys.primary);
       if (persistent && hasGamesRows(persistent)) {
@@ -957,7 +1202,7 @@ gamesRouter.get("/", async (c) => {
 
   // Fast scoreboard path: use cached live/scheduled feeds for today's slate.
   // This avoids slow provider fan-out for /games list views that do not need odds.
-  if (!includeOdds && !status && date === getTodayEasternDateString()) {
+  if (isTodayFastScoreboardRequest) {
     const scopedSports = sport ? [sport] : undefined;
     const [liveResult, scheduledResult] = await Promise.all([
       withTimeout(
@@ -1196,29 +1441,72 @@ gamesRouter.get("/", async (c) => {
       console.log("[Games API] Soccer cache read failed:", err);
     }
 
-    const soccerResult = await withTimeout(
-      fetchGamesWithFallback(sport, { status, date }),
-      listTimeoutMs,
-      { data: [], fromCache: false, provider: "none", error: `${sport}_timeout` } as any
-    );
+    const [sportsRadarScheduleResult, fallbackResult] = await Promise.all([
+      withTimeout(
+        fetchSoccerGamesFromSportsRadarDailySchedule(date, status, c.env),
+        listTimeoutMs,
+        { games: [], error: "soccer_sportsradar_timeout" }
+      ),
+      withTimeout(
+        fetchGamesWithFallback(sport, { status, date }),
+        listTimeoutMs,
+        { data: [], fromCache: false, provider: "none", error: `${sport}_timeout` } as any
+      ),
+    ]);
+    const normalizeNaturalKey = (game: Partial<Game>): string => {
+      const day = getEasternDateString(game.start_time || "") || date;
+      const norm = (value: unknown) =>
+        String(value || "")
+          .toLowerCase()
+          .replace(/[^a-z0-9]/g, "");
+      const home = norm(game.home_team_name || game.home_team_code);
+      const away = norm(game.away_team_name || game.away_team_code);
+      return `${day}:${home}:${away}`;
+    };
+    const mergedById = new Map<string, Game>();
+    const naturalKeys = new Set<string>();
+    for (const game of fallbackResult.data || []) {
+      const gameId = String(game?.game_id || "").trim();
+      if (!gameId) continue;
+      mergedById.set(gameId, game as Game);
+      naturalKeys.add(normalizeNaturalKey(game as Game));
+    }
+    for (const game of sportsRadarScheduleResult.games || []) {
+      const gameId = String(game?.game_id || "").trim();
+      if (!gameId) continue;
+      if (mergedById.has(gameId)) continue;
+      const naturalKey = normalizeNaturalKey(game);
+      if (naturalKeys.has(naturalKey)) continue;
+      mergedById.set(gameId, game);
+      naturalKeys.add(naturalKey);
+    }
+    const soccerGames = Array.from(mergedById.values()).map((game) => ({
+      ...game,
+      league: normalizeSoccerLeagueLabel(inferSoccerLeagueFromTeams(game) || game.league || "SOCCER"),
+    }));
+    const soccerProvider = sportsRadarScheduleResult.games.length > 0
+      ? (fallbackResult.data.length > 0 ? "SportsRadar+fallback" : "SportsRadar")
+      : fallbackResult.provider;
 
     const soccerEnrichedGames = includeOdds
       ? await withTimeout(
-          enrichGamesWithOdds(soccerResult.data, c.env),
+          enrichGamesWithOdds(soccerGames, c.env),
           9000,
-          soccerResult.data
+          soccerGames
         )
-      : soccerResult.data;
-    if (!includeOdds && soccerResult.data.length > 0 && c.env.DB) {
-      c.executionCtx.waitUntil(captureLineMovementSnapshotsForGames(soccerResult.data, c.env));
+      : soccerGames;
+    if (!includeOdds && soccerGames.length > 0 && c.env.DB) {
+      c.executionCtx.waitUntil(captureLineMovementSnapshotsForGames(soccerGames, c.env));
     }
 
     const soccerPayload = {
       games: soccerEnrichedGames.map(withClientGameId),
-      fromCache: soccerResult.fromCache,
-      cachedAt: soccerResult.cachedAt ? new Date(soccerResult.cachedAt).toISOString() : undefined,
-      provider: soccerResult.provider,
+      fromCache: sportsRadarScheduleResult.games.length === 0 && fallbackResult.fromCache,
+      cachedAt: fallbackResult.cachedAt ? new Date(fallbackResult.cachedAt).toISOString() : undefined,
+      provider: soccerProvider,
       timestamp: new Date().toISOString(),
+      ...(sportsRadarScheduleResult.error ? { sportsRadarError: sportsRadarScheduleResult.error } : {}),
+      ...(fallbackResult.error ? { fallbackError: fallbackResult.error } : {}),
     };
 
     try {
@@ -1906,8 +2194,22 @@ gamesRouter.get("/:gameId", async (c) => {
     : gameId;
   
   let result = await fetchGameWithFallback(normalizedGameId);
+
+  // Legacy watchboard rows can store sr:sport_event IDs while canonical rows
+  // in sdio_games use provider_game_id formats (e.g., sr_nba_*). Try alias
+  // candidates before considering provider-specific fallbacks.
+  if (!result.data && (normalizedGameId.startsWith("sr:sport_event:") || normalizedGameId.startsWith("sr:match:"))) {
+    const aliasCandidates = buildLineHistoryIdCandidates(normalizedGameId);
+    for (const candidate of aliasCandidates) {
+      const normalizedCandidate = String(candidate || "").trim();
+      if (!normalizedCandidate || normalizedCandidate === normalizedGameId) continue;
+      result = await fetchGameWithFallback(normalizedCandidate);
+      if (result.data) break;
+    }
+  }
   
-  if (!result.data && normalizedGameId.startsWith("sr:sport_event:") && c.env.SPORTSRADAR_API_KEY) {
+  const shouldTrySoccerDetailFallback = gameId.startsWith("soccer_") || normalizedGameId.startsWith("sr:match:");
+  if (!result.data && shouldTrySoccerDetailFallback && c.env.SPORTSRADAR_API_KEY) {
     try {
       const soccerProvider = getSportsRadarProvider(c.env.SPORTSRADAR_API_KEY, null);
       const detail = await soccerProvider.fetchSoccerMatchDetail(normalizedGameId, c.env.SPORTSRADAR_API_KEY);
@@ -4665,6 +4967,7 @@ gamesRouter.get("/:gameId/line-history", async (c) => {
  */
 gamesRouter.get("/odds/:sport", async (c) => {
   const sport = c.req.param("sport") as SportKey;
+  const forceFresh = c.req.query("fresh") === "1" || c.req.query("fresh") === "true";
   
   if (!SUPPORTED_SPORTS.includes(sport)) {
     return c.json({ 
@@ -4691,10 +4994,11 @@ gamesRouter.get("/odds/:sport", async (c) => {
     )
   );
   const oddsObject: Record<string, unknown> = {};
+  const oddsDb = forceFresh ? undefined : c.env.DB;
   let usedKey: string | null = null;
   for (const keyCandidate of keyChain) {
     try {
-      const oddsMap = await fetchSportsRadarOdds(sport, mainApiKey, c.env.DB, undefined, keyCandidate);
+      const oddsMap = await fetchSportsRadarOdds(sport, mainApiKey, oddsDb, undefined, keyCandidate);
       for (const [key, value] of oddsMap) oddsObject[key] = value;
       usedKey = keyCandidate;
       if (Object.keys(oddsObject).length > 0) break;

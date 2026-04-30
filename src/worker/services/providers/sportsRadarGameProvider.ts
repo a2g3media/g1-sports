@@ -111,6 +111,12 @@ type MlbPregameState = {
   probableAwayPitcher: MlbPitcherState | null;
 };
 
+type MlbDerivedInningState = {
+  inningNumber: number | null;
+  inningHalf: "top" | "bottom" | null;
+  periodLabel: string | null;
+};
+
 /**
  * Initialize the SportsRadar provider with an API key
  */
@@ -133,12 +139,26 @@ function mapStatus(srStatus: string | undefined): Game["status"] {
   const status = srStatus.toLowerCase();
   
   // Live statuses
-  if (status === "inprogress" || status === "in_progress" || status === "live" || status === "halftime") {
+  if (
+    status === "inprogress" ||
+    status === "in_progress" ||
+    status === "live" ||
+    status === "halftime" ||
+    status === "1st_half" ||
+    status === "2nd_half"
+  ) {
     return "IN_PROGRESS";
   }
   
   // Final statuses
-  if (status === "closed" || status === "complete" || status === "final") {
+  if (
+    status === "closed" ||
+    status === "complete" ||
+    status === "final" ||
+    status === "ended" ||
+    status === "finished" ||
+    status === "after_penalties"
+  ) {
     return "FINAL";
   }
   
@@ -546,6 +566,60 @@ function extractMlbLiveState(srGame: any): MlbLiveState | undefined {
   };
 }
 
+async function fetchMlbInningStateFromPbp(
+  config: { base: string; version: string },
+  gameId: string
+): Promise<MlbDerivedInningState | null> {
+  if (!apiKey) return null;
+  const url = `${config.base}/${config.version}/en/games/${gameId}/pbp.json?api_key=${apiKey}`;
+  try {
+    const response = await fetch(url, {
+      headers: { Accept: "application/json" },
+    });
+    if (!response.ok) return null;
+    const raw = await response.json() as any;
+    const game = raw?.game || raw || {};
+    const innings = Array.isArray(game?.innings) ? game.innings : [];
+    if (!innings.length) return null;
+
+    for (let i = innings.length - 1; i >= 0; i -= 1) {
+      const inning = innings[i];
+      const inningNumber = asNullableNumber(inning?.number ?? inning?.sequence);
+      const halves = Array.isArray(inning?.halfs) ? inning.halfs : [];
+
+      for (let j = halves.length - 1; j >= 0; j -= 1) {
+        const halfNode = halves[j];
+        const hasEvents = Array.isArray(halfNode?.events) && halfNode.events.length > 0;
+        if (!hasEvents) continue;
+        const halfRaw = asNullableString(halfNode?.half);
+        const halfNorm = String(halfRaw || "").toUpperCase();
+        const inningHalf = halfNorm === "T" ? "top" : halfNorm === "B" ? "bottom" : null;
+        const periodLabel = inningNumber && inningHalf
+          ? `${inningHalf === "top" ? "Top" : "Bot"} ${inningNumber}`
+          : inningNumber
+            ? `Inning ${inningNumber}`
+            : null;
+        return {
+          inningNumber,
+          inningHalf,
+          periodLabel,
+        };
+      }
+
+      if (inningNumber) {
+        return {
+          inningNumber,
+          inningHalf: null,
+          periodLabel: `Inning ${inningNumber}`,
+        };
+      }
+    }
+  } catch {
+    // Best-effort MLB inning fallback.
+  }
+  return null;
+}
+
 // ============================================
 // FETCH WITH RETRY
 // ============================================
@@ -669,6 +743,14 @@ export async function fetchLiveScores(
     const awayTeam = data.away || data.away_team;
     const mlbLiveState = sport === "mlb" ? extractMlbLiveState(data) : undefined;
     const mlbPregameState = sport === "mlb" ? extractMlbPregameState(data, homeTeam, awayTeam) : undefined;
+    const needsMlbInningFallback = (
+      sport === "mlb" &&
+      (periodInfo.period == null || !periodInfo.periodLabel) &&
+      (!mlbLiveState || (mlbLiveState.inningNumber == null && mlbLiveState.inningHalf == null))
+    );
+    const derivedMlbInning = needsMlbInningFallback
+      ? await fetchMlbInningStateFromPbp(config, gameId)
+      : null;
     
     // Extract scores - summary endpoint has them in various locations
     // For LIVE games, scores may be under .scoring or need to be summed from periods
@@ -699,14 +781,37 @@ export async function fetchLiveScores(
     // Get actual status from summary endpoint
     const actualStatus = mapStatus(data.status);
     
+    const normalizedPeriod = actualStatus === "IN_PROGRESS"
+      ? (periodInfo.period ?? derivedMlbInning?.inningNumber ?? undefined)
+      : undefined;
+    const normalizedPeriodLabel = actualStatus === "FINAL"
+      ? "Final"
+      : (actualStatus === "IN_PROGRESS"
+        ? (periodInfo.periodLabel ?? derivedMlbInning?.periodLabel ?? undefined)
+        : undefined);
+    const normalizedClock = actualStatus === "IN_PROGRESS" ? periodInfo.clock : "";
+
     return {
       homeScore,
       awayScore,
       status: actualStatus,
-      period: periodInfo.period,
-      periodLabel: periodInfo.periodLabel,
-      clock: periodInfo.clock,
-      mlbLiveState,
+      period: normalizedPeriod,
+      periodLabel: normalizedPeriodLabel,
+      clock: normalizedClock,
+      mlbLiveState:
+        sport === "mlb"
+          ? {
+              inningNumber: mlbLiveState?.inningNumber ?? derivedMlbInning?.inningNumber ?? null,
+              inningHalf: mlbLiveState?.inningHalf ?? derivedMlbInning?.inningHalf ?? null,
+              outs: mlbLiveState?.outs ?? null,
+              balls: mlbLiveState?.balls ?? null,
+              strikes: mlbLiveState?.strikes ?? null,
+              runnersOnBase: mlbLiveState?.runnersOnBase ?? null,
+              currentBatter: mlbLiveState?.currentBatter ?? null,
+              currentPitcher: mlbLiveState?.currentPitcher ?? null,
+              lastPlay: mlbLiveState?.lastPlay ?? null,
+            }
+          : mlbLiveState,
       mlbPregameState,
     };
   } catch (err) {
@@ -916,9 +1021,20 @@ async function fetchGamesFromSportsRadar(sport: SportKey, date: Date): Promise<{
             if (result.scores.status) {
               game.status = result.scores.status as Game["status"];
             }
-            game.period = result.scores.period ?? game.period;
-            game.period_label = result.scores.periodLabel ?? game.period_label;
-            game.clock = result.scores.clock ?? game.clock;
+            const resolvedStatus = String(game.status || "").toUpperCase() as Game["status"];
+            if (resolvedStatus === "IN_PROGRESS") {
+              game.period = result.scores.period ?? game.period;
+              game.period_label = result.scores.periodLabel ?? game.period_label;
+              game.clock = result.scores.clock ?? game.clock;
+            } else if (resolvedStatus === "FINAL") {
+              game.period = undefined;
+              game.period_label = "Final";
+              game.clock = "";
+            } else {
+              game.period = undefined;
+              game.period_label = undefined;
+              game.clock = "";
+            }
             game.mlbLiveState = result.scores.mlbLiveState ?? game.mlbLiveState;
             game.mlbPregameState = result.scores.mlbPregameState ?? game.mlbPregameState;
           }

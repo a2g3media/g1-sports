@@ -4,7 +4,7 @@
  */
 
 import { useState, useEffect, useMemo, useCallback, useRef, memo } from "react";
-import { useNavigate, Link, useParams } from "react-router-dom";
+import { useNavigate, Link, useParams, useSearchParams } from "react-router-dom";
 import {
   Plus,
   MoreVertical,
@@ -67,6 +67,7 @@ const BOARD_COLORS = [
   { border: 'border-orange-500/50', bg: 'bg-orange-500/5', accent: '#f97316', text: 'text-orange-400' },
   { border: 'border-pink-500/50', bg: 'bg-pink-500/5', accent: '#ec4899', text: 'text-pink-400' },
 ];
+const DEFAULT_BOARD_COLOR = BOARD_COLORS[0];
 
 // =====================================================
 // TYPES
@@ -85,6 +86,34 @@ interface GameData {
   period_label: string | null;
   clock: string | null;
   start_time: string;
+}
+
+const INVALID_WATCHBOARD_TEAM_TOKENS = new Set(["", "TBD", "UNK", "UNKNOWN", "HOME", "AWAY"]);
+
+function looksLikeRawWatchboardId(value: string): boolean {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (!normalized) return true;
+  return normalized.startsWith("sr:")
+    || normalized.startsWith("sr_")
+    || normalized.startsWith("espn_")
+    || normalized.includes(":sport_event:")
+    || normalized.includes(":match:");
+}
+
+function isRenderableWatchboardGame(game: GameData | undefined | null): game is GameData {
+  if (!game) return false;
+  const sport = String(game.sport || "").trim().toLowerCase();
+  if (!sport || sport === "unknown") return false;
+  if (String(game.status || "").trim().toUpperCase() === "UNKNOWN") return false;
+  const homeCode = String(game.home_team_code || "").trim().toUpperCase();
+  const awayCode = String(game.away_team_code || "").trim().toUpperCase();
+  if (INVALID_WATCHBOARD_TEAM_TOKENS.has(homeCode) || INVALID_WATCHBOARD_TEAM_TOKENS.has(awayCode)) return false;
+  const gameId = String(game.game_id || "").trim();
+  const homeName = String(game.home_team_name || "").trim();
+  const awayName = String(game.away_team_name || "").trim();
+  if (homeName && (looksLikeRawWatchboardId(homeName) || homeName === gameId)) return false;
+  if (awayName && (looksLikeRawWatchboardId(awayName) || awayName === gameId)) return false;
+  return true;
 }
 
 interface LatestPlay {
@@ -523,7 +552,7 @@ const GameTile = memo(function GameTile({
           </span>
         ) : isFinal ? (
           <span className="px-1.5 sm:px-2 py-0.5 sm:py-1 rounded-full bg-slate-700/50 text-slate-400 text-[10px] sm:text-xs font-medium">
-            FINAL
+            {formatFinalStatusWithDate(game.start_time)}
           </span>
         ) : (
           <span className="inline-flex items-center gap-0.5 sm:gap-1 px-1.5 sm:px-2 py-0.5 sm:py-1 rounded-full bg-slate-700/50 text-slate-400 text-[10px] sm:text-xs">
@@ -683,9 +712,37 @@ const GameTile = memo(function GameTile({
 function formatGameTime(isoString: string): string {
   try {
     const date = new Date(isoString);
-    return date.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+    if (Number.isNaN(date.getTime())) return "";
+    const formattedDate = date.toLocaleDateString("en-US", {
+      month: "short",
+      day: "numeric",
+    });
+    const formattedTime = date.toLocaleTimeString("en-US", {
+      hour: "numeric",
+      minute: "2-digit",
+    });
+    const now = new Date();
+    const isToday =
+      date.getFullYear() === now.getFullYear() &&
+      date.getMonth() === now.getMonth() &&
+      date.getDate() === now.getDate();
+    return isToday ? formattedTime : `${formattedDate} • ${formattedTime}`;
   } catch {
     return "";
+  }
+}
+
+function formatFinalStatusWithDate(isoString: string): string {
+  try {
+    const date = new Date(isoString);
+    if (Number.isNaN(date.getTime())) return "FINAL";
+    const formattedDate = date.toLocaleDateString("en-US", {
+      month: "short",
+      day: "numeric",
+    });
+    return `FINAL • ${formattedDate}`;
+  } catch {
+    return "FINAL";
   }
 }
 
@@ -1478,6 +1535,8 @@ function CoachGWatcher({ games, latestPlays, liveGameCount, userId }: CoachGWatc
 export function WatchboardPage() {
   const navigate = useNavigate();
   const { id: urlBoardId } = useParams<{ id?: string }>();
+  const [searchParams] = useSearchParams();
+  const queryBoardId = searchParams.get("board");
   const { subscription } = useSubscription();
   const { isMuted, toggleMute, playSound } = useSoundEffects();
   const {
@@ -1505,8 +1564,9 @@ export function WatchboardPage() {
 
   // Auto-switch to board from URL param
   useEffect(() => {
-    if (urlBoardId && boards.length > 0) {
-      const targetId = parseInt(urlBoardId, 10);
+    const requestedBoardId = String(urlBoardId || queryBoardId || "").trim();
+    if (requestedBoardId && boards.length > 0) {
+      const targetId = parseInt(requestedBoardId, 10);
       if (!isNaN(targetId) && activeBoard?.id !== targetId) {
         const boardExists = boards.some(b => b.id === targetId);
         if (boardExists) {
@@ -1514,7 +1574,7 @@ export function WatchboardPage() {
         }
       }
     }
-  }, [urlBoardId, boards, activeBoard?.id, switchBoard]);
+  }, [urlBoardId, queryBoardId, boards, activeBoard?.id, switchBoard]);
 
   const [games, setGames] = useState<GameData[]>([]);
   // All boards with games for multi-board display
@@ -1538,6 +1598,12 @@ export function WatchboardPage() {
   const [lastRefresh, setLastRefresh] = useState<Date | null>(null);
   // Focused board view - null means show all boards, number means show just that board
   const [focusedBoardId, setFocusedBoardId] = useState<number | null>(null);
+  const watchboardPageLoggedRef = useRef(false);
+  const watchboardPagePerfStartRef = useRef(Date.now());
+  const watchboardPageFirstRenderMsRef = useRef<number | null>(null);
+  const watchboardPageHydrationDoneMsRef = useRef<number | null>(null);
+  const WATCHBOARD_GAME_FETCH_TIMEOUT_MS = 7000;
+  const WATCHBOARD_PREVIEW_TIMEOUT_MS = 8000;
 
   // Tier limits
   const tierLimits = getTierLimits(subscription?.tier);
@@ -1549,12 +1615,22 @@ export function WatchboardPage() {
 
   // Helper to fetch a single game by ID (handles soccer games separately)
   const fetchSingleGame = useCallback(async (id: string): Promise<GameData | null> => {
+    const fetchJsonWithTimeout = async <T,>(url: string, timeoutMs = WATCHBOARD_GAME_FETCH_TIMEOUT_MS): Promise<T> => {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), timeoutMs);
+      try {
+        const res = await fetch(url, { signal: controller.signal });
+        if (!res.ok) throw new Error(`Request failed: ${res.status}`);
+        return await res.json();
+      } finally {
+        clearTimeout(timeout);
+      }
+    };
+
     try {
       // Soccer games use sr:match: prefix - fetch from soccer API
       if (id.startsWith("sr:match:") || id.startsWith("sr:sport_event:")) {
-        const res = await fetch(`/api/soccer/match/${encodeURIComponent(id)}`);
-        if (!res.ok) return null;
-        const data = await res.json();
+        const data = await fetchJsonWithTimeout<{ match?: any }>(`/api/soccer/match/${encodeURIComponent(id)}`);
         if (!data.match) return null;
         // Transform soccer match to GameData format
         return {
@@ -1573,12 +1649,25 @@ export function WatchboardPage() {
         };
       }
       // Standard games - fetch from games API
-      const res = await fetch(`/api/games/${id}`);
-      if (!res.ok) return null;
-      const data = await res.json();
-      return data.game || data;
+      const data = await fetchJsonWithTimeout<any>(`/api/games/${encodeURIComponent(id)}?lite=1`);
+      const game = data.game || data;
+      if (game?.home_team_code || game?.home_team_name) return game;
+
+      // Legacy ESPN watchboard IDs can fail direct lookup; resolve from sport slate.
+      const espnMatch = String(id || "").match(/^espn_([a-z0-9]+)_(.+)$/i);
+      if (espnMatch) {
+        const sport = String(espnMatch[1] || "").toLowerCase();
+        const token = String(espnMatch[2] || "").trim();
+        const slate = await fetchJsonWithTimeout<{ games?: any[] }>(`/api/games?sport=${encodeURIComponent(sport)}&includeOdds=0`);
+        const rows = Array.isArray(slate.games) ? slate.games : [];
+        for (const row of rows) {
+          const blob = JSON.stringify(row);
+          if (blob.includes(token)) return row as GameData;
+        }
+      }
+      return null;
     } catch { return null; }
-  }, []);
+  }, [WATCHBOARD_GAME_FETCH_TIMEOUT_MS]);
 
   // Fetch game data for all game IDs (legacy - still used for active board)
   const fetchGames = useCallback(async () => {
@@ -1601,29 +1690,58 @@ export function WatchboardPage() {
   // Fetch ALL boards with their games for multi-board display
   const fetchAllBoardsWithGames = useCallback(async () => {
     if (!user?.id) return;
+    const isResolvedGameData = (game: GameData | undefined | null): game is GameData => {
+      if (!game) return false;
+      const hasCodes = Boolean(
+        game.home_team_code
+        && game.home_team_code !== "TBD"
+        && game.away_team_code
+        && game.away_team_code !== "TBD"
+      );
+      const hasNames = Boolean(game.home_team_name && game.away_team_name);
+      const hasKnownSport = String(game.sport || "").toLowerCase() !== "unknown";
+      return (hasCodes || hasNames) && hasKnownSport;
+    };
     setLoadingGames(true);
     try {
-      // Get all boards with game IDs
-      const boardsRes = await fetch("/api/watchboards/home-preview", {
-        headers: { "x-user-id": user.id.toString() },
-      });
-      const boardsData = await boardsRes.json();
-      const boardsList = boardsData.boards || [];
-
-      // Collect all unique game IDs across all boards
-      const allGameIds = new Set<string>();
-      boardsList.forEach((b: { gameIds: string[] }) => b.gameIds?.forEach((id: string) => allGameIds.add(id)));
-
-      // Fetch all games in parallel
-      const gameMap: Record<string, GameData> = {};
-      if (allGameIds.size > 0) {
-        const gameResults = await Promise.all(
-          Array.from(allGameIds).map(fetchSingleGame)
-        );
-        gameResults.filter(Boolean).forEach((g) => {
-          if (g) gameMap[g.game_id] = g;
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), WATCHBOARD_PREVIEW_TIMEOUT_MS);
+      let boardsRes: Response;
+      try {
+        // Get all boards with game IDs
+        boardsRes = await fetch("/api/watchboards/home-preview", {
+          headers: { "x-user-id": user.id.toString() },
+          signal: controller.signal,
         });
+      } finally {
+        clearTimeout(timeout);
       }
+      if (!boardsRes.ok) {
+        throw new Error(`watchboards preview failed: ${boardsRes.status}`);
+      }
+      const boardsData = await boardsRes.json();
+      const rawBoardsList = Array.isArray(boardsData?.boards) ? boardsData.boards : [];
+      const seenBoardIds = new Set<number>();
+      const boardsList = rawBoardsList.filter((board: any) => {
+        const id = Number(board?.id);
+        const name = String(board?.name || "").trim();
+        if (!Number.isFinite(id) || id <= 0 || !name) return false;
+        if (seenBoardIds.has(id)) return false;
+        seenBoardIds.add(id);
+        return true;
+      });
+
+      // Seed map from payload rows only.
+      const gameMap: Record<string, GameData> = {};
+      boardsList.forEach((b: { gameIds?: string[]; games?: GameData[] }) => {
+        (b.games || []).forEach((g) => {
+          const gid = String(g?.game_id || "").trim();
+          if (!gid) return;
+          if (isRenderableWatchboardGame(g)) {
+            gameMap[gid] = g;
+          }
+        });
+      });
 
       // Build boards with their games
       const boardsWithGames = boardsList.map((b: Watchboard & { gameIds: string[] }) => ({
@@ -1631,22 +1749,54 @@ export function WatchboardPage() {
         gameIds: b.gameIds || [],
         games: (b.gameIds || []).map((id: string) => gameMap[id]).filter(Boolean) as GameData[],
       }));
+      console.log("[WATCHBOARD PAGE HYDRATE]", {
+        boards: boardsWithGames.length,
+        items: boardsWithGames.reduce((sum, board) => sum + (board.gameIds?.length || 0), 0),
+      });
 
-      setAllBoardsData(boardsWithGames);
+      setAllBoardsData((prev) => boardsWithGames.map((nextBoard) => {
+        const prevBoard = prev.find((entry) => entry.board.id === nextBoard.board.id);
+        if (!prevBoard) return nextBoard;
+        const nextGameMap = new Map(nextBoard.games.map((g) => [String(g.game_id || "").trim(), g]));
+        const prevGameMap = new Map(prevBoard.games.map((g) => [String(g.game_id || "").trim(), g]));
+        const mergedGames = nextBoard.gameIds
+          .map((id) => {
+            const key = String(id || "").trim();
+            const nextGame = nextGameMap.get(key);
+            const prevGame = prevGameMap.get(key);
+            if (!nextGame) return prevGame || null;
+            if (!prevGame) return nextGame;
+            return isResolvedGameData(nextGame) ? nextGame : (isResolvedGameData(prevGame) ? prevGame : nextGame);
+          })
+          .filter(Boolean) as GameData[];
+        return {
+          ...nextBoard,
+          games: mergedGames,
+        };
+      }));
       setLastRefresh(new Date());
+      watchboardPageHydrationDoneMsRef.current = Date.now() - watchboardPagePerfStartRef.current;
+      const itemCount = boardsWithGames.reduce((sum, board) => sum + (board.gameIds?.length || 0), 0);
+      console.log("[WATCHBOARD PAGE PERF]", {
+        firstRenderMs: watchboardPageFirstRenderMsRef.current,
+        hydrationDoneMs: watchboardPageHydrationDoneMsRef.current,
+        itemCount,
+      });
     } catch (err) {
       console.error("Failed to fetch all boards:", err);
     } finally {
       setLoadingGames(false);
     }
-  }, [user?.id]);
+  }, [user?.id, WATCHBOARD_PREVIEW_TIMEOUT_MS]);
 
   // Hydrate from hub data immediately (instant navigation)
   useEffect(() => {
     if (hubWatchboards && hubWatchboards.length > 0 && allBoardsData.length === 0) {
       // Transform hub data to local format for instant display
       // Hub returns {id, name, gameIds, games, hasActiveGames}, local needs {board: Watchboard, gameIds, games}
-      const boardsWithGames = hubWatchboards.map((b) => ({
+      const boardsWithGames = hubWatchboards
+        .filter((b) => Number.isFinite(Number(b?.id)) && Number(b.id) > 0 && String(b?.name || "").trim().length > 0)
+        .map((b) => ({
         board: {
           id: b.id,
           name: b.name,
@@ -1654,29 +1804,51 @@ export function WatchboardPage() {
           updated_at: '',
         } as Watchboard,
         gameIds: b.gameIds || [],
-        games: (b.games || []).map(g => ({
-          ...g,
-          home_team_name: g.home_team_name || 'TBD',
-          away_team_name: g.away_team_name || 'TBD',
-        })) as GameData[],
+        games: (b.games || []).filter(isRenderableWatchboardGame) as GameData[],
       }));
       setAllBoardsData(boardsWithGames);
     }
   }, [hubWatchboards, allBoardsData.length]);
 
   useEffect(() => {
+    if (watchboardPageLoggedRef.current) return;
+    const sourceBoards = allBoardsData.length > 0
+      ? allBoardsData.map((entry) => ({ id: entry.board.id, gameIds: entry.gameIds || [] }))
+      : boards.map((board) => ({ id: board.id, gameIds: board.id === activeBoard?.id ? gameIds : [] }));
+    const ids = Array.from(new Set(sourceBoards.flatMap((board) => board.gameIds.map((id) => String(id || "").trim()).filter(Boolean))));
+    console.log("[WATCHBOARD PAGE DATA]", {
+      boardCount: sourceBoards.length,
+      itemCounts: sourceBoards.map((board) => board.gameIds.length),
+      ids,
+    });
+    watchboardPageLoggedRef.current = true;
+  }, [activeBoard?.id, allBoardsData, boards, gameIds]);
+
+  useEffect(() => {
+    if (watchboardPageFirstRenderMsRef.current !== null) return;
+    if (isLoading && allBoardsData.length === 0 && boards.length === 0) return;
+    watchboardPageFirstRenderMsRef.current = Date.now() - watchboardPagePerfStartRef.current;
+    const itemCount = allBoardsData.length > 0
+      ? allBoardsData.reduce((sum, board) => sum + (board.gameIds?.length || 0), 0)
+      : gameIds.length;
+    console.log("[WATCHBOARD PAGE PERF]", {
+      firstRenderMs: watchboardPageFirstRenderMsRef.current,
+      hydrationDoneMs: watchboardPageHydrationDoneMsRef.current,
+      itemCount,
+    });
+  }, [allBoardsData, boards.length, gameIds.length, isLoading]);
+
+  useEffect(() => {
     fetchGames();
-    // Skip initial fetch if we already have hub data, just start refresh interval
-    if (!hubWatchboards || hubWatchboards.length === 0) {
-      fetchAllBoardsWithGames();
-    }
+    // Always hydrate from /home-preview immediately so cached UNKNOWN rows do not linger.
+    fetchAllBoardsWithGames();
     // Refresh every 30 seconds for live games
     const interval = setInterval(() => {
       fetchGames();
       fetchAllBoardsWithGames();
     }, 30000);
     return () => clearInterval(interval);
-  }, [fetchGames, fetchAllBoardsWithGames, hubWatchboards]);
+  }, [fetchGames, fetchAllBoardsWithGames]);
 
   // Fetch bet leg statuses for games on the watchboard
   const fetchBetLegs = useCallback(async () => {
@@ -1971,19 +2143,6 @@ export function WatchboardPage() {
     handleDragEnd();
   }, [draggedIndex, sortedGames, reorderGames, handleDragEnd]);
 
-  if (isLoading) {
-    return (
-      <>
-        <CinematicBackground />
-        <div className="min-h-screen flex flex-col items-center justify-center gap-3">
-          <RefreshCw className="w-8 h-8 text-blue-400 animate-spin" />
-          <p className="text-slate-300 text-sm font-medium">Loading watchboard...</p>
-          <p className="text-slate-500 text-xs">Syncing your boards, games, and props</p>
-        </div>
-      </>
-    );
-  }
-
   return (
     <>
       <CinematicBackground />
@@ -2012,6 +2171,9 @@ export function WatchboardPage() {
                     Saved
                   </span>
                 </div>
+                {isLoading && (
+                  <p className="text-blue-300/80 text-xs mb-1">Syncing watchboards in background...</p>
+                )}
                 <p className="text-slate-400 text-sm">
                   {sortedGames.length} {sortedGames.length === 1 ? "game" : "games"}
                   {props.length > 0 && ` • ${props.length} ${props.length === 1 ? "prop" : "props"}`}
@@ -2031,7 +2193,7 @@ export function WatchboardPage() {
                       type: 'watchboard',
                       title: 'My GZ Sports Watchboard',
                       description: `Watching ${allBoardsData.reduce((acc, b) => acc + b.games.length, 0)} games`,
-                      boardName: allBoardsData.length === 1 ? allBoardsData[0].board.name : `${allBoardsData.length} Boards`,
+                      boardName: allBoardsData.length === 1 ? (allBoardsData[0]?.board?.name || "Watchboard") : `${allBoardsData.length} Boards`,
                       gameCount: allBoardsData.reduce((acc, b) => acc + b.games.length, 0),
                       liveCount: allBoardsData.flatMap(b => b.games).filter(g => g.status === 'IN_PROGRESS' || g.status === 'live').length,
                     } as ShareData}
@@ -2043,7 +2205,17 @@ export function WatchboardPage() {
                 {boards.length < tierLimits.maxBoards ? (
                   <Button
                     onClick={() => {
-                      const name = `Board ${boards.length + 1}`;
+                      const used = new Set(
+                        boards
+                          .map((board) => {
+                            const match = String(board?.name || "").trim().match(/^Board\s+(\d+)$/i);
+                            return match ? Number(match[1]) : null;
+                          })
+                          .filter((value): value is number => Number.isFinite(value) && value > 0)
+                      );
+                      let nextIndex = 1;
+                      while (used.has(nextIndex)) nextIndex += 1;
+                      const name = `Board ${nextIndex}`;
                       createBoard(name);
                     }}
                     className="min-h-[44px] gap-2 border border-cyan-400/30 bg-cyan-500/15 text-cyan-100 hover:bg-cyan-500/20 active:scale-[0.98]"
@@ -2118,9 +2290,16 @@ export function WatchboardPage() {
                 {/* All Boards - Each with colored border */}
                 {/* Filter to focused board if one is selected */}
                 {(() => {
-                  const boardsToShow = focusedBoardId !== null 
-                    ? allBoardsData.filter(b => b.board.id === focusedBoardId) 
-                    : allBoardsData;
+                  const canonicalBoards = allBoardsData.filter((entry) =>
+                    entry
+                    && entry.board
+                    && Number.isFinite(Number(entry.board.id))
+                    && Number(entry.board.id) > 0
+                    && String(entry.board.name || "").trim().length > 0
+                  );
+                  const boardsToShow = focusedBoardId !== null
+                    ? canonicalBoards.filter((b) => b.board.id === focusedBoardId)
+                    : canonicalBoards;
                   const isFocused = focusedBoardId !== null;
                   
                   return (
@@ -2139,8 +2318,9 @@ export function WatchboardPage() {
                       {boardsToShow.map((boardData, _boardIdx) => {
                         // Find actual index in allBoardsData for consistent colors
                         const actualIdx = allBoardsData.findIndex(b => b.board.id === boardData.board.id);
-                        const colorScheme = BOARD_COLORS[actualIdx % BOARD_COLORS.length];
-                        const boardGames = boardData.games;
+                        const colorIdx = actualIdx >= 0 ? actualIdx : _boardIdx;
+                        const colorScheme = BOARD_COLORS[colorIdx % BOARD_COLORS.length] || DEFAULT_BOARD_COLOR;
+                        const boardGames = boardData.games.filter(isRenderableWatchboardGame);
                         
                         // When focused, use larger grid layout
                         const boardGridClass = isFocused

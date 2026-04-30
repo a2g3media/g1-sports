@@ -96,11 +96,31 @@ function resolveOddsCacheTtlSeconds(date?: string): number {
   return requested === todayEt ? ODDS_CACHE_TTL_LIVE_SECONDS : ODDS_CACHE_TTL_PREGAME_SECONDS;
 }
 
+type OddsApiTier = "trial" | "production";
+// Account is provisioned as Odds Comparison "Qualified Trial".
+// Keep trial first and only to stay inside route latency budgets.
+const ODDS_API_TIERS: OddsApiTier[] = ["trial"];
+const ODDS_API_ROOT = "https://api.sportradar.com";
+
+function buildOddsComparisonBaseUrls(products: string[]): string[] {
+  const urls: string[] = [];
+  for (const product of products) {
+    for (const tier of ODDS_API_TIERS) {
+      urls.push(`${ODDS_API_ROOT}/oddscomparison-${product}/${tier}/v2`);
+    }
+  }
+  return urls;
+}
+
+function inferOddsTierFromUrl(url: string): OddsApiTier {
+  return url.includes("/trial/") ? "trial" : "production";
+}
+
 // Market types we care about
 const MARKET_TYPES = {
   SPREAD: ['spread', 'handicap', 'point_spread', 'american_football.handicap', 'basketball.handicap', 'ice_hockey.handicap', 'baseball.handicap'],
   TOTAL: ['total', 'over_under', 'totals', 'american_football.totals', 'basketball.totals', 'ice_hockey.totals', 'baseball.totals'],
-  MONEYLINE: ['moneyline', 'winner', '1x2', 'h2h', 'match_winner', '2way', 'american_football.match_winner', 'basketball.match_winner'],
+  MONEYLINE: ['moneyline', 'winner', '1x2', 'h2h', 'match_winner', '2way', 'draw no bet', 'american_football.match_winner', 'basketball.match_winner'],
 };
 
 export interface SportsRadarOdds {
@@ -119,7 +139,36 @@ export interface SportsRadarOdds {
   total1H: number | null;
   moneyline1HHome: number | null;
   moneyline1HAway: number | null;
+  f5SpreadHome?: number | null;
+  f5SpreadAway?: number | null;
+  f5Total?: number | null;
+  f5MoneylineHome?: number | null;
+  f5MoneylineAway?: number | null;
   bookmaker?: string;
+}
+
+function mergeSportsRadarOddsRows(existing: SportsRadarOdds | undefined, incoming: SportsRadarOdds): SportsRadarOdds {
+  if (!existing) return incoming;
+  return {
+    ...existing,
+    ...incoming,
+    spread: incoming.spread ?? existing.spread,
+    spreadHome: incoming.spreadHome ?? existing.spreadHome,
+    spreadAway: incoming.spreadAway ?? existing.spreadAway,
+    total: incoming.total ?? existing.total,
+    moneylineHome: incoming.moneylineHome ?? existing.moneylineHome,
+    moneylineAway: incoming.moneylineAway ?? existing.moneylineAway,
+    spread1HHome: incoming.spread1HHome ?? existing.spread1HHome,
+    spread1HAway: incoming.spread1HAway ?? existing.spread1HAway,
+    total1H: incoming.total1H ?? existing.total1H,
+    moneyline1HHome: incoming.moneyline1HHome ?? existing.moneyline1HHome,
+    moneyline1HAway: incoming.moneyline1HAway ?? existing.moneyline1HAway,
+    f5SpreadHome: incoming.f5SpreadHome ?? existing.f5SpreadHome,
+    f5SpreadAway: incoming.f5SpreadAway ?? existing.f5SpreadAway,
+    f5Total: incoming.f5Total ?? existing.f5Total,
+    f5MoneylineHome: incoming.f5MoneylineHome ?? existing.f5MoneylineHome,
+    f5MoneylineAway: incoming.f5MoneylineAway ?? existing.f5MoneylineAway,
+  };
 }
 
 interface SportEventMarket {
@@ -156,6 +205,16 @@ interface SportsRadarOddsResponse {
   generated_at?: string;
 }
 
+type SrOddsDebugContext = {
+  enabled: boolean;
+  sampleKey: string;
+  requestedGameId?: string;
+};
+
+function maskOddsApiKey(url: string): string {
+  return url.replace(/api_key=[^&]+/i, "api_key=***");
+}
+
 /**
  * Fetch odds for all games in a sport/competition
  * Uses D1 database caching to persist across restarts and reduce rate limiting.
@@ -165,12 +224,13 @@ export async function fetchSportsRadarOdds(
   apiKey: string,
   db?: D1Database, // Optional database for persistent caching
   date?: string, // YYYY-MM-DD format (optional)
-  oddsApiKey?: string // Separate Odds Comparison API key (if different from main key)
+  oddsApiKey?: string, // Separate Odds Comparison API key (if different from main key)
+  debug?: SrOddsDebugContext
 ): Promise<Map<string, SportsRadarOdds>> {
   // Use dedicated odds API key if provided, otherwise fall back to main key
   const effectiveApiKey = oddsApiKey || apiKey;
   const sportLower = sport.toLowerCase();
-  const cacheKey = `sr_odds_${sportLower}_${date || 'all'}`;
+  const cacheKey = `sr_odds_v2_${sportLower}_${date || 'all'}`;
   const oddsCacheTtlSeconds = resolveOddsCacheTtlSeconds(date);
   
   // Check D1 database cache first if available
@@ -178,6 +238,16 @@ export async function fetchSportsRadarOdds(
     try {
       const cached = await getCachedData<Record<string, SportsRadarOdds>>(db, cacheKey);
       if (cached) {
+        if (debug?.enabled) {
+          console.log("[SR_ODDS_CACHE]", {
+            sample: debug.sampleKey,
+            stage: "read",
+            cacheKey,
+            hit: true,
+            keys: Object.keys(cached).length,
+            rateLimited: Boolean((cached as any)?._rate_limited),
+          });
+        }
         // Check if this is a rate-limit backoff entry
         if ((cached as any)._rate_limited) {
           console.log(`[SportsRadar Odds] ${sport}: In rate-limit backoff period, skipping API call`);
@@ -187,6 +257,14 @@ export async function fetchSportsRadarOdds(
           console.log(`[SportsRadar Odds] DB cache hit for ${sport}: ${Object.keys(cached).length} games`);
           return new Map(Object.entries(cached));
         }
+      }
+      if (debug?.enabled) {
+        console.log("[SR_ODDS_CACHE]", {
+          sample: debug.sampleKey,
+          stage: "read",
+          cacheKey,
+          hit: false,
+        });
       }
     } catch (err) {
       console.error(`[SportsRadar Odds] DB cache read error:`, err);
@@ -206,10 +284,7 @@ export async function fetchSportsRadarOdds(
   // Prematch and liveodds feeds are the active products for this account.
   // The "regular" feed consistently returns 403 — skip it to avoid
   // wasting a call and hitting rate limits.
-  const BASE_URLS = [
-    'https://api.sportradar.com/oddscomparison-prematch/production/v2',
-    'https://api.sportradar.com/oddscomparison-liveodds/production/v2',
-  ];
+  const BASE_URLS = buildOddsComparisonBaseUrls(['prematch', 'liveodds']);
   
   // Fetch from all competition IDs for this sport
   if (competitionIds && competitionIds.length > 0) {
@@ -231,7 +306,18 @@ export async function fetchSportsRadarOdds(
             : baseUrl.includes('liveodds')
               ? 'liveodds'
               : 'prematch';
-          console.log(`[SportsRadar Odds] Fetching ${sport} (${competitionId}) via production ${feed}`);
+          const tier = inferOddsTierFromUrl(baseUrl);
+          console.log(`[SportsRadar Odds] Fetching ${sport} (${competitionId}) via ${tier} ${feed}`);
+          if (debug?.enabled) {
+            console.log("[SR_ODDS_FETCH]", {
+              sample: debug.sampleKey,
+              sport: sportLower,
+              competitionId,
+              feed,
+              url: maskOddsApiKey(url),
+              requestedGameId: debug.requestedGameId || null,
+            });
+          }
           const response = await fetch(url, {
             headers: { 'Accept': 'application/json' },
           });
@@ -242,10 +328,45 @@ export async function fetchSportsRadarOdds(
             // The API returns competition_sport_event_markets for competition endpoint
             const events = data.competition_sport_event_markets || data.sport_event_markets || data.sport_events || [];
             console.log(`[SportsRadar Odds] ${sport} (${competitionId}): ${events.length} events found`);
+            if (debug?.enabled) {
+              const firstEvent = Array.isArray(events) && events.length > 0 ? events[0] : null;
+              console.log("[SR_ODDS_RAW_SHAPE]", {
+                sample: debug.sampleKey,
+                sport: sportLower,
+                competitionId,
+                feed,
+                status: response.status,
+                ok: response.ok,
+                topLevelKeys: Object.keys(data || {}).slice(0, 12),
+                eventCount: Array.isArray(events) ? events.length : 0,
+                firstEventKeys: firstEvent ? Object.keys(firstEvent).slice(0, 12) : [],
+              });
+            }
             
             const parsedOdds = parseOddsResponse({ sport_event_markets: events }, sportLower);
             for (const [key, odds] of parsedOdds) {
-              oddsMap.set(key, odds);
+              oddsMap.set(key, mergeSportsRadarOddsRows(oddsMap.get(key), odds));
+            }
+            if (debug?.enabled) {
+              const firstNormalized = parsedOdds.size > 0 ? Array.from(parsedOdds.values())[0] : null;
+              console.log("[SR_ODDS_NORMALIZED]", {
+                sample: debug.sampleKey,
+                sport: sportLower,
+                competitionId,
+                feed,
+                normalizedRows: parsedOdds.size,
+                firstNormalized: firstNormalized
+                  ? {
+                      gameId: firstNormalized.gameId,
+                      homeTeam: firstNormalized.homeTeam,
+                      awayTeam: firstNormalized.awayTeam,
+                      spread: firstNormalized.spread,
+                      total: firstNormalized.total,
+                      moneylineHome: firstNormalized.moneylineHome,
+                      moneylineAway: firstNormalized.moneylineAway,
+                    }
+                  : null,
+              });
             }
             // Keep scanning other odds feeds (regular/prematch/liveodds):
             // some competitions return 200 with zero events on one feed and
@@ -266,13 +387,26 @@ export async function fetchSportsRadarOdds(
             break; // Stop trying endpoint variants if rate-limited
           } else {
             console.log(`[SportsRadar Odds] ${sport} (${competitionId}): API error ${response.status}`);
+            if (debug?.enabled) {
+              console.log("[SR_ODDS_RAW_SHAPE]", {
+                sample: debug.sampleKey,
+                sport: sportLower,
+                competitionId,
+                feed,
+                status: response.status,
+                ok: false,
+                topLevelKeys: [],
+                eventCount: 0,
+                firstEventKeys: [],
+              });
+            }
           }
         } catch (err) {
           console.error(`[SportsRadar Odds] ${sport} (${competitionId}) error:`, err);
         }
       }
       if (!fetched) {
-        console.log(`[SportsRadar Odds] ${sport} (${competitionId}): no successful production endpoint response`);
+        console.log(`[SportsRadar Odds] ${sport} (${competitionId}): no successful oddscomparison endpoint response`);
       }
     }
     
@@ -299,7 +433,8 @@ export async function fetchSportsRadarOdds(
           : baseUrl.includes('liveodds')
             ? 'liveodds'
             : 'prematch';
-        console.log(`[SportsRadar Odds] Fallback fetch ${sport} (${sportUrn}) via production ${feed}`);
+        const tier = inferOddsTierFromUrl(baseUrl);
+        console.log(`[SportsRadar Odds] Fallback fetch ${sport} (${sportUrn}) via ${tier} ${feed}`);
         const response = await fetch(url, {
           headers: { 'Accept': 'application/json' },
         });
@@ -312,7 +447,7 @@ export async function fetchSportsRadarOdds(
         console.log(`[SportsRadar Odds] ${sport} (${sportUrn}) fallback: ${events.length} events found`);
         const parsedOdds = parseOddsResponse({ sport_event_markets: events }, sportLower);
         for (const [key, odds] of parsedOdds) {
-          oddsMap.set(key, odds);
+          oddsMap.set(key, mergeSportsRadarOddsRows(oddsMap.get(key), odds));
         }
       } catch (err) {
         console.error(`[SportsRadar Odds] ${sport} (${sportUrn}) fallback error:`, err);
@@ -333,10 +468,10 @@ export async function fetchSportsRadarOdds(
   // Some sports can expose schedule IDs that differ from score provider IDs.
   if (oddsMap.size === 0 && sportUrn) {
     const targetDate = date || getTodayEasternDateString();
-    const scheduleUrls = [
-      `https://api.sportradar.com/oddscomparison-liveodds/production/v2/en/schedules/${targetDate}/schedule.json?api_key=${effectiveApiKey}`,
-      `https://api.sportradar.com/oddscomparison-liveodds/production/v2/en/sports/${encodeURIComponent(sportUrn)}/schedules/${targetDate}/schedule.json?api_key=${effectiveApiKey}`,
-    ];
+    const scheduleUrls = ODDS_API_TIERS.flatMap((tier) => [
+      `${ODDS_API_ROOT}/oddscomparison-liveodds/${tier}/v2/en/schedules/${targetDate}/schedule.json?api_key=${effectiveApiKey}`,
+      `${ODDS_API_ROOT}/oddscomparison-liveodds/${tier}/v2/en/sports/${encodeURIComponent(sportUrn)}/schedules/${targetDate}/schedule.json?api_key=${effectiveApiKey}`,
+    ]);
     const scheduleEventIds = new Set<string>();
     for (const url of scheduleUrls) {
       try {
@@ -375,9 +510,11 @@ export async function fetchSportsRadarOdds(
         const homeKey = normalizeTeamName(resolved.homeTeam);
         const awayKey = normalizeTeamName(resolved.awayTeam);
         const matchKey = `${sportLower}|${awayKey}|${homeKey}`;
-        oddsMap.set(matchKey, resolved);
-        oddsMap.set(String(resolved.gameId || eventId), resolved);
-        oddsMap.set(`${sportLower}|${String(resolved.awayTeam || "").toLowerCase()}|${String(resolved.homeTeam || "").toLowerCase()}`, resolved);
+        oddsMap.set(matchKey, mergeSportsRadarOddsRows(oddsMap.get(matchKey), resolved));
+        const eventKey = String(resolved.gameId || eventId);
+        oddsMap.set(eventKey, mergeSportsRadarOddsRows(oddsMap.get(eventKey), resolved));
+        const nameKey = `${sportLower}|${String(resolved.awayTeam || "").toLowerCase()}|${String(resolved.homeTeam || "").toLowerCase()}`;
+        oddsMap.set(nameKey, mergeSportsRadarOddsRows(oddsMap.get(nameKey), resolved));
       } catch {
         // Ignore single-event failures.
       }
@@ -416,6 +553,7 @@ function parseOddsResponse(data: SportsRadarOddsResponse, sport: string): Map<st
     console.log(`[SportsRadar Odds] Market names in first event:`, marketNames.slice(0, 10));
   }
   
+  let rawMarketsLogged = false;
   for (const event of events) {
     const sportEvent = event.sport_event;
     if (!sportEvent?.id) continue;
@@ -442,22 +580,50 @@ function parseOddsResponse(data: SportsRadarOddsResponse, sport: string): Map<st
       total1H: null,
       moneyline1HHome: null,
       moneyline1HAway: null,
+      f5SpreadHome: null,
+      f5SpreadAway: null,
+      f5Total: null,
+      f5MoneylineHome: null,
+      f5MoneylineAway: null,
     };
     
     // Parse markets from best-coverage bookmaker, not blindly first.
-    const markets = event.markets || [];
+    const markets = [
+      ...(Array.isArray(event.markets) ? event.markets : []),
+      ...(Array.isArray((event as any)?.bookmakers)
+        ? (event as any).bookmakers.flatMap((book: any) => (Array.isArray(book?.markets) ? book.markets : []))
+        : []),
+    ];
+    if (!rawMarketsLogged) {
+      console.log('RAW_MARKETS', markets);
+      rawMarketsLogged = true;
+    }
     
     for (const market of markets) {
       const marketName = (market.name || '').toLowerCase();
-      const books = market.books || [];
+      const books = market.books || market.bookmakers || [];
       const orderedBooks = books
         .filter((candidate: any) => Array.isArray(candidate?.outcomes) && candidate.outcomes.length > 0)
         .sort((a: any, b: any) => (b.outcomes?.length || 0) - (a.outcomes?.length || 0));
-      const book = orderedBooks[0];
+      const bookWithRealPrice = orderedBooks.find((candidate: any) =>
+        (candidate.outcomes || []).some((outcome: any) => {
+          const americanRaw = outcome?.odds_american;
+          const american = americanRaw !== undefined ? Number.parseInt(String(americanRaw), 10) : NaN;
+          if (Number.isFinite(american) && american !== 0) return true;
+          const decimalRaw = outcome?.odds_decimal ?? outcome?.odds;
+          const decimal = decimalRaw !== undefined ? Number.parseFloat(String(decimalRaw)) : NaN;
+          return Number.isFinite(decimal) && decimal > 1;
+        })
+      );
+      const book = bookWithRealPrice || orderedBooks[0];
       
       if (!book?.outcomes) continue;
       
-      const isFirstHalfMarket = isFirstHalfMarketName(marketName);
+      const isNhlQuarterPeriodAlias =
+        String(sport || "").toLowerCase() === "nhl" &&
+        (marketName.includes("1st quarter") || marketName.includes("first quarter") || marketName.includes("q1"));
+      const isFirstHalfMarket = isFirstHalfOrPeriodMarket(market) || isNhlQuarterPeriodAlias;
+      const isF5Market = isFirstFiveMarket(market);
       const isDerivativeMarket = isDerivativeMarketName(marketName);
 
       // Spread/Handicap
@@ -470,14 +636,22 @@ function parseOddsResponse(data: SportsRadarOddsResponse, sport: string): Map<st
           if (handicapValue !== undefined && !isNaN(handicapValue)) {
             // Use outcome.type field for team identification (e.g., "home_{hcp}", "away_handicap")
             const outcomeType = (outcome.type || '').toLowerCase();
-            const isHome = outcomeType.includes('home') || 
+            const isHome = outcomeType.includes('home') ||
+                           outcomeType === '1' ||
                            outcome.competitor === homeTeam.id || 
                            outcome.name?.toLowerCase().includes(homeTeam.name.toLowerCase().split(' ').pop() || '');
-            const isAway = outcomeType.includes('away') || 
+            const isAway = outcomeType.includes('away') ||
+                           outcomeType === '2' ||
                            outcome.competitor === awayTeam.id || 
                            outcome.name?.toLowerCase().includes(awayTeam.name.toLowerCase().split(' ').pop() || '');
             
-            if (isFirstHalfMarket) {
+            if (isF5Market) {
+              if (isHome) {
+                odds.f5SpreadHome = handicapValue;
+              } else if (isAway) {
+                odds.f5SpreadAway = handicapValue;
+              }
+            } else if (isFirstHalfMarket) {
               if (isHome) {
                 odds.spread1HHome = handicapValue;
               } else if (isAway) {
@@ -501,6 +675,12 @@ function parseOddsResponse(data: SportsRadarOddsResponse, sport: string): Map<st
             odds.spreadHome = -odds.spreadAway;
             odds.spread = odds.spreadHome;
           }
+        } else if (isF5Market) {
+          if (odds.f5SpreadHome !== null && odds.f5SpreadAway === null) {
+            odds.f5SpreadAway = -odds.f5SpreadHome;
+          } else if (odds.f5SpreadAway !== null && odds.f5SpreadHome === null) {
+            odds.f5SpreadHome = -odds.f5SpreadAway;
+          }
         } else if (isFirstHalfMarket) {
           if (odds.spread1HHome !== null && odds.spread1HAway === null) {
             odds.spread1HAway = -odds.spread1HHome;
@@ -512,13 +692,17 @@ function parseOddsResponse(data: SportsRadarOddsResponse, sport: string): Map<st
       
       // Total/Over-Under
       if (isMarketType(marketName, MARKET_TYPES.TOTAL)) {
+        const isTeamTotal = isTeamSpecificTotalMarketName(marketName);
+        if (isTeamTotal) continue;
         for (const outcome of book.outcomes) {
           // Parse total from various possible fields (may be strings)
-          const rawTotal = outcome.total ?? outcome.handicap;
+          const rawTotal = outcome.total ?? outcome.handicap ?? outcome.line;
           if (rawTotal !== undefined) {
             const totalValue = parseFloat(String(rawTotal));
             if (!isNaN(totalValue)) {
-              if (isFirstHalfMarket) {
+              if (isF5Market) {
+                odds.f5Total = totalValue;
+              } else if (isFirstHalfMarket) {
                 odds.total1H = totalValue;
               } else if (!isDerivativeMarket) {
                 // Main O/U must always be full-game pregame total.
@@ -531,7 +715,9 @@ function parseOddsResponse(data: SportsRadarOddsResponse, sport: string): Map<st
       }
       
       // Moneyline/Winner
-      if (isMarketType(marketName, MARKET_TYPES.MONEYLINE)) {
+      if (isMoneylineMarketCandidate(marketName)) {
+        let marketHomePrice: number | null = null;
+        let marketAwayPrice: number | null = null;
         for (const outcome of book.outcomes) {
           // SportsRadar provides odds_american directly, or odds_decimal we can convert
           let americanOdds: number | null = null;
@@ -543,7 +729,7 @@ function parseOddsResponse(data: SportsRadarOddsResponse, sport: string): Map<st
             americanOdds = decimalToAmerican(outcome.odds);
           }
           
-          if (americanOdds !== null && !isNaN(americanOdds)) {
+          if (americanOdds !== null && !isNaN(americanOdds) && americanOdds !== 0) {
             // Use outcome.type field for team identification
             const outcomeType = (outcome.type || '').toLowerCase();
             const isHome = outcomeType.includes('home') || outcomeType === '1' ||
@@ -552,20 +738,23 @@ function parseOddsResponse(data: SportsRadarOddsResponse, sport: string): Map<st
             const isAway = outcomeType.includes('away') || outcomeType === '2' ||
                            outcome.competitor === awayTeam.id || 
                            outcome.name?.toLowerCase().includes(awayTeam.name.toLowerCase().split(' ').pop() || '');
-            
-            if (isFirstHalfMarket) {
-              if (isHome) {
-                odds.moneyline1HHome = americanOdds;
-              } else if (isAway) {
-                odds.moneyline1HAway = americanOdds;
-              }
-            } else if (!isDerivativeMarket) {
-              if (isHome) {
-                odds.moneylineHome = americanOdds;
-              } else if (isAway) {
-                odds.moneylineAway = americanOdds;
-              }
-            }
+            if (isHome) marketHomePrice = americanOdds;
+            if (isAway) marketAwayPrice = americanOdds;
+          }
+        }
+
+        // Only accept market when both teams were identified to avoid
+        // misclassifying exotic "winner-like" derivatives.
+        if (marketHomePrice !== null && marketAwayPrice !== null) {
+          if (isF5Market) {
+            odds.f5MoneylineHome = marketHomePrice;
+            odds.f5MoneylineAway = marketAwayPrice;
+          } else if (isFirstHalfMarket) {
+            odds.moneyline1HHome = marketHomePrice;
+            odds.moneyline1HAway = marketAwayPrice;
+          } else if (!isDerivativeMarket) {
+            odds.moneylineHome = marketHomePrice;
+            odds.moneylineAway = marketAwayPrice;
           }
         }
       }
@@ -583,7 +772,12 @@ function parseOddsResponse(data: SportsRadarOddsResponse, sport: string): Map<st
       odds.spread1HAway !== null ||
       odds.total1H !== null ||
       odds.moneyline1HHome !== null ||
-      odds.moneyline1HAway !== null
+      odds.moneyline1HAway !== null ||
+      odds.f5SpreadHome !== null ||
+      odds.f5SpreadAway !== null ||
+      odds.f5Total !== null ||
+      odds.f5MoneylineHome !== null ||
+      odds.f5MoneylineAway !== null
     ) {
       // Create key based on team names for matching
       const homeKey = normalizeTeamName(homeTeam.name);
@@ -612,11 +806,7 @@ export async function fetchSportsRadarOddsForGame(
   sportEventId: string,
   apiKey: string
 ): Promise<SportsRadarOdds | null> {
-  const baseUrls = [
-    'https://api.sportradar.com/oddscomparison-regular/production/v2',
-    'https://api.sportradar.com/oddscomparison-liveodds/production/v2',
-    'https://api.sportradar.com/oddscomparison-prematch/production/v2',
-  ];
+  const baseUrls = buildOddsComparisonBaseUrls(['regular', 'liveodds', 'prematch']);
   console.log(`[SportsRadar Odds] Fetching odds for game: ${sportEventId}`);
 
   for (const baseUrl of baseUrls) {
@@ -630,7 +820,8 @@ export async function fetchSportsRadarOddsForGame(
         : baseUrl.includes('liveodds')
           ? 'live'
           : 'prematch';
-      console.log(`[SportsRadar Odds] Game odds response (production ${feed}): ${response.status}`);
+      const tier = inferOddsTierFromUrl(baseUrl);
+      console.log(`[SportsRadar Odds] Game odds response (${tier} ${feed}): ${response.status}`);
       if (!response.ok) continue;
 
       const data = await response.json() as SportsRadarOddsResponse;
@@ -727,11 +918,7 @@ export async function fetchAllSportsbooksForGame(
   
   // Fetch from competition to get all bookmakers.
   // Try all feeds: some games are present in liveodds/regular but not prematch.
-  const BASE_URLS = [
-    'https://api.sportradar.com/oddscomparison-prematch/production/v2',
-    'https://api.sportradar.com/oddscomparison-regular/production/v2',
-    'https://api.sportradar.com/oddscomparison-liveodds/production/v2',
-  ];
+  const BASE_URLS = buildOddsComparisonBaseUrls(['prematch', 'regular', 'liveodds']);
   const competitionScanIds = competitionIds;
   
   try {
@@ -870,7 +1057,10 @@ export async function fetchAllSportsbooksForGame(
           
           if (!book.outcomes) continue;
           
-      const isFirstHalfMarket = isFirstHalfMarketName(marketName);
+      const isNhlQuarterPeriodAlias =
+        String(sport || "").toLowerCase() === "nhl" &&
+        (marketName.includes("1st quarter") || marketName.includes("first quarter") || marketName.includes("q1"));
+      const isFirstHalfMarket = isFirstHalfOrPeriodMarket(market) || isNhlQuarterPeriodAlias || isFirstFiveMarket(market);
       const isDerivativeMarket = isDerivativeMarketName(marketName);
 
       // Parse spread
@@ -881,8 +1071,8 @@ export async function fetchAllSportsbooksForGame(
               
               if (handicapValue !== undefined && !isNaN(handicapValue)) {
                 const outcomeType = (outcome.type || '').toLowerCase();
-                const isHome = outcomeType.includes('home') || outcome.competitor === homeTeam.id;
-                const isAway = outcomeType.includes('away') || outcome.competitor === awayTeam.id;
+                const isHome = outcomeType.includes('home') || outcomeType === '1' || outcome.competitor === homeTeam.id;
+                const isAway = outcomeType.includes('away') || outcomeType === '2' || outcome.competitor === awayTeam.id;
                 
                 if (isFirstHalfMarket) {
                   if (isHome) bookOdds.spread1HHome = handicapValue;
@@ -908,7 +1098,7 @@ export async function fetchAllSportsbooksForGame(
           // Parse total
       if (isMarketType(marketName, MARKET_TYPES.TOTAL)) {
             for (const outcome of book.outcomes) {
-              const rawTotal = outcome.total ?? outcome.handicap;
+              const rawTotal = outcome.total ?? outcome.handicap ?? outcome.line;
               if (rawTotal !== undefined) {
                 const totalValue = parseFloat(String(rawTotal));
                 if (!isNaN(totalValue)) {
@@ -1006,7 +1196,39 @@ function isFirstHalfMarketName(marketName: string): boolean {
     normalized.includes("1 h") ||
     normalized.includes("first half") ||
     normalized.includes("1st half") ||
-    normalized.includes("halftime")
+    normalized.includes("halftime") ||
+    // NHL period markets should hydrate the same period slots used by the odds board.
+    normalized.includes("first period") ||
+    normalized.includes("1st period") ||
+    normalized.includes("first_period") ||
+    normalized.includes("1st_period") ||
+    normalized.includes("period 1") ||
+    normalized.includes("1p")
+  );
+}
+
+function isFirstHalfOrPeriodMarket(market: any): boolean {
+  const name = String(market?.name || market?.market || "").toLowerCase();
+  const id = String(market?.id || market?.market_id || "").toLowerCase();
+  const segment = String(
+    market?.segment || market?.period_name || market?.period || market?.group || ""
+  ).toLowerCase();
+  return isFirstHalfMarketName(`${name} ${id} ${segment}`);
+}
+
+function isFirstFiveMarket(market: any): boolean {
+  const name = String(market?.name || market?.id || market?.market || '').toLowerCase();
+  const segment = String(market?.segment || market?.period_name || market?.period || '').toLowerCase();
+  return (
+    name.includes('first_5') ||
+    name.includes('first 5') ||
+    name.includes('first five') ||
+    name.includes('1 to 5') ||
+    name.includes('innings 1 to 5') ||
+    name.includes('f5') ||
+    segment.includes('first_5') ||
+    segment.includes('first 5') ||
+    segment.includes('f5')
   );
 }
 
@@ -1037,6 +1259,32 @@ function isDerivativeMarketName(marketName: string): boolean {
     normalized.includes("alternate total") ||
     normalized.includes("alternative total") ||
     normalized.includes("alt total")
+  );
+}
+
+function isTeamSpecificTotalMarketName(marketName: string): boolean {
+  const normalized = marketName.toLowerCase();
+  return (
+    normalized.includes("team total") ||
+    normalized.includes("home total") ||
+    normalized.includes("away total") ||
+    normalized.includes("home team total") ||
+    normalized.includes("away team total") ||
+    normalized.includes("totals - home") ||
+    normalized.includes("totals - away")
+  );
+}
+
+function isMoneylineMarketCandidate(marketName: string): boolean {
+  const normalized = marketName.toLowerCase();
+  if (!isMarketType(normalized, MARKET_TYPES.MONEYLINE)) return false;
+  return !(
+    normalized.includes("winning margin") ||
+    normalized.includes("odd/even") ||
+    normalized.includes("both teams") ||
+    normalized.includes("race to") ||
+    normalized.includes("correct score") ||
+    normalized.includes("exact score")
   );
 }
 
@@ -1517,18 +1765,14 @@ export async function fetchGamePlayerProps(
     return inFlightProps;
   }
   const candidateUrls = isLiveGame
-    ? [
-        // Prefer live feed first for in-progress games.
-        `https://api.sportradar.com/oddscomparison-liveodds/production/v2/en/sport_events/${encodedEventId}/players_props.json?api_key=${apiKey}`,
-        // Fall back to dedicated player-props feed when live endpoint is sparse.
-        `https://api.sportradar.com/oddscomparison-player-props/production/v2/en/sport_events/${encodedEventId}/players_props.json?api_key=${apiKey}`,
-      ]
-    : [
-        // Prefer pre-match props feed for scheduled games.
-        `https://api.sportradar.com/oddscomparison-player-props/production/v2/en/sport_events/${encodedEventId}/players_props.json?api_key=${apiKey}`,
-        // Fall back to liveodds feed if provider routes this market there.
-        `https://api.sportradar.com/oddscomparison-liveodds/production/v2/en/sport_events/${encodedEventId}/players_props.json?api_key=${apiKey}`,
-      ];
+    ? ODDS_API_TIERS.flatMap((tier) => [
+        `${ODDS_API_ROOT}/oddscomparison-liveodds/${tier}/v2/en/sport_events/${encodedEventId}/players_props.json?api_key=${apiKey}`,
+        `${ODDS_API_ROOT}/oddscomparison-player-props/${tier}/v2/en/sport_events/${encodedEventId}/players_props.json?api_key=${apiKey}`,
+      ])
+    : ODDS_API_TIERS.flatMap((tier) => [
+        `${ODDS_API_ROOT}/oddscomparison-player-props/${tier}/v2/en/sport_events/${encodedEventId}/players_props.json?api_key=${apiKey}`,
+        `${ODDS_API_ROOT}/oddscomparison-liveodds/${tier}/v2/en/sport_events/${encodedEventId}/players_props.json?api_key=${apiKey}`,
+      ]);
   
   // Clean team names for logging
   const cleanTeamName = (name: string) => {

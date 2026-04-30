@@ -80,6 +80,13 @@ function safeStorageSet(key: string, value: string): void {
   }
 }
 
+function isLocalhostDevRuntime(): boolean {
+  if (typeof window === "undefined") return false;
+  const host = String(window.location.hostname || "").toLowerCase();
+  const meta = import.meta as ImportMeta & { env?: { DEV?: boolean } };
+  return Boolean(meta?.env?.DEV) || host === "localhost" || host === "127.0.0.1";
+}
+
 interface DemoAuthContextValue {
   user: MochaUser | null;
   isPending: boolean;
@@ -110,11 +117,16 @@ export function DemoAuthProvider({ children }: { children: ReactNode }) {
     try {
       const stored = safeStorageGet(DEMO_MODE_KEY);
       const storedRole = safeStorageGet(DEV_ROLE_KEY) as DevRole | null;
-      if (stored === "true") {
+      // Localhost/dev guardrail: keep a stable demo user scope by default.
+      // This prevents guest fallback drift that makes watchboards disappear after refreshes.
+      const shouldForceLocalDemo = isLocalhostDevRuntime() && stored !== "true";
+      if (stored === "true" || shouldForceLocalDemo) {
+        const nextRole: DevRole = storedRole && DEMO_USERS[storedRole] ? storedRole : "user";
+        safeStorageSet(DEMO_MODE_KEY, "true");
+        safeStorageSet(DEV_ROLE_KEY, nextRole);
         setIsDemoMode(true);
-        if (storedRole && DEMO_USERS[storedRole]) {
-          setDevRole(storedRole);
-        }
+        setDevRole(nextRole);
+        setRealUser(null);
       } else {
         setIsDemoMode(false);
         // Fetch real user in non-demo mode
@@ -138,10 +150,25 @@ export function DemoAuthProvider({ children }: { children: ReactNode }) {
         const user = await response.json();
         setRealUser(user);
       } else {
+        if (response.status === 401 && isLocalhostDevRuntime()) {
+          // Local dev guardrail: avoid drifting into guest scope where watchboards disappear.
+          const fallbackRole: DevRole = "user";
+          safeStorageSet(DEMO_MODE_KEY, "true");
+          safeStorageSet(DEV_ROLE_KEY, fallbackRole);
+          setDevRole(fallbackRole);
+          setIsDemoMode(true);
+        }
         setRealUser(null);
       }
     } catch (error) {
       console.error("Failed to fetch user:", error);
+      if (isLocalhostDevRuntime()) {
+        const fallbackRole: DevRole = "user";
+        safeStorageSet(DEMO_MODE_KEY, "true");
+        safeStorageSet(DEV_ROLE_KEY, fallbackRole);
+        setDevRole(fallbackRole);
+        setIsDemoMode(true);
+      }
       setRealUser(null);
     } finally {
       setIsFetching(false);

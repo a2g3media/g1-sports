@@ -262,13 +262,17 @@ export function AIIntelligenceFeed({ games, className }: AIIntelligenceFeedProps
       ? data.sharp_radar
           .filter((s) => s && typeof s === 'object')
           .slice(0, 6)
-          .map((s) => ({
-            type: String(s.type || 'signal'),
-            label: signalTypeLabel(s.type),
-            value: String(s.message || 'Signal detected'),
-            importance: s.importance === 'high' || s.importance === 'low' ? s.importance : 'medium',
-            icon: s.icon || undefined,
-          }))
+          .map((s) => {
+            const importance: GameContextSignal['importance'] =
+              s.importance === 'high' || s.importance === 'low' ? s.importance : 'medium';
+            return {
+              type: String(s.type || 'signal'),
+              label: signalTypeLabel(s.type),
+              value: String(s.message || 'Signal detected'),
+              importance,
+              icon: s.icon || undefined,
+            };
+          })
           .filter((s) => !isPlaceholderCoachGText(s.value) && !isInvalidZeroSignalText(s.value))
       : [];
 
@@ -283,7 +287,6 @@ export function AIIntelligenceFeed({ games, className }: AIIntelligenceFeedProps
     const fallbackContext = toFallbackContext(game, 'Coach G data is warming up.');
     const edgeScoreValue = Number(data.edge_score);
     const hasValidEdgeScore = isValidPositiveMetric(edgeScoreValue);
-    const edgeRounded = hasValidEdgeScore ? Math.round(edgeScoreValue) : null;
     const lineCurrent = Number(data.line_prediction?.current_line);
     const lineProjected = Number(data.line_prediction?.projected_line);
     const lineConfidence = Number(data.line_prediction?.confidence);
@@ -575,14 +578,14 @@ function IntelligenceCard({
   const edgeValue = Number(context?.edgeScore);
   const hasEdgeMetric = isValidPositiveMetric(edgeValue);
   const hasLineMetric = hasStrictValidLinePrediction(context?.linePrediction);
-  const confidenceValue = Number(context?.linePrediction?.confidence);
   const topPropEdgeScore = Number(context?.topPropEdge?.edgeScore);
   const hasPropMetric = Boolean(context?.topPropEdge)
     && isValidPositiveMetric(topPropEdgeScore)
     && !isPlaceholderCoachGText(context?.topPropEdge?.player)
     && !isPlaceholderCoachGText(context?.topPropEdge?.prop);
-  const linePredictionText = hasLineMetric
-    ? `${context.linePrediction.currentLine.toFixed(1)} -> ${context.linePrediction.projectedLine.toFixed(1)} (${Math.round(context.linePrediction.confidence)}% conf)`
+  const strictLinePrediction = hasLineMetric ? context?.linePrediction : null;
+  const linePredictionText = hasLineMetric && context?.linePrediction
+    ? `${strictLinePrediction!.currentLine!.toFixed(1)} -> ${strictLinePrediction!.projectedLine!.toFixed(1)} (${Math.round(strictLinePrediction!.confidence)}% conf)`
     : null;
   const hasAnyValidMetric = hasEdgeMetric || hasLineMetric || hasPropMetric;
   const primaryLineText = hasAnyValidMetric ? summaryText : "Analyzing matchup...";

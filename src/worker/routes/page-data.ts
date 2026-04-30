@@ -158,6 +158,57 @@ type PageDataOddsPayload = {
     sport: string;
     partialReason: string | null;
   };
+  board: {
+    key: string;
+    date: string;
+    sport: string;
+    generatedAt: string;
+    sections: Array<{
+      sport: string;
+      label: string;
+      count: number;
+      cards: Array<{
+        id: string;
+        gameId: string;
+        canonicalRouteId: string;
+        sport: string;
+        league: string | null;
+        homeTeam: { abbr: string; name: string };
+        awayTeam: { abbr: string; name: string };
+        homeScore: number | null;
+        awayScore: number | null;
+        status: "live" | "scheduled" | "final";
+        period: string;
+        periodLabel: string;
+        clock: string;
+        mlbLiveState: {
+          inningHalf: string;
+          inningNumber: number | null;
+          inningState: string;
+        } | null;
+        startTime: string;
+        channel: string | null;
+        odds: {
+          spread: number | null;
+          spreadOpen: number | null;
+          total: number | null;
+          totalOpen: number | null;
+          mlHome: number | null;
+          mlAway: number | null;
+          spread1H: number | null;
+          total1H: number | null;
+          ml1HHome: number | null;
+          ml1HAway: number | null;
+          f5: {
+            spread: { home: number | null; away: number | null };
+            total: number | null;
+            moneyline: { home: number | null; away: number | null };
+          };
+        };
+        hasRealOdds: boolean;
+      }>;
+    }>;
+  };
   games: any[];
   oddsSummaryByGame: Record<string, any>;
 };
@@ -499,6 +550,268 @@ function writeL1Generic<T>(
 function normalizeSport(sportRaw: string): string {
   const s = String(sportRaw || "").trim().toUpperCase();
   return s || "ALL";
+}
+
+const ODDS_BOARD_SPORT_ORDER = ["MLB", "NBA", "NHL", "NCAAB", "NFL", "NCAAF", "SOCCER"];
+const ODDS_BOARD_SPORT_LABELS: Record<string, string> = {
+  MLB: "MLB",
+  NBA: "NBA",
+  NHL: "NHL",
+  NCAAB: "NCAAB",
+  NFL: "NFL",
+  NCAAF: "NCAAF",
+  SOCCER: "Soccer",
+};
+
+function normalizeSportForOddsBoard(rawSport: unknown, rawLeague?: unknown): string {
+  const upper = String(rawSport || "").toUpperCase();
+  const league = String(rawLeague || "").toUpperCase();
+  const soccerLeagueHints = [
+    "UEFA", "EUROPA", "CHAMPIONS", "PREMIER", "EPL", "MLS",
+    "LA_LIGA", "LA LIGA", "SERIE_A", "SERIE A", "BUNDES",
+    "LIGUE_1", "LIGUE 1", "LIGA_MX", "LIGA MX", "EREDIVISIE",
+    "PRIMEIRA", "COPA", "WORLD CUP", "NATIONS LEAGUE",
+  ];
+  const hasSoccerLeagueSignal = soccerLeagueHints.some((hint) => league.includes(hint));
+  if (upper === "CBB" || upper === "NCAAM" || upper === "NCAA_MEN_BASKETBALL") return "NCAAB";
+  if (upper === "CFB" || upper === "NCAAFB" || upper === "NCAA_FOOTBALL") return "NCAAF";
+  if (upper === "ICEHOCKEY" || upper === "HOCKEY") return "NHL";
+  if (upper === "BASEBALL") return "MLB";
+  if (
+    hasSoccerLeagueSignal ||
+    upper === "SOCCER" ||
+    upper === "FOOTBALL_SOCCER" ||
+    upper === "EPL" ||
+    upper === "MLS" ||
+    upper === "UCL" ||
+    upper === "UEFA" ||
+    upper === "EUROPA_LEAGUE" ||
+    upper === "EUROPA-LEAGUE" ||
+    upper === "CHAMPIONS_LEAGUE" ||
+    upper === "CHAMPIONS-LEAGUE" ||
+    upper === "PREMIER_LEAGUE" ||
+    upper === "PREMIER-LEAGUE" ||
+    upper === "LA_LIGA" ||
+    upper === "SERIE_A" ||
+    upper === "BUNDESLIGA" ||
+    upper === "LIGUE_1"
+  ) return "SOCCER";
+  if (upper === "BASKETBALL") {
+    if (league.includes("NCAA") || league.includes("NCAAB") || league.includes("CBB")) return "NCAAB";
+    return "NBA";
+  }
+  if (upper === "FOOTBALL") {
+    if (league.includes("NCAA") || league.includes("NCAAF") || league.includes("COLLEGE")) return "NCAAF";
+    if (hasSoccerLeagueSignal) return "SOCCER";
+    return "NFL";
+  }
+  if (!upper) return "NBA";
+  return upper;
+}
+
+function toFiniteNumberOrNull(value: unknown): number | null {
+  if (value === null || value === undefined) return null;
+  if (typeof value === "string" && value.trim() === "") return null;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+function normalizeOddsBoardStatus(value: unknown): "live" | "scheduled" | "final" {
+  const compact = String(value || "").toLowerCase().trim().replace(/[\s-]+/g, "_");
+  if (compact === "final" || compact === "completed" || compact === "closed" || compact === "ended") return "final";
+  if (
+    compact === "live" ||
+    compact === "in_progress" ||
+    compact === "inprogress" ||
+    compact.includes("live") ||
+    compact.includes("progress") ||
+    compact.includes("underway") ||
+    compact.includes("ongoing")
+  ) return "live";
+  return "scheduled";
+}
+
+function buildOddsBoardPayload(params: {
+  date: string;
+  sport: string;
+  games: any[];
+  oddsSummaryByGame: Record<string, any>;
+}): PageDataOddsPayload["board"] {
+  const boardKey = `odds-board:${params.date}:${String(params.sport || "ALL").toUpperCase()}`;
+  const bySport = new Map<string, PageDataOddsPayload["board"]["sections"][number]["cards"]>();
+  const summaryMap = params.oddsSummaryByGame && typeof params.oddsSummaryByGame === "object"
+    ? params.oddsSummaryByGame
+    : {};
+
+  for (const game of Array.isArray(params.games) ? params.games : []) {
+    if (!game || typeof game !== "object") continue;
+    const gameId = String(game?.game_id || game?.id || "").trim();
+    if (!gameId) continue;
+    const idKey = gameId.toLowerCase();
+    const sportKey = normalizeSportForOddsBoard(game?.sport, game?.league);
+    const sportUpper = String(sportKey || "").toUpperCase();
+    const summary = (summaryMap[idKey] && typeof summaryMap[idKey] === "object") ? summaryMap[idKey] : {};
+
+    const spread = toFiniteNumberOrNull(summary?.spread?.home_line ?? game?.spread_home ?? game?.spreadHome ?? game?.spread);
+    const total = toFiniteNumberOrNull(summary?.total?.line ?? game?.total ?? game?.overUnder ?? game?.over_under);
+    const mlHome = toFiniteNumberOrNull(summary?.moneyline?.home_price ?? game?.moneyline_home ?? game?.moneylineHome);
+    const mlAway = toFiniteNumberOrNull(summary?.moneyline?.away_price ?? game?.moneyline_away ?? game?.moneylineAway);
+    const periodSpreadHome = toFiniteNumberOrNull(
+      sportUpper === "MLB"
+        ? (summary?.f5?.spread?.home ?? summary?.first_half?.spread?.home_line ?? game?.spread_1h_home ?? game?.spread1HHome)
+        : (summary?.first_half?.spread?.home_line ?? game?.spread_1h_home ?? game?.spread1HHome ?? summary?.f5?.spread?.home)
+    );
+    const periodTotal = toFiniteNumberOrNull(
+      sportUpper === "MLB"
+        ? (summary?.f5?.total ?? summary?.first_half?.total?.line ?? game?.total_1h ?? game?.total1H)
+        : (summary?.first_half?.total?.line ?? game?.total_1h ?? game?.total1H ?? summary?.f5?.total)
+    );
+    const periodMlHome = toFiniteNumberOrNull(
+      sportUpper === "MLB"
+        ? (summary?.f5?.moneyline?.home ?? summary?.first_half?.moneyline?.home_price ?? game?.moneyline_1h_home ?? game?.moneyline1HHome)
+        : (summary?.first_half?.moneyline?.home_price ?? game?.moneyline_1h_home ?? game?.moneyline1HHome ?? summary?.f5?.moneyline?.home)
+    );
+    const periodMlAway = toFiniteNumberOrNull(
+      sportUpper === "MLB"
+        ? (summary?.f5?.moneyline?.away ?? summary?.first_half?.moneyline?.away_price ?? game?.moneyline_1h_away ?? game?.moneyline1HAway)
+        : (summary?.first_half?.moneyline?.away_price ?? game?.moneyline_1h_away ?? game?.moneyline1HAway ?? summary?.f5?.moneyline?.away)
+    );
+    const periodSpreadAway = toFiniteNumberOrNull(
+      summary?.first_half?.spread?.away_line
+      ?? game?.spread_1h_away
+      ?? game?.spread1HAway
+      ?? summary?.f5?.spread?.away
+      ?? (periodSpreadHome == null ? null : -periodSpreadHome)
+    );
+
+    const f5SpreadHome = sportUpper === "MLB"
+      ? toFiniteNumberOrNull(summary?.f5?.spread?.home ?? periodSpreadHome)
+      : null;
+    const f5SpreadAway = sportUpper === "MLB"
+      ? toFiniteNumberOrNull(summary?.f5?.spread?.away ?? (f5SpreadHome == null ? null : -f5SpreadHome))
+      : null;
+    const f5Total = sportUpper === "MLB"
+      ? toFiniteNumberOrNull(summary?.f5?.total ?? periodTotal)
+      : null;
+    const f5MlHome = sportUpper === "MLB"
+      ? toFiniteNumberOrNull(summary?.f5?.moneyline?.home ?? periodMlHome)
+      : null;
+    const f5MlAway = sportUpper === "MLB"
+      ? toFiniteNumberOrNull(summary?.f5?.moneyline?.away ?? periodMlAway)
+      : null;
+
+    const card: PageDataOddsPayload["board"]["sections"][number]["cards"][number] = {
+      id: gameId,
+      gameId,
+      canonicalRouteId: String(game?.canonical_route_id || game?.canonicalRouteId || gameId),
+      sport: sportKey,
+      league: game?.league ? String(game.league) : null,
+      homeTeam: {
+        abbr: String(game?.home_team_code || game?.homeTeamCode || game?.homeTeam || "TBD"),
+        name: String(game?.home_team_name || game?.homeTeamFull || game?.homeTeam || game?.home_team_code || "Home"),
+      },
+      awayTeam: {
+        abbr: String(game?.away_team_code || game?.awayTeamCode || game?.awayTeam || "TBD"),
+        name: String(game?.away_team_name || game?.awayTeamFull || game?.awayTeam || game?.away_team_code || "Away"),
+      },
+      homeScore: toFiniteNumberOrNull(game?.home_score),
+      awayScore: toFiniteNumberOrNull(game?.away_score),
+      status: normalizeOddsBoardStatus(game?.status),
+      period: String(game?.period || ""),
+      periodLabel: String(game?.period_label || game?.periodLabel || ""),
+      clock: String(game?.clock || ""),
+      mlbLiveState: (
+        game?.mlbLiveState && typeof game.mlbLiveState === "object"
+          ? {
+              inningHalf: String(game?.mlbLiveState?.inningHalf || game?.mlbLiveState?.inning_half || ""),
+              inningNumber: toFiniteNumberOrNull(game?.mlbLiveState?.inningNumber ?? game?.mlbLiveState?.inning_number ?? game?.inning ?? null),
+              inningState: String(game?.mlbLiveState?.inningState || game?.mlbLiveState?.inning_state || ""),
+            }
+          : null
+      ),
+      startTime: String(game?.start_time || game?.startTime || ""),
+      channel: game?.channel ? String(game.channel) : null,
+      odds: {
+        spread,
+        spreadOpen: toFiniteNumberOrNull(summary?.opening_spread),
+        total,
+        totalOpen: toFiniteNumberOrNull(summary?.opening_total),
+        mlHome,
+        mlAway,
+        spread1H: periodSpreadHome,
+        total1H: periodTotal,
+        ml1HHome: periodMlHome,
+        ml1HAway: periodMlAway,
+        f5: {
+          spread: { home: f5SpreadHome, away: f5SpreadAway },
+          total: f5Total,
+          moneyline: { home: f5MlHome, away: f5MlAway },
+        },
+      },
+      hasRealOdds: Boolean(
+        spread != null ||
+        total != null ||
+        mlHome != null ||
+        mlAway != null ||
+        periodSpreadHome != null ||
+        periodSpreadAway != null ||
+        periodTotal != null ||
+        periodMlHome != null ||
+        periodMlAway != null ||
+        f5SpreadHome != null ||
+        f5Total != null ||
+        f5MlHome != null ||
+        f5MlAway != null
+      ),
+    };
+
+    const existing = bySport.get(sportKey) || [];
+    existing.push(card);
+    bySport.set(sportKey, existing);
+  }
+
+  const sortCards = (cards: PageDataOddsPayload["board"]["sections"][number]["cards"]) =>
+    cards.sort((a, b) => {
+      const rank = (status: string): number => {
+        if (status === "live") return 0;
+        if (status === "scheduled") return 1;
+        return 2;
+      };
+      const statusDelta = rank(a.status) - rank(b.status);
+      if (statusDelta !== 0) return statusDelta;
+      const aTs = Date.parse(String(a.startTime || ""));
+      const bTs = Date.parse(String(b.startTime || ""));
+      if (Number.isFinite(aTs) && Number.isFinite(bTs) && aTs !== bTs) return aTs - bTs;
+      return String(a.id).localeCompare(String(b.id));
+    });
+
+  const requestedSport = String(params.sport || "ALL").toUpperCase();
+  const sportOrder = requestedSport === "ALL"
+    ? ODDS_BOARD_SPORT_ORDER
+    : [requestedSport];
+  const dynamicSports = Array.from(bySport.keys()).filter((key) => !sportOrder.includes(key)).sort();
+  const orderedSports = [...sportOrder, ...dynamicSports];
+
+  const sections = orderedSports
+    .map((sportKey) => {
+      const cards = sortCards([...(bySport.get(sportKey) || [])]);
+      if (cards.length === 0) return null;
+      return {
+        sport: sportKey,
+        label: ODDS_BOARD_SPORT_LABELS[sportKey] || sportKey,
+        count: cards.length,
+        cards,
+      };
+    })
+    .filter((section): section is NonNullable<typeof section> => Boolean(section));
+
+  return {
+    key: boardKey,
+    date: params.date,
+    sport: requestedSport,
+    generatedAt: new Date().toISOString(),
+    sections,
+  };
 }
 
 function normalizeSportForIdentity(sportRaw: string): string {
@@ -1068,6 +1381,14 @@ function getOddsSlatePersistentKeys(scope: string, date: string, gameIdsParam: s
   };
 }
 
+function getOddsSlateSportFallbackPersistentKeys(scope: string, sport: string): { primary: string; backup: string } {
+  const key = `${scope}|sport_fallback|${String(sport || "").trim().toLowerCase()}`;
+  return {
+    primary: `odds_slate_sport_v1:${key}`,
+    backup: `odds_slate_sport_v1_backup:${key}`,
+  };
+}
+
 function getOddsSummaryPersistentKeys(scope: string, gameId: string): { primary: string; backup: string } {
   const key = `${scope}:${gameId}:0`;
   return {
@@ -1083,19 +1404,136 @@ function extractSlateSummaries(body: any): any[] {
 }
 
 function mapOddsSummary(oddsSummaryByGame: Record<string, any>, summary: any): void {
-  const gameId = String(summary?.game?.game_id || summary?.requested_game_id || summary?.game_id || "").trim().toLowerCase();
-  if (!gameId) return;
-  oddsSummaryByGame[gameId] = summary;
+  const toFinite = (value: unknown): number | null => {
+    const n = Number(value);
+    return Number.isFinite(n) ? n : null;
+  };
+  const toAmericanOdds = (outcome: any): number | null => {
+    const american = toFinite(outcome?.odds_american);
+    if (american !== null) return Math.trunc(american);
+    const decimal = toFinite(outcome?.odds_decimal ?? outcome?.odds);
+    if (decimal === null || decimal <= 1) return null;
+    if (decimal >= 2) return Math.round((decimal - 1) * 100);
+    return Math.round(-100 / (decimal - 1));
+  };
+
+  const existingF5 = summary?.f5;
+  const existingF5Values = [
+    existingF5?.spread?.home,
+    existingF5?.spread?.away,
+    existingF5?.total,
+    existingF5?.moneyline?.home,
+    existingF5?.moneyline?.away,
+  ].map((value) => toFinite(value));
+  const hasValidExistingF5 = existingF5Values.some((value) => value !== null && value !== 0);
+  if (summary && typeof summary === "object" && !hasValidExistingF5) {
+    let spreadHome = toFinite(summary?.first_half?.spread?.home_line ?? summary?.spread_1h_home ?? summary?.spread1HHome);
+    let spreadAway = toFinite(summary?.first_half?.spread?.away_line ?? summary?.spread_1h_away ?? summary?.spread1HAway);
+    let total = toFinite(summary?.first_half?.total?.line ?? summary?.total_1h ?? summary?.total1H);
+    let mlHome = toFinite(summary?.first_half?.moneyline?.home_price ?? summary?.moneyline_1h_home ?? summary?.moneyline1HHome);
+    let mlAway = toFinite(summary?.first_half?.moneyline?.away_price ?? summary?.moneyline_1h_away ?? summary?.moneyline1HAway);
+
+    const markets = Array.isArray(summary?.markets)
+      ? summary.markets
+      : Array.isArray(summary?.game?.markets)
+        ? summary.game.markets
+        : [];
+    const f5Markets = markets.filter((m: any) => {
+      const name = String(m?.name || "").toLowerCase();
+      const id = String(m?.id || "").toLowerCase();
+      const segment = String(m?.segment || "").toLowerCase();
+      return (
+        name.includes("first") ||
+        name.includes("f5") ||
+        name.includes("1 to 5") ||
+        id.includes("first") ||
+        id.includes("f5") ||
+        Number(m?.period) === 1 ||
+        segment === "first_5"
+      );
+    });
+    if (f5Markets.length > 0) {
+      for (const market of f5Markets) {
+        const marketName = `${String(market?.name || "")} ${String(market?.id || "")}`.toLowerCase();
+        const books = Array.isArray(market?.books) ? market.books : [];
+        const book = books.find((candidate: any) => Array.isArray(candidate?.outcomes) && candidate.outcomes.length > 0);
+        const outcomes = Array.isArray(book?.outcomes) ? book.outcomes : [];
+        if (outcomes.length === 0) continue;
+
+        if (marketName.includes("spread") || marketName.includes("handicap")) {
+          for (const outcome of outcomes) {
+            const handicap = toFinite(outcome?.handicap ?? outcome?.spread ?? outcome?.line);
+            if (handicap === null) continue;
+            const outcomeType = String(outcome?.type || "").toLowerCase();
+            if (spreadHome === null && outcomeType.includes("home")) spreadHome = handicap;
+            if (spreadAway === null && outcomeType.includes("away")) spreadAway = handicap;
+          }
+        }
+
+        if (marketName.includes("total")) {
+          for (const outcome of outcomes) {
+            const line = toFinite(outcome?.total ?? outcome?.handicap ?? outcome?.line);
+            if (line !== null) {
+              total = line;
+              break;
+            }
+          }
+        }
+
+        if (marketName.includes("winner") || marketName.includes("moneyline") || marketName.includes("1x2")) {
+          for (const outcome of outcomes) {
+            const price = toAmericanOdds(outcome);
+            if (price === null) continue;
+            const outcomeType = String(outcome?.type || "").toLowerCase();
+            if (mlHome === null && outcomeType.includes("home")) mlHome = price;
+            if (mlAway === null && outcomeType.includes("away")) mlAway = price;
+          }
+        }
+      }
+    }
+
+    if (spreadAway === null && spreadHome !== null) spreadAway = -spreadHome;
+    if (spreadHome === null && spreadAway !== null) spreadHome = -spreadAway;
+    if (
+      spreadHome != null ||
+      spreadAway != null ||
+      total != null ||
+      mlHome != null ||
+      mlAway != null
+    ) {
+      summary.f5 = {
+        spread: {
+          home: spreadHome,
+          away: spreadAway,
+        },
+        total,
+        moneyline: {
+          home: mlHome,
+          away: mlAway,
+        },
+      };
+    }
+  }
+  const toKey = (value: unknown): string => String(value || "").trim().toLowerCase();
+  const gameId = toKey(summary?.game?.game_id || summary?.requested_game_id || summary?.game_id);
+  const gameExternalId = toKey(summary?.game?.external_id || summary?.external_id);
+  const requestedId = toKey(summary?.requested_game_id);
+  const keys = [gameId, gameExternalId, requestedId].filter(Boolean);
+  if (keys.length === 0) return;
+  for (const key of keys) {
+    oddsSummaryByGame[key] = summary;
+    console.log('F5_SUMMARY', oddsSummaryByGame[key]?.f5);
+  }
 }
 
 function buildSyntheticSummaryFromGame(game: any): any | null {
   const gameId = String(game?.game_id || game?.id || "").trim();
   if (!gameId) return null;
   const toFinite = (v: unknown): number | null => {
-    const n = Number(v);
-    return Number.isFinite(n) ? n : null;
+    return toFiniteNumberOrNull(v);
   };
   const spread = toFinite(game?.spread ?? game?.spread_home ?? game?.spreadHome);
+  const spreadAway = spread === null ? null : -spread;
   const total = toFinite(game?.overUnder ?? game?.total ?? game?.over_under);
   const mlHome = toFinite(game?.moneylineHome ?? game?.moneyline_home ?? game?.ml_home);
   const mlAway = toFinite(game?.moneylineAway ?? game?.moneyline_away ?? game?.ml_away);
@@ -1110,7 +1548,7 @@ function buildSyntheticSummaryFromGame(game: any): any | null {
       away_team_code: game?.away_team_code,
       start_time: game?.start_time,
     },
-    spread: spread === null ? null : { line: spread },
+    spread: spread === null ? null : { home_line: spread, away_line: spreadAway, line: spread },
     total: total === null ? null : { line: total },
     moneyline: mlHome === null && mlAway === null ? null : { home_price: mlHome, away_price: mlAway },
     source: "games_snapshot_fallback",
@@ -1133,28 +1571,147 @@ function normalizeOddsTeamToken(value: unknown): string {
   return parts.length > 0 ? parts[parts.length - 1] : "";
 }
 
+function buildSlateMatchupKey(away: unknown, home: unknown): string {
+  const awayToken = normalizeOddsTeamToken(away);
+  const homeToken = normalizeOddsTeamToken(home);
+  if (!awayToken || !homeToken) return "";
+  return `${awayToken}|${homeToken}`;
+}
+
+function buildGameMatchupKeys(game: any): string[] {
+  const keys = new Set<string>();
+  const awayCandidates = [game?.away_team_code, game?.away_team_name];
+  const homeCandidates = [game?.home_team_code, game?.home_team_name];
+  for (const away of awayCandidates) {
+    for (const home of homeCandidates) {
+      const key = buildSlateMatchupKey(away, home);
+      if (key) keys.add(key);
+    }
+  }
+  return Array.from(keys);
+}
+
+function buildSummaryMatchupKeys(summary: any): string[] {
+  const game = summary?.game || {};
+  const keys = new Set<string>();
+  const awayCandidates = [game?.away_team_code, game?.away_team_name];
+  const homeCandidates = [game?.home_team_code, game?.home_team_name];
+  for (const away of awayCandidates) {
+    for (const home of homeCandidates) {
+      const key = buildSlateMatchupKey(away, home);
+      if (key) keys.add(key);
+    }
+  }
+  return Array.from(keys);
+}
+
+function hasRenderableF5Summary(summary: any): boolean {
+  if (!summary || typeof summary !== "object") return false;
+  const toFinite = (v: unknown): number | null => {
+    return toFiniteNumberOrNull(v);
+  };
+  const f5 = summary?.f5;
+  if (!f5 || typeof f5 !== "object") return false;
+  const spreadHome = toFinite(f5?.spread?.home);
+  const spreadAway = toFinite(f5?.spread?.away);
+  const total = toFinite(f5?.total);
+  const mlHome = toFinite(f5?.moneyline?.home);
+  const mlAway = toFinite(f5?.moneyline?.away);
+  const hasSpread = (spreadHome !== null && spreadHome !== 0) || (spreadAway !== null && spreadAway !== 0);
+  const hasTotal = total !== null && total !== 0;
+  const hasMoneyline = (mlHome !== null && mlHome !== 0) || (mlAway !== null && mlAway !== 0);
+  return hasSpread && (hasTotal || hasMoneyline);
+}
+
+function hasRenderableFirstHalfSummary(summary: any, sport: string): boolean {
+  if (!summary || typeof summary !== "object") return false;
+  const fh = summary?.first_half;
+  if (!fh || typeof fh !== "object") return false;
+  const toFinite = (v: unknown): number | null => {
+    return toFiniteNumberOrNull(v);
+  };
+  const spreadHome = toFinite(fh?.spread?.home_line);
+  const spreadAway = toFinite(fh?.spread?.away_line);
+  const total = toFinite(fh?.total?.line);
+  const mlHome = toFinite(fh?.moneyline?.home_price);
+  const mlAway = toFinite(fh?.moneyline?.away_price);
+
+  const hasSpread = (spreadHome !== null && spreadHome !== 0) || (spreadAway !== null && spreadAway !== 0);
+  const hasTotal = total !== null && total !== 0;
+  const hasMoneyline = (mlHome !== null && mlHome !== 0) || (mlAway !== null && mlAway !== 0);
+  if (!hasSpread && !hasTotal && !hasMoneyline) return false;
+
+  const sportUpper = String(sport || "").trim().toUpperCase();
+  if (sportUpper === "NBA" || sportUpper === "NCAAB") {
+    if (!hasSpread || !hasTotal || total === null || total < 80) return false;
+    if (!hasMoneyline) return false;
+  }
+  return true;
+}
+
+function shouldKeepExistingSummaryForLiveRecovery(summary: any, sport: string): boolean {
+  if (!summary || typeof summary !== "object") return false;
+  const sportUpper = String(sport || "").trim().toUpperCase();
+  if (sportUpper === "MLB") return hasRenderableF5Summary(summary);
+  if (sportUpper === "NBA" || sportUpper === "NCAAB") return hasRenderableFirstHalfSummary(summary, sportUpper);
+  if (sportUpper === "NHL") return hasRenderableFirstHalfSummary(summary, sportUpper);
+  return true;
+}
+
 function buildSyntheticSummaryFromLiveOddsMap(game: any, sport: string, oddsMap: Record<string, any>): any | null {
   if (!oddsMap || typeof oddsMap !== "object") return null;
   const gameId = String(game?.game_id || game?.id || "").trim();
   if (!gameId) return null;
   const sportLower = String(sport || game?.sport || "").trim().toLowerCase();
   if (!sportLower) return null;
+  const plain = (value: unknown): string =>
+    String(value || "")
+      .trim()
+      .toLowerCase()
+      .replace(/\s+/g, " ");
   const homeCode = normalizeOddsTeamToken(game?.home_team_code);
   const awayCode = normalizeOddsTeamToken(game?.away_team_code);
   const homeName = normalizeOddsTeamToken(game?.home_team_name);
   const awayName = normalizeOddsTeamToken(game?.away_team_name);
+  const homeNamePlain = plain(game?.home_team_name || game?.homeTeam || game?.home_team_code);
+  const awayNamePlain = plain(game?.away_team_name || game?.awayTeam || game?.away_team_code);
+  const nicknameToken = (value: unknown): string => {
+    const raw = String(value || "").trim().toLowerCase();
+    if (!raw) return "";
+    const parts = raw.split(/\s+/).filter(Boolean);
+    return normalizeOddsTeamToken(parts[parts.length - 1] || raw);
+  };
+  const homeNick = nicknameToken(game?.home_team_name || game?.homeTeam);
+  const awayNick = nicknameToken(game?.away_team_name || game?.awayTeam);
+  const homeNickPlain = plain((String(game?.home_team_name || game?.homeTeam || "").trim().split(/\s+/).filter(Boolean).pop()) || "");
+  const awayNickPlain = plain((String(game?.away_team_name || game?.awayTeam || "").trim().split(/\s+/).filter(Boolean).pop()) || "");
+  const eventId = (() => {
+    if (gameId.startsWith("sr:sport_event:")) return gameId;
+    if (gameId.startsWith("sr_")) {
+      const parts = gameId.split("_");
+      if (parts.length >= 3) return `sr:sport_event:${parts.slice(2).join("_")}`;
+    }
+    if (/^[0-9a-f-]{30,}$/i.test(gameId)) return `sr:sport_event:${gameId}`;
+    return "";
+  })();
   const lookupKeys = [
+    eventId,
+    gameId,
+    eventId.replace("sr:sport_event:", "sr:match:"),
     `${sportLower}|${awayCode}|${homeCode}`,
     `${sportLower}|${awayName}|${homeName}`,
+    `${sportLower}|${awayNamePlain}|${homeNamePlain}`,
     `${sportLower}|${awayCode || awayName}|${homeCode || homeName}`,
-  ];
+    `${sportLower}|${awayNick}|${homeNick}`,
+    `${sportLower}|${awayNickPlain}|${homeNickPlain}`,
+    `${sportLower}|${awayNick || awayCode || awayName}|${homeNick || homeCode || homeName}`,
+  ].filter(Boolean);
   const liveOdds = lookupKeys
     .map((key) => oddsMap[key])
     .find((candidate) => candidate && typeof candidate === "object");
   if (!liveOdds) return null;
   const toFinite = (v: unknown): number | null => {
-    const n = Number(v);
-    return Number.isFinite(n) ? n : null;
+    return toFiniteNumberOrNull(v);
   };
   const spreadHome = toFinite(liveOdds.spreadHome ?? liveOdds.spread ?? null);
   const spreadAway = toFinite(liveOdds.spreadAway ?? (spreadHome !== null ? -spreadHome : null));
@@ -1166,6 +1723,11 @@ function buildSyntheticSummaryFromLiveOddsMap(game: any, sport: string, oddsMap:
   const total1H = toFinite(liveOdds.total1H);
   const ml1HHome = toFinite(liveOdds.moneyline1HHome);
   const ml1HAway = toFinite(liveOdds.moneyline1HAway);
+  const f5SpreadHome = toFinite(liveOdds?.f5?.spread?.home ?? liveOdds?.f5SpreadHome);
+  const f5SpreadAway = toFinite(liveOdds?.f5?.spread?.away ?? liveOdds?.f5SpreadAway);
+  const f5Total = toFinite(liveOdds?.f5?.total ?? liveOdds?.f5Total);
+  const f5MlHome = toFinite(liveOdds?.f5?.moneyline?.home ?? liveOdds?.f5MoneylineHome);
+  const f5MlAway = toFinite(liveOdds?.f5?.moneyline?.away ?? liveOdds?.f5MoneylineAway);
   if (
     spreadHome === null &&
     spreadAway === null &&
@@ -1205,6 +1767,18 @@ function buildSyntheticSummaryFromLiveOddsMap(game: any, sport: string, oddsMap:
             total: total1H === null ? null : { line: total1H },
             moneyline: ml1HHome === null && ml1HAway === null ? null : { home_price: ml1HHome, away_price: ml1HAway },
           },
+    f5:
+      f5SpreadHome === null &&
+      f5SpreadAway === null &&
+      f5Total === null &&
+      f5MlHome === null &&
+      f5MlAway === null
+        ? null
+        : {
+            spread: { home: f5SpreadHome, away: f5SpreadAway },
+            total: f5Total,
+            moneyline: { home: f5MlHome, away: f5MlAway },
+          },
     source: "sportsradar_odds_live_recovery",
     fallback_type: "live_odds_matchup",
     fallback_reason: "Recovered odds from SportsRadar sport odds map when cached summaries were sparse",
@@ -1216,13 +1790,25 @@ function buildSyntheticSummaryFromLiveOddsMap(game: any, sport: string, oddsMap:
 async function readOddsSummariesFromCache(db: D1Database, params: {
   date: string;
   gameIds: string[];
+  sport?: string;
+  games?: any[];
 }): Promise<{ oddsSummaryByGame: Record<string, any>; source: string }> {
   const scope = "PROD";
   const oddsSummaryByGame: Record<string, any> = {};
   let slatePrimaryHits = 0;
   let slateBackupHits = 0;
+  let sportSlatePrimaryHits = 0;
+  let sportSlateBackupHits = 0;
   let summaryPrimaryHits = 0;
   let summaryBackupHits = 0;
+  const wantedIds = new Set(params.gameIds.map((id) => String(id || "").trim().toLowerCase()).filter(Boolean));
+  const slateMatchupKeys = new Set<string>(
+    (params.games || []).flatMap((game) => buildGameMatchupKeys(game))
+  );
+  const hasSummaryForId = (id: string): boolean => {
+    const key = String(id || "").trim().toLowerCase();
+    return Boolean(key && oddsSummaryByGame[key]);
+  };
 
   const chunks = chunkArray(params.gameIds, 30);
   for (const ids of chunks) {
@@ -1287,7 +1873,37 @@ async function readOddsSummariesFromCache(db: D1Database, params: {
     }
   }
 
-  const missingIds = params.gameIds.filter((id) => !oddsSummaryByGame[id]);
+  if (params.sport && Object.keys(oddsSummaryByGame).length < params.gameIds.length) {
+    const sportKeys = getOddsSlateSportFallbackPersistentKeys(scope, params.sport);
+    for (const key of [sportKeys.primary, sportKeys.backup]) {
+      try {
+        const payload = await getCachedData<any>(db, key);
+        const summaries = extractSlateSummaries(payload);
+        if (summaries.length === 0) continue;
+        for (const summary of summaries) {
+          const summaryId = String(
+            summary?.requested_game_id
+            || summary?.game?.game_id
+            || summary?.game_id
+            || ""
+          ).trim().toLowerCase();
+          const summaryMatchesSlate = buildSummaryMatchupKeys(summary).some((matchKey) => slateMatchupKeys.has(matchKey));
+          if (!wantedIds.has(summaryId) && !summaryMatchesSlate) continue;
+          mapOddsSummary(oddsSummaryByGame, summary);
+        }
+        if (key === sportKeys.primary) {
+          sportSlatePrimaryHits += summaries.length;
+        } else {
+          sportSlateBackupHits += summaries.length;
+        }
+        if (Object.keys(oddsSummaryByGame).length >= params.gameIds.length) break;
+      } catch {
+        // Non-fatal.
+      }
+    }
+  }
+
+  const missingIds = params.gameIds.filter((id) => !hasSummaryForId(id));
   for (const id of missingIds) {
     const keys = getOddsSummaryPersistentKeys(scope, id);
     try {
@@ -1299,7 +1915,7 @@ async function readOddsSummariesFromCache(db: D1Database, params: {
     } catch {
       // Non-fatal.
     }
-    if (oddsSummaryByGame[id]) continue;
+    if (hasSummaryForId(id)) continue;
     try {
       const backup = await getCachedData<any>(db, keys.backup);
       if (backup && typeof backup === "object") {
@@ -1311,7 +1927,7 @@ async function readOddsSummariesFromCache(db: D1Database, params: {
     }
   }
 
-  const source = `cache_only(slate_primary=${slatePrimaryHits},slate_backup=${slateBackupHits},summary_primary=${summaryPrimaryHits},summary_backup=${summaryBackupHits})`;
+  const source = `cache_only(slate_primary=${slatePrimaryHits},slate_backup=${slateBackupHits},sport_primary=${sportSlatePrimaryHits},sport_backup=${sportSlateBackupHits},summary_primary=${summaryPrimaryHits},summary_backup=${summaryBackupHits})`;
   return { oddsSummaryByGame, source };
 }
 
@@ -1868,7 +2484,11 @@ function hasUsableOddsPageDataPayload(payload: PageDataOddsPayload | null | unde
   if (!payload) return false;
   const games = Array.isArray(payload.games) ? payload.games.length : 0;
   const odds = Object.keys(payload.oddsSummaryByGame || {}).length;
-  return games > 0 || odds > 0;
+  const sectionCount = Array.isArray(payload.board?.sections) ? payload.board.sections.length : 0;
+  const boardCardCount = Array.isArray(payload.board?.sections)
+    ? payload.board.sections.reduce((count, section) => count + (Array.isArray(section?.cards) ? section.cards.length : 0), 0)
+    : 0;
+  return games > 0 || odds > 0 || sectionCount > 0 || boardCardCount > 0;
 }
 
 function hasUsableSportHubPageDataPayload(payload: PageDataSportHubPayload | null | undefined): boolean {
@@ -2948,14 +3568,22 @@ pageDataRouter.get("/games", async (c) => {
   const gameIds = uniqueGameIds(games, 90);
 
   // Cache-first odds hydration: no fresh deep compute in user navigation path.
-  const oddsCache = await readOddsSummariesFromCache(c.env.DB, { date, gameIds });
+  const oddsCache = await readOddsSummariesFromCache(c.env.DB, {
+    date,
+    gameIds,
+    sport: String(sport || "").toLowerCase(),
+    games,
+  });
   const oddsSummaryByGame: Record<string, any> = { ...oddsCache.oddsSummaryByGame };
   let oddsSource = oddsCache.source;
   for (const game of games) {
     const id = String(game?.game_id || game?.id || "").trim().toLowerCase();
     if (!id || oddsSummaryByGame[id]) continue;
     const synthetic = buildSyntheticSummaryFromGame(game);
-    if (synthetic) oddsSummaryByGame[id] = synthetic;
+    if (synthetic) {
+      oddsSummaryByGame[id] = synthetic;
+      console.log('F5_SUMMARY', oddsSummaryByGame[id]?.f5);
+    }
   }
   const oddsCoverage = gameIds.length > 0
     ? Object.keys(oddsSummaryByGame).length / gameIds.length
@@ -2968,6 +3596,7 @@ pageDataRouter.get("/games", async (c) => {
     let recovered = 0;
     for (const sportKey of sportsToRecover) {
       const oddsUrl = new URL(`/api/games/odds/${encodeURIComponent(String(sportKey || "").toLowerCase())}`, origin);
+      oddsUrl.searchParams.set("fresh", "1");
       const liveOddsStarted = now();
       const liveOddsRes = await readJsonWithBudget(oddsUrl.toString(), 9000);
       upstreamFetchMs += Math.max(0, now() - liveOddsStarted);
@@ -2978,10 +3607,13 @@ pageDataRouter.get("/games", async (c) => {
       for (const game of games) {
         if (String(game?.sport || "").trim().toUpperCase() !== String(sportKey || "").trim().toUpperCase()) continue;
         const id = String(game?.game_id || game?.id || "").trim().toLowerCase();
-        if (!id || oddsSummaryByGame[id]) continue;
+        if (!id) continue;
+        const existingSummary = oddsSummaryByGame[id];
+        if (existingSummary && shouldKeepExistingSummaryForLiveRecovery(existingSummary, String(sportKey || ""))) continue;
         const synthetic = buildSyntheticSummaryFromLiveOddsMap(game, sportKey, liveOddsMap);
         if (!synthetic) continue;
         oddsSummaryByGame[id] = synthetic;
+        console.log('F5_SUMMARY', oddsSummaryByGame[id]?.f5);
         recovered += 1;
       }
     }
@@ -3459,9 +4091,10 @@ pageDataRouter.get("/odds", async (c) => {
   const policy = getFreshnessPolicy("medium");
   const date = getDateFromQuery(c.req.query("date"));
   const sport = normalizeSport(c.req.query("sport") || "ALL");
-  const cacheKey = pageDataGenericKey("odds", { v: "v1", date, sport });
-  const d1PrimaryKey = `page_data_odds_v1:${cacheKey}`;
-  const d1BackupKey = `page_data_odds_v1_backup:${cacheKey}`;
+  const boardCacheKey = `odds-board:${date}:${String(sport || "ALL").toUpperCase()}`;
+  const cacheKey = boardCacheKey;
+  const d1PrimaryKey = `page_data_odds_board_v1:${cacheKey}`;
+  const d1BackupKey = `page_data_odds_board_v1_backup:${cacheKey}`;
 
   const l1Fresh = readL1FreshGeneric(pageDataOddsL1, cacheKey);
   if (!forceFresh && l1Fresh && hasUsableOddsPageDataPayload(l1Fresh)) {
@@ -3512,6 +4145,13 @@ pageDataRouter.get("/odds", async (c) => {
       },
       degraded: true,
       meta: { date, sport, partialReason: "snapshot_missing" },
+      board: {
+        key: boardCacheKey,
+        date,
+        sport,
+        generatedAt: new Date().toISOString(),
+        sections: [],
+      },
       games: [],
       oddsSummaryByGame: {},
     };
@@ -3528,10 +4168,19 @@ pageDataRouter.get("/odds", async (c) => {
   gamesUrl.searchParams.set("includeOdds", "0");
   if (sport !== "ALL") gamesUrl.searchParams.set("sport", sport);
 
+  const initialGamesBudgetMs = sport === "ALL" ? 3500 : 2500;
+  const retryGamesBudgetMs = sport === "ALL" ? 7000 : 5000;
   const gamesStarted = now();
-  const gamesRes = await readJsonWithBudget(gamesUrl.toString(), 1300);
+  let gamesRes = await readJsonWithBudget(gamesUrl.toString(), initialGamesBudgetMs);
   upstreamFetchMs += Math.max(0, now() - gamesStarted);
-  const gamesFromHttp = extractGamesArray(gamesRes.body);
+  let gamesFromHttp = extractGamesArray(gamesRes.body);
+  // Cold starts can exceed the initial budget. Give one bounded retry before committing empty games.
+  if (gamesFromHttp.length === 0 && !gamesRes.ok) {
+    const retryStarted = now();
+    gamesRes = await readJsonWithBudget(gamesUrl.toString(), retryGamesBudgetMs);
+    upstreamFetchMs += Math.max(0, now() - retryStarted);
+    gamesFromHttp = extractGamesArray(gamesRes.body);
+  }
   const cacheFallback = gamesFromHttp.length > 0
     ? { games: [], source: null as "games_list_v2_primary" | "games_list_v2_backup" | null }
     : await readGamesFromPersistentCache(c.env.DB, date, sport);
@@ -3539,8 +4188,14 @@ pageDataRouter.get("/odds", async (c) => {
   let gamesSource = gamesFromHttp.length > 0 ? "internal_http" : (cacheFallback.source || "none");
   const gameIds = uniqueGameIds(games, 90);
 
-  const oddsCache = await readOddsSummariesFromCache(c.env.DB, { date, gameIds });
+  const oddsCache = await readOddsSummariesFromCache(c.env.DB, {
+    date,
+    gameIds,
+    sport: String(sport || "").toLowerCase(),
+    games,
+  });
   const oddsSummaryByGame: Record<string, any> = { ...oddsCache.oddsSummaryByGame };
+  let oddsSource = oddsCache.source;
 
   // If either slice is still empty, try page-data games snapshots as a last cached source.
   if (games.length === 0 || Object.keys(oddsSummaryByGame).length === 0) {
@@ -3554,12 +4209,120 @@ pageDataRouter.get("/odds", async (c) => {
     }
   }
 
+  const matchedOddsGameCount = games.reduce((count, game) => {
+    const id = String(game?.game_id || game?.id || "").trim().toLowerCase();
+    return id && oddsSummaryByGame[id] ? count + 1 : count;
+  }, 0);
+  const sportUpper = String(sport || "").trim().toUpperCase();
+  const hasInvalidBasketballFirstHalf = (
+    (sportUpper === "NBA" || sportUpper === "NCAAB") &&
+    games.some((game) => {
+      const id = String(game?.game_id || game?.id || "").trim().toLowerCase();
+      if (!id) return false;
+      const summary = oddsSummaryByGame[id];
+      if (!summary) return false;
+      return !hasRenderableFirstHalfSummary(summary, sportUpper);
+    })
+  );
+  const hasInvalidNhlPeriod = (
+    sportUpper === "NHL" &&
+    games.some((game) => {
+      const id = String(game?.game_id || game?.id || "").trim().toLowerCase();
+      if (!id) return false;
+      const summary = oddsSummaryByGame[id];
+      if (!summary) return false;
+      return !hasRenderableFirstHalfSummary(summary, sportUpper);
+    })
+  );
+
+  const shouldAttemptLiveRecovery =
+    games.length > 0 &&
+    c.env.SPORTSRADAR_API_KEY &&
+    (
+      sport === "ALL"
+        ? matchedOddsGameCount < games.length
+        : (matchedOddsGameCount < games.length || hasInvalidBasketballFirstHalf || hasInvalidNhlPeriod)
+    );
+
+  if (shouldAttemptLiveRecovery) {
+    try {
+      const supportedRecoverySports = new Set(["MLB", "NBA", "NHL", "NCAAB", "NFL", "NCAAF", "SOCCER"]);
+      const recoverySports = (
+        sport === "ALL"
+          ? Array.from(
+              new Set(
+                games
+                  .map((game) => normalizeSportForOddsBoard(game?.sport, game?.league))
+                  .filter((sportKey) => supportedRecoverySports.has(String(sportKey || "").toUpperCase()))
+              )
+            )
+          : [String(sport || "").toUpperCase()]
+      ).filter((sportKey) => supportedRecoverySports.has(String(sportKey || "").toUpperCase()));
+
+      const timeoutForRecoverySport = (sportKey: string): number => {
+        const upper = String(sportKey || "").toUpperCase();
+        if (upper === "MLB") return sport === "ALL" ? 18_000 : 12_000;
+        if (upper === "NBA" || upper === "NHL" || upper === "NCAAB") return sport === "ALL" ? 6_500 : 5_000;
+        return sport === "ALL" ? 6_000 : 4_500;
+      };
+
+      const liveOddsMapsBySport: Record<string, Record<string, any>> = {};
+      const liveRecoveryResults = await Promise.allSettled(
+        recoverySports.map(async (recoverySport) => {
+          const oddsUrl = new URL(`/api/games/odds/${encodeURIComponent(String(recoverySport || "").toLowerCase())}`, origin);
+          oddsUrl.searchParams.set("fresh", "1");
+          const liveOddsStarted = now();
+          const liveOddsRes = await readJsonWithBudget(oddsUrl.toString(), timeoutForRecoverySport(recoverySport));
+          upstreamFetchMs += Math.max(0, now() - liveOddsStarted);
+          const map = (liveOddsRes.body?.odds && typeof liveOddsRes.body.odds === "object")
+            ? (liveOddsRes.body.odds as Record<string, any>)
+            : {};
+          return { recoverySport, map };
+        })
+      );
+
+      for (const result of liveRecoveryResults) {
+        if (result.status !== "fulfilled") continue;
+        liveOddsMapsBySport[String(result.value.recoverySport || "").toUpperCase()] = result.value.map || {};
+      }
+
+      let recovered = 0;
+      for (const game of games) {
+        const id = String(game?.game_id || game?.id || "").trim().toLowerCase();
+        if (!id) continue;
+        const gameSport = String(
+          sport === "ALL"
+            ? normalizeSportForOddsBoard(game?.sport, game?.league)
+            : sport
+        ).toUpperCase();
+        const liveOddsMap = liveOddsMapsBySport[gameSport];
+        if (!liveOddsMap || Object.keys(liveOddsMap).length === 0) continue;
+        const existingSummary = oddsSummaryByGame[id];
+        if (existingSummary && shouldKeepExistingSummaryForLiveRecovery(existingSummary, gameSport)) continue;
+        const synthetic = buildSyntheticSummaryFromLiveOddsMap(game, gameSport, liveOddsMap);
+        if (!synthetic) continue;
+        oddsSummaryByGame[id] = synthetic;
+        console.log('F5_SUMMARY', oddsSummaryByGame[id]?.f5);
+        recovered += 1;
+      }
+      if (recovered > 0) {
+        const recoveryLabel = recoverySports.join(",").toLowerCase() || String(sport || "").toLowerCase();
+        oddsSource = `${oddsSource};sport_odds_live_recovery=${recovered};recovery_sports=${recoveryLabel}`;
+      }
+    } catch {
+      // Non-fatal fallback path.
+    }
+  }
+
   // Partial-allowed fallback: synthesize sparse odds rows from game snapshot fields.
   for (const game of games) {
     const id = String(game?.game_id || game?.id || "").trim().toLowerCase();
     if (!id || oddsSummaryByGame[id]) continue;
     const synthetic = buildSyntheticSummaryFromGame(game);
-    if (synthetic) oddsSummaryByGame[id] = synthetic;
+    if (synthetic) {
+      oddsSummaryByGame[id] = synthetic;
+      console.log('F5_SUMMARY', oddsSummaryByGame[id]?.f5);
+    }
   }
 
   if (games.length === 0 && l1Stale && hasUsableOddsPageDataPayload(l1Stale)) {
@@ -3588,6 +4351,12 @@ pageDataRouter.get("/odds", async (c) => {
     },
     degraded,
     meta: { date, sport, partialReason },
+    board: buildOddsBoardPayload({
+      date,
+      sport,
+      games,
+      oddsSummaryByGame,
+    }),
     games,
     oddsSummaryByGame,
   };
@@ -3620,7 +4389,7 @@ pageDataRouter.get("/odds", async (c) => {
     gamesSource,
     gamesStatus: gamesRes.status,
     odds: oddsCount,
-    oddsSource: oddsCache.source,
+    oddsSource,
     degraded,
     partialReason,
   });

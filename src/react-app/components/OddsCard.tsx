@@ -7,8 +7,9 @@ import { useNavigate } from 'react-router-dom';
 import { Bell, TrendingUp, TrendingDown, Star, MoreVertical } from 'lucide-react';
 import { cn } from '@/react-app/lib/utils';
 import { getTeamOrCountryLogoUrl } from '@/react-app/lib/teamLogos';
+import { getSportAvatarConfig } from '@/react-app/lib/sportAvatars';
 import { getMarketPeriodLabels } from '@/react-app/lib/marketPeriodLabels';
-import { toOddsGamePath } from '@/react-app/lib/gameRoutes';
+import { toGameDetailPath } from '@/react-app/lib/gameRoutes';
 import { useState } from 'react';
 
 export interface OddsCardGame {
@@ -22,7 +23,13 @@ export interface OddsCardGame {
   awayScore?: number | null;
   status: 'live' | 'scheduled' | 'final' | string;
   period?: string;
+  periodLabel?: string;
   clock?: string;
+  mlbLiveState?: {
+    inningHalf?: string;
+    inningNumber?: number;
+    inningState?: string;
+  } | null;
   startTime?: string;
   channel?: string | null;
   spread?: number;
@@ -49,6 +56,21 @@ export interface OddsCardGame {
     moneyline1HHome?: number;
     ml1HAway?: number;
     moneyline1HAway?: number;
+    spread1P?: number;
+    total1P?: number;
+    ml1PHome?: number;
+    ml1PAway?: number;
+    f5?: {
+      spread?: {
+        home?: number | null;
+        away?: number | null;
+      };
+      total?: number | null;
+      moneyline?: {
+        home?: number | null;
+        away?: number | null;
+      };
+    };
   };
 }
 
@@ -68,12 +90,21 @@ export function OddsCard({ game, isInWatchboard, onAlertClick, onWatchboardClick
   const homeCode = typeof game.homeTeam === 'object' ? game.homeTeam.abbr : game.homeTeam;
   const awayName = typeof game.awayTeam === 'object' ? (game.awayTeam.name || game.awayTeam.abbr) : game.awayTeam;
   const homeName = typeof game.homeTeam === 'object' ? (game.homeTeam.name || game.homeTeam.abbr) : game.homeTeam;
-  const awayLogo = getTeamOrCountryLogoUrl(awayCode, game.sport, game.league);
-  const homeLogo = getTeamOrCountryLogoUrl(homeCode, game.sport, game.league);
+  const awayLogo = getTeamOrCountryLogoUrl(awayCode, game.sport, game.league, { teamName: awayName });
+  const homeLogo = getTeamOrCountryLogoUrl(homeCode, game.sport, game.league, { teamName: homeName });
+  const fallbackLogo = getSportAvatarConfig(String(game.sport || '').toLowerCase()).src;
   
   // Status detection
-  const statusLower = (game.status || '').toString().toLowerCase();
-  const isLive = statusLower === 'live' || statusLower === 'in_progress' || statusLower === 'inprogress';
+  const statusLower = (game.status || '').toString().toLowerCase().trim();
+  const statusCompact = statusLower.replace(/[\s-]+/g, '_');
+  const isLive =
+    statusCompact === 'live' ||
+    statusCompact === 'in_progress' ||
+    statusCompact === 'inprogress' ||
+    statusCompact === 'underway' ||
+    statusCompact === 'ongoing' ||
+    statusCompact.includes('live') ||
+    statusCompact.includes('progress');
   const isFinal = statusLower === 'final' || statusLower === 'completed' || statusLower === 'closed';
   
   // Odds values
@@ -87,11 +118,39 @@ export function OddsCard({ game, isInWatchboard, onAlertClick, onWatchboardClick
   const totalOpen = numOrUndefined(game.odds?.totalOpen ?? game.overUnderOpen);
   const mlAway = numOrUndefined(game.odds?.mlAway ?? game.odds?.awayML ?? game.moneylineAway);
   const mlHome = numOrUndefined(game.odds?.mlHome ?? game.odds?.homeML ?? game.moneylineHome);
-  const spread1H = numOrUndefined(game.odds?.spread1H ?? game.odds?.spread1HHome);
-  const total1H = numOrUndefined(game.odds?.total1H);
-  const ml1HAway = numOrUndefined(game.odds?.ml1HAway ?? game.odds?.moneyline1HAway);
-  const ml1HHome = numOrUndefined(game.odds?.ml1HHome ?? game.odds?.moneyline1HHome);
-  const hasAny1H = spread1H != null || total1H != null || ml1HAway != null || ml1HHome != null;
+  const sportUpper = String(game.sport || '').toUpperCase();
+  const periodSpread = numOrUndefined(
+    sportUpper === 'MLB'
+      ? (game.odds?.f5?.spread?.home ?? game.odds?.spread1H ?? game.odds?.spread1HHome)
+      : sportUpper === 'NHL'
+        ? (game.odds?.spread1P ?? game.odds?.spread1H ?? game.odds?.spread1HHome ?? game.odds?.f5?.spread?.home)
+        : (game.odds?.spread1H ?? game.odds?.spread1HHome ?? game.odds?.f5?.spread?.home)
+  );
+  const rawPeriodTotal = numOrUndefined(
+    sportUpper === 'MLB'
+      ? (game.odds?.f5?.total ?? game.odds?.total1H)
+      : sportUpper === 'NHL'
+        ? (game.odds?.total1P ?? game.odds?.total1H ?? game.odds?.f5?.total)
+        : (game.odds?.total1H ?? game.odds?.f5?.total)
+  );
+  const rawPeriodMlAway = numOrUndefined(
+    sportUpper === 'MLB'
+      ? (game.odds?.f5?.moneyline?.away ?? game.odds?.ml1HAway ?? game.odds?.moneyline1HAway)
+      : sportUpper === 'NHL'
+        ? (game.odds?.ml1PAway ?? game.odds?.ml1HAway ?? game.odds?.moneyline1HAway ?? game.odds?.f5?.moneyline?.away)
+        : (game.odds?.ml1HAway ?? game.odds?.moneyline1HAway ?? game.odds?.f5?.moneyline?.away)
+  );
+  const rawPeriodMlHome = numOrUndefined(
+    sportUpper === 'MLB'
+      ? (game.odds?.f5?.moneyline?.home ?? game.odds?.ml1HHome ?? game.odds?.moneyline1HHome)
+      : sportUpper === 'NHL'
+        ? (game.odds?.ml1PHome ?? game.odds?.ml1HHome ?? game.odds?.moneyline1HHome ?? game.odds?.f5?.moneyline?.home)
+        : (game.odds?.ml1HHome ?? game.odds?.moneyline1HHome ?? game.odds?.f5?.moneyline?.home)
+  );
+  const periodTotal = rawPeriodTotal === 0 ? undefined : rawPeriodTotal;
+  const periodMlAway = rawPeriodMlAway === 0 ? undefined : rawPeriodMlAway;
+  const periodMlHome = rawPeriodMlHome === 0 ? undefined : rawPeriodMlHome;
+  const hasAnyPeriod = periodSpread != null || periodTotal != null || periodMlAway != null || periodMlHome != null;
   const periodLabels = getMarketPeriodLabels(game.sport);
   
   // Movement detection (compare current to opening)
@@ -107,6 +166,36 @@ export function OddsCard({ game, isInWatchboard, onAlertClick, onWatchboardClick
   const gameTime = game.startTime 
     ? new Date(game.startTime).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' }) 
     : '';
+  const isMlb = sportUpper === 'MLB';
+  const mlbLiveLabel = (() => {
+    if (!isLive || !isMlb) return '';
+    const normalize = (value: string): string =>
+      value
+        .replace(/\bbottom\b/i, 'Bot')
+        .replace(/\btop\b/i, 'Top')
+        .replace(/\bmiddle\b/i, 'Mid')
+        .replace(/\bend\b/i, 'End')
+        .replace(/\s+/g, ' ')
+        .trim();
+    const label = String(game.periodLabel || '').trim();
+    if (label) return normalize(label);
+    const state = String(game.mlbLiveState?.inningState || '').trim();
+    if (state) return normalize(state);
+    const halfRaw = String(game.mlbLiveState?.inningHalf || '').trim().toLowerCase();
+    const inning = Number(game.mlbLiveState?.inningNumber ?? game.period);
+    if (Number.isFinite(inning)) {
+      const half = halfRaw.startsWith('top') ? 'Top' : halfRaw.startsWith('bottom') ? 'Bot' : '';
+      const suffix = inning % 10 === 1 && inning % 100 !== 11 ? 'st'
+        : inning % 10 === 2 && inning % 100 !== 12 ? 'nd'
+        : inning % 10 === 3 && inning % 100 !== 13 ? 'rd'
+        : 'th';
+      return `${half ? `${half} ` : ''}${inning}${suffix}`.trim();
+    }
+    return '';
+  })();
+  const liveMetaLabel = isMlb
+    ? mlbLiveLabel
+    : [game.period, game.clock].filter(Boolean).join(' • ');
 
   const formatSpread = (value: number | undefined): string => {
     if (value == null) return "—";
@@ -124,7 +213,7 @@ export function OddsCard({ game, isInWatchboard, onAlertClick, onWatchboardClick
   const handleClick = () => {
     const gameId = game.gameId || game.id;
     const sport = (game.sport || 'nba').toLowerCase();
-    navigate(toOddsGamePath(sport, gameId));
+    navigate(toGameDetailPath(sport, gameId));
   };
   
   const handleMenuClick = (e: React.MouseEvent) => {
@@ -179,8 +268,17 @@ export function OddsCard({ game, isInWatchboard, onAlertClick, onWatchboardClick
             )}
             
             {/* Period/Clock for live */}
-            {isLive && game.period && (
-              <span className="text-[10px] text-slate-500">{game.period} {game.clock && `• ${game.clock}`}</span>
+            {isLive && liveMetaLabel && (
+              <span
+                className={cn(
+                  "text-[10px]",
+                  isMlb && mlbLiveLabel
+                    ? "rounded-full border border-red-400/35 bg-red-500/12 px-2 py-0.5 text-[10px] font-semibold tracking-[0.02em] text-red-200"
+                    : "text-slate-500"
+                )}
+              >
+                {liveMetaLabel}
+              </span>
             )}
           </div>
           
@@ -209,7 +307,15 @@ export function OddsCard({ game, isInWatchboard, onAlertClick, onWatchboardClick
               src={awayLogo ?? undefined} 
               alt="" 
               className="h-[26px] w-[26px] object-contain"
-              onError={(e) => { e.currentTarget.style.opacity = '0'; }}
+              onError={(e) => {
+                const img = e.currentTarget;
+                if (img.dataset.fallbackApplied === 'true') {
+                  img.style.opacity = '0';
+                  return;
+                }
+                img.dataset.fallbackApplied = 'true';
+                img.src = fallbackLogo;
+              }}
             />
             <div className="min-w-0 flex-1">
               <div className={cn(
@@ -235,7 +341,15 @@ export function OddsCard({ game, isInWatchboard, onAlertClick, onWatchboardClick
               src={homeLogo ?? undefined} 
               alt="" 
               className="h-[26px] w-[26px] object-contain"
-              onError={(e) => { e.currentTarget.style.opacity = '0'; }}
+              onError={(e) => {
+                const img = e.currentTarget;
+                if (img.dataset.fallbackApplied === 'true') {
+                  img.style.opacity = '0';
+                  return;
+                }
+                img.dataset.fallbackApplied = 'true';
+                img.src = fallbackLogo;
+              }}
             />
             <div className="min-w-0 flex-1">
               <div className={cn(
@@ -300,18 +414,18 @@ export function OddsCard({ game, isInWatchboard, onAlertClick, onWatchboardClick
             <div className="text-center min-w-[58px]">
               <div className="text-slate-500">Spread</div>
               <div className="font-semibold text-violet-100">
-                {spread1H != null ? `${homeCode} ${formatSpread(spread1H)}` : "—"}
+                {periodSpread != null ? `${homeCode} ${formatSpread(periodSpread)}` : "—"}
               </div>
             </div>
             <div className="text-center min-w-[40px]">
               <div className="text-slate-500">Total</div>
-              <div className="font-semibold text-violet-100">{total1H != null ? total1H : "—"}</div>
+              <div className="font-semibold text-violet-100">{periodTotal != null ? periodTotal : "—"}</div>
             </div>
             <div className="text-center min-w-[84px]">
               <div className="text-slate-500">ML</div>
               <div className="font-semibold text-violet-100">
-                {hasAny1H
-                  ? `${formatMoneyline(ml1HAway)} / ${formatMoneyline(ml1HHome)}`
+                {hasAnyPeriod
+                  ? `${formatMoneyline(periodMlAway)} / ${formatMoneyline(periodMlHome)}`
                   : "—"}
               </div>
             </div>

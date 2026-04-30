@@ -75,11 +75,40 @@ interface WatchboardState {
   error: string | null;
 }
 
+interface WatchboardHomePreviewBoard {
+  id: number;
+  name: string;
+  gameIds?: string[];
+}
+
+interface WatchboardChangeDetail {
+  source?: string;
+  action?: string;
+  itemId?: string;
+  boardId?: number | null;
+  entity?: string;
+}
+
 // localStorage keys
 const STORAGE_KEY = "gz-watchboards";
 const STORAGE_GAMES_KEY = "gz-watchboard-games";
 const STORAGE_PROPS_KEY = "gz-watchboard-props";
 const STORAGE_PLAYERS_KEY = "gz-watchboard-players";
+const WATCHBOARD_FETCH_TIMEOUT_MS = 30000;
+
+async function fetchJsonWithTimeout<T = any>(input: RequestInfo | URL, init?: RequestInit, timeoutMs = WATCHBOARD_FETCH_TIMEOUT_MS): Promise<T> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(input, { ...init, signal: controller.signal });
+    if (!res.ok) {
+      throw new Error(`Request failed: ${res.status}`);
+    }
+    return await res.json();
+  } finally {
+    clearTimeout(timeout);
+  }
+}
 
 // Guest localStorage helpers
 function getGuestBoards(): Watchboard[] {
@@ -144,16 +173,82 @@ export function useWatchboards() {
   });
   
   const fetchedRef = useRef(false);
+  const hasBroadcastInitialStateRef = useRef(false);
+  const mutationDebugLoggedRef = useRef(false);
+
+  const mapHomePreviewBoardsToWatchboards = useCallback((rows: WatchboardHomePreviewBoard[], userId: string): Watchboard[] => {
+    return rows
+      .map((row, idx) => {
+        const id = Number(row?.id);
+        const name = String(row?.name || "").trim();
+        if (!Number.isFinite(id) || id <= 0 || !name) return null;
+        const now = new Date().toISOString();
+        return {
+          id,
+          user_id: userId,
+          name,
+          pinned_game_id: null,
+          is_active: idx === 0,
+          created_at: now,
+          updated_at: now,
+        } satisfies Watchboard;
+      })
+      .filter(Boolean) as Watchboard[];
+  }, []);
+
+  const broadcastWatchboardState = useCallback((source: string) => {
+    if (typeof window === "undefined") return;
+    const ids = Array.from(new Set([
+      ...state.gameIds.map((id) => String(id || "").trim()),
+      ...state.props.map((p) => String(p.id)),
+      ...state.players.map((p) => String(p.id)),
+    ])).filter(Boolean);
+    const payload = {
+      source,
+      watchboardPageCount: ids.length,
+      ids,
+      activeBoardId: state.activeBoard?.id ?? null,
+      ts: Date.now(),
+    };
+    (window as any).__GZ_WATCHBOARD_SOURCE_LAST__ = payload;
+    window.dispatchEvent(new CustomEvent("watchboards:changed", { detail: payload }));
+  }, [state.activeBoard?.id, state.gameIds, state.players, state.props]);
+
+  const emitMutationEvent = useCallback((params: {
+    action: string;
+    itemId: string;
+    boardId: number | null;
+    beforeCount: number;
+    afterCount: number;
+    entity?: "game" | "prop" | "player";
+  }) => {
+    if (!mutationDebugLoggedRef.current) {
+      mutationDebugLoggedRef.current = true;
+      console.log("[WATCHBOARD MUTATION]", params);
+    }
+    if (typeof window !== "undefined") {
+      window.dispatchEvent(new CustomEvent("watchboards:changed", {
+        detail: {
+          source: `mutation:${params.action}`,
+          action: params.action,
+          itemId: params.itemId,
+          boardId: params.boardId,
+          beforeCount: params.beforeCount,
+          afterCount: params.afterCount,
+          entity: params.entity,
+        },
+      }));
+    }
+  }, []);
 
   // Fetch boards from API or localStorage
   const fetchBoards = useCallback(async () => {
     if (isAuthenticated && user) {
       // Fetch from API
       try {
-        const res = await fetch("/api/watchboards", {
+        const data = await fetchJsonWithTimeout<{ boards?: Watchboard[] }>("/api/watchboards", {
           headers: { "x-user-id": user.id.toString() },
         });
-        const data = await res.json();
         
         const boards: Watchboard[] = data.boards || [];
         const activeBoard = boards.find(b => b.is_active) || boards[0] || null;
@@ -163,23 +258,20 @@ export function useWatchboards() {
         let props: WatchboardProp[] = [];
         let players: WatchboardPlayer[] = [];
         if (activeBoard) {
-          const [gamesRes, propsRes, playersRes] = await Promise.all([
-            fetch("/api/watchboards/active", {
+          const [gamesResult, propsResult, playersResult] = await Promise.allSettled([
+            fetchJsonWithTimeout<{ gameIds?: string[] }>("/api/watchboards/active", {
               headers: { "x-user-id": user.id.toString() },
             }),
-            fetch("/api/watchboards/props", {
+            fetchJsonWithTimeout<{ props?: WatchboardProp[] }>("/api/watchboards/props", {
               headers: { "x-user-id": user.id.toString() },
             }),
-            fetch("/api/watchboards/players", {
+            fetchJsonWithTimeout<{ players?: WatchboardPlayer[] }>("/api/watchboards/players", {
               headers: { "x-user-id": user.id.toString() },
             }),
           ]);
-          const gamesData = await gamesRes.json();
-          const propsData = await propsRes.json();
-          const playersData = await playersRes.json();
-          gameIds = gamesData.gameIds || [];
-          props = propsData.props || [];
-          players = playersData.players || [];
+          gameIds = gamesResult.status === "fulfilled" ? (gamesResult.value.gameIds || []) : [];
+          props = propsResult.status === "fulfilled" ? (propsResult.value.props || []) : [];
+          players = playersResult.status === "fulfilled" ? (playersResult.value.players || []) : [];
         }
         
         setState({
@@ -192,8 +284,40 @@ export function useWatchboards() {
           error: null,
         });
       } catch (err) {
-        console.error("[useWatchboards] Fetch error:", err);
-        setState(prev => ({ ...prev, isLoading: false, error: "Failed to load watchboards" }));
+        console.error("[useWatchboards] Primary fetch error, attempting fallback:", err);
+        try {
+          const fallbackData = await fetchJsonWithTimeout<{ boards?: WatchboardHomePreviewBoard[] }>("/api/watchboards/home-preview?fast=1", {
+            headers: { "x-user-id": user.id.toString() },
+          }, 12000);
+          const fallbackBoards = mapHomePreviewBoardsToWatchboards(fallbackData.boards || [], user.id.toString());
+          if (fallbackBoards.length > 0) {
+            const fallbackActive = fallbackBoards[0] || null;
+            let fallbackGameIds: string[] = [];
+            if (fallbackActive) {
+              const activeResult = await fetchJsonWithTimeout<{ gameIds?: string[] }>("/api/watchboards/active", {
+                headers: { "x-user-id": user.id.toString() },
+              }, 12000).catch(() => null);
+              fallbackGameIds = activeResult?.gameIds || [];
+            }
+            setState((prev) => ({
+              ...prev,
+              boards: fallbackBoards,
+              activeBoard: fallbackActive,
+              gameIds: fallbackGameIds,
+              isLoading: false,
+              error: null,
+            }));
+            return;
+          }
+        } catch (fallbackErr) {
+          console.error("[useWatchboards] Fallback fetch error:", fallbackErr);
+        }
+        setState(prev => ({
+          ...prev,
+          isLoading: false,
+          // Keep existing board state if already loaded; avoid hard-failing the page.
+          error: prev.boards.length > 0 ? null : "Failed to load watchboards",
+        }));
       }
     } else {
       // Guest mode - use localStorage
@@ -248,6 +372,51 @@ export function useWatchboards() {
     fetchBoards();
   }, [isAuthenticated, user?.id]);
 
+  // Broadcast mutation-driven watchboard state so Home/DataHub stays in sync.
+  useEffect(() => {
+    if (state.isLoading) return;
+    if (!hasBroadcastInitialStateRef.current) {
+      hasBroadcastInitialStateRef.current = true;
+      return;
+    }
+    broadcastWatchboardState("useWatchboards");
+  }, [
+    broadcastWatchboardState,
+    state.activeBoard?.id,
+    state.boards,
+    state.gameIds,
+    state.isLoading,
+    state.players,
+    state.props,
+  ]);
+
+  // Keep this hook in sync with external optimistic mutations
+  // (e.g., AddToWatchboardModal) in the same event tick.
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const onWatchboardChanged = (event: Event) => {
+      const detail = (event as CustomEvent<WatchboardChangeDetail>).detail || {};
+      const action = String(detail.action || "");
+      const itemId = String(detail.itemId || "").trim();
+      const boardId = typeof detail.boardId === "number" ? detail.boardId : null;
+      const entity = String(detail.entity || "").toLowerCase();
+      if (!itemId || !boardId) return;
+      if (action !== "add" && action !== "remove" && action !== "rollback:add" && action !== "rollback:remove") return;
+      if (entity !== "game") return;
+      setState((prev) => {
+        if (prev.activeBoard?.id !== boardId) return prev;
+        if (action === "add" || action === "rollback:remove") {
+          if (prev.gameIds.includes(itemId)) return prev;
+          return { ...prev, gameIds: [...prev.gameIds, itemId] };
+        }
+        if (!prev.gameIds.includes(itemId)) return prev;
+        return { ...prev, gameIds: prev.gameIds.filter((id) => id !== itemId) };
+      });
+    };
+    window.addEventListener("watchboards:changed", onWatchboardChanged as EventListener);
+    return () => window.removeEventListener("watchboards:changed", onWatchboardChanged as EventListener);
+  }, []);
+
   // Add game to active board (legacy - for backwards compatibility)
   const addGame = useCallback(async (gameId: string, addedFrom?: string): Promise<{ success: boolean; boardName?: string; error?: string }> => {
     if (state.gameIds.includes(gameId)) {
@@ -255,6 +424,13 @@ export function useWatchboards() {
     }
 
     if (isAuthenticated && user) {
+      const boardId = state.activeBoard?.id ?? null;
+      const beforeCount = state.gameIds.length;
+      setState(prev => ({
+        ...prev,
+        gameIds: prev.gameIds.includes(gameId) ? prev.gameIds : [...prev.gameIds, gameId],
+      }));
+      emitMutationEvent({ action: "add", itemId: gameId, boardId, beforeCount, afterCount: beforeCount + 1, entity: "game" });
       try {
         const res = await fetch("/api/watchboards/games", {
           method: "POST",
@@ -267,14 +443,14 @@ export function useWatchboards() {
         const data = await res.json();
         
         if (data.success) {
-          setState(prev => ({
-            ...prev,
-            gameIds: [...prev.gameIds, gameId],
-          }));
           return { success: true, boardName: data.boardName };
         }
+        setState(prev => ({ ...prev, gameIds: prev.gameIds.filter(id => id !== gameId) }));
+        emitMutationEvent({ action: "rollback:add", itemId: gameId, boardId, beforeCount: beforeCount + 1, afterCount: beforeCount, entity: "game" });
         return { success: false, error: data.error };
       } catch (err) {
+        setState(prev => ({ ...prev, gameIds: prev.gameIds.filter(id => id !== gameId) }));
+        emitMutationEvent({ action: "rollback:add", itemId: gameId, boardId, beforeCount: beforeCount + 1, afterCount: beforeCount, entity: "game" });
         return { success: false, error: "Failed to add game" };
       }
     } else {
@@ -297,7 +473,7 @@ export function useWatchboards() {
       
       return { success: true, boardName: state.activeBoard?.name || "My Watchboard" };
     }
-  }, [isAuthenticated, user, state.gameIds, state.activeBoard]);
+  }, [emitMutationEvent, isAuthenticated, state.activeBoard, state.gameIds, user]);
 
   // Add game to a SPECIFIC board (new API - for modal use)
   const addGameToBoard = useCallback(async (
@@ -305,6 +481,17 @@ export function useWatchboards() {
     boardId: number, 
     addedFrom?: string
   ): Promise<{ success: boolean; boardName?: string; boardId?: number; error?: string }> => {
+    const isActiveBoardTarget = state.activeBoard?.id === boardId;
+    const beforeCount = state.gameIds.length;
+    if (isActiveBoardTarget && !state.gameIds.includes(gameId)) {
+      setState(prev => ({
+        ...prev,
+        gameIds: prev.gameIds.includes(gameId) ? prev.gameIds : [...prev.gameIds, gameId],
+      }));
+      emitMutationEvent({ action: "add", itemId: gameId, boardId, beforeCount, afterCount: beforeCount + 1, entity: "game" });
+    } else {
+      emitMutationEvent({ action: "add", itemId: gameId, boardId, beforeCount, afterCount: beforeCount, entity: "game" });
+    }
     if (isAuthenticated && user) {
       try {
         const res = await fetch("/api/watchboards/games", {
@@ -318,17 +505,18 @@ export function useWatchboards() {
         const data = await res.json();
         
         if (data.success) {
-          // If added to active board, update local state
-          if (state.activeBoard?.id === boardId) {
-            setState(prev => ({
-              ...prev,
-              gameIds: [...prev.gameIds, gameId],
-            }));
-          }
           return { success: true, boardName: data.boardName, boardId: data.boardId };
+        }
+        if (isActiveBoardTarget) {
+          setState(prev => ({ ...prev, gameIds: prev.gameIds.filter(id => id !== gameId) }));
+          emitMutationEvent({ action: "rollback:add", itemId: gameId, boardId, beforeCount: beforeCount + 1, afterCount: beforeCount, entity: "game" });
         }
         return { success: false, error: data.error, boardName: data.boardName };
       } catch (err) {
+        if (isActiveBoardTarget) {
+          setState(prev => ({ ...prev, gameIds: prev.gameIds.filter(id => id !== gameId) }));
+          emitMutationEvent({ action: "rollback:add", itemId: gameId, boardId, beforeCount: beforeCount + 1, afterCount: beforeCount, entity: "game" });
+        }
         return { success: false, error: "Failed to add game" };
       }
     } else {
@@ -355,28 +543,40 @@ export function useWatchboards() {
       const board = state.boards.find(b => b.id === boardId);
       return { success: true, boardName: board?.name || "Watchboard", boardId };
     }
-  }, [isAuthenticated, user, state.activeBoard, state.boards]);
+  }, [emitMutationEvent, isAuthenticated, state.activeBoard, state.boards, state.gameIds, user]);
 
   // Remove game from active board
   const removeGame = useCallback(async (gameId: string): Promise<boolean> => {
     if (isAuthenticated && user) {
+      const boardId = state.activeBoard?.id ?? null;
+      const beforeIds = [...state.gameIds];
+      const beforeCount = state.gameIds.length;
+      setState(prev => ({
+        ...prev,
+        gameIds: prev.gameIds.filter(id => id !== gameId),
+      }));
+      const afterIds = beforeIds.filter((id) => id !== gameId);
+      console.log("[WATCHBOARD DELETE]", { beforeIds, deletedId: gameId, afterIds });
+      emitMutationEvent({ action: "remove", itemId: gameId, boardId, beforeCount, afterCount: Math.max(0, beforeCount - 1), entity: "game" });
       try {
         await fetch(`/api/watchboards/games/${encodeURIComponent(gameId)}`, {
           method: "DELETE",
           headers: { "x-user-id": user.id.toString() },
         });
-        setState(prev => ({
-          ...prev,
-          gameIds: prev.gameIds.filter(id => id !== gameId),
-        }));
         return true;
       } catch {
+        setState(prev => ({
+          ...prev,
+          gameIds: prev.gameIds.includes(gameId) ? prev.gameIds : [...prev.gameIds, gameId],
+        }));
+        emitMutationEvent({ action: "rollback:remove", itemId: gameId, boardId, beforeCount: Math.max(0, beforeCount - 1), afterCount: beforeCount, entity: "game" });
         return false;
       }
     } else {
       // Guest mode
       const gamesMap = getGuestGames();
       const boardId = state.activeBoard?.id || 1;
+      const beforeIds = [...state.gameIds];
       gamesMap[boardId] = (gamesMap[boardId] || []).filter(id => id !== gameId);
       setGuestGames(gamesMap);
       
@@ -384,9 +584,18 @@ export function useWatchboards() {
         ...prev,
         gameIds: prev.gameIds.filter(id => id !== gameId),
       }));
+      const afterIds = beforeIds.filter((id) => id !== gameId);
+      console.log("[WATCHBOARD DELETE]", { beforeIds, deletedId: gameId, afterIds });
+      emitMutationEvent({
+        action: "remove",
+        itemId: gameId,
+        boardId,
+        beforeCount: beforeIds.length,
+        afterCount: afterIds.length,
+      });
       return true;
     }
-  }, [isAuthenticated, user, state.activeBoard]);
+  }, [emitMutationEvent, isAuthenticated, state.activeBoard, state.gameIds, user]);
 
   // Reorder games
   const reorderGames = useCallback(async (newOrder: string[]): Promise<boolean> => {
@@ -433,11 +642,14 @@ export function useWatchboards() {
         });
         const data = await res.json();
         if (data.board) {
+          const incomingBoard = data.board as Watchboard;
           setState(prev => ({
             ...prev,
-            boards: [...prev.boards, data.board],
+            boards: prev.boards.some((board) => board.id === incomingBoard.id)
+              ? prev.boards.map((board) => (board.id === incomingBoard.id ? incomingBoard : board))
+              : [...prev.boards, incomingBoard],
           }));
-          return data.board;
+          return incomingBoard;
         }
         return null;
       } catch {
@@ -551,6 +763,11 @@ export function useWatchboards() {
           method: "DELETE",
           headers: { "x-user-id": user.id.toString() },
         });
+        if (typeof window !== "undefined") {
+          window.dispatchEvent(new CustomEvent("watchboards:changed", {
+            detail: { source: "mutation:delete-board", action: "delete-board", boardId, ts: Date.now() },
+          }));
+        }
         await fetchBoards();
         return true;
       } catch {
@@ -587,6 +804,11 @@ export function useWatchboards() {
         isLoading: false,
         error: null,
       });
+      if (typeof window !== "undefined") {
+        window.dispatchEvent(new CustomEvent("watchboards:changed", {
+          detail: { source: "mutation:delete-board", action: "delete-board", boardId, ts: Date.now() },
+        }));
+      }
       return true;
     }
   }, [isAuthenticated, user, state.boards.length, state.activeBoard, fetchBoards]);
@@ -804,6 +1026,8 @@ export function useWatchboards() {
   // Remove prop from active board
   const removeProp = useCallback(async (propId: number): Promise<boolean> => {
     if (isAuthenticated && user) {
+      const boardId = state.activeBoard?.id ?? null;
+      const beforeCount = state.props.length;
       try {
         await fetch(`/api/watchboards/props/${propId}`, {
           method: "DELETE",
@@ -813,6 +1037,13 @@ export function useWatchboards() {
           ...prev,
           props: prev.props.filter(p => p.id !== propId),
         }));
+        emitMutationEvent({
+          action: "remove",
+          itemId: String(propId),
+          boardId,
+          beforeCount,
+          afterCount: Math.max(0, beforeCount - 1),
+        });
         return true;
       } catch {
         return false;
@@ -828,9 +1059,16 @@ export function useWatchboards() {
         ...prev,
         props: prev.props.filter(p => p.id !== propId),
       }));
+      emitMutationEvent({
+        action: "remove",
+        itemId: String(propId),
+        boardId,
+        beforeCount: state.props.length,
+        afterCount: Math.max(0, state.props.length - 1),
+      });
       return true;
     }
-  }, [isAuthenticated, user, state.activeBoard]);
+  }, [emitMutationEvent, isAuthenticated, state.activeBoard, state.props.length, user]);
 
   // Update prop (e.g., current stat value)
   const updateProp = useCallback(async (propId: number, updates: { current_stat_value?: number; selection?: string; line_value?: number }): Promise<boolean> => {
@@ -897,6 +1135,53 @@ export function useWatchboards() {
     prop_selection?: string;
     board_id?: number;
   }): Promise<{ success: boolean; error?: string }> => {
+    const boardId = player.board_id ?? state.activeBoard?.id ?? null;
+    const beforeCount = state.players.length;
+    const optimisticPlayerName = String(player.player_name || "").trim();
+    const optimisticSport = String(player.sport || "").trim();
+    if (boardId !== null && boardId === state.activeBoard?.id && optimisticPlayerName && optimisticSport) {
+      setState(prev => {
+        if (prev.players.some(p => p.player_name === optimisticPlayerName && p.sport === optimisticSport)) {
+          return prev;
+        }
+        const optimisticPlayer: WatchboardPlayer = {
+          id: -Date.now(),
+          watchboard_id: boardId,
+          user_id: user?.id ? String(user.id) : "guest",
+          player_name: optimisticPlayerName,
+          player_id: player.player_id || null,
+          sport: optimisticSport,
+          team: player.team || null,
+          team_abbr: player.team_abbr || null,
+          position: player.position || null,
+          headshot_url: player.headshot_url || null,
+          prop_type: player.prop_type || null,
+          prop_line: player.prop_line ?? null,
+          prop_selection: player.prop_selection || null,
+          current_stat_value: null,
+          order_index: prev.players.length,
+          is_active: true,
+          created_at: new Date().toISOString(),
+        };
+        return { ...prev, players: [...prev.players, optimisticPlayer] };
+      });
+      emitMutationEvent({
+        action: "add",
+        itemId: `${optimisticSport}:${optimisticPlayerName}`,
+        boardId,
+        beforeCount,
+        afterCount: beforeCount + 1,
+      });
+    } else if (boardId !== null) {
+      emitMutationEvent({
+        action: "add",
+        itemId: `${optimisticSport}:${optimisticPlayerName}`,
+        boardId,
+        beforeCount,
+        afterCount: beforeCount,
+      });
+    }
+
     if (isAuthenticated && user) {
       try {
         const res = await fetch("/api/watchboards/players", {
@@ -910,11 +1195,39 @@ export function useWatchboards() {
         const data = await res.json();
         
         if (data.success) {
-          await fetchBoards();
+          if (boardId !== null && boardId === state.activeBoard?.id) {
+            await fetchBoards();
+          }
           return { success: true };
+        }
+        if (boardId !== null && boardId === state.activeBoard?.id && optimisticPlayerName && optimisticSport) {
+          setState(prev => ({
+            ...prev,
+            players: prev.players.filter(p => !(p.player_name === optimisticPlayerName && p.sport === optimisticSport && p.id < 0)),
+          }));
+          emitMutationEvent({
+            action: "rollback:add",
+            itemId: `${optimisticSport}:${optimisticPlayerName}`,
+            boardId,
+            beforeCount: beforeCount + 1,
+            afterCount: beforeCount,
+          });
         }
         return { success: false, error: data.error };
       } catch {
+        if (boardId !== null && boardId === state.activeBoard?.id && optimisticPlayerName && optimisticSport) {
+          setState(prev => ({
+            ...prev,
+            players: prev.players.filter(p => !(p.player_name === optimisticPlayerName && p.sport === optimisticSport && p.id < 0)),
+          }));
+          emitMutationEvent({
+            action: "rollback:add",
+            itemId: `${optimisticSport}:${optimisticPlayerName}`,
+            boardId,
+            beforeCount: beforeCount + 1,
+            afterCount: beforeCount,
+          });
+        }
         return { success: false, error: "Failed to follow player" };
       }
     } else {
@@ -976,22 +1289,42 @@ export function useWatchboards() {
       
       return { success: true };
     }
-  }, [isAuthenticated, user, state.activeBoard, fetchBoards]);
+  }, [emitMutationEvent, fetchBoards, isAuthenticated, state.activeBoard, state.players.length, user]);
 
   // Unfollow a player
   const unfollowPlayer = useCallback(async (playerId: number): Promise<boolean> => {
     if (isAuthenticated && user) {
+      const beforeCount = state.players.length;
+      const existingPlayer = state.players.find(p => p.id === playerId);
+      const boardId = state.activeBoard?.id ?? null;
+      setState(prev => ({
+        ...prev,
+        players: prev.players.filter(p => p.id !== playerId),
+      }));
+      emitMutationEvent({
+        action: "remove",
+        itemId: existingPlayer ? `${existingPlayer.sport}:${existingPlayer.player_name}` : String(playerId),
+        boardId,
+        beforeCount,
+        afterCount: Math.max(0, beforeCount - 1),
+      });
       try {
         await fetch(`/api/watchboards/players/${playerId}`, {
           method: "DELETE",
           headers: { "x-user-id": user.id.toString() },
         });
-        setState(prev => ({
-          ...prev,
-          players: prev.players.filter(p => p.id !== playerId),
-        }));
         return true;
       } catch {
+        if (existingPlayer) {
+          setState(prev => ({ ...prev, players: [...prev.players, existingPlayer] }));
+          emitMutationEvent({
+            action: "rollback:remove",
+            itemId: `${existingPlayer.sport}:${existingPlayer.player_name}`,
+            boardId,
+            beforeCount: Math.max(0, beforeCount - 1),
+            afterCount: beforeCount,
+          });
+        }
         return false;
       }
     } else {
@@ -1009,7 +1342,7 @@ export function useWatchboards() {
       }));
       return true;
     }
-  }, [isAuthenticated, user, state.activeBoard]);
+  }, [emitMutationEvent, isAuthenticated, state.activeBoard, state.players, user]);
 
   // Unfollow by name
   const unfollowPlayerByName = useCallback(async (playerName: string, sport: string): Promise<boolean> => {

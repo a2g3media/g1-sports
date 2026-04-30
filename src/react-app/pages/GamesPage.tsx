@@ -1,4 +1,21 @@
 /**
+ * :rotating_light: LOCKED FILE — DO NOT MODIFY :rotating_light:
+ *
+ * This file contains the stabilized live games engine.
+ *
+ * DO NOT CHANGE:
+ * - live loop (setInterval / rehydration)
+ * - resolveGameState
+ * - live detection (isGameLive)
+ * - bucket logic (LIVE / FINAL / UPCOMING)
+ * - data pipeline or mappings
+ *
+ * ONLY ALLOWED:
+ * - small UI text/spacing tweaks
+ *
+ * Any logic change requires explicit approval.
+ */
+/**
  * GamesPage - TODAY COMMAND CENTER
  * Premium watchboard layout: compact header, sport quick-jump, games by league
  */
@@ -24,14 +41,14 @@ import { incrementPerfCounter, startPerfTimer } from '@/react-app/lib/perfTeleme
 import { OddsTelemetryDebugPanel } from '@/react-app/components/debug/OddsTelemetryDebugPanel';
 import { generateCoachWhisper as _generateCoachWhisper } from '@/react-app/lib/coachWhisper';
 import { useFeatureFlags } from '@/react-app/hooks/useFeatureFlags';
-import FavoriteEntityButton from '@/react-app/components/FavoriteEntityButton';
-import { useFavorites } from '@/react-app/hooks/useFavorites';
 import { prefetch } from '@/react-app/components/LazyRoute';
+import { useSafeDataLoader } from '@/react-app/lib/useSafeDataLoader';
 // getTeamLogoUrl imported via teamLogos but unused currently
 // import { getTeamLogoUrl } from '@/react-app/lib/teamLogos';
 
 type StatusFilter = 'all' | 'live' | 'scheduled' | 'final';
 type CommandTab = 'scores' | 'odds' | 'props';
+type GamesFetchResult = { blockingError: string | null };
 
 // ============================================
 // DATE-BASED GAMES CACHE - Instant date switching
@@ -320,6 +337,273 @@ const getGamesApiPath = (dateStr: string, sport: string, includeOdds: boolean = 
     sport: String(sport || "").trim().toUpperCase() || "ALL",
     tab: includeOdds ? "odds" : "scores",
   });
+};
+
+type ResolvedStatusBucket = 'LIVE' | 'FINAL' | 'UPCOMING';
+
+type FreshSportTruthSnapshot = {
+  canonicalId: string;
+  canonicalMatchKey: string | null;
+  sport: string;
+  status: string;
+  period: string | null;
+  periodLabel: string | null;
+  clock: string | null;
+  homeScore: number | null;
+  awayScore: number | null;
+  startTime: string | null;
+  lastUpdatedAt: string | null;
+  source: 'sport_fresh';
+};
+
+type ResolvedGameState = {
+  canonicalId: string;
+  canonicalMatchKey: string | null;
+  sport: string;
+  status_bucket: ResolvedStatusBucket;
+  status: string;
+  display_status_label: string;
+  period: string | null;
+  period_label: string | null;
+  clock: string | null;
+  homeScore: number | null;
+  awayScore: number | null;
+  start_time: string | null;
+  last_updated_at: string | null;
+  source_of_truth_used: 'sport_fresh' | 'all_payload';
+};
+
+const LIVE_STATUS_TOKENS = new Set([
+  'LIVE',
+  'IN_PROGRESS',
+  'HALFTIME',
+  'HALF_TIME',
+  'INTERMISSION',
+  'END_PERIOD',
+  'END_OF_PERIOD',
+  'OT',
+  'OVERTIME',
+  'EXTRA_TIME',
+  'ET',
+  'Q1',
+  'Q2',
+  'Q3',
+  'Q4',
+  '1H',
+  '2H',
+  'P1',
+  'P2',
+  'P3',
+  'TOP',
+  'BOT',
+  'MID',
+  'END',
+  'RUNNING',
+]);
+
+const FINAL_STATUS_TOKENS = new Set([
+  'FINAL',
+  'COMPLETED',
+  'COMPLETE',
+  'CLOSED',
+  'FT',
+  'FULL_TIME',
+  'AFTER_ET',
+  'AET',
+  'AFTER_PENALTIES',
+  'PEN',
+  'ENDED',
+  'POSTGAME',
+]);
+
+const UPCOMING_STATUS_TOKENS = new Set([
+  'SCHEDULED',
+  'NOT_STARTED',
+  'PRE',
+  'PREGAME',
+  'UPCOMING',
+  'NS',
+  'TBD',
+  'DELAYED',
+]);
+
+const SPORT_REFRESH_CANDIDATES = ['MLB', 'NBA', 'NHL', 'NFL', 'NCAAB', 'NCAAF', 'SOCCER', 'MMA', 'GOLF'] as const;
+const LIVE_REHYDRATE_INTERVAL_MS = 20_000;
+const SLATE_REHYDRATE_INTERVAL_MS = 75_000;
+const SPORT_TRUTH_CACHE_TTL_MS = 6_000;
+
+const normalizeStatusUpper = (value: unknown): string => {
+  return String(value || '').trim().toUpperCase().replace(/\s+/g, '_');
+};
+
+const normalizeClockText = (value: unknown): string | null => {
+  const text = String(value ?? '').trim();
+  return text ? text : null;
+};
+
+const normalizePeriodText = (value: unknown): string | null => {
+  const text = String(value ?? '').trim();
+  return text ? text : null;
+};
+
+const sportFromGameLike = (game: any): string => normalizeSportForGamesPage(game?.sport, game?.league);
+
+const canonicalGameId = (game: any): string => {
+  const preferred = [
+    game?.game_id,
+    game?.gameId,
+    game?.id,
+    game?.external_id,
+    game?.externalId,
+  ]
+    .map((v) => String(v || '').trim())
+    .find(Boolean);
+  if (preferred) return preferred;
+  const fallback = [
+    sportFromGameLike(game),
+    String(game?.home_team_code || game?.homeTeam?.abbreviation || game?.homeTeam?.abbr || game?.home_team_name || '').trim(),
+    String(game?.away_team_code || game?.awayTeam?.abbreviation || game?.awayTeam?.abbr || game?.away_team_name || '').trim(),
+    String(game?.start_time || game?.startTime || '').trim(),
+  ]
+    .filter(Boolean)
+    .join('|');
+  return fallback || `unknown_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+};
+
+const canonicalMatchKeyFromGame = (game: any): string | null => {
+  return buildOddsMatchKey(
+    sportFromGameLike(game),
+    game?.home_team_code || game?.homeTeam?.abbreviation || game?.homeTeam?.abbr || game?.home_team_name || game?.homeTeam?.name,
+    game?.away_team_code || game?.awayTeam?.abbreviation || game?.awayTeam?.abbr || game?.away_team_name || game?.awayTeam?.name,
+    game?.start_time || game?.startTime || ''
+  );
+};
+
+const statusLooksLive = (status: string, period: string | null, clock: string | null): boolean => {
+  if (LIVE_STATUS_TOKENS.has(status)) return true;
+  if (FINAL_STATUS_TOKENS.has(status) || UPCOMING_STATUS_TOKENS.has(status)) return false;
+  const periodText = String(period || '').toUpperCase();
+  const clockText = String(clock || '').toUpperCase();
+  return LIVE_STATUS_TOKENS.has(periodText) || LIVE_STATUS_TOKENS.has(clockText) || Boolean(clockText && /[:']/i.test(clockText));
+};
+
+const statusLooksFinal = (status: string): boolean => FINAL_STATUS_TOKENS.has(status);
+
+const toStatusBucket = (status: string, period: string | null, clock: string | null): ResolvedStatusBucket => {
+  if (statusLooksFinal(status)) return 'FINAL';
+  if (statusLooksLive(status, period, clock)) return 'LIVE';
+  return 'UPCOMING';
+};
+
+const isFinalLikeStatusText = (status: unknown): boolean => {
+  const upper = normalizeStatusUpper(status);
+  return FINAL_STATUS_TOKENS.has(upper) || upper === 'FINAL';
+};
+
+const parsePeriodNumber = (period: unknown): number | null => {
+  if (typeof period === 'number' && Number.isFinite(period)) return period;
+  const raw = String(period ?? '').trim();
+  if (!raw) return null;
+  const match = raw.match(/\d{1,2}/);
+  if (!match) return null;
+  const num = Number(match[0]);
+  return Number.isFinite(num) ? num : null;
+};
+
+const isClockNonZero = (clock: unknown): boolean => {
+  const raw = String(clock ?? '').trim();
+  if (!raw) return false;
+  const digitsOnly = raw.replace(/[^0-9]/g, '');
+  if (!digitsOnly) return false;
+  return Number(digitsOnly) > 0;
+};
+
+/** :lock: LOCKED LOGIC — DO NOT TOUCH */
+function isGameLive(game: any): boolean {
+  const status = String(game?.status || '').trim();
+  const statusUpper = normalizeStatusUpper(status);
+  if (isFinalLikeStatusText(statusUpper)) return false;
+  if (
+    status === 'inprogress' ||
+    statusUpper === 'IN_PROGRESS' ||
+    status === 'live' ||
+    statusUpper === 'LIVE' ||
+    status === 'playing' ||
+    statusUpper === 'PLAYING'
+  ) {
+    return true;
+  }
+
+  const period = game?.period ?? game?.period_label ?? game?.periodLabel;
+  const periodNumber = parsePeriodNumber(period);
+  if (periodNumber != null && periodNumber > 0) return true;
+
+  const clock = game?.clock;
+  if (isClockNonZero(clock)) return true;
+
+  return false;
+}
+
+const cleanFinalLiveFields = (bucket: ResolvedStatusBucket, value: string | null): string | null => {
+  if (bucket === 'FINAL') return null;
+  return value;
+};
+
+const buildFreshTruthSnapshot = (game: any): FreshSportTruthSnapshot => {
+  const canonicalId = canonicalGameId(game);
+  const status = normalizeStatusUpper(game?.status);
+  return {
+    canonicalId,
+    canonicalMatchKey: canonicalMatchKeyFromGame(game),
+    sport: sportFromGameLike(game),
+    status,
+    period: normalizePeriodText(game?.period),
+    periodLabel: normalizePeriodText(game?.period_label ?? game?.periodLabel),
+    clock: normalizeClockText(game?.clock),
+    homeScore: toFiniteNumberOrNull(game?.home_score ?? game?.homeTeam?.score),
+    awayScore: toFiniteNumberOrNull(game?.away_score ?? game?.awayTeam?.score),
+    startTime: String(game?.start_time || game?.startTime || '').trim() || null,
+    lastUpdatedAt: String(game?.last_updated_at || game?.updated_at || '').trim() || null,
+    source: 'sport_fresh',
+  };
+};
+
+/** :lock: LOCKED LOGIC — DO NOT TOUCH */
+const resolveGameState = (
+  rawGame: any,
+  freshTruth?: FreshSportTruthSnapshot
+): ResolvedGameState => {
+  const canonicalId = canonicalGameId(rawGame);
+  const canonicalMatchKey = canonicalMatchKeyFromGame(rawGame);
+  const sport = sportFromGameLike(rawGame);
+  const baseStatus = normalizeStatusUpper(rawGame?.status || 'SCHEDULED');
+  const mergedStatus = freshTruth?.status || baseStatus;
+  const mergedPeriod = normalizePeriodText(freshTruth?.period ?? rawGame?.period);
+  const mergedPeriodLabel = normalizePeriodText(freshTruth?.periodLabel ?? rawGame?.period_label ?? rawGame?.periodLabel);
+  const mergedClock = normalizeClockText(freshTruth?.clock ?? rawGame?.clock);
+  const bucket = toStatusBucket(mergedStatus, mergedPeriodLabel || mergedPeriod, mergedClock);
+
+  const statusForCard = bucket === 'UPCOMING' ? 'SCHEDULED' : bucket;
+  const finalPeriod = cleanFinalLiveFields(bucket, mergedPeriod);
+  const finalPeriodLabel = cleanFinalLiveFields(bucket, mergedPeriodLabel);
+  const finalClock = cleanFinalLiveFields(bucket, mergedClock);
+
+  return {
+    canonicalId,
+    canonicalMatchKey,
+    sport,
+    status_bucket: bucket,
+    status: statusForCard,
+    display_status_label: finalPeriodLabel || finalPeriod || finalClock || statusForCard,
+    period: finalPeriod,
+    period_label: finalPeriodLabel,
+    clock: finalClock,
+    homeScore: freshTruth?.homeScore ?? toFiniteNumberOrNull(rawGame?.home_score),
+    awayScore: freshTruth?.awayScore ?? toFiniteNumberOrNull(rawGame?.away_score),
+    start_time: String(freshTruth?.startTime || rawGame?.start_time || '').trim() || null,
+    last_updated_at: String(freshTruth?.lastUpdatedAt || rawGame?.last_updated_at || '').trim() || null,
+    source_of_truth_used: freshTruth ? 'sport_fresh' : 'all_payload',
+  };
 };
 
 // Sport validation - ALL is special, fetches from all sports
@@ -793,18 +1077,23 @@ export function GamesPage() {
   const navigate = useNavigate();
   const { openChat } = useGlobalAI();
   const { flags } = useFeatureFlags();
-  const { isFavorite } = useFavorites();
+
+  useEffect(() => {
+    if (typeof process !== 'undefined' && process.env.NODE_ENV === 'development') {
+      console.warn(':rotating_light: GamesPage is LOCKED — logic modifications are restricted.');
+    }
+  }, []);
   
   // Watchboard integration - with defensive checks
   const watchboardsResult = useWatchboards();
   const activeBoard = watchboardsResult?.activeBoard || null;
+  const activeBoardGameIds = watchboardsResult?.gameIds || [];
   
   // Pre-compute watchboard game IDs as Set for O(1) lookup (instant sport switching)
   const watchboardGameIdsSet = useMemo(() => {
     if (!activeBoard) return new Set<string>();
-    const gameIds = (activeBoard as any).gameIds || [];
-    return new Set<string>(gameIds);
-  }, [activeBoard]);
+    return new Set<string>(activeBoardGameIds);
+  }, [activeBoard, activeBoardGameIds]);
   
   // Fast O(1) lookup function
   const isGameInWatchboard = useCallback((gameId: string): boolean => {
@@ -969,6 +1258,15 @@ export function GamesPage() {
   const currentGamesRef = useRef<any[]>([]);
   const mountedRef = useRef(true);
   const oddsAutoRecoveryAttemptRef = useRef<string>('');
+  const [freshTruthById, setFreshTruthById] = useState<Record<string, FreshSportTruthSnapshot>>({});
+  const [freshTruthByMatchKey, setFreshTruthByMatchKey] = useState<Record<string, FreshSportTruthSnapshot>>({});
+  const [truthCycleCount, setTruthCycleCount] = useState(0);
+  const wasGamesLoaderLoadingRef = useRef(false);
+  const liveMissingCountsRef = useRef<Record<string, number>>({});
+  const [droppedLiveIds, setDroppedLiveIds] = useState<Record<string, true>>({});
+  const liveRefreshInFlightFastRef = useRef(false);
+  const liveRefreshInFlightMlbRef = useRef(false);
+  const gamesPageShapeLoggedRef = useRef(false);
   
   useEffect(() => {
     // React strict mode runs effect cleanup/re-run in development.
@@ -987,8 +1285,9 @@ export function GamesPage() {
     dateToFetch?: Date,
     forceRefresh = false,
     sportToFetch: ExtendedSportKey = 'ALL',
-    silentRefresh = false
-  ) => {
+    silentRefresh = false,
+    loaderManaged = false
+  ): Promise<GamesFetchResult> => {
     const stopPerf = startPerfTimer('games.pageData.fetch');
     const startedAt =
       typeof performance !== 'undefined' && typeof performance.now === 'function'
@@ -1003,9 +1302,9 @@ export function GamesPage() {
     const hasExisting = currentGamesRef.current.length > 0;
     try {
       if (!silentRefresh) {
-        setHubError(null);
+        if (!loaderManaged) setHubError(null);
         setStaleNotice(null);
-        setHubLoading(true);
+        if (!loaderManaged) setHubLoading(true);
       }
       console.info("PAGE_DATA_START", { route: "games", date: dateStr, sport: sportKey, tab: activeTab, forceRefresh });
       const payload = await fetchJsonCached<any>(buildPageDataGamesUrl({
@@ -1029,8 +1328,12 @@ export function GamesPage() {
       const explicitPayloadError = String(payload?.error || "").trim();
       if (payload?.ok === false || explicitPayloadError) {
         const isGlobalSlate = sportKey === 'ALL' && !isSingleSportRoute;
+        const payloadError = explicitPayloadError || "Unable to load games right now.";
         if (!hasExisting && isGlobalSlate) {
-          setHubError(explicitPayloadError || "Unable to load games right now.");
+          if (loaderManaged) {
+            return { blockingError: payloadError };
+          }
+          setHubError(payloadError);
         } else if (!hasExisting) {
           // Single-sport failure should degrade to an empty slate, never global error UI.
           setRawGames([]);
@@ -1039,7 +1342,7 @@ export function GamesPage() {
         } else {
           setStaleNotice(explicitPayloadError || "Games refresh failed. Showing available slate.");
         }
-        return;
+        return { blockingError: null };
       }
       let nextGames = Array.isArray(payload?.games) ? payload.games : [];
       const nextSummary = (payload?.oddsSummaryByGame && typeof payload.oddsSummaryByGame === 'object')
@@ -1182,6 +1485,7 @@ export function GamesPage() {
           }),
         }).catch(() => {});
       }
+      return { blockingError: null };
     } catch (err) {
       console.warn('[GamesPage] page-data fetch failed', err);
       const msg = String((err as any)?.message || "");
@@ -1209,7 +1513,7 @@ export function GamesPage() {
             setStaleNotice('Soccer slate is temporarily unavailable.');
           }
           setHubError(null);
-          return;
+          return { blockingError: null };
         } catch (soccerRecoveryErr) {
           console.warn('[GamesPage] Soccer recovery request failed', soccerRecoveryErr);
         }
@@ -1232,7 +1536,11 @@ export function GamesPage() {
         setStaleNotice('Showing cached slate while live refresh retries.');
       } else if (!hasExisting) {
         if (sportKey === 'ALL' && !isSingleSportRoute) {
-          setHubError('Unable to load games right now. Please try again.');
+          const globalError = 'Unable to load games right now. Please try again.';
+          if (loaderManaged) {
+            return { blockingError: globalError };
+          }
+          setHubError(globalError);
         } else {
           // Single-sport request failures must render empty-state instead of failure UI.
           setRawGames([]);
@@ -1243,15 +1551,93 @@ export function GamesPage() {
       } else {
         setStaleNotice('Live refresh failed. Showing available slate.');
       }
+      return { blockingError: null };
     } finally {
       stopPerf();
-      if (mountedRef.current && !silentRefresh) {
+      if (mountedRef.current && !silentRefresh && !loaderManaged) {
         setHubLoading(false);
         setRefreshCycleCount((v) => v + 1);
       }
     }
   }, [activeTab, flags.PAGE_DATA_OBSERVABILITY_ENABLED]);
-  
+
+  const gamesLoader = useSafeDataLoader<any[]>(
+    `games:page:${formatDateYYYYMMDD(selectedDate)}:${selectedSport}`,
+    async () => {
+      const result = await fetchGamesPageData(selectedDate, false, selectedSport, false, true);
+      if (result.blockingError) {
+        throw new Error(result.blockingError);
+      }
+      return currentGamesRef.current;
+    },
+    {
+      enabled: false,
+      timeoutMs: 4500,
+      retries: 2,
+      retryDelayMs: 800,
+      seedData: rawGames.length > 0 ? rawGames : undefined,
+    }
+  );
+
+  const collectSportsForTruthRefresh = useCallback((baseGames: any[]): string[] => {
+    const present = new Set<string>();
+    for (const game of baseGames) {
+      const sport = sportFromGameLike(game);
+      if (sport) present.add(sport);
+    }
+    if (selectedSport !== 'ALL') {
+      present.add(selectedSport);
+    }
+    const ordered = SPORT_REFRESH_CANDIDATES.filter((sport) => present.has(sport));
+    if (ordered.length > 0) return ordered;
+    return selectedSport !== 'ALL' ? [selectedSport] : ['MLB', 'NBA', 'NHL', 'SOCCER'];
+  }, [selectedSport]);
+
+  const refreshFreshSportTruth = useCallback(async (
+    dateToFetch: Date,
+    baseGames: any[],
+    forceRefresh = false
+  ) => {
+    const targetSports = collectSportsForTruthRefresh(baseGames);
+    if (targetSports.length === 0) {
+      setFreshTruthById({});
+      setFreshTruthByMatchKey({});
+      return;
+    }
+    const dateStr = formatDateYYYYMMDD(dateToFetch);
+    const settled = await Promise.allSettled(
+      targetSports.map(async (sport) => {
+        const url = `/api/games?sport=${encodeURIComponent(String(sport || '').toLowerCase())}&date=${encodeURIComponent(dateStr)}&includeOdds=1&fresh=${forceRefresh ? '1' : '0'}`;
+        const payload = await fetchJsonCached<any>(url, {
+          cacheKey: `games_sport_truth:${dateStr}:${sport}:${forceRefresh ? 'fresh' : 'cached'}`,
+          ttlMs: forceRefresh ? 0 : SPORT_TRUTH_CACHE_TTL_MS,
+          timeoutMs: 2_500,
+          bypassCache: forceRefresh,
+          init: { credentials: 'include' },
+        });
+        return Array.isArray(payload?.games) ? payload.games : [];
+      })
+    );
+
+    const nextById: Record<string, FreshSportTruthSnapshot> = {};
+    const nextByMatchKey: Record<string, FreshSportTruthSnapshot> = {};
+    for (const result of settled) {
+      if (result.status !== 'fulfilled') continue;
+      for (const raw of result.value) {
+        const snapshot = buildFreshTruthSnapshot(raw);
+        if (!snapshot.canonicalId) continue;
+        nextById[snapshot.canonicalId] = snapshot;
+        if (snapshot.canonicalMatchKey) {
+          nextByMatchKey[snapshot.canonicalMatchKey] = snapshot;
+        }
+      }
+    }
+    if (!mountedRef.current) return;
+    setFreshTruthById(nextById);
+    setFreshTruthByMatchKey(nextByMatchKey);
+    setTruthCycleCount((prev) => prev + 1);
+  }, [collectSportsForTruthRefresh]);
+
   // Pre-fetch adjacent dates in background for instant switching
   const prefetchAdjacentDates = useCallback((baseDate: Date, _sportToFetch: ExtendedSportKey = 'ALL') => {
     // Keep adjacent-date prefetch on ALL so it reuses the same page-data cache path
@@ -1292,6 +1678,25 @@ export function GamesPage() {
     });
   }, []);
   
+  useEffect(() => {
+    const wasLoading = wasGamesLoaderLoadingRef.current;
+    if (wasLoading && !gamesLoader.loading) {
+      setRefreshCycleCount((v) => v + 1);
+    }
+    wasGamesLoaderLoadingRef.current = gamesLoader.loading;
+    setHubLoading(gamesLoader.loading);
+  }, [gamesLoader.loading]);
+
+  useEffect(() => {
+    if (gamesLoader.error && currentGamesRef.current.length === 0) {
+      setHubError(gamesLoader.error.message || 'Unable to load games right now. Please try again.');
+      return;
+    }
+    if (!gamesLoader.loading) {
+      setHubError(null);
+    }
+  }, [gamesLoader.error, gamesLoader.loading]);
+
   // Initial fetch and refetch when date/sport changes.
   // Keep the current slate visible while refresh is in flight.
   useEffect(() => {
@@ -1300,7 +1705,6 @@ export function GamesPage() {
     const sportKey = (selectedSport || 'ALL').toUpperCase();
     setHubError(null);
     setStaleNotice(null);
-    setHubLoading(true);
     const cachedByDate = dateGamesCache.get(dateScopedCacheKey)
       || (() => {
         const fallbackGames = loadCachedGamesForDate(dateStr, sportKey, 10 * 60_000, false);
@@ -1316,13 +1720,9 @@ export function GamesPage() {
       if (Object.keys(cachedByDate.summary).length > 0) {
         setOddsSummaryByGame((prev) => mergeOddsSummaryRecord(prev, cachedByDate.summary));
       }
-      setHubLoading(false);
-      // Silent background refresh keeps cache warm without UI thrash.
-      void fetchGamesPageData(selectedDate, false, selectedSport, true);
-      return;
     }
-    void fetchGamesPageData(selectedDate, false, selectedSport, false);
-  }, [fetchGamesPageData, selectedDate, selectedSport]);
+    void gamesLoader.refresh();
+  }, [gamesLoader.refresh, selectedDate, selectedSport]);
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
@@ -1367,47 +1767,81 @@ export function GamesPage() {
     setOddsSummaryByGame((prev) => mergeOddsSummaryRecord(prev, cached));
   }, [selectedDateStr]);
 
-  // Refresh function - force bypass cache
+  // Refresh function
   const hubRefresh = useCallback(async () => {
-    await fetchGamesPageData(selectedDate, true, selectedSport);
-  }, [fetchGamesPageData, selectedDate, selectedSport]);
-  
+    await gamesLoader.refresh();
+  }, [gamesLoader.refresh]);
+
+  const rawLikelyLiveCount = useMemo(() => {
+    if (rawGames.length === 0) return 0;
+    return rawGames.reduce((count, game) => count + (isGameLive(game) ? 1 : 0), 0);
+  }, [rawGames]);
+
+  useEffect(() => {
+    if (rawGames.length === 0) {
+      setFreshTruthById({});
+      setFreshTruthByMatchKey({});
+      return;
+    }
+    void refreshFreshSportTruth(selectedDate, rawGames, false);
+  }, [rawGames, selectedDate, refreshFreshSportTruth]);
+
+  useEffect(() => {
+    if (rawGames.length === 0) return;
+    const cadenceMs = rawLikelyLiveCount > 0 ? LIVE_REHYDRATE_INTERVAL_MS : SLATE_REHYDRATE_INTERVAL_MS;
+    const interval = window.setInterval(() => {
+      void fetchGamesPageData(selectedDate, true, selectedSport, true);
+      void refreshFreshSportTruth(selectedDate, currentGamesRef.current, true);
+    }, cadenceMs);
+    return () => window.clearInterval(interval);
+  }, [rawGames.length, rawLikelyLiveCount, fetchGamesPageData, refreshFreshSportTruth, selectedDate, selectedSport]);
+
   // Transform raw API games to LiveGame-like format
   const hubGames = useMemo(() => {
     return rawGames.map((game: any) => {
       const sportKey = normalizeSportForGamesPage(game.sport, game.league);
-        const gameId = game.game_id || game.id || `gen_${sportKey}_${game.home_team_code}_${game.away_team_code}_${game.start_time}`;
-        const idSummary = buildOddsLookupCandidates(gameId)
-          .map((candidate) => oddsSummaryByGame[candidate])
-          .find(Boolean);
-        const matchupCandidates = [
-          buildOddsMatchKey(sportKey, game.home_team_code, game.away_team_code, game.start_time),
-          buildOddsMatchKey(sportKey, game.home_team_name, game.away_team_name, game.start_time),
-          buildOddsMatchKey(sportKey, game.home_team_code || game.home_team_name, game.away_team_code || game.away_team_name, game.start_time),
-          buildOddsMatchKey(sportKey, game.home_team_code, game.away_team_code, ""),
-          buildOddsMatchKey(sportKey, game.home_team_name, game.away_team_name, ""),
-        ].filter((key): key is string => Boolean(key));
-        const matchupSummary = matchupCandidates.map((candidate) => oddsSummaryByGame[candidate]).find(Boolean);
-        const summary = idSummary || matchupSummary;
+      const canonicalId = canonicalGameId(game);
+      const canonicalMatchKey = canonicalMatchKeyFromGame(game);
+      const freshTruth = freshTruthById[canonicalId] || (canonicalMatchKey ? freshTruthByMatchKey[canonicalMatchKey] : undefined);
+      const resolved = resolveGameState(game, freshTruth);
+      const gameId = game.game_id || game.id || canonicalId || `gen_${sportKey}_${game.home_team_code}_${game.away_team_code}_${game.start_time}`;
+      const idSummary = buildOddsLookupCandidates(gameId)
+        .map((candidate) => oddsSummaryByGame[candidate])
+        .find(Boolean);
+      const matchupCandidates = [
+        buildOddsMatchKey(sportKey, game.home_team_code, game.away_team_code, game.start_time),
+        buildOddsMatchKey(sportKey, game.home_team_name, game.away_team_name, game.start_time),
+        buildOddsMatchKey(sportKey, game.home_team_code || game.home_team_name, game.away_team_code || game.away_team_name, game.start_time),
+        buildOddsMatchKey(sportKey, game.home_team_code, game.away_team_code, ""),
+        buildOddsMatchKey(sportKey, game.home_team_name, game.away_team_name, ""),
+      ].filter((key): key is string => Boolean(key));
+      const matchupSummary = matchupCandidates.map((candidate) => oddsSummaryByGame[candidate]).find(Boolean);
+      const summary = idSummary || matchupSummary;
+
       return {
         id: gameId,
+        canonicalId: resolved.canonicalId,
         sport: sportKey,
         homeTeam: {
           name: game.home_team_name || game.home_team_code || 'TBD',
           abbreviation: game.home_team_code || 'TBD',
-          score: game.home_score ?? null,
+          score: resolved.homeScore ?? game.home_score ?? null,
           logo: typeof game.home_logo_url === 'string' ? game.home_logo_url : undefined,
         },
         awayTeam: {
           name: game.away_team_name || game.away_team_code || 'TBD',
           abbreviation: game.away_team_code || 'TBD',
-          score: game.away_score ?? null,
+          score: resolved.awayScore ?? game.away_score ?? null,
           logo: typeof game.away_logo_url === 'string' ? game.away_logo_url : undefined,
         },
-        status: game.status || 'SCHEDULED',
-        period: game.period || null,
-        clock: game.clock || null,
-        startTime: game.start_time || null,
+        status: resolved.status,
+        status_bucket: resolved.status_bucket,
+        source_of_truth_used: resolved.source_of_truth_used,
+        period: resolved.period,
+        period_label: resolved.period_label,
+        clock: resolved.clock,
+        startTime: resolved.start_time || game.start_time || null,
+        last_updated_at: resolved.last_updated_at,
         probableAwayPitcher: readProbablePitcherFromGame(game, "away"),
         probableHomePitcher: readProbablePitcherFromGame(game, "home"),
         channel: game.channel || null,
@@ -1421,10 +1855,253 @@ export function GamesPage() {
           total1H: toFiniteNumberOrNull(summary?.first_half?.total?.line ?? game.total_1h ?? game.total1H),
           moneyline1HHome: toFiniteNumberOrNull(summary?.first_half?.moneyline?.home_price ?? game.moneyline_1h_home ?? game.moneyline1HHome),
           moneyline1HAway: toFiniteNumberOrNull(summary?.first_half?.moneyline?.away_price ?? game.moneyline_1h_away ?? game.moneyline1HAway),
+          f5: {
+            spread: {
+              home: toFiniteNumberOrNull(summary?.f5?.spread?.home ?? summary?.first_half?.spread?.home_line),
+              away: toFiniteNumberOrNull(summary?.f5?.spread?.away ?? summary?.first_half?.spread?.away_line),
+            },
+            total: toFiniteNumberOrNull(summary?.f5?.total ?? summary?.first_half?.total?.line),
+            moneyline: {
+              home: toFiniteNumberOrNull(summary?.f5?.moneyline?.home ?? summary?.first_half?.moneyline?.home_price),
+              away: toFiniteNumberOrNull(summary?.f5?.moneyline?.away ?? summary?.first_half?.moneyline?.away_price),
+            },
+          },
         },
       };
     });
-  }, [rawGames, oddsSummaryByGame]);
+  }, [rawGames, oddsSummaryByGame, freshTruthById, freshTruthByMatchKey, truthCycleCount]);
+
+  useEffect(() => {
+    if (gamesPageShapeLoggedRef.current) return;
+    const sample = hubGames.find((game) => game && typeof game === 'object');
+    if (!sample) return;
+    gamesPageShapeLoggedRef.current = true;
+    console.log('GAMES_PAGE_SHAPE', sample);
+  }, [hubGames]);
+
+  const liveGameCatalog = useMemo(() => {
+    const catalog: Record<string, { sport: string; canonicalMatchKey: string | null }> = {};
+    for (const game of hubGames) {
+      const id = String(game?.id || '').trim();
+      if (!id) continue;
+      if (!isGameLive(game)) continue;
+      const sport = normalizeSportForGamesPage(game?.sport);
+      catalog[id] = {
+        sport,
+        canonicalMatchKey: canonicalMatchKeyFromGame(game),
+      };
+    }
+    return catalog;
+  }, [hubGames]);
+
+  /** :lock: LOCKED LOGIC — DO NOT TOUCH */
+  const liveGameIds = useMemo(() => {
+    // Keep all live IDs in the refresh loop so temporarily-missing games
+    // auto-recover once the provider emits fresh truth again.
+    return Object.keys(liveGameCatalog);
+  }, [liveGameCatalog]);
+
+  useEffect(() => {
+    console.log('LIVE DETECTION CHECK', hubGames.map((g: any) => ({
+      id: g?.id,
+      status: g?.status,
+      period: g?.period ?? g?.period_label ?? null,
+      clock: g?.clock ?? null,
+      isLive: isGameLive(g),
+    })));
+  }, [hubGames, truthCycleCount]);
+
+  useEffect(() => {
+    if (rawGames.length === 0) {
+      liveMissingCountsRef.current = {};
+      setDroppedLiveIds({});
+      return;
+    }
+    setDroppedLiveIds((prev) => {
+      const next: Record<string, true> = {};
+      for (const id of Object.keys(prev)) {
+        if (liveGameCatalog[id]) next[id] = true;
+      }
+      return next;
+    });
+  }, [rawGames.length, liveGameCatalog]);
+
+  const fetchFreshSportTruthByGameIds = useCallback(async (
+    ids: string[],
+    timeoutMs = 12_000
+  ): Promise<Record<string, FreshSportTruthSnapshot>> => {
+    if (ids.length === 0) return {};
+    const idSet = new Set(ids.map((id) => String(id || '').trim()).filter(Boolean));
+    if (idSet.size === 0) return {};
+
+    const sports = Array.from(new Set(
+      Array.from(idSet)
+        .map((id) => liveGameCatalog[id]?.sport)
+        .filter((sport): sport is string => Boolean(sport))
+    ));
+    if (sports.length === 0) return {};
+
+    const dateStr = formatDateYYYYMMDD(selectedDate);
+    const settled = await Promise.allSettled(
+      sports.map(async (sport) => {
+        const url = `/api/games?sport=${encodeURIComponent(sport)}&date=${encodeURIComponent(dateStr)}&includeOdds=1&fresh=1`;
+        const payload = await fetchJsonCached<any>(url, {
+          cacheKey: `games_live_truth:${dateStr}:${sport}`,
+          ttlMs: 0,
+          timeoutMs,
+          bypassCache: true,
+          init: { credentials: 'include' },
+        });
+        if (Array.isArray(payload)) return payload;
+        return Array.isArray(payload?.games) ? payload.games : [];
+      })
+    );
+
+    const byId: Record<string, FreshSportTruthSnapshot> = {};
+    const byMatchKey: Record<string, FreshSportTruthSnapshot> = {};
+    for (const result of settled) {
+      if (result.status !== 'fulfilled') continue;
+      for (const raw of result.value) {
+        const snapshot = buildFreshTruthSnapshot(raw);
+        byId[snapshot.canonicalId] = snapshot;
+        if (snapshot.canonicalMatchKey) byMatchKey[snapshot.canonicalMatchKey] = snapshot;
+      }
+    }
+
+    const selected: Record<string, FreshSportTruthSnapshot> = {};
+    for (const id of idSet) {
+      const direct = byId[id];
+      if (direct) {
+        selected[id] = direct;
+        continue;
+      }
+      const matchKey = liveGameCatalog[id]?.canonicalMatchKey;
+      if (matchKey && byMatchKey[matchKey]) {
+        selected[id] = byMatchKey[matchKey];
+      }
+    }
+    return selected;
+  }, [liveGameCatalog, selectedDate]);
+
+  /** :lock: LOCKED LOGIC — DO NOT TOUCH */
+  const refreshLiveGames = useCallback(async (
+    ids: string[],
+    lane: 'fast' | 'mlb',
+    timeoutMs: number
+  ) => {
+    const inFlightRef = lane === 'mlb' ? liveRefreshInFlightMlbRef : liveRefreshInFlightFastRef;
+    if (inFlightRef.current) return;
+    inFlightRef.current = true;
+    try {
+    if (!ids.length) return;
+    const freshSportData = await fetchFreshSportTruthByGameIds(ids, timeoutMs);
+    const idSet = new Set(ids);
+    const droppedNow: string[] = [];
+    const recoveredNow: string[] = [];
+    const resolvedFinalNow = new Set<string>();
+
+    setRawGames((prev) => prev.map((game) => {
+      const gameId = canonicalGameId(game);
+      if (!idSet.has(gameId)) return game;
+      const fresh = freshSportData[gameId];
+      if (!fresh) return game;
+      const oldResolved = resolveGameState(game);
+      const resolved = resolveGameState(game, fresh);
+      if (
+        oldResolved.status !== resolved.status ||
+        oldResolved.period !== resolved.period ||
+        oldResolved.clock !== resolved.clock
+      ) {
+        console.log('LIVE UPDATE', {
+          id: gameId,
+          old: oldResolved.status,
+          new: resolved.status,
+          period: resolved.period,
+          clock: resolved.clock,
+        });
+      }
+      if (resolved.status_bucket === 'FINAL') {
+        resolvedFinalNow.add(gameId);
+      }
+      return {
+        ...game,
+        status: resolved.status,
+        period: resolved.period,
+        period_label: resolved.period_label,
+        clock: resolved.clock,
+        home_score: resolved.homeScore ?? game.home_score ?? null,
+        away_score: resolved.awayScore ?? game.away_score ?? null,
+        last_updated_at: resolved.last_updated_at ?? game.last_updated_at ?? null,
+      };
+    }));
+
+    const nextMissing = { ...liveMissingCountsRef.current };
+    for (const id of ids) {
+      if (freshSportData[id]) {
+        nextMissing[id] = 0;
+        recoveredNow.push(id);
+        continue;
+      }
+      const misses = (nextMissing[id] || 0) + 1;
+      nextMissing[id] = misses;
+      if (misses >= 2) {
+        droppedNow.push(id);
+      }
+    }
+    liveMissingCountsRef.current = nextMissing;
+
+    if (Object.keys(freshSportData).length > 0) {
+      setFreshTruthById((prev) => ({ ...prev, ...freshSportData }));
+      setFreshTruthByMatchKey((prev) => {
+        const next = { ...prev };
+        for (const snapshot of Object.values(freshSportData)) {
+          if (snapshot.canonicalMatchKey) next[snapshot.canonicalMatchKey] = snapshot;
+        }
+        return next;
+      });
+      setTruthCycleCount((prev) => prev + 1);
+    }
+
+    if (droppedNow.length > 0 || resolvedFinalNow.size > 0 || recoveredNow.length > 0) {
+      setDroppedLiveIds((prev) => {
+        const next = { ...prev };
+        for (const id of recoveredNow) delete next[id];
+        for (const id of droppedNow) next[id] = true;
+        for (const id of resolvedFinalNow) next[id] = true;
+        return next;
+      });
+    }
+    } finally {
+      inFlightRef.current = false;
+    }
+  }, [fetchFreshSportTruthByGameIds]);
+
+  const fastLiveGameIds = useMemo(
+    () => liveGameIds.filter((id) => String(liveGameCatalog[id]?.sport || '').toUpperCase() !== 'MLB'),
+    [liveGameIds, liveGameCatalog]
+  );
+  const mlbLiveGameIds = useMemo(
+    () => liveGameIds.filter((id) => String(liveGameCatalog[id]?.sport || '').toUpperCase() === 'MLB'),
+    [liveGameIds, liveGameCatalog]
+  );
+
+  useEffect(() => {
+    if (!fastLiveGameIds.length) return;
+    void refreshLiveGames(fastLiveGameIds, 'fast', 3_500);
+    const interval = window.setInterval(() => {
+      void refreshLiveGames(fastLiveGameIds, 'fast', 3_500);
+    }, 5_000);
+    return () => window.clearInterval(interval);
+  }, [fastLiveGameIds.join(','), refreshLiveGames]);
+
+  useEffect(() => {
+    if (!mlbLiveGameIds.length) return;
+    void refreshLiveGames(mlbLiveGameIds, 'mlb', 12_000);
+    const interval = window.setInterval(() => {
+      void refreshLiveGames(mlbLiveGameIds, 'mlb', 12_000);
+    }, 12_000);
+    return () => window.clearInterval(interval);
+  }, [mlbLiveGameIds.join(','), refreshLiveGames]);
   
   // Data state
   const [refreshing, setRefreshing] = useState(false);
@@ -1490,14 +2167,21 @@ export function GamesPage() {
           const homeRank = teamLookup[homeAbbr]?.apRank ?? null;
           const awayRank = teamLookup[awayAbbr]?.apRank ?? null;
           
-          // Safely determine status
+          // Status is resolved once upstream; downstream reads must not mutate it.
           const rawStatus = g.status || 'SCHEDULED';
-          const statusStr = typeof rawStatus === 'string' ? rawStatus : 'SCHEDULED';
-          const normalizedStatus = (statusStr === 'IN_PROGRESS' ? 'LIVE' : statusStr) as 'LIVE' | 'FINAL' | 'SCHEDULED';
+          const statusStr = normalizeStatusUpper(rawStatus || 'SCHEDULED');
+          const bucket = String((g as any).status_bucket || '').toUpperCase();
+          const normalizedStatus = (
+            bucket === 'LIVE' || statusStr === 'IN_PROGRESS' || statusStr === 'LIVE'
+              ? 'LIVE'
+              : bucket === 'FINAL' || FINAL_STATUS_TOKENS.has(statusStr)
+                ? 'FINAL'
+                : 'SCHEDULED'
+          ) as 'LIVE' | 'FINAL' | 'SCHEDULED';
           
           return {
-            id: g.id || `game-${Math.random()}`,
-            gameId: g.id || '',
+            id: String(g.id || canonicalGameId(g)),
+            gameId: String(g.id || canonicalGameId(g)),
             sport: normalizeSportForGamesPage(g.sport || 'NBA', (g as any).league),
             league: undefined,
             homeTeam: {
@@ -1516,8 +2200,12 @@ export function GamesPage() {
             startTime: g.startTime || undefined,
             probableAwayPitcher: g.probableAwayPitcher,
             probableHomePitcher: g.probableHomePitcher,
-            period: g.period || undefined,
-            clock: g.clock || undefined,
+            inningNumber: g?.mlbLiveState?.inningNumber ?? g?.inningNumber ?? g?.inning ?? null,
+            inningHalf: g?.mlbLiveState?.inningHalf ?? g?.inningHalf ?? g?.inning_half ?? null,
+            inningState: g?.inningState ?? g?.inning_state ?? null,
+            mlbLiveState: g?.mlbLiveState ?? null,
+            period: normalizedStatus === 'FINAL' ? undefined : (g.period_label || g.period || undefined),
+            clock: normalizedStatus === 'FINAL' ? undefined : (g.clock || undefined),
             spread: g.odds?.spreadHome ?? undefined,
             overUnder: g.odds?.total ?? undefined,
             moneylineHome: g.odds?.moneylineHome ?? undefined,
@@ -1535,6 +2223,17 @@ export function GamesPage() {
               total1H: g.odds?.total1H ?? undefined,
               moneyline1HHome: g.odds?.moneyline1HHome ?? undefined,
               moneyline1HAway: g.odds?.moneyline1HAway ?? undefined,
+              f5: {
+                spread: {
+                  home: g.odds?.f5?.spread?.home ?? undefined,
+                  away: g.odds?.f5?.spread?.away ?? undefined,
+                },
+                total: g.odds?.f5?.total ?? undefined,
+                moneyline: {
+                  home: g.odds?.f5?.moneyline?.home ?? undefined,
+                  away: g.odds?.f5?.moneyline?.away ?? undefined,
+                },
+              },
             },
             publicBetting: {
               homePercent,
@@ -1760,6 +2459,41 @@ export function GamesPage() {
     return { liveGames: live, scheduledGames: scheduled, finalGames: final, filteredCount: filtered.length };
   }, [games, statusFilter, selectedSport, leagueFilter, conferenceFilter, ncaabTeamLookup, ncaafTeamLookup, activeTab]);
 
+  useEffect(() => {
+    if (games.length === 0) return;
+    const liveIds = new Set(liveGames.map((g) => g.id));
+    const finalIds = new Set(finalGames.map((g) => g.id));
+    const overlap = [...liveIds].filter((id) => finalIds.has(id));
+    if (overlap.length > 0) {
+      console.error('[GamesPage][invariant] LIVE/FINAL overlap detected', { overlap });
+    }
+
+    const finalWithLiveFields = finalGames.filter((g) => Boolean((g.period || '').trim()) || Boolean((g.clock || '').trim()));
+    if (finalWithLiveFields.length > 0) {
+      console.error('[GamesPage][invariant] FINAL game contains live fields', {
+        ids: finalWithLiveFields.slice(0, 10).map((g) => g.id),
+      });
+    }
+
+    const mismatchedWithFreshTruth = games.filter((game) => {
+      const byId = freshTruthById[String(game.id || '')];
+      if (!byId) return false;
+      const expectedBucket = toStatusBucket(byId.status, byId.periodLabel || byId.period, byId.clock);
+      const actualBucket = String(game.status || '').toUpperCase() === 'LIVE'
+        ? 'LIVE'
+        : String(game.status || '').toUpperCase() === 'FINAL'
+          ? 'FINAL'
+          : 'UPCOMING';
+      return expectedBucket !== actualBucket;
+    });
+    if (mismatchedWithFreshTruth.length > 0) {
+      console.error('[GamesPage][invariant] ALL tab truth differs from sport truth', {
+        count: mismatchedWithFreshTruth.length,
+        sample: mismatchedWithFreshTruth.slice(0, 5).map((g) => g.id),
+      });
+    }
+  }, [games, liveGames, finalGames, freshTruthById]);
+
   // Status counts (same date filter as sections so tab counts match displayed games)
   const statusCounts = useMemo(() => {
     if (games.length === 0) return { all: 0, live: 0, scheduled: 0, final: 0 };
@@ -1787,11 +2521,10 @@ export function GamesPage() {
   // Watchboard games - games that are in the user's active watchboard
   const watchboardGames = useMemo(() => {
     if (!activeBoard || games.length === 0) return [];
-    // activeBoard has gameIds as string[] from the hook
-    const watchboardGameIds = new Set((activeBoard as any).gameIds || []);
+    const watchboardGameIds = new Set(activeBoardGameIds);
     if (watchboardGameIds.size === 0) return [];
     return games.filter(g => watchboardGameIds.has(g.id) || watchboardGameIds.has(g.gameId || ''));
-  }, [games, activeBoard]);
+  }, [games, activeBoard, activeBoardGameIds]);
 
   // Prime Time games - upcoming games on national TV
   const primeTimeGames = useMemo(() => {
@@ -1852,8 +2585,8 @@ export function GamesPage() {
 
   // @ts-ignore - reserved for coach integration
   const _handleCoachClick = useCallback((game: ApprovedScoreCardGame) => {
-    const homeTeam = typeof game.homeTeam === 'string' ? game.homeTeam : game.homeTeam.abbr;
-    const awayTeam = typeof game.awayTeam === 'string' ? game.awayTeam : game.awayTeam.abbr;
+    const homeTeam = typeof game.homeTeam === 'string' ? game.homeTeam : game.homeTeam?.abbr || 'Home';
+    const awayTeam = typeof game.awayTeam === 'string' ? game.awayTeam : game.awayTeam?.abbr || 'Away';
     openChat(`Tell me about the ${awayTeam} vs ${homeTeam} game`);
   }, [openChat]);
 
@@ -1876,7 +2609,6 @@ export function GamesPage() {
   const sectionHeaderClass = "mb-4 inline-flex items-center gap-2 rounded-full border border-white/12 bg-gradient-to-b from-white/[0.07] to-white/[0.02] px-3 py-1.5 text-[#D1D5DB] ring-1 ring-white/10 shadow-[inset_0_1px_0_rgba(255,255,255,0.08)]";
   const showMoreBtnClass = "mt-4 w-full rounded-xl border border-white/12 bg-gradient-to-b from-white/[0.07] to-white/[0.02] px-4 py-2.5 text-[12px] font-semibold text-[#D1D5DB] ring-1 ring-white/10 shadow-[inset_0_1px_0_rgba(255,255,255,0.08)] transition-all duration-200 hover:border-white/20 hover:bg-[#16202B] hover:text-[#E5E7EB]";
   const sportGroupHeaderClass = "mb-4 flex items-center justify-between rounded-[12px] border border-white/[0.06] bg-[#121821]/95 px-4 py-3 backdrop-blur-xl shadow-[0_10px_22px_rgba(0,0,0,0.26)]";
-  const sportGroupHubBtnClass = "inline-flex items-center gap-1 rounded-md border border-white/[0.05] bg-white/5 px-2 py-1 text-xs text-[#9CA3AF] transition-colors hover:text-[#E5E7EB]";
 
   // Group games by sport for ALL view - memoized for performance
   const groupGamesBySport = useMemo(() => {
@@ -1898,41 +2630,31 @@ export function GamesPage() {
   }, []);
 
   const renderCompactGameTile = useCallback((game: ApprovedScoreCardGame, forceInWatchboard?: boolean) => {
-    const home = typeof game.homeTeam === 'string' ? game.homeTeam : game.homeTeam?.name || game.homeTeam?.abbr || 'Home';
-    const away = typeof game.awayTeam === 'string' ? game.awayTeam : game.awayTeam?.name || game.awayTeam?.abbr || 'Away';
-    const favoriteEnabled = Boolean(flags.GAME_FAVORITES_ENABLED);
-    const gameIsFavorite = favoriteEnabled ? isFavorite('game', game.id) : false;
+    const safeId = String(game?.id || game?.gameId || '');
+    if (!safeId) return null;
+    const safeStatus = String(game?.status || 'SCHEDULED').toUpperCase();
+    const safeHomeTeam = game?.homeTeam || { abbr: 'TBD', name: 'TBD' };
+    const safeAwayTeam = game?.awayTeam || { abbr: 'TBD', name: 'TBD' };
+    const safePeriod = game?.period != null ? String(game.period) : undefined;
+    const safeClock = game?.clock != null ? String(game.clock) : undefined;
     return (
-      <div key={game.id} className="relative">
-        {favoriteEnabled && (
-          <div className="absolute right-2 top-2 z-20">
-            <FavoriteEntityButton
-              type="game"
-              entityId={game.id}
-              sport={String(game.sport || '').toLowerCase()}
-              metadata={{
-                game_id: game.id,
-                home_team: home,
-                away_team: away,
-                sport: String(game.sport || '').toLowerCase(),
-              }}
-              compact
-              className="border-slate-600/50 bg-slate-950/70 hover:bg-slate-900/85"
-            />
-          </div>
-        )}
+      <div key={safeId} className="relative">
         <CompactGameTile
           game={{
-            id: game.id,
-            sport: game.sport,
-            homeTeam: game.homeTeam,
-            awayTeam: game.awayTeam,
-            homeScore: game.homeScore,
-            awayScore: game.awayScore,
-            status: game.status,
-            period: game.period,
-            clock: game.clock,
-            startTime: game.startTime,
+            id: safeId,
+            sport: game?.sport || 'NBA',
+            homeTeam: safeHomeTeam,
+            awayTeam: safeAwayTeam,
+            homeScore: typeof game?.homeScore === 'number' ? game.homeScore : null,
+            awayScore: typeof game?.awayScore === 'number' ? game.awayScore : null,
+            status: safeStatus,
+            period: safePeriod,
+            clock: safeClock,
+            startTime: game?.startTime,
+            inningNumber: game?.inningNumber ?? game?.mlbLiveState?.inningNumber ?? null,
+            inningHalf: game?.inningHalf ?? game?.mlbLiveState?.inningHalf ?? null,
+            inningState: game?.inningState ?? null,
+            mlbLiveState: game?.mlbLiveState ?? null,
             probableAwayPitcher: game.probableAwayPitcher,
             probableHomePitcher: game.probableHomePitcher,
             channel: game.channel,
@@ -1940,18 +2662,29 @@ export function GamesPage() {
             overUnder: game.overUnder ?? game.odds?.total ?? null,
             mlHome: game.moneylineHome ?? game.odds?.mlHome ?? null,
             mlAway: game.moneylineAway ?? game.odds?.mlAway ?? null,
-            spread1H: game.odds?.spread1HHome ?? null,
-            total1H: game.odds?.total1H ?? null,
-            ml1HHome: game.odds?.moneyline1HHome ?? null,
-            ml1HAway: game.odds?.moneyline1HAway ?? null,
+            odds: {
+              f5: {
+                spread: {
+                  home: game.odds?.f5?.spread?.home ?? null,
+                  away: game.odds?.f5?.spread?.away ?? null,
+                },
+                total: game.odds?.f5?.total ?? null,
+                moneyline: {
+                  home: game.odds?.f5?.moneyline?.home ?? null,
+                  away: game.odds?.f5?.moneyline?.away ?? null,
+                },
+              },
+            },
           }}
           onClick={() => handleGameClick(game)}
-          isInWatchboard={forceInWatchboard ?? isGameInWatchboard(game.id)}
-          isFavorite={gameIsFavorite}
+          onCoachClick={() => _handleCoachClick(game)}
+          isInWatchboard={forceInWatchboard ?? isGameInWatchboard(safeId)}
+          showQuickAction
+          onQuickWatchboard={() => _handleWatchClick(game)}
         />
       </div>
     );
-  }, [flags.GAME_FAVORITES_ENABLED, handleGameClick, isFavorite, isGameInWatchboard]);
+  }, [_handleCoachClick, _handleWatchClick, handleGameClick, isGameInWatchboard]);
 
   // Special section for watchboard games with enhanced styling
   const renderWatchboardSection = () => {
@@ -2038,12 +2771,6 @@ export function GamesPage() {
                         {sportGames.length} game{sportGames.length !== 1 ? 's' : ''}
                       </span>
                     </div>
-                    <button
-                      onClick={() => navigate(`/sports/${sport.toLowerCase()}`)}
-                      className={sportGroupHubBtnClass}
-                    >
-                      View Hub <ChevronRight className="h-3.5 w-3.5" />
-                    </button>
                   </div>
                   <div className="grid grid-cols-2 gap-3">
                     {displayGames.map((game) => renderCompactGameTile(game))}
@@ -2204,12 +2931,6 @@ export function GamesPage() {
                       {sportGames.length} game{sportGames.length !== 1 ? 's' : ''}
                     </span>
                   </div>
-                  <button
-                    onClick={() => navigate(`/sports/${sport.toLowerCase()}`)}
-                    className={sportGroupHubBtnClass}
-                  >
-                    View Hub <ChevronRight className="h-3.5 w-3.5" />
-                  </button>
                 </div>
                 <div className="grid grid-cols-2 gap-3">
                   {displayGames.map((game) => renderCompactGameTile(game))}
@@ -2567,61 +3288,7 @@ export function GamesPage() {
                     return (
                       <>
                         <div className="grid grid-cols-2 gap-3">
-                          {displayGames.map((game) => {
-                            const home = typeof game.homeTeam === 'string' ? game.homeTeam : game.homeTeam?.name || game.homeTeam?.abbr || 'Home';
-                            const away = typeof game.awayTeam === 'string' ? game.awayTeam : game.awayTeam?.name || game.awayTeam?.abbr || 'Away';
-                            const favoriteEnabled = Boolean(flags.GAME_FAVORITES_ENABLED);
-                            const gameIsFavorite = favoriteEnabled ? isFavorite('game', game.id) : false;
-                            return (
-                              <div key={game.id} className="relative">
-                                {favoriteEnabled && (
-                                  <div className="absolute right-2 top-2 z-20">
-                                    <FavoriteEntityButton
-                                      type="game"
-                                      entityId={game.id}
-                                      sport={String(game.sport || '').toLowerCase()}
-                                      metadata={{
-                                        game_id: game.id,
-                                        home_team: home,
-                                        away_team: away,
-                                        sport: String(game.sport || '').toLowerCase(),
-                                      }}
-                                      compact
-                                      className="border-slate-600/50 bg-slate-950/70 hover:bg-slate-900/85"
-                                    />
-                                  </div>
-                                )}
-                                <CompactGameTile
-                                  game={{
-                                    id: game.id,
-                                    sport: game.sport,
-                                    homeTeam: game.homeTeam,
-                                    awayTeam: game.awayTeam,
-                                    homeScore: game.homeScore,
-                                    awayScore: game.awayScore,
-                                    status: game.status,
-                                    period: game.period,
-                                    clock: game.clock,
-                                    startTime: game.startTime,
-                                    probableAwayPitcher: game.probableAwayPitcher,
-                                    probableHomePitcher: game.probableHomePitcher,
-                                    channel: game.channel,
-                                    spread: game.spread ?? game.odds?.spread ?? null,
-                                    overUnder: game.overUnder ?? game.odds?.total ?? null,
-                                    mlHome: game.moneylineHome ?? game.odds?.mlHome ?? null,
-                                    mlAway: game.moneylineAway ?? game.odds?.mlAway ?? null,
-                                    spread1H: game.odds?.spread1HHome ?? null,
-                                    total1H: game.odds?.total1H ?? null,
-                                    ml1HHome: game.odds?.moneyline1HHome ?? null,
-                                    ml1HAway: game.odds?.moneyline1HAway ?? null,
-                                  }}
-                                  onClick={() => handleGameClick(game)}
-                                  isInWatchboard={isGameInWatchboard(game.id)}
-                                  isFavorite={gameIsFavorite}
-                                />
-                              </div>
-                            );
-                          })}
+                          {displayGames.map((game) => renderCompactGameTile(game))}
                         </div>
                         {hasMore && (
                           <button
@@ -2771,20 +3438,22 @@ export function GamesPage() {
       />
       
       {/* Add to Watchboard Modal */}
-      <AddToWatchboardModal
-        isOpen={watchboardModal.open}
-        onClose={() => setWatchboardModal({ open: false, gameId: '', gameSummary: '' })}
-        gameId={watchboardModal.gameId}
-        gameSummary={watchboardModal.gameSummary}
-        onSuccess={(boardName) => {
-          setToast({ message: `Added to ${boardName}`, type: 'success' });
-          setTimeout(() => setToast(null), 2500);
-        }}
-        onError={(error) => {
-          setToast({ message: error, type: 'error' });
-          setTimeout(() => setToast(null), 2500);
-        }}
-      />
+      {watchboardModal.open && (
+        <AddToWatchboardModal
+          isOpen={watchboardModal.open}
+          onClose={() => setWatchboardModal({ open: false, gameId: '', gameSummary: '' })}
+          gameId={watchboardModal.gameId}
+          gameSummary={watchboardModal.gameSummary}
+          onSuccess={(boardName) => {
+            setToast({ message: `Added to ${boardName}`, type: 'success' });
+            setTimeout(() => setToast(null), 2500);
+          }}
+          onError={(error) => {
+            setToast({ message: error, type: 'error' });
+            setTimeout(() => setToast(null), 2500);
+          }}
+        />
+      )}
       
       {/* Toast notification */}
       {toast && (

@@ -1,6 +1,15 @@
+/**
+ * HOMEPAGE LOCKED
+ * Do not change behavior/order/render rules without explicit approval.
+ * Homepage stability rules:
+ * - exactly 3 Games Today cards
+ * - soccer + White Sox logo stability
+ * - static sport icon row behavior
+ * - watchboards render immediately and stay synced on Home
+ * - no flicker / no late visual swapping
+ */
 import { memo, useState, useRef, useEffect, type ReactNode } from 'react';
 import { cn } from '@/react-app/lib/utils';
-import { useOddsFormat } from '@/react-app/hooks/useOddsFormat';
 import { getTeamOrCountryLogoUrl } from '@/react-app/lib/teamLogos';
 import { PlayerPhoto } from '@/react-app/components/PlayerPhoto';
 import { Plus, Check, ChevronDown, TrendingUp, TrendingDown, Minus } from 'lucide-react';
@@ -9,6 +18,11 @@ import { CoachGExternalLinkIcon } from './CoachGExternalLinkIcon';
 import FavoriteEntityButton from '@/react-app/components/FavoriteEntityButton';
 import { useFeatureFlags } from '@/react-app/hooks/useFeatureFlags';
 import { useFavorites } from '@/react-app/hooks/useFavorites';
+import {
+  HOMEPAGE_TARGETED_LOGO_PRIORITY,
+  homeLockDevLog,
+  resolveHomeTeamLogo,
+} from '@/react-app/lib/homeLockRules';
 
 // ====================
 // GAME STATE SYSTEM
@@ -114,6 +128,17 @@ export interface ApprovedScoreCardGame {
     total1H?: number;
     moneyline1HHome?: number;
     moneyline1HAway?: number;
+    f5?: {
+      spread?: {
+        home?: number;
+        away?: number;
+      };
+      total?: number;
+      moneyline?: {
+        home?: number;
+        away?: number;
+      };
+    };
   };
   // TV broadcast channel
   channel?: string | null;
@@ -121,6 +146,13 @@ export interface ApprovedScoreCardGame {
   isOvertime?: boolean;
   probableAwayPitcher?: { name: string; record?: string };
   probableHomePitcher?: { name: string; record?: string };
+  inningNumber?: number | null;
+  inningHalf?: string | null;
+  inningState?: string | null;
+  mlbLiveState?: {
+    inningNumber?: number | null;
+    inningHalf?: string | null;
+  } | null;
 }
 
 interface ApprovedScoreCardProps {
@@ -271,13 +303,24 @@ export function transformLiveGameToCard(game: {
   hasCoachInsight?: boolean;
   community?: { homePercent: number; awayPercent: number };
   channel?: string | null;
-  odds?: {
-    spreadHome?: number | null;
-    total?: number | null;
-    moneylineHome?: number | null;
-    moneylineAway?: number | null;
-  };
+  normalizedOdds?: {
+    spread: number | null;
+    total: number | null;
+    homeML: number | null;
+    awayML: number | null;
+  } | null;
 }): ApprovedScoreCardGame {
+  const debugFlag = '__homeNormalizedOddsLogged__';
+  if (typeof window !== 'undefined' && !(window as any)[debugFlag]) {
+    (window as any)[debugFlag] = true;
+    console.log('NORMALIZED_ODDS', game.normalizedOdds ?? null);
+  }
+  const normalized = game.normalizedOdds ?? null;
+  const resolvedSpread = normalized?.spread ?? undefined;
+  const resolvedTotal = normalized?.total ?? undefined;
+  const resolvedMlHome = normalized?.homeML ?? undefined;
+  const resolvedMlAway = normalized?.awayML ?? undefined;
+
   return {
     id: game.id,
     sport: game.sport,
@@ -291,10 +334,10 @@ export function transformLiveGameToCard(game: {
     clock: game.clock,
     startTime: game.startTime,
     channel: game.channel || null,
-    spread: game.odds?.spreadHome ?? undefined,
-    overUnder: game.odds?.total ?? undefined,
-    moneylineHome: game.odds?.moneylineHome ?? undefined,
-    moneylineAway: game.odds?.moneylineAway ?? undefined,
+    spread: resolvedSpread ?? undefined,
+    overUnder: resolvedTotal ?? undefined,
+    moneylineHome: resolvedMlHome ?? undefined,
+    moneylineAway: resolvedMlAway ?? undefined,
     homeLogoUrl: game.homeTeam.logo || null,
     awayLogoUrl: game.awayTeam.logo || null,
     coachSignal: game.hasCoachInsight ? 'edge' : undefined,
@@ -319,25 +362,49 @@ function formatStartTime(startTime: string | undefined): string {
   if (!startTime) return '';
   try {
     const date = new Date(startTime);
+    if (Number.isNaN(date.getTime())) return '';
     const timeLabel = date.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
     const dateLabel = date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
-    return `${dateLabel} ${timeLabel}`;
+    const now = new Date();
+    const isToday =
+      date.getFullYear() === now.getFullYear() &&
+      date.getMonth() === now.getMonth() &&
+      date.getDate() === now.getDate();
+    return isToday ? timeLabel : `${dateLabel} • ${timeLabel}`;
   } catch {
     return '';
   }
 }
 
-function formatStartDateTimeParts(startTime: string | undefined): { date: string; time: string } | null {
+function formatStartDateTimeParts(startTime: string | undefined): { date: string; time: string; isToday: boolean } | null {
   if (!startTime) return null;
   try {
     const date = new Date(startTime);
     if (Number.isNaN(date.getTime())) return null;
+    const now = new Date();
+    const isToday =
+      date.getFullYear() === now.getFullYear() &&
+      date.getMonth() === now.getMonth() &&
+      date.getDate() === now.getDate();
     return {
       date: date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' }),
       time: date.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' }),
+      isToday,
     };
   } catch {
     return null;
+  }
+}
+
+function formatFinalDateLabel(startTime: string | undefined): string {
+  if (!startTime) return 'FINAL';
+  try {
+    const date = new Date(startTime);
+    if (Number.isNaN(date.getTime())) return 'FINAL';
+    const formattedDate = date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+    return `FINAL • ${formattedDate}`;
+  } catch {
+    return 'FINAL';
   }
 }
 
@@ -554,8 +621,27 @@ const TeamIcon = memo(function TeamIcon({
   const isGolf = (sport || '').toUpperCase() === 'GOLF';
   const [imgError, setImgError] = useState(false);
   const inlineLogo = String(directLogoUrl || '').trim() || null;
-  const logoUrl = inlineLogo || (sport ? getTeamOrCountryLogoUrl(abbr, sport, league) : null);
-  const showLogo = logoUrl && !imgError;
+  const mappedLogo = sport ? getTeamOrCountryLogoUrl(abbr, sport, league, { teamName }) : null;
+  const resolvedLogo = resolveHomeTeamLogo({
+    abbr,
+    teamName,
+    sport,
+    mappedLogo,
+    inlineLogo,
+  });
+  useEffect(() => {
+    if (!resolvedLogo.isSoccer && !resolvedLogo.isWhiteSox) return;
+    homeLockDevLog("logo path chosen for soccer/white sox", {
+      abbr,
+      teamName: teamName || null,
+      sport: sport || null,
+      hasMappedLogo: Boolean(mappedLogo),
+      hasInlineLogo: Boolean(inlineLogo),
+      chosen: resolvedLogo.logoSrc,
+    });
+  }, [abbr, inlineLogo, mappedLogo, resolvedLogo.isSoccer, resolvedLogo.isWhiteSox, resolvedLogo.logoSrc, sport, teamName]);
+  const logoSrc = resolvedLogo.logoSrc;
+  const showLogo = logoSrc && !imgError;
   const usesHubSizing = sizePreset === 'hub';
   const iconWrap = usesHubSizing ? "w-16 h-16 sm:w-20 sm:h-20" : "w-14 h-14 sm:w-16 sm:h-16";
   const badgeClasses = cn(
@@ -584,12 +670,16 @@ const TeamIcon = memo(function TeamIcon({
           />
         ) : showLogo ? (
           <img 
-            src={logoUrl} 
+            src={logoSrc} 
             alt={abbr}
             className={cn(
               "w-[92%] h-[92%] object-contain saturate-[1.08] contrast-[1.05] brightness-[1.01] [filter:drop-shadow(0_12px_21px_rgba(0,0,0,0.62))_drop-shadow(0_0_1px_rgba(255,255,255,0.72))]"
             )}
-            onError={() => setImgError(true)}
+            onError={() => {
+              if (!resolvedLogo.suppressImgErrorFallback) {
+                setImgError(true);
+              }
+            }}
           />
         ) : (
           <span className={cn(
@@ -601,6 +691,9 @@ const TeamIcon = memo(function TeamIcon({
       </div>
       {hasPossession && (
         <span className="absolute -top-0.5 -right-0.5 w-2.5 h-2.5 bg-yellow-400 rounded-full animate-pulse" />
+      )}
+      {(resolvedLogo.isSoccer || resolvedLogo.isWhiteSox) && (
+        <span className="sr-only">{HOMEPAGE_TARGETED_LOGO_PRIORITY}</span>
       )}
     </div>
   );
@@ -731,62 +824,6 @@ const TeamBlock = memo(function TeamBlock({
   );
 });
 
-/** Simple horizontal odds row: SPREAD | O/U | ML - shows both teams' spreads */
-const OddsRow = memo(function OddsRow({ 
-  spreadHome, 
-  spreadAway,
-  total, 
-  mlHome, 
-  mlAway,
-  homeTeam,
-  awayTeam,
-  formatSpread,
-  formatMoneyline,
-}: { 
-  spreadHome?: number;
-  spreadAway?: number;
-  total?: number;
-  mlHome?: number;
-  mlAway?: number;
-  homeTeam: string;
-  awayTeam: string;
-  formatSpread: (v: number | undefined | null) => string;
-  formatMoneyline: (v: number | undefined | null) => string;
-}) {
-  const hasSpread = spreadHome !== undefined || spreadAway !== undefined;
-  const hasTotal = total !== undefined;
-  const hasML = mlHome !== undefined || mlAway !== undefined;
-  
-  if (!hasSpread && !hasTotal && !hasML) return null;
-  
-  return (
-    <div className="flex flex-wrap items-center justify-center gap-2 sm:gap-4 text-xs">
-      {hasSpread && (
-        <div className="flex items-center gap-1">
-          <span className="text-[9px] sm:text-[10px] text-slate-500 font-medium uppercase">Spread</span>
-          <span className="text-xs sm:text-sm font-semibold text-white truncate max-w-[120px] sm:max-w-none">
-            {awayTeam} {formatSpread(spreadAway)} / {homeTeam} {formatSpread(spreadHome)}
-          </span>
-        </div>
-      )}
-      {hasTotal && (
-        <div className="flex items-center gap-1">
-          <span className="text-[9px] sm:text-[10px] text-slate-500 font-medium uppercase">O/U</span>
-          <span className="text-xs sm:text-sm font-semibold text-white">{total}</span>
-        </div>
-      )}
-      {hasML && (
-        <div className="flex items-center gap-1">
-          <span className="text-[9px] sm:text-[10px] text-slate-500 font-medium uppercase">ML</span>
-          <span className="text-xs sm:text-sm font-semibold text-white truncate max-w-[100px] sm:max-w-none">
-            {formatMoneyline(mlAway)} / {formatMoneyline(mlHome)}
-          </span>
-        </div>
-      )}
-    </div>
-  );
-});
-
 /** Gold vs Blue public betting percentage bar - enhanced contrast */
 const PublicBetBar = memo(function PublicBetBar({ 
   homePercent, 
@@ -881,34 +918,26 @@ const WatchButton = memo(function WatchButton({
   onClick?: () => void;
   isInWatchboard?: boolean;
 }) {
-  const [justAdded, setJustAdded] = useState(false);
-  
   const handleClick = (e: React.MouseEvent) => {
     e.stopPropagation();
-    if (isInWatchboard) return; // Already added
     onClick?.();
-    setJustAdded(true);
-    setTimeout(() => setJustAdded(false), 1500);
   };
-  
-  const showCheck = isInWatchboard || justAdded;
   
   return (
     <button
       onClick={handleClick}
-      disabled={isInWatchboard}
       className={cn(
         "flex items-center gap-1.5 px-3 py-2.5 sm:py-1.5 rounded-lg text-xs font-semibold transition-all duration-200 min-h-[44px] sm:min-h-0",
-        showCheck
+        isInWatchboard
           ? "bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 cursor-default"
           : "bg-blue-500/20 text-blue-400 border border-blue-500/30 hover:bg-blue-500/30 hover:border-blue-400/50 active:scale-95"
       )}
-      aria-label={showCheck ? "Added to Watchboard" : "Add to Watchboard"}
+      aria-label={isInWatchboard ? "In watchboard, add to another" : "Add to Watchboard"}
     >
-      {showCheck ? (
+      {isInWatchboard ? (
         <>
           <Check className="w-4 h-4 sm:w-3.5 sm:h-3.5" />
-          <span>Watching</span>
+          <span>In Watchboard</span>
         </>
       ) : (
         <>
@@ -1029,7 +1058,6 @@ export const ApprovedScoreCard = memo(function ApprovedScoreCard({
   mode = 'detail',
   visualPreset = 'default',
 }: ApprovedScoreCardProps) {
-  const { formatMoneylineValue, formatSpreadValue } = useOddsFormat();
   const { flags } = useFeatureFlags();
   const { isFavorite } = useFavorites();
   const [isExpanded, setIsExpanded] = useState(false);
@@ -1037,16 +1065,6 @@ export const ApprovedScoreCard = memo(function ApprovedScoreCard({
   const awayTeam = getTeamAbbr(game.awayTeam);
   const homeTeamName = getTeamName(game.homeTeam);
   const awayTeamName = getTeamName(game.awayTeam);
-  
-  const formatSpread = (spread: number | undefined | null): string => {
-    if (spread === undefined || spread === null) return '-';
-    return formatSpreadValue(spread);
-  };
-  
-  const formatMoneyline = (ml: number | undefined | null): string => {
-    if (ml === undefined || ml === null) return '-';
-    return formatMoneylineValue(ml);
-  };
   
   // Use centralized game state system
   const { state: gameState, winnerSide, leaderSide } = computeGameState(
@@ -1079,14 +1097,6 @@ export const ApprovedScoreCard = memo(function ApprovedScoreCard({
   const homeIsLeader = leaderSide === 'home';
   const awayIsLeader = leaderSide === 'away';
   
-  // Extract odds - calculate both home and away spreads
-  const spreadHome = game.odds?.spread ?? game.odds?.spreadHome ?? game.spread;
-  const spreadAway = spreadHome !== undefined ? -spreadHome : undefined;
-  const total = game.odds?.total ?? game.overUnder;
-  const mlHome = game.odds?.mlHome ?? game.moneylineHome;
-  const mlAway = game.odds?.mlAway ?? game.moneylineAway;
-  
-  const hasOdds = spreadHome !== undefined || total !== undefined || mlHome !== undefined;
   const hasPublicBets = game.publicBetHome !== undefined || game.publicBetAway !== undefined;
   const showPredictor = !isCompact && Boolean(game.predictorText);
   const showPublicBets = !isCompact && hasPublicBets;
@@ -1106,7 +1116,7 @@ export const ApprovedScoreCard = memo(function ApprovedScoreCard({
       }
       return label;
     }
-    if (isFinal) return 'Final';
+    if (isFinal) return formatFinalDateLabel(game.startTime);
     if (isLive) {
       if ((game.sport || '').toUpperCase() === 'SOCCER') {
         const soccerDisplay = formatSoccerLiveDisplay(
@@ -1311,12 +1321,10 @@ export const ApprovedScoreCard = memo(function ApprovedScoreCard({
           )}>
             {isScheduled && scheduledDateTimeParts ? (
               <span className="inline-flex items-center gap-1.5">
-                <span className="text-[11px] font-semibold uppercase tracking-wide text-slate-400/95">
-                  {scheduledDateTimeParts.date}
-                </span>
-                <span className="text-slate-600">•</span>
                 <span className="text-sm font-bold text-slate-200">
-                  {scheduledDateTimeParts.time}
+                  {scheduledDateTimeParts.isToday
+                    ? scheduledDateTimeParts.time
+                    : `${scheduledDateTimeParts.date} • ${scheduledDateTimeParts.time}`}
                 </span>
               </span>
             ) : (
@@ -1372,28 +1380,6 @@ export const ApprovedScoreCard = memo(function ApprovedScoreCard({
           />
         </div>
       </div>
-      
-      {/* ===== DIVIDER ===== */}
-      {hasOdds && (
-        <div className="mx-3 border-t border-slate-700/50" />
-      )}
-      
-      {/* ===== ODDS ROW: SPREAD | O/U | ML ===== */}
-      {hasOdds && (
-        <div className="px-3 py-2">
-          <OddsRow
-            spreadHome={spreadHome}
-            spreadAway={spreadAway}
-            total={total}
-            mlHome={mlHome}
-            mlAway={mlAway}
-            homeTeam={homeTeam}
-            awayTeam={awayTeam}
-            formatSpread={formatSpread}
-            formatMoneyline={formatMoneyline}
-          />
-        </div>
-      )}
       
       {/* ===== DIVIDER ===== */}
       {showPredictor && (

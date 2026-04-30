@@ -128,6 +128,12 @@ export interface LiveGame {
     movementSpread: number | null;
     movementTotal: number | null;
   };
+  normalizedOdds?: {
+    spread: number | null;
+    total: number | null;
+    homeML: number | null;
+    awayML: number | null;
+  } | null;
 }
 
 interface DbGame {

@@ -26,6 +26,122 @@ import {
 
 const app = new Hono<{ Bindings: Env }>();
 
+const WORKER_FETCH_TIMEOUT_MS = 10000;
+const FETCH_GUARD_FLAG = "__GZ_FETCH_GUARD_INSTALLED__";
+const ORIGINAL_FETCH_REF = "__GZ_ORIGINAL_FETCH__";
+const FETCH_STALE_CACHE_REF = "__GZ_FETCH_STALE_CACHE__";
+
+type StaleFetchEntry = {
+  status: number;
+  statusText: string;
+  headers: [string, string][];
+  body: ArrayBuffer;
+  storedAt: number;
+};
+
+function resolveFetchUrl(input: RequestInfo | URL): string {
+  if (typeof input === "string") return input;
+  if (input instanceof URL) return input.toString();
+  return input.url;
+}
+
+function resolveFetchMethod(input: RequestInfo | URL, init?: RequestInit): string {
+  return String(init?.method || ((input instanceof Request && input.method) || "GET")).toUpperCase();
+}
+
+function buildStaleCacheKey(method: string, url: string): string {
+  return `${method}:${url}`;
+}
+
+if (!(globalThis as any)[FETCH_GUARD_FLAG]) {
+  const originalFetch: typeof fetch =
+    (globalThis as any)[ORIGINAL_FETCH_REF] || globalThis.fetch.bind(globalThis);
+  const staleCache: Map<string, StaleFetchEntry> =
+    (globalThis as any)[FETCH_STALE_CACHE_REF] || new Map<string, StaleFetchEntry>();
+  (globalThis as any)[ORIGINAL_FETCH_REF] = originalFetch;
+  (globalThis as any)[FETCH_STALE_CACHE_REF] = staleCache;
+
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+    const url = resolveFetchUrl(input);
+    const method = resolveFetchMethod(input, init);
+    const cacheKey = buildStaleCacheKey(method, url);
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort("fetch_timeout"), WORKER_FETCH_TIMEOUT_MS);
+    const upstreamSignal = init?.signal;
+    const abortFromUpstream = () => controller.abort("upstream_abort");
+
+    if (upstreamSignal) {
+      if (upstreamSignal.aborted) {
+        abortFromUpstream();
+      } else {
+        upstreamSignal.addEventListener("abort", abortFromUpstream, { once: true });
+      }
+    }
+
+    try {
+      const response = await originalFetch(input, { ...(init || {}), signal: controller.signal });
+      const contentType = String(response.headers.get("content-type") || "").toLowerCase();
+      const isCacheable = method === "GET" && response.ok && (contentType.includes("json") || contentType.startsWith("text/"));
+      if (isCacheable) {
+        try {
+          const cloned = response.clone();
+          staleCache.set(cacheKey, {
+            status: cloned.status,
+            statusText: cloned.statusText,
+            headers: Array.from(cloned.headers.entries()),
+            body: await cloned.arrayBuffer(),
+            storedAt: Date.now(),
+          });
+        } catch (cacheErr) {
+          console.warn("[FetchGuard] Failed to cache response snapshot", { method, url, error: cacheErr });
+        }
+      }
+      return response;
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      console.error("FETCH ERROR", {
+        method,
+        url,
+        reason,
+        aborted: controller.signal.aborted,
+        abortReason: controller.signal.aborted ? String(controller.signal.reason || "") : null,
+      });
+      const stale = staleCache.get(cacheKey);
+      if (stale) {
+        const staleAgeMs = Date.now() - stale.storedAt;
+        return new Response(stale.body.slice(0), {
+          status: stale.status,
+          statusText: stale.statusText,
+          headers: {
+            ...Object.fromEntries(stale.headers),
+            "x-fetch-fallback": "stale",
+            "x-fetch-stale-age-ms": String(staleAgeMs),
+            "cache-control": "no-store",
+          },
+        });
+      }
+      return new Response(
+        JSON.stringify({ error: "FETCH_ERROR", message: reason, method, url }),
+        {
+          status: 503,
+          headers: {
+            "content-type": "application/json",
+            "cache-control": "no-store",
+            "x-fetch-fallback": "none",
+          },
+        }
+      );
+    } finally {
+      clearTimeout(timeoutId);
+      if (upstreamSignal) {
+        upstreamSignal.removeEventListener("abort", abortFromUpstream);
+      }
+    }
+  }) as typeof fetch;
+
+  (globalThis as any)[FETCH_GUARD_FLAG] = true;
+}
+
 // Consistent JSON 404 shape across all API routes.
 app.notFound((c) => {
   return c.json(

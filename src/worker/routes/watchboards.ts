@@ -4,6 +4,7 @@
  */
 
 import { Hono } from "hono";
+import { fetchGameWithFallback } from "../services/providers";
 
 type Bindings = {
   DB: D1Database;
@@ -14,87 +15,250 @@ type Bindings = {
 const watchboardsRouter = new Hono<{ Bindings: Bindings }>();
 
 let ensureWatchboardSchemaPromise: Promise<void> | null = null;
+let ensureWatchboardSchemaReady = false;
+const WATCHBOARD_HOME_PREVIEW_FALLBACK_LIMIT = 40;
+const WATCHBOARD_DETAIL_SEED_TIMEOUT_MS = 900;
+const DEBUG_LOG_ENDPOINT = "http://127.0.0.1:7738/ingest/3f0629af-a99a-4780-a8a2-f41a5bc25b15";
+const DEBUG_SESSION_ID = "05f1a6";
+const makeWatchboardRequestId = (incoming: string | null | undefined): string => {
+  const candidate = String(incoming || "").trim();
+  if (candidate) return candidate;
+  return `wb_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+};
+
+function sendDebugLog(payload: {
+  runId: string;
+  hypothesisId: string;
+  location: string;
+  message: string;
+  data: Record<string, unknown>;
+}): void {
+  // #region agent log
+  fetch(DEBUG_LOG_ENDPOINT, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Debug-Session-Id": DEBUG_SESSION_ID,
+    },
+    body: JSON.stringify({
+      sessionId: DEBUG_SESSION_ID,
+      ...payload,
+      timestamp: Date.now(),
+    }),
+  }).catch(() => {});
+  // #endregion
+}
+
+function pickNumber(value: unknown): number | null {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+function parseWatchboardGameSummary(summary: string | null | undefined): {
+  awayName: string | null;
+  homeName: string | null;
+} {
+  const raw = String(summary || "").trim();
+  if (!raw) return { awayName: null, homeName: null };
+  const normalized = raw.replace(/\s+vs\.?\s+/i, " @ ");
+  const [away, home] = normalized.split("@").map((v) => String(v || "").trim());
+  return {
+    awayName: away || null,
+    homeName: home || null,
+  };
+}
+
+function toCodeFromName(name: string | null | undefined): string {
+  const cleaned = String(name || "").replace(/[^a-z0-9 ]/gi, " ").trim();
+  if (!cleaned) return "TBD";
+  const tokens = cleaned.split(/\s+/).filter(Boolean);
+  if (tokens.length >= 2) {
+    const initials = tokens.slice(0, 3).map((token) => token[0]?.toUpperCase() || "").join("");
+    return initials || cleaned.slice(0, 3).toUpperCase();
+  }
+  return cleaned.slice(0, 3).toUpperCase();
+}
+
+function deriveFallbackCodesFromGameId(gameId: string): { awayCode: string; homeCode: string } {
+  const seed = String(gameId || "").replace(/[^a-z0-9]/gi, "").toUpperCase();
+  const awayCode = (seed.slice(0, 3) || "G1").padEnd(3, "X").slice(0, 3);
+  const homeCode = (seed.slice(-3) || "G2").padEnd(3, "Y").slice(0, 3);
+  return { awayCode, homeCode };
+}
+
+function buildFallbackWatchboardRow(row: {
+  game_id: string;
+  home_team_code?: string | null;
+  away_team_code?: string | null;
+  home_team_name?: string | null;
+  away_team_name?: string | null;
+  status?: string | null;
+  start_time?: string | null;
+}): {
+  game_id: string;
+  sport: string;
+  home_team_code: string;
+  away_team_code: string;
+  home_team_name: string | null;
+  away_team_name: string | null;
+  home_score: number | null;
+  away_score: number | null;
+  status: string;
+  start_time: string;
+  period_label: string | null;
+  clock: string | null;
+} {
+  const gameId = String(row.game_id || "").trim();
+  const homeNameRaw = String(row.home_team_name || "").trim();
+  const awayNameRaw = String(row.away_team_name || "").trim();
+  const homeName = homeNameRaw || null;
+  const awayName = awayNameRaw || null;
+  const derivedCodes = deriveFallbackCodesFromGameId(gameId);
+  const homeCode = String(row.home_team_code || "").trim() || (homeName ? toCodeFromName(homeName) : "") || derivedCodes.homeCode;
+  const awayCode = String(row.away_team_code || "").trim() || (awayName ? toCodeFromName(awayName) : "") || derivedCodes.awayCode;
+  return {
+    game_id: gameId,
+    sport: "unknown",
+    home_team_code: homeCode,
+    away_team_code: awayCode,
+    home_team_name: homeName,
+    away_team_name: awayName,
+    home_score: null,
+    away_score: null,
+    status: String(row.status || "SCHEDULED").trim() || "SCHEDULED",
+    start_time: String(row.start_time || "").trim() || new Date().toISOString(),
+    period_label: null,
+    clock: null,
+  };
+}
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T | null> {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const timeoutPromise = new Promise<null>((resolve) => {
+    timer = setTimeout(() => resolve(null), timeoutMs);
+  });
+  return Promise.race([promise, timeoutPromise]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
+}
 
 async function ensureWatchboardSchema(db: D1Database): Promise<void> {
+  if (ensureWatchboardSchemaReady) return;
   if (ensureWatchboardSchemaPromise) {
     await ensureWatchboardSchemaPromise;
     return;
   }
 
   ensureWatchboardSchemaPromise = (async () => {
-    await db.prepare(`
-      CREATE TABLE IF NOT EXISTS watchboards (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id TEXT NOT NULL,
-        name TEXT NOT NULL DEFAULT 'My Watchboard',
-        pinned_game_id TEXT,
-        is_active INTEGER NOT NULL DEFAULT 0,
-        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-      )
-    `).run();
+    // Fast path: if core tables exist, avoid running DDL bootstrap.
+    try {
+      await db.prepare("SELECT id FROM watchboards LIMIT 1").first();
+      await db.prepare("SELECT id FROM watchboard_games LIMIT 1").first();
+      await db.prepare("SELECT id FROM watchboard_props LIMIT 1").first();
+      await db.prepare("SELECT id FROM watchboard_players LIMIT 1").first();
+      return;
+    } catch {
+      // Missing schema pieces; run one-time bootstrap below.
+    }
 
-    await db.prepare(`
-      CREATE TABLE IF NOT EXISTS watchboard_games (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        watchboard_id INTEGER NOT NULL,
-        game_id TEXT NOT NULL,
-        order_index INTEGER NOT NULL DEFAULT 0,
-        added_from TEXT,
-        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-      )
-    `).run();
-
-    await db.prepare(`
-      CREATE TABLE IF NOT EXISTS watchboard_props (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        watchboard_id INTEGER NOT NULL,
-        game_id TEXT NOT NULL,
-        player_name TEXT NOT NULL,
-        player_id TEXT,
-        team TEXT,
-        sport TEXT NOT NULL,
-        prop_type TEXT NOT NULL,
-        line_value REAL NOT NULL DEFAULT 0,
-        selection TEXT NOT NULL DEFAULT '',
-        odds_american INTEGER,
-        current_stat_value REAL,
-        order_index INTEGER NOT NULL DEFAULT 0,
-        added_from TEXT,
-        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-      )
-    `).run();
-
-    await db.prepare(`
-      CREATE TABLE IF NOT EXISTS watchboard_players (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        watchboard_id INTEGER NOT NULL,
-        user_id TEXT NOT NULL,
-        player_name TEXT NOT NULL,
-        player_id TEXT,
-        sport TEXT NOT NULL,
-        team TEXT,
-        team_abbr TEXT,
-        position TEXT,
-        headshot_url TEXT,
-        prop_type TEXT,
-        prop_line REAL,
-        prop_selection TEXT,
-        current_stat_value REAL,
-        order_index INTEGER NOT NULL DEFAULT 0,
-        is_active INTEGER NOT NULL DEFAULT 1,
-        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-      )
-    `).run();
+    await db.batch([
+      db.prepare(`
+        CREATE TABLE IF NOT EXISTS watchboards (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          user_id TEXT NOT NULL,
+          name TEXT NOT NULL DEFAULT 'My Watchboard',
+          pinned_game_id TEXT,
+          is_active INTEGER NOT NULL DEFAULT 0,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+      `),
+      db.prepare(`
+        CREATE INDEX IF NOT EXISTS idx_watchboards_user_id
+        ON watchboards(user_id)
+      `),
+      db.prepare(`
+        CREATE INDEX IF NOT EXISTS idx_watchboards_user_active
+        ON watchboards(user_id, is_active)
+      `),
+      db.prepare(`
+        CREATE INDEX IF NOT EXISTS idx_watchboards_user_name
+        ON watchboards(user_id, name)
+      `),
+      db.prepare(`
+        CREATE TABLE IF NOT EXISTS watchboard_games (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          watchboard_id INTEGER NOT NULL,
+          game_id TEXT NOT NULL,
+          order_index INTEGER NOT NULL DEFAULT 0,
+          added_from TEXT,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+      `),
+      db.prepare(`
+        CREATE INDEX IF NOT EXISTS idx_watchboard_games_board_id
+        ON watchboard_games(watchboard_id)
+      `),
+      db.prepare(`
+        CREATE INDEX IF NOT EXISTS idx_watchboard_games_board_game
+        ON watchboard_games(watchboard_id, game_id)
+      `),
+      db.prepare(`
+        CREATE INDEX IF NOT EXISTS idx_watchboard_games_board_order
+        ON watchboard_games(watchboard_id, order_index)
+      `),
+      db.prepare(`
+        CREATE TABLE IF NOT EXISTS watchboard_props (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          watchboard_id INTEGER NOT NULL,
+          game_id TEXT NOT NULL,
+          player_name TEXT NOT NULL,
+          player_id TEXT,
+          team TEXT,
+          sport TEXT NOT NULL,
+          prop_type TEXT NOT NULL,
+          line_value REAL NOT NULL DEFAULT 0,
+          selection TEXT NOT NULL DEFAULT '',
+          odds_american INTEGER,
+          current_stat_value REAL,
+          order_index INTEGER NOT NULL DEFAULT 0,
+          added_from TEXT,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+      `),
+      db.prepare(`
+        CREATE TABLE IF NOT EXISTS watchboard_players (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          watchboard_id INTEGER NOT NULL,
+          user_id TEXT NOT NULL,
+          player_name TEXT NOT NULL,
+          player_id TEXT,
+          sport TEXT NOT NULL,
+          team TEXT,
+          team_abbr TEXT,
+          position TEXT,
+          headshot_url TEXT,
+          prop_type TEXT,
+          prop_line REAL,
+          prop_selection TEXT,
+          current_stat_value REAL,
+          order_index INTEGER NOT NULL DEFAULT 0,
+          is_active INTEGER NOT NULL DEFAULT 1,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+      `),
+    ]);
   })();
 
   try {
     await ensureWatchboardSchemaPromise;
-  } finally {
+    ensureWatchboardSchemaReady = true;
+  } catch (error) {
     ensureWatchboardSchemaPromise = null;
+    throw error;
   }
 }
 
@@ -162,6 +326,343 @@ interface WatchboardPlayer {
   is_active: boolean;
   created_at: string;
   updated_at: string;
+}
+
+function normalizeBoardName(name: string | null | undefined): string {
+  return String(name || "").trim();
+}
+
+function buildGameIdAliasCandidates(gameId: string | null | undefined): string[] {
+  const normalized = String(gameId || "").trim();
+  if (!normalized) return [];
+  const seen = new Set<string>();
+  const push = (value: string | null | undefined) => {
+    const next = String(value || "").trim();
+    if (!next || seen.has(next)) return;
+    seen.add(next);
+  };
+
+  push(normalized);
+
+  const soccerLegacy = normalized.startsWith("soccer_sr:sport_event:")
+    ? normalized.replace(/^soccer_/, "")
+    : normalized;
+  push(soccerLegacy);
+
+  const srMatch = normalized.match(/^sr_([a-z0-9]+)_(.+)$/i);
+  if (srMatch) {
+    const external = String(srMatch[2] || "").trim();
+    push(external);
+    if (external) {
+      push(`sr:sport_event:${external}`);
+      push(`sr:match:${external}`);
+    }
+  }
+
+  const espnMatch = normalized.match(/^espn_([a-z0-9]+)_(.+)$/i);
+  if (espnMatch) {
+    const external = String(espnMatch[2] || "").trim();
+    push(external);
+  }
+
+  if (normalized.startsWith("sr:sport_event:")) {
+    const external = normalized.replace("sr:sport_event:", "").trim();
+    push(external);
+  }
+  if (normalized.startsWith("sr:match:")) {
+    const external = normalized.replace("sr:match:", "").trim();
+    push(external);
+  }
+
+  return Array.from(seen);
+}
+
+function isLikelyCanonicalWatchboardGameId(gameId: string | null | undefined): boolean {
+  const normalized = String(gameId || "").trim();
+  if (!normalized) return false;
+  if (/^sr_[a-z0-9]+_[a-z0-9-]+$/i.test(normalized)) return true;
+  if (/^espn_[a-z0-9]+_[a-z0-9:_-]+$/i.test(normalized)) return true;
+  return false;
+}
+
+async function lookupProviderGameIdByCandidates(db: D1Database, candidates: string[]): Promise<string | null> {
+  if (!Array.isArray(candidates) || candidates.length === 0) return null;
+  const placeholders = candidates.map(() => "?").join(",");
+  const row = await db
+    .prepare(`
+      SELECT provider_game_id
+      FROM sdio_games
+      WHERE provider_game_id IN (${placeholders})
+      ORDER BY datetime(updated_at) DESC, id DESC
+      LIMIT 1
+    `)
+    .bind(...candidates)
+    .first<{ provider_game_id: string | null }>();
+  const providerGameId = String(row?.provider_game_id || "").trim();
+  return providerGameId || null;
+}
+
+async function lookupCanonicalProviderGameIdByCandidates(db: D1Database, candidates: string[]): Promise<string | null> {
+  if (!Array.isArray(candidates) || candidates.length === 0) return null;
+  const placeholders = candidates.map(() => "?").join(",");
+  const row = await db
+    .prepare(`
+      SELECT provider_game_id
+      FROM canonical_games
+      WHERE provider_game_id IN (${placeholders})
+         OR provider_event_id IN (${placeholders})
+      ORDER BY datetime(updated_at) DESC
+      LIMIT 1
+    `)
+    .bind(...candidates, ...candidates)
+    .first<{ provider_game_id: string | null }>();
+  const providerGameId = String(row?.provider_game_id || "").trim();
+  return providerGameId || null;
+}
+
+async function canHydrateWatchboardGameId(db: D1Database, gameIdCandidates: string[]): Promise<boolean> {
+  const candidates = Array.from(
+    new Set((gameIdCandidates || []).map((id) => String(id || "").trim()).filter(Boolean))
+  );
+  if (candidates.length === 0) return false;
+  try {
+    const direct = await lookupProviderGameIdByCandidates(db, candidates);
+    if (direct) return true;
+    const canonical = await lookupCanonicalProviderGameIdByCandidates(db, candidates);
+    if (canonical) {
+      const canonicalHydrated = await lookupProviderGameIdByCandidates(db, [canonical]);
+      if (canonicalHydrated) return true;
+    }
+    for (const candidate of candidates.slice(0, 2)) {
+      const detail = await withTimeout(fetchGameWithFallback(candidate), 1200);
+      const sport = String(detail?.data?.game?.sport || "").trim().toLowerCase();
+      if (sport) return true;
+    }
+    // #region agent log
+    sendDebugLog({
+      runId: "syncing-debug-run2",
+      hypothesisId: "H4",
+      location: "src/worker/routes/watchboards.ts:canHydrateWatchboardGameId",
+      message: "canHydrate resolved false",
+      data: {
+        candidates: candidates.slice(0, 4),
+        hadCanonicalAlias: Boolean(canonical),
+      },
+    });
+    // #endregion
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+async function resolveCanonicalWatchboardGameId(db: D1Database, gameId: string): Promise<string> {
+  const normalized = String(gameId || "").trim();
+  if (!normalized) return "";
+
+  if (normalized.startsWith("soccer_sr:sport_event:")) {
+    return normalized.replace(/^soccer_/, "");
+  }
+  // Provider-native IDs already join against sdio_games.provider_game_id.
+  // SportsRadar event IDs (sr:sport_event:/sr:match:) still need alias resolution
+  // so watchboard rows hydrate from the primary home-preview join path.
+  if (isLikelyCanonicalWatchboardGameId(normalized)) {
+    return normalized;
+  }
+
+  const directCandidates = buildGameIdAliasCandidates(normalized);
+  const canonicalHit = await lookupCanonicalProviderGameIdByCandidates(db, directCandidates);
+  if (canonicalHit) return canonicalHit;
+  const directHit = await lookupProviderGameIdByCandidates(db, directCandidates);
+  if (directHit) return directHit;
+
+  const resolvedDetail = await withTimeout(fetchGameWithFallback(normalized), 2200);
+  const detailGame = resolvedDetail?.data?.game as Record<string, unknown> | undefined;
+  if (detailGame) {
+    const providerFromDetail = String((detailGame as any).provider_game_id || "").trim();
+    if (isLikelyCanonicalWatchboardGameId(providerFromDetail)) {
+      return providerFromDetail;
+    }
+    const detailCandidates = new Set<string>(directCandidates);
+    const add = (value: unknown) => {
+      const next = String(value || "").trim();
+      if (!next) return;
+      detailCandidates.add(next);
+    };
+    add(detailGame.game_id);
+    add((detailGame as any).provider_game_id);
+    add((detailGame as any).event_id);
+    add(detailGame.id);
+    add(detailGame.external_id);
+    const external = String(detailGame.external_id || "").trim();
+    if (external) {
+      detailCandidates.add(`sr:sport_event:${external}`);
+      detailCandidates.add(`sr:match:${external}`);
+    }
+    const canonicalCandidateHit = await lookupCanonicalProviderGameIdByCandidates(db, Array.from(detailCandidates));
+    if (canonicalCandidateHit) return canonicalCandidateHit;
+    const candidateHit = await lookupProviderGameIdByCandidates(db, Array.from(detailCandidates));
+    if (candidateHit) return candidateHit;
+  }
+
+  return normalized;
+}
+
+async function resolveCanonicalWatchboardGameIdSafe(db: D1Database, gameId: string): Promise<string> {
+  const normalized = String(gameId || "").trim();
+  if (!normalized) return "";
+  try {
+    return await resolveCanonicalWatchboardGameId(db, normalized);
+  } catch (error) {
+    console.warn("[Watchboards] canonicalize game_id failed; using raw id", {
+      gameId: normalized,
+      error,
+    });
+    return normalized;
+  }
+}
+
+async function seedWatchboardGameSnapshot(
+  db: D1Database,
+  gameIdCandidates: string[]
+): Promise<void> {
+  const candidates = Array.from(
+    new Set((gameIdCandidates || []).map((id) => String(id || "").trim()).filter(Boolean))
+  );
+  if (candidates.length === 0) return;
+  try {
+    let detailGame: Record<string, unknown> | null = null;
+    for (const candidate of candidates) {
+      const detail = await withTimeout(fetchGameWithFallback(candidate), WATCHBOARD_DETAIL_SEED_TIMEOUT_MS);
+      const game = detail?.data?.game as Record<string, unknown> | undefined;
+      const sport = String(game?.sport || "").trim().toLowerCase();
+      if (game && sport) {
+        detailGame = game;
+        break;
+      }
+    }
+    if (!detailGame) return;
+    const sport = String(detailGame.sport || "").trim().toLowerCase();
+    if (!sport) return;
+
+    const homeTeamCode = String(detailGame.home_team_code || detailGame.home_team || "").trim() || "TBD";
+    const awayTeamCode = String(detailGame.away_team_code || detailGame.away_team || "").trim() || "TBD";
+    const homeTeamName = String(detailGame.home_team_name || "").trim() || null;
+    const awayTeamName = String(detailGame.away_team_name || "").trim() || null;
+    const status = String(detailGame.status || "SCHEDULED").trim() || "SCHEDULED";
+    const startTime = String(detailGame.start_time || "").trim() || new Date().toISOString();
+    const periodLabel = String(detailGame.period_label || detailGame.period || "").trim() || null;
+    const clock = String(detailGame.clock || "").trim() || null;
+    const scoreHome = pickNumber(detailGame.home_score);
+    const scoreAway = pickNumber(detailGame.away_score);
+
+    const providerFromDetail = String((detailGame as any).provider_game_id || "").trim();
+    const eventFromDetail = String((detailGame as any).event_id || "").trim();
+    const externalFromDetail = String(detailGame.external_id || "").trim();
+    const keysToSeed = Array.from(new Set([
+      ...candidates,
+      providerFromDetail,
+      eventFromDetail,
+      externalFromDetail ? `sr:sport_event:${externalFromDetail}` : "",
+      externalFromDetail ? `sr:match:${externalFromDetail}` : "",
+    ].map((v) => String(v || "").trim()).filter(Boolean)));
+
+    for (const providerGameId of keysToSeed) {
+      await db
+        .prepare("DELETE FROM sdio_games WHERE provider_game_id = ? AND sport = ?")
+        .bind(providerGameId, sport)
+        .run();
+      await db
+        .prepare(`
+          INSERT INTO sdio_games (
+            provider_game_id,
+            sport,
+            league,
+            home_team,
+            away_team,
+            home_team_name,
+            away_team_name,
+            start_time,
+            status,
+            score_home,
+            score_away,
+            period,
+            clock,
+            last_sync,
+            updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        `)
+        .bind(
+          providerGameId,
+          sport,
+          sport.toUpperCase(),
+          homeTeamCode,
+          awayTeamCode,
+          homeTeamName,
+          awayTeamName,
+          startTime,
+          status,
+          scoreHome,
+          scoreAway,
+          periodLabel,
+          clock
+        )
+        .run();
+    }
+  } catch (error) {
+    console.warn("[Watchboards] seed snapshot failed", {
+      candidates,
+      error,
+    });
+  }
+}
+
+async function seedWatchboardPlaceholderSnapshot(
+  db: D1Database,
+  gameId: string,
+  gameSummary?: string
+): Promise<void> {
+  const providerGameId = String(gameId || "").trim();
+  if (!providerGameId) return;
+  const parsed = parseWatchboardGameSummary(gameSummary);
+  const awayName = parsed.awayName || null;
+  const homeName = parsed.homeName || null;
+  const derivedCodes = deriveFallbackCodesFromGameId(providerGameId);
+  const awayCode = awayName ? toCodeFromName(awayName) : derivedCodes.awayCode;
+  const homeCode = homeName ? toCodeFromName(homeName) : derivedCodes.homeCode;
+  await db
+    .prepare("DELETE FROM sdio_games WHERE provider_game_id = ? AND sport = 'unknown'")
+    .bind(providerGameId)
+    .run();
+  await db
+    .prepare(`
+      INSERT INTO sdio_games (
+        provider_game_id,
+        sport,
+        league,
+        home_team,
+        away_team,
+        home_team_name,
+        away_team_name,
+        start_time,
+        status,
+        score_home,
+        score_away,
+        period,
+        clock,
+        last_sync,
+        updated_at
+      ) VALUES (?, 'unknown', 'UNKNOWN', ?, ?, ?, ?, ?, 'SCHEDULED', NULL, NULL, NULL, NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+    `)
+    .bind(
+      providerGameId,
+      homeCode,
+      awayCode,
+      homeName,
+      awayName,
+      new Date().toISOString()
+    )
+    .run();
 }
 
 // Helper to get or create default watchboard for user
@@ -256,9 +757,13 @@ watchboardsRouter.get("/active", async (c) => {
 watchboardsRouter.get("/home-preview", async (c) => {
   const userId = c.req.header("x-user-id") || "guest";
   const db = c.env.DB;
+  const fastMode = c.req.query("fast") === "1";
+  const startedAt = Date.now();
+  let queryCount = 0;
 
   try {
     // Get all boards for user
+    queryCount += 1;
     const boards = await db
       .prepare("SELECT * FROM watchboards WHERE user_id = ? ORDER BY updated_at DESC")
       .bind(userId)
@@ -290,9 +795,10 @@ watchboardsRouter.get("/home-preview", async (c) => {
     };
 
     // Join watchboard_games with sdio_games to get full game data.
-    // If sdio tables are unavailable, gracefully fall back to IDs-only payload.
+    // If primary join misses rows, run one batched enrichment query.
     let allGamesWithData: { results: HomePreviewRow[] } = { results: [] };
     try {
+      queryCount += 1;
       allGamesWithData = await db
         .prepare(`
           SELECT 
@@ -311,14 +817,41 @@ watchboardsRouter.get("/home-preview", async (c) => {
             g.period AS period_label,
             g.clock
           FROM watchboard_games wg
-          LEFT JOIN sdio_games g ON wg.game_id = g.provider_game_id
+          LEFT JOIN (
+            SELECT provider_game_id, sport, home_team, away_team, home_team_name, away_team_name, score_home, score_away, status, start_time, period, clock
+            FROM (
+              SELECT
+                provider_game_id,
+                sport,
+                home_team,
+                away_team,
+                home_team_name,
+                away_team_name,
+                score_home,
+                score_away,
+                status,
+                start_time,
+                period,
+                clock,
+                ROW_NUMBER() OVER (
+                  PARTITION BY provider_game_id
+                  ORDER BY
+                    CASE WHEN lower(trim(coalesce(sport, ''))) = 'unknown' THEN 1 ELSE 0 END ASC,
+                    datetime(updated_at) DESC,
+                    id DESC
+                ) AS rn
+              FROM sdio_games
+            ) ranked_games
+            WHERE rn = 1
+          ) g ON wg.game_id = g.provider_game_id
           WHERE wg.watchboard_id IN (${placeholders})
           ORDER BY wg.order_index ASC
         `)
         .bind(...boardIds)
         .all<HomePreviewRow>();
     } catch (error) {
-      console.warn("[Watchboards] home-preview game join unavailable, returning ids only", error);
+      console.warn("[Watchboards] home-preview game join unavailable, falling back to lightweight game rows", error);
+      queryCount += 1;
       const idsOnly = await db
         .prepare(`
           SELECT watchboard_id, game_id, order_index
@@ -348,6 +881,202 @@ watchboardsRouter.get("/home-preview", async (c) => {
       };
     }
 
+    const unresolvedIds = Array.from(new Set(
+      (allGamesWithData.results || [])
+        .filter((row) => !row.sport || String(row.sport || "").trim().toLowerCase() === "unknown")
+        .map((row) => String(row.game_id || "").trim())
+        .filter(Boolean)
+    ));
+    const enrichedByGameId = new Map<string, HomePreviewRow>();
+    let fallbackResolvedCount = 0;
+    if (unresolvedIds.length > 0) {
+      const unresolvedPlaceholders = unresolvedIds.map(() => "?").join(",");
+      try {
+        queryCount += 1;
+        const enriched = await db
+          .prepare(`
+            SELECT
+              provider_game_id,
+              sport,
+              home_team AS home_team_code,
+              away_team AS away_team_code,
+              home_team_name,
+              away_team_name,
+              score_home AS home_score,
+              score_away AS away_score,
+              status,
+              start_time,
+              period AS period_label,
+              clock
+            FROM sdio_games
+            WHERE provider_game_id IN (${unresolvedPlaceholders})
+          `)
+          .bind(...unresolvedIds)
+          .all<{
+            provider_game_id: string | null;
+            sport: string | null;
+            home_team_code: string | null;
+            away_team_code: string | null;
+            home_team_name: string | null;
+            away_team_name: string | null;
+            home_score: number | null;
+            away_score: number | null;
+            status: string | null;
+            start_time: string | null;
+            period_label: string | null;
+            clock: string | null;
+          }>();
+        for (const row of enriched.results || []) {
+          const normalized = {
+            watchboard_id: 0,
+            game_id: String(row.provider_game_id || "").trim(),
+            order_index: 0,
+            sport: row.sport,
+            home_team_code: row.home_team_code,
+            away_team_code: row.away_team_code,
+            home_team_name: row.home_team_name,
+            away_team_name: row.away_team_name,
+            home_score: row.home_score,
+            away_score: row.away_score,
+            status: row.status,
+            start_time: row.start_time,
+            period_label: row.period_label,
+            clock: row.clock,
+          } satisfies HomePreviewRow;
+          const providerKey = String(row.provider_game_id || "").trim();
+          if (providerKey) enrichedByGameId.set(providerKey, normalized);
+        }
+      } catch (error) {
+        console.warn("[Watchboards] home-preview unresolved enrichment failed", {
+          unresolvedCount: unresolvedIds.length,
+          error,
+        });
+      }
+
+      // Local fallback resolver for legacy/non-canonical watchboard IDs.
+      // Important: keep home-preview deterministic and avoid external fetches
+      // on the critical render path.
+      const stillUnresolved = unresolvedIds
+        .filter((id) => !enrichedByGameId.has(id))
+        .slice(0, WATCHBOARD_HOME_PREVIEW_FALLBACK_LIMIT);
+      if (stillUnresolved.length > 0) {
+        try {
+          const fallbackPlaceholders = stillUnresolved.map(() => "?").join(",");
+          queryCount += 1;
+          const canonicalMapped = await db
+            .prepare(`
+              SELECT
+                cg.provider_event_id,
+                cg.provider_game_id,
+                sg.sport,
+                sg.home_team AS home_team_code,
+                sg.away_team AS away_team_code,
+                sg.home_team_name,
+                sg.away_team_name,
+                sg.score_home AS home_score,
+                sg.score_away AS away_score,
+                sg.status,
+                sg.start_time,
+                sg.period AS period_label,
+                sg.clock
+              FROM canonical_games cg
+              LEFT JOIN sdio_games sg
+                ON sg.provider_game_id = cg.provider_game_id
+              WHERE cg.provider_event_id IN (${fallbackPlaceholders})
+                 OR cg.provider_game_id IN (${fallbackPlaceholders})
+            `)
+            .bind(...stillUnresolved, ...stillUnresolved)
+            .all<{
+              provider_event_id: string | null;
+              provider_game_id: string | null;
+              sport: string | null;
+              home_team_code: string | null;
+              away_team_code: string | null;
+              home_team_name: string | null;
+              away_team_name: string | null;
+              home_score: number | null;
+              away_score: number | null;
+              status: string | null;
+              start_time: string | null;
+              period_label: string | null;
+              clock: string | null;
+            }>();
+
+          const resolvedKeys = new Set<string>();
+          const remapStatements: D1PreparedStatement[] = [];
+          for (const row of canonicalMapped.results || []) {
+            const providerEventId = String(row.provider_event_id || "").trim();
+            const providerGameId = String(row.provider_game_id || "").trim();
+            const sport = String(row.sport || "").trim();
+
+            let normalized: HomePreviewRow | null = null;
+            if (sport) {
+              normalized = {
+                watchboard_id: 0,
+                game_id: providerGameId || providerEventId,
+                order_index: 0,
+                sport,
+                home_team_code: row.home_team_code,
+                away_team_code: row.away_team_code,
+                home_team_name: row.home_team_name,
+                away_team_name: row.away_team_name,
+                home_score: row.home_score,
+                away_score: row.away_score,
+                status: row.status,
+                start_time: row.start_time,
+                period_label: row.period_label,
+                clock: row.clock,
+              };
+            } else if (providerGameId && enrichedByGameId.has(providerGameId)) {
+              normalized = enrichedByGameId.get(providerGameId)!;
+            }
+            if (!normalized) continue;
+
+            if (providerGameId) {
+              enrichedByGameId.set(providerGameId, normalized);
+              if (stillUnresolved.includes(providerGameId)) resolvedKeys.add(providerGameId);
+            }
+            if (providerEventId) {
+              enrichedByGameId.set(providerEventId, normalized);
+              if (stillUnresolved.includes(providerEventId)) resolvedKeys.add(providerEventId);
+              if (providerGameId && providerEventId !== providerGameId) {
+                remapStatements.push(
+                  db.prepare(`
+                    UPDATE watchboard_games
+                    SET game_id = ?
+                    WHERE watchboard_id IN (${placeholders})
+                      AND game_id = ?
+                      AND NOT EXISTS (
+                        SELECT 1
+                        FROM watchboard_games wg2
+                        WHERE wg2.watchboard_id = watchboard_games.watchboard_id
+                          AND wg2.game_id = ?
+                      )
+                  `).bind(providerGameId, ...boardIds, providerEventId, providerGameId)
+                );
+              }
+            }
+          }
+          if (remapStatements.length > 0) {
+            try {
+              await db.batch(remapStatements);
+            } catch (remapError) {
+              console.warn("[Watchboards] unresolved id remap failed", {
+                rowCount: remapStatements.length,
+                error: remapError,
+              });
+            }
+          }
+          fallbackResolvedCount += resolvedKeys.size;
+        } catch (error) {
+          console.warn("[Watchboards] home-preview fallback resolver failed", {
+            unresolvedCount: stillUnresolved.length,
+            error,
+          });
+        }
+      }
+    }
+
     // Group games by board with full data
     const gamesByBoard: Record<number, { gameIds: string[]; games: Array<{
       game_id: string;
@@ -362,50 +1091,57 @@ watchboardsRouter.get("/home-preview", async (c) => {
       start_time: string;
       period_label: string | null;
       clock: string | null;
-      needs_fetch?: boolean;
     }> }> = {};
     
+    let degradedCount = 0;
+    let skippedFallbackNoIdentityCount = 0;
     for (const row of allGamesWithData.results) {
       if (!gamesByBoard[row.watchboard_id]) {
         gamesByBoard[row.watchboard_id] = { gameIds: [], games: [] };
       }
       gamesByBoard[row.watchboard_id].gameIds.push(row.game_id);
       
-      // If join succeeded (game exists in sdio_games), add full data
-      if (row.sport) {
+      const rowSport = String(row.sport || "").trim().toLowerCase();
+      const enriched = rowSport && rowSport !== "unknown"
+        ? row
+        : enrichedByGameId.get(String(row.game_id || "").trim());
+      const enrichedSport = String(enriched?.sport || "").trim().toLowerCase();
+      if (enrichedSport && enrichedSport !== "unknown") {
         gamesByBoard[row.watchboard_id].games.push({
           game_id: row.game_id,
-          sport: row.sport,
-          home_team_code: row.home_team_code || 'TBD',
-          away_team_code: row.away_team_code || 'TBD',
-          home_team_name: row.home_team_name,
-          away_team_name: row.away_team_name,
-          home_score: row.home_score,
-          away_score: row.away_score,
-          status: row.status || 'SCHEDULED',
-          start_time: row.start_time || new Date().toISOString(),
-          period_label: row.period_label,
-          clock: row.clock,
+          sport: enriched.sport,
+          home_team_code: enriched.home_team_code || '',
+          away_team_code: enriched.away_team_code || '',
+          home_team_name: enriched.home_team_name,
+          away_team_name: enriched.away_team_name,
+          home_score: enriched.home_score,
+          away_score: enriched.away_score,
+          status: enriched.status || 'SCHEDULED',
+          start_time: enriched.start_time || '',
+          period_label: enriched.period_label,
+          clock: enriched.clock,
         });
       } else {
-        // Game not in sdio_games - likely soccer (SportsRadar) or other external source
-        // Add placeholder entry so frontend knows to fetch from appropriate API
-        const isSoccerMatch = row.game_id.startsWith('sr:');
-        gamesByBoard[row.watchboard_id].games.push({
-          game_id: row.game_id,
-          sport: isSoccerMatch ? 'soccer' : 'unknown',
-          home_team_code: 'TBD',
-          away_team_code: 'TBD',
-          home_team_name: null,
-          away_team_name: null,
-          home_score: null,
-          away_score: null,
-          status: 'SCHEDULED',
-          start_time: new Date().toISOString(),
-          period_label: null,
-          clock: null,
-          needs_fetch: true,
-        });
+        degradedCount += 1;
+        const hasIdentityHints = Boolean(
+          String(row.home_team_name || "").trim()
+          || String(row.away_team_name || "").trim()
+          || String(row.home_team_code || "").trim()
+          || String(row.away_team_code || "").trim()
+        );
+        if (hasIdentityHints) {
+          gamesByBoard[row.watchboard_id].games.push(buildFallbackWatchboardRow({
+            game_id: row.game_id,
+            home_team_code: row.home_team_code,
+            away_team_code: row.away_team_code,
+            home_team_name: row.home_team_name,
+            away_team_name: row.away_team_name,
+            status: row.status,
+            start_time: row.start_time,
+          }));
+        } else {
+          skippedFallbackNoIdentityCount += 1;
+        }
       }
     }
 
@@ -417,10 +1153,181 @@ watchboardsRouter.get("/home-preview", async (c) => {
       games: gamesByBoard[board.id]?.games || [],
     }));
 
-    return c.json({ boards: boardsWithGames });
+    const durationMs = Date.now() - startedAt;
+    const payloadBytes = JSON.stringify(boardsWithGames).length;
+    console.info("[Watchboards][home-preview][perf]", {
+      durationMs,
+      payloadBytes,
+      queryCount,
+      boardCount: boardsWithGames.length,
+      unresolvedCount: unresolvedIds.length,
+      degradedCount,
+      fallbackResolvedCount,
+    });
+    // #region agent log
+    sendDebugLog({
+      runId: "syncing-debug-run1",
+      hypothesisId: "H1",
+      location: "src/worker/routes/watchboards.ts:home-preview",
+      message: "home-preview hydration summary",
+      data: {
+        unresolvedCount: unresolvedIds.length,
+        degradedCount,
+        fallbackResolvedCount,
+        skippedFallbackNoIdentityCount,
+        boardCount: boardsWithGames.length,
+        boardGameRows: boardsWithGames.reduce((sum, board) => sum + (board.gameIds?.length || 0), 0),
+        boardHydratedRows: boardsWithGames.reduce((sum, board) => sum + (board.games?.length || 0), 0),
+      },
+    });
+    // #endregion
+
+    return c.json({
+      boards: boardsWithGames,
+      meta: {
+        durationMs,
+        payloadBytes,
+        queryCount,
+        unresolvedCount: unresolvedIds.length,
+        degradedCount,
+        fallbackResolvedCount,
+      },
+    });
   } catch (error) {
     console.error("[Watchboards] Error getting home preview:", error);
     return c.json({ error: "Failed to get watchboards preview" }, 500);
+  }
+});
+
+// POST /api/watchboards/create-with-game - Create board and add game in one request
+watchboardsRouter.post("/create-with-game", async (c) => {
+  const userId = c.req.header("x-user-id") || "guest";
+  const requestId = makeWatchboardRequestId(c.req.header("x-request-id"));
+  const db = c.env.DB;
+  const startedAt = Date.now();
+  const { name, game_id, added_from, client_mutation_id, game_summary } = await c.req.json<{
+    name: string;
+    game_id: string;
+    added_from?: string;
+    client_mutation_id?: string;
+    game_summary?: string;
+  }>();
+
+  const normalizedName = normalizeBoardName(name);
+  const normalizedGameId = String(game_id || "").trim();
+  if (!normalizedName) {
+    return c.json({ error: "Board name is required", request_id: requestId }, 400);
+  }
+  if (!normalizedGameId) {
+    return c.json({ error: "game_id is required", request_id: requestId }, 400);
+  }
+
+  let boardId: number | null = null;
+  let createdBoard = false;
+  try {
+    const canonicalGameId = await resolveCanonicalWatchboardGameIdSafe(db, normalizedGameId);
+    const candidateGameIds = Array.from(new Set([normalizedGameId, canonicalGameId].filter(Boolean)));
+
+    const existingBoard = await db
+      .prepare(`
+        SELECT * FROM watchboards
+        WHERE user_id = ? AND lower(trim(name)) = lower(trim(?))
+        ORDER BY updated_at DESC, id DESC
+        LIMIT 1
+      `)
+      .bind(userId, normalizedName)
+      .first<Watchboard>();
+    if (existingBoard) {
+      boardId = existingBoard.id;
+    } else {
+      const created = await db
+        .prepare("INSERT INTO watchboards (user_id, name, is_active) VALUES (?, ?, 0)")
+        .bind(userId, normalizedName)
+        .run();
+      boardId = Number(created.meta.last_row_id || 0) || null;
+      if (!boardId) {
+        return c.json({ error: "Failed to create watchboard", request_id: requestId }, 500);
+      }
+      createdBoard = true;
+    }
+
+    const duplicatePlaceholders = candidateGameIds.map(() => "?").join(",");
+    const alreadyHasGame = await db
+      .prepare(`
+        SELECT id, order_index
+        FROM watchboard_games
+        WHERE watchboard_id = ?
+          AND game_id IN (${duplicatePlaceholders})
+        ORDER BY id DESC
+        LIMIT 1
+      `)
+      .bind(boardId, ...candidateGameIds)
+      .first<{ id: number; order_index: number | null }>();
+    let orderIndex = Number(alreadyHasGame?.order_index ?? 0) || 0;
+    if (!alreadyHasGame) {
+      const maxOrder = await db
+        .prepare("SELECT MAX(order_index) as max_order FROM watchboard_games WHERE watchboard_id = ?")
+        .bind(boardId)
+        .first<{ max_order: number | null }>();
+      const nextOrder = (maxOrder?.max_order ?? -1) + 1;
+      orderIndex = nextOrder;
+      // Keep insert compatible with older local schemas that may not have added_from.
+      await db
+        .prepare("INSERT INTO watchboard_games (watchboard_id, game_id, order_index) VALUES (?, ?, ?)")
+        .bind(boardId, canonicalGameId, nextOrder)
+        .run();
+    }
+
+    await db
+      .prepare("UPDATE watchboards SET updated_at = CURRENT_TIMESTAMP WHERE id = ?")
+      .bind(boardId)
+      .run();
+
+    const board = await db
+      .prepare("SELECT * FROM watchboards WHERE id = ? AND user_id = ?")
+      .bind(boardId, userId)
+      .first<Watchboard>();
+    await seedWatchboardGameSnapshot(db, candidateGameIds);
+    const isResolvable = await canHydrateWatchboardGameId(db, candidateGameIds);
+    if (!isResolvable) {
+      await seedWatchboardPlaceholderSnapshot(db, canonicalGameId || normalizedGameId, game_summary);
+    }
+    const durationMs = Date.now() - startedAt;
+    console.info("[Watchboards][create-with-game]", {
+      durationMs,
+      boardId,
+      gameId: normalizedGameId,
+      canonicalGameId,
+      clientMutationId: client_mutation_id || null,
+      requestId,
+    });
+    return c.json({
+      success: true,
+      board,
+      boardId,
+      boardName: board?.name || normalizedName,
+      gameId: canonicalGameId,
+      order_index: orderIndex,
+      client_mutation_id: client_mutation_id || null,
+      request_id: requestId,
+    }, 201);
+  } catch (error) {
+    if (boardId && createdBoard) {
+      try {
+        await db.prepare("DELETE FROM watchboard_games WHERE watchboard_id = ?").bind(boardId).run();
+        await db.prepare("DELETE FROM watchboards WHERE id = ?").bind(boardId).run();
+      } catch {
+        // best-effort cleanup for partial create
+      }
+    }
+    console.error("[Watchboards] Error creating board with game:", {
+      error,
+      boardId,
+      gameId: normalizedGameId,
+      clientMutationId: client_mutation_id || null,
+      requestId,
+    });
+    return c.json({ error: "Failed to create watchboard with game", request_id: requestId }, 500);
   }
 });
 
@@ -430,14 +1337,28 @@ watchboardsRouter.post("/", async (c) => {
   const db = c.env.DB;
   const { name } = await c.req.json<{ name: string }>();
 
-  if (!name || name.trim().length === 0) {
+  const normalizedName = normalizeBoardName(name);
+  if (!normalizedName) {
     return c.json({ error: "Board name is required" }, 400);
   }
 
   try {
+    const existingBoard = await db
+      .prepare(`
+        SELECT * FROM watchboards
+        WHERE user_id = ? AND lower(trim(name)) = lower(trim(?))
+        ORDER BY updated_at DESC, id DESC
+        LIMIT 1
+      `)
+      .bind(userId, normalizedName)
+      .first<Watchboard>();
+    if (existingBoard) {
+      return c.json({ board: existingBoard, existing: true }, 200);
+    }
+
     const result = await db
       .prepare("INSERT INTO watchboards (user_id, name, is_active) VALUES (?, ?, 0)")
-      .bind(userId, name.trim())
+      .bind(userId, normalizedName)
       .run();
 
     const newBoard = await db
@@ -555,11 +1476,13 @@ watchboardsRouter.delete("/:id", async (c) => {
 // POST /api/watchboards/games - Add game to a specific board or active board
 watchboardsRouter.post("/games", async (c) => {
   const userId = c.req.header("x-user-id") || "guest";
+  const requestId = makeWatchboardRequestId(c.req.header("x-request-id"));
   const db = c.env.DB;
-  const { game_id, added_from, board_id } = await c.req.json<{ game_id: string; added_from?: string; board_id?: number }>();
+  const startedAt = Date.now();
+  const { game_id, added_from, board_id, client_mutation_id, game_summary } = await c.req.json<{ game_id: string; added_from?: string; board_id?: number; client_mutation_id?: string; game_summary?: string }>();
 
   if (!game_id) {
-    return c.json({ error: "game_id is required" }, 400);
+    return c.json({ error: "game_id is required", request_id: requestId }, 400);
   }
 
   try {
@@ -573,7 +1496,7 @@ watchboardsRouter.post("/games", async (c) => {
         .first<Watchboard>();
       
       if (!specificBoard) {
-        return c.json({ error: "Watchboard not found" }, 404);
+        return c.json({ error: "Watchboard not found", request_id: requestId }, 404);
       }
       board = specificBoard;
     } else {
@@ -581,14 +1504,33 @@ watchboardsRouter.post("/games", async (c) => {
       board = await getOrCreateDefaultWatchboard(db, userId);
     }
 
-    // Check if already exists in this board
+    const canonicalGameId = await resolveCanonicalWatchboardGameIdSafe(db, game_id);
+    const candidateGameIds = Array.from(new Set([game_id, canonicalGameId].filter(Boolean)));
+    const duplicatePlaceholders = candidateGameIds.map(() => "?").join(",");
+
+    // Check if already exists in this board (including legacy/raw aliases).
     const existing = await db
-      .prepare("SELECT id FROM watchboard_games WHERE watchboard_id = ? AND game_id = ?")
-      .bind(board.id, game_id)
+      .prepare(`
+        SELECT id
+        FROM watchboard_games
+        WHERE watchboard_id = ?
+          AND game_id IN (${duplicatePlaceholders})
+        ORDER BY id DESC
+        LIMIT 1
+      `)
+      .bind(board.id, ...candidateGameIds)
       .first();
 
     if (existing) {
-      return c.json({ error: "Game already in watchboard", alreadyExists: true, boardName: board.name }, 400);
+      console.info("[Watchboards][add-game:already-exists]", {
+        requestId,
+        boardId: board.id,
+        gameId: game_id,
+        canonicalGameId,
+        clientMutationId: client_mutation_id || null,
+        durationMs: Date.now() - startedAt,
+      });
+      return c.json({ error: "Game already in watchboard", alreadyExists: true, boardName: board.name, request_id: requestId }, 400);
     }
 
     // Get max order_index
@@ -599,15 +1541,54 @@ watchboardsRouter.post("/games", async (c) => {
 
     const nextOrder = (maxOrder?.max_order ?? -1) + 1;
 
+    // Keep insert compatible with older local schemas that may not have added_from.
     await db
-      .prepare("INSERT INTO watchboard_games (watchboard_id, game_id, order_index, added_from) VALUES (?, ?, ?, ?)")
-      .bind(board.id, game_id, nextOrder, added_from || null)
+      .prepare("INSERT INTO watchboard_games (watchboard_id, game_id, order_index) VALUES (?, ?, ?)")
+      .bind(board.id, canonicalGameId, nextOrder)
       .run();
 
-    return c.json({ success: true, boardId: board.id, boardName: board.name, order_index: nextOrder }, 201);
+    await seedWatchboardGameSnapshot(db, candidateGameIds);
+    const isResolvable = await canHydrateWatchboardGameId(db, candidateGameIds);
+    if (!isResolvable) {
+      await seedWatchboardPlaceholderSnapshot(db, canonicalGameId || game_id, game_summary);
+    }
+    // #region agent log
+    sendDebugLog({
+      runId: "syncing-delay-run1",
+      hypothesisId: "H8",
+      location: "src/worker/routes/watchboards.ts:POST /games",
+      message: "add-game mutation lifecycle",
+      data: {
+        requestId,
+        boardId: board.id,
+        gameId: game_id,
+        canonicalGameId,
+        isResolvable,
+        usedPlaceholderSeed: !isResolvable,
+        durationMs: Date.now() - startedAt,
+      },
+    });
+    // #endregion
+
+    console.info("[Watchboards][add-game]", {
+      requestId,
+      boardId: board.id,
+      gameId: game_id,
+      canonicalGameId,
+      clientMutationId: client_mutation_id || null,
+      durationMs: Date.now() - startedAt,
+    });
+    return c.json({ success: true, boardId: board.id, boardName: board.name, order_index: nextOrder, request_id: requestId }, 201);
   } catch (error) {
-    console.error("[Watchboards] Error adding game:", error);
-    return c.json({ error: "Failed to add game to watchboard" }, 500);
+    console.error("[Watchboards] Error adding game:", {
+      error,
+      requestId,
+      gameId: game_id,
+      boardId: board_id || null,
+      clientMutationId: client_mutation_id || null,
+      durationMs: Date.now() - startedAt,
+    });
+    return c.json({ error: "Failed to add game to watchboard", request_id: requestId }, 500);
   }
 });
 
@@ -620,10 +1601,19 @@ watchboardsRouter.delete("/games/:gameId", async (c) => {
   try {
     const board = await getOrCreateDefaultWatchboard(db, userId);
 
-    await db
-      .prepare("DELETE FROM watchboard_games WHERE watchboard_id = ? AND game_id = ?")
-      .bind(board.id, gameId)
-      .run();
+    const canonicalGameId = await resolveCanonicalWatchboardGameIdSafe(db, gameId);
+    const candidateGameIds = Array.from(new Set([...buildGameIdAliasCandidates(gameId), canonicalGameId].filter(Boolean)));
+    if (candidateGameIds.length > 0) {
+      const placeholders = candidateGameIds.map(() => "?").join(",");
+      await db
+        .prepare(`
+          DELETE FROM watchboard_games
+          WHERE watchboard_id = ?
+            AND game_id IN (${placeholders})
+        `)
+        .bind(board.id, ...candidateGameIds)
+        .run();
+    }
 
     // Re-index remaining games
     const remaining = await db
@@ -676,21 +1666,51 @@ watchboardsRouter.put("/games/reorder", async (c) => {
 // GET /api/watchboards/games/check/:gameId - Check if game is in active board
 watchboardsRouter.get("/games/check/:gameId", async (c) => {
   const userId = c.req.header("x-user-id") || "guest";
+  const requestId = makeWatchboardRequestId(c.req.header("x-request-id"));
   const db = c.env.DB;
   const gameId = c.req.param("gameId");
+  const boardIdParam = String(c.req.query("board_id") || "").trim();
+  const requestedBoardId = Number(boardIdParam);
+  const hasRequestedBoardId = Number.isFinite(requestedBoardId) && requestedBoardId > 0;
 
   try {
-    const board = await getOrCreateDefaultWatchboard(db, userId);
+    const board = hasRequestedBoardId
+      ? await db
+        .prepare("SELECT * FROM watchboards WHERE id = ? AND user_id = ?")
+        .bind(requestedBoardId, userId)
+        .first<Watchboard>()
+      : await getOrCreateDefaultWatchboard(db, userId);
+    if (!board) {
+      return c.json({ inWatchboard: false, request_id: requestId }, 404);
+    }
 
+    const canonicalGameId = await resolveCanonicalWatchboardGameIdSafe(db, gameId);
+    const candidateGameIds = Array.from(new Set([...buildGameIdAliasCandidates(gameId), canonicalGameId].filter(Boolean)));
+    if (candidateGameIds.length === 0) {
+      return c.json({ inWatchboard: false, request_id: requestId });
+    }
+    const placeholders = candidateGameIds.map(() => "?").join(",");
     const existing = await db
-      .prepare("SELECT id FROM watchboard_games WHERE watchboard_id = ? AND game_id = ?")
-      .bind(board.id, gameId)
+      .prepare(`
+        SELECT id
+        FROM watchboard_games
+        WHERE watchboard_id = ?
+          AND game_id IN (${placeholders})
+        ORDER BY id DESC
+        LIMIT 1
+      `)
+      .bind(board.id, ...candidateGameIds)
       .first();
 
-    return c.json({ inWatchboard: !!existing });
+    return c.json({ inWatchboard: !!existing, boardId: board.id, request_id: requestId });
   } catch (error) {
-    console.error("[Watchboards] Error checking game:", error);
-    return c.json({ error: "Failed to check game" }, 500);
+    console.error("[Watchboards] Error checking game:", {
+      error,
+      gameId,
+      requestedBoardId: hasRequestedBoardId ? requestedBoardId : null,
+      requestId,
+    });
+    return c.json({ error: "Failed to check game", request_id: requestId }, 500);
   }
 });
 

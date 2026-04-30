@@ -1,17 +1,33 @@
 /**
- * WatchboardPreview - Home page module showing user's active watchboards
- * Shows all boards with games that aren't final, auto-hides completed boards
+ * HOMEPAGE LOCKED
+ * Do not change behavior/order/render rules without explicit approval.
+ * Homepage stability rules:
+ * - exactly 3 Games Today cards
+ * - soccer + White Sox logo stability
+ * - static sport icon row behavior
+ * - watchboards render immediately and stay synced on Home
+ * - no flicker / no late visual swapping
  */
 
 import { memo, useEffect, useState, useCallback, useRef } from "react";
 import { Link, useNavigate } from "react-router-dom";
-import { Eye, Plus, Radio, Clock, ChevronRight, LayoutGrid } from "lucide-react";
+import { Eye, Plus, Radio, Clock, ChevronRight, LayoutGrid, MoreVertical, Trash2 } from "lucide-react";
 import { cn } from "@/react-app/lib/utils";
 import { toGameDetailPath } from "@/react-app/lib/gameRoutes";
 import { useDemoAuth } from "@/react-app/contexts/DemoAuthContext";
-import { getTeamLogoUrl } from "@/react-app/lib/teamLogos";
 import { getTeamColors } from "@/react-app/data/team-colors";
 import { useDataHubWatchboards } from "@/react-app/hooks/useDataHub";
+import { TeamLogo } from "@/react-app/components/TeamLogo";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/react-app/components/ui/dropdown-menu";
+import { homeLockDevLog } from "@/react-app/lib/homeLockRules";
+
+const DEBUG_LOG_ENDPOINT = "http://127.0.0.1:7738/ingest/3f0629af-a99a-4780-a8a2-f41a5bc25b15";
+const DEBUG_SESSION_ID = "05f1a6";
 
 interface GameData {
   game_id: string;
@@ -36,16 +52,118 @@ interface BoardWithGames {
   hasActiveGames: boolean; // true if any game is not final
 }
 
-function buildFallbackLogoDataUri(label: string): string {
-  const safe = (label || "TBD").trim();
-  const initials = safe
-    .split(/\s+/)
-    .map((part) => part[0] || "")
-    .join("")
-    .slice(0, 3)
-    .toUpperCase() || "TBD";
-  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48"><rect width="100%" height="100%" fill="#1e293b"/><text x="50%" y="54%" dominant-baseline="middle" text-anchor="middle" fill="#ffffff" font-size="16" font-family="Arial, sans-serif">${initials}</text></svg>`;
-  return `data:image/svg+xml;charset=UTF-8,${encodeURIComponent(svg)}`;
+function inferSportFromGameId(gameId: string): string {
+  const id = String(gameId || "").trim().toLowerCase();
+  if (id.startsWith("sr:")) return "soccer";
+  if (id.startsWith("espn_nba_")) return "nba";
+  if (id.startsWith("espn_nfl_")) return "nfl";
+  if (id.startsWith("espn_mlb_")) return "mlb";
+  if (id.startsWith("espn_nhl_")) return "nhl";
+  if (id.startsWith("espn_soccer_")) return "soccer";
+  return "unknown";
+}
+
+const INVALID_TEAM_TOKENS = new Set(["", "TBD", "UNK", "UNKNOWN", "HOME", "AWAY"]);
+
+function looksLikeRawGameId(value: string): boolean {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (!normalized) return true;
+  return normalized.startsWith("sr:")
+    || normalized.startsWith("sr_")
+    || normalized.startsWith("espn_")
+    || normalized.includes(":sport_event:")
+    || normalized.includes(":match:");
+}
+
+function sendDebugLog(payload: {
+  runId: string;
+  hypothesisId: string;
+  location: string;
+  message: string;
+  data: Record<string, unknown>;
+}): void {
+  // #region agent log
+  fetch(DEBUG_LOG_ENDPOINT, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Debug-Session-Id": DEBUG_SESSION_ID,
+    },
+    body: JSON.stringify({
+      sessionId: DEBUG_SESSION_ID,
+      ...payload,
+      timestamp: Date.now(),
+    }),
+  }).catch(() => {});
+  // #endregion
+}
+
+function isRenderableWatchboardGame(game: GameData | undefined | null): game is GameData {
+  if (!game) return false;
+  const sport = String(game.sport || "").trim().toLowerCase();
+  if (!sport) return false;
+  if (String(game.status || "").trim().toUpperCase() === "UNKNOWN") return false;
+  const homeCode = String(game.home_team_code || "").trim().toUpperCase();
+  const awayCode = String(game.away_team_code || "").trim().toUpperCase();
+  if (INVALID_TEAM_TOKENS.has(homeCode) || INVALID_TEAM_TOKENS.has(awayCode)) return false;
+  const gameId = String(game.game_id || "").trim();
+  const homeName = String(game.home_team_name || "").trim();
+  const awayName = String(game.away_team_name || "").trim();
+  if (homeName && (looksLikeRawGameId(homeName) || homeName === gameId)) return false;
+  if (awayName && (looksLikeRawGameId(awayName) || awayName === gameId)) return false;
+  return true;
+}
+
+function buildGameIdAliasCandidates(gameId: string | null | undefined): string[] {
+  const normalized = String(gameId || "").trim();
+  if (!normalized) return [];
+  const seen = new Set<string>();
+  const push = (value: string | null | undefined) => {
+    const next = String(value || "").trim();
+    if (!next || seen.has(next)) return;
+    seen.add(next);
+  };
+
+  push(normalized);
+
+  const soccerLegacy = normalized.startsWith("soccer_sr:sport_event:")
+    ? normalized.replace(/^soccer_/, "")
+    : normalized;
+  push(soccerLegacy);
+
+  const srMatch = normalized.match(/^sr_([a-z0-9]+)_(.+)$/i);
+  if (srMatch) {
+    const external = String(srMatch[2] || "").trim();
+    push(external);
+    if (external) {
+      push(`sr:sport_event:${external}`);
+      push(`sr:match:${external}`);
+    }
+  }
+
+  if (normalized.startsWith("sr:sport_event:")) {
+    const external = normalized.replace("sr:sport_event:", "").trim();
+    push(external);
+  }
+  if (normalized.startsWith("sr:match:")) {
+    const external = normalized.replace("sr:match:", "").trim();
+    push(external);
+  }
+
+  const espnMatch = normalized.match(/^espn_([a-z0-9]+)_(.+)$/i);
+  if (espnMatch) {
+    const external = String(espnMatch[2] || "").trim();
+    push(external);
+  }
+
+  return Array.from(seen);
+}
+
+function gameIdsMatch(a: string | null | undefined, b: string | null | undefined): boolean {
+  const left = buildGameIdAliasCandidates(a);
+  const right = new Set(buildGameIdAliasCandidates(b));
+  if (left.length === 0 || right.size === 0) return false;
+  return left.some((value) => right.has(value));
 }
 
 // Compact game tile for preview
@@ -64,9 +182,34 @@ const PreviewTile = memo(function PreviewTile({
   const formatTime = (dateStr: string) => {
     try {
       const date = new Date(dateStr);
-      return date.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
+      if (Number.isNaN(date.getTime())) return "";
+      const formattedDate = date.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+      const formattedTime = date.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
+      return `${formattedDate} • ${formattedTime}`;
     } catch {
       return "";
+    }
+  };
+
+  const formatLiveLabel = (dateStr: string) => {
+    try {
+      const date = new Date(dateStr);
+      if (Number.isNaN(date.getTime())) return "LIVE";
+      const formattedDate = date.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+      return `LIVE • ${formattedDate}`;
+    } catch {
+      return "LIVE";
+    }
+  };
+
+  const formatFinalLabel = (dateStr: string) => {
+    try {
+      const date = new Date(dateStr);
+      if (Number.isNaN(date.getTime())) return "FINAL";
+      const formattedDate = date.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+      return `FINAL • ${formattedDate}`;
+    } catch {
+      return "FINAL";
     }
   };
 
@@ -93,11 +236,11 @@ const PreviewTile = memo(function PreviewTile({
         {isLive ? (
           <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full bg-red-500/20 text-red-400 text-[8px] sm:text-[9px] font-medium">
             <Radio className="w-2 h-2 sm:w-2.5 sm:h-2.5 animate-pulse" />
-            LIVE
+            {formatLiveLabel(game.start_time)}
           </span>
         ) : isFinal ? (
           <span className="px-1.5 py-0.5 rounded-full bg-slate-700/50 text-slate-400 text-[8px] sm:text-[9px] font-medium">
-            FINAL
+            {formatFinalLabel(game.start_time)}
           </span>
         ) : (
           <span className="inline-flex items-center gap-0.5 text-slate-400 text-[8px] sm:text-[9px]">
@@ -112,15 +255,12 @@ const PreviewTile = memo(function PreviewTile({
         {/* Away */}
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-1.5 sm:gap-2">
-            <img
-              src={getTeamLogoUrl(game.away_team_code || "TBD", game.sport?.toUpperCase()) ?? undefined}
-              alt={game.away_team_code}
+            <TeamLogo
+              teamCode={game.away_team_code || "TBD"}
+              teamName={game.away_team_name}
+              sport={game.sport || "unknown"}
+              size={24}
               className="w-5 h-5 sm:w-6 sm:h-6 rounded-full bg-slate-800"
-              onError={(e) => {
-                const img = e.target as HTMLImageElement;
-                img.onerror = null;
-                img.src = buildFallbackLogoDataUri(game.away_team_code || "TBD");
-              }}
             />
             <span className="text-xs sm:text-sm font-semibold text-white">{game.away_team_code}</span>
           </div>
@@ -131,15 +271,12 @@ const PreviewTile = memo(function PreviewTile({
         {/* Home */}
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-1.5 sm:gap-2">
-            <img
-              src={getTeamLogoUrl(game.home_team_code || "TBD", game.sport?.toUpperCase()) ?? undefined}
-              alt={game.home_team_code}
+            <TeamLogo
+              teamCode={game.home_team_code || "TBD"}
+              teamName={game.home_team_name}
+              sport={game.sport || "unknown"}
+              size={24}
               className="w-5 h-5 sm:w-6 sm:h-6 rounded-full bg-slate-800"
-              onError={(e) => {
-                const img = e.target as HTMLImageElement;
-                img.onerror = null;
-                img.src = buildFallbackLogoDataUri(game.home_team_code || "TBD");
-              }}
             />
             <span className="text-xs sm:text-sm font-semibold text-white">{game.home_team_code}</span>
           </div>
@@ -165,13 +302,26 @@ const PreviewTile = memo(function PreviewTile({
 const BoardSection = memo(function BoardSection({
   board,
   onGameClick,
+  onDeleteBoard,
+  canDeleteBoard,
 }: {
   board: BoardWithGames;
   onGameClick: (game: GameData) => void;
+  onDeleteBoard?: (board: BoardWithGames) => void;
+  canDeleteBoard?: boolean;
 }) {
-  // Show up to 4 games per board in preview
-  const displayGames = board.games.slice(0, 4);
-  const hasMore = board.games.length > 4;
+  const boardGameIds = Array.isArray(board.gameIds) ? board.gameIds : [];
+  const hydratedGames = Array.isArray(board.games) ? board.games.filter(isRenderableWatchboardGame) : [];
+  // Keep board order, but tolerate canonical/raw game-id alias differences.
+  const displayEntries = boardGameIds.map((gameId) => {
+    const normalizedGameId = String(gameId || "").trim();
+    const matchedGame = hydratedGames.find((game) => gameIdsMatch(game.game_id, normalizedGameId));
+    if (matchedGame) {
+      return { kind: "game" as const, gameId: normalizedGameId, game: matchedGame };
+    }
+    return { kind: "unresolved" as const, gameId: normalizedGameId };
+  });
+  const unresolvedCount = displayEntries.filter((entry) => entry.kind === "unresolved").length;
 
   return (
     <div className="space-y-2">
@@ -182,38 +332,74 @@ const BoardSection = memo(function BoardSection({
             {board.name}
           </span>
           <span className="text-[10px] text-white/30">
-            {board.games.length} game{board.games.length !== 1 ? "s" : ""}
+            {boardGameIds.length} game{boardGameIds.length !== 1 ? "s" : ""}
           </span>
+          {unresolvedCount > 0 && (
+            <span className="text-[10px] text-amber-300/70">
+              • {unresolvedCount} syncing
+            </span>
+          )}
         </div>
-        <Link
-          to={`/watchboard?board=${board.id}`}
-          className="text-[10px] sm:text-[11px] font-medium text-blue-400/60 hover:text-blue-400 transition-colors flex items-center gap-0.5"
-        >
-          Open
-          <ChevronRight className="w-3 h-3" />
-        </Link>
+        <div className="flex items-center gap-1">
+          <Link
+            to={`/watchboard/${board.id}`}
+            className="text-[10px] sm:text-[11px] font-medium text-blue-400/60 hover:text-blue-400 transition-colors flex items-center gap-0.5"
+          >
+            Open
+            <ChevronRight className="w-3 h-3" />
+          </Link>
+          {canDeleteBoard && onDeleteBoard && (
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <button
+                  type="button"
+                  className="inline-flex items-center justify-center rounded-md p-1 text-white/45 hover:text-white hover:bg-white/10 transition-colors"
+                  aria-label={`Board actions for ${board.name}`}
+                >
+                  <MoreVertical className="w-3.5 h-3.5" />
+                </button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end">
+                <DropdownMenuItem
+                  onClick={() => onDeleteBoard(board)}
+                  className="text-red-400 focus:text-red-300"
+                >
+                  <Trash2 className="w-3.5 h-3.5 mr-2" />
+                  Delete Board
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
+          )}
+        </div>
       </div>
 
       {/* Games grid - 2 columns */}
-      <div className="grid grid-cols-2 gap-2">
-        {displayGames.map((game) => (
-          <PreviewTile
-            key={game.game_id}
-            game={game}
-            onClick={() => onGameClick(game)}
-          />
-        ))}
-      </div>
-
-      {/* Show more indicator */}
-      {hasMore && (
-        <Link
-          to={`/watchboard?board=${board.id}`}
-          className="block text-center text-[10px] text-white/30 hover:text-white/50 py-1"
-        >
-          +{board.games.length - 4} more games →
-        </Link>
+      {displayEntries.length > 0 ? (
+        <div className="grid grid-cols-2 gap-2">
+          {displayEntries.map((entry, idx) => (
+            entry.kind === "game" ? (
+              <PreviewTile
+                key={`game-${entry.game.game_id}-${idx}`}
+                game={entry.game}
+                onClick={() => onGameClick(entry.game)}
+              />
+            ) : (
+              <div
+                key={`sync-${entry.gameId || idx}`}
+                className="rounded-lg border border-amber-400/20 bg-amber-500/[0.06] px-3 py-3 text-[10px] text-amber-200/75"
+              >
+                <div className="font-semibold tracking-wide uppercase">Syncing</div>
+                <div className="mt-1 text-amber-100/70">Game details are still loading.</div>
+              </div>
+            )
+          ))}
+        </div>
+      ) : (
+        <div className="rounded-lg border border-white/10 bg-white/[0.03] px-3 py-2 text-[11px] text-white/50">
+          {unresolvedCount > 0 ? `Syncing ${unresolvedCount} game${unresolvedCount === 1 ? "" : "s"}...` : "No valid games yet"}
+        </div>
       )}
+
     </div>
   );
 });
@@ -257,7 +443,7 @@ export const WatchboardPreview = memo(function WatchboardPreview() {
         headers: { "x-user-id": user.id.toString() },
       });
       const data = await res.json();
-      const boardsData: Array<{ 
+      const rawBoardsData: Array<{ 
         id: number; 
         name: string; 
         gameIds: string[];
@@ -276,6 +462,15 @@ export const WatchboardPreview = memo(function WatchboardPreview() {
           clock: string | null;
         }>;
       }> = data.boards || [];
+      const seenBoardIds = new Set<number>();
+      const boardsData = rawBoardsData.filter((board) => {
+        const id = Number(board?.id);
+        const name = String(board?.name || "").trim();
+        if (!Number.isFinite(id) || id <= 0 || !name) return false;
+        if (seenBoardIds.has(id)) return false;
+        seenBoardIds.add(id);
+        return true;
+      });
 
       if (boardsData.length === 0) {
         setBoards([]);
@@ -284,8 +479,14 @@ export const WatchboardPreview = memo(function WatchboardPreview() {
       }
 
       // Transform API data to component format
+      const rejectionCounts = {
+        missingSport: 0,
+        unknownStatus: 0,
+        invalidTeamToken: 0,
+        rawName: 0,
+      };
       const boardsWithGames: BoardWithGames[] = boardsData.map(b => {
-        const games: GameData[] = b.games.map(g => ({
+        const mappedGames: GameData[] = b.games.map(g => ({
           game_id: g.game_id,
           sport: g.sport,
           home_team_code: g.home_team_code,
@@ -299,6 +500,35 @@ export const WatchboardPreview = memo(function WatchboardPreview() {
           period_label: g.period_label || undefined,
           clock: g.clock || undefined,
         }));
+        const games: GameData[] = mappedGames.filter((game) => {
+          const sport = String(game.sport || "").trim().toLowerCase();
+          if (!sport) {
+            rejectionCounts.missingSport += 1;
+            return false;
+          }
+          if (String(game.status || "").trim().toUpperCase() === "UNKNOWN") {
+            rejectionCounts.unknownStatus += 1;
+            return false;
+          }
+          const homeCode = String(game.home_team_code || "").trim().toUpperCase();
+          const awayCode = String(game.away_team_code || "").trim().toUpperCase();
+          if (INVALID_TEAM_TOKENS.has(homeCode) || INVALID_TEAM_TOKENS.has(awayCode)) {
+            rejectionCounts.invalidTeamToken += 1;
+            return false;
+          }
+          const gameId = String(game.game_id || "").trim();
+          const homeName = String(game.home_team_name || "").trim();
+          const awayName = String(game.away_team_name || "").trim();
+          if (homeName && (looksLikeRawGameId(homeName) || homeName === gameId)) {
+            rejectionCounts.rawName += 1;
+            return false;
+          }
+          if (awayName && (looksLikeRawGameId(awayName) || awayName === gameId)) {
+            rejectionCounts.rawName += 1;
+            return false;
+          }
+          return true;
+        });
         
         const hasActiveGames = games.some(g => {
           const status = g.status?.toLowerCase();
@@ -316,7 +546,23 @@ export const WatchboardPreview = memo(function WatchboardPreview() {
 
       // Show all boards with games (including final/completed slates)
       // so recently updated watchboards don't disappear from Home.
-      const boardsToShow = boardsWithGames.filter(b => b.games.length > 0);
+      const boardsToShow = boardsWithGames.filter(b => (b.gameIds?.length || 0) > 0 || b.games.length > 0);
+      // #region agent log
+      sendDebugLog({
+        runId: "syncing-debug-run1",
+        hypothesisId: "H2",
+        location: "src/react-app/components/WatchboardPreview.tsx:fetchBoardsWithGames",
+        message: "home preview renderability summary",
+        data: {
+          boardCount: boardsData.length,
+          boardRows: boardsData.reduce((sum, board) => sum + (Array.isArray(board?.gameIds) ? board.gameIds.length : 0), 0),
+          hydratedRowsRaw: boardsData.reduce((sum, board) => sum + (Array.isArray(board?.games) ? board.games.length : 0), 0),
+          hydratedRowsRenderable: boardsWithGames.reduce((sum, board) => sum + board.games.length, 0),
+          unresolvedRows: boardsWithGames.reduce((sum, board) => sum + Math.max(0, (board.gameIds?.length || 0) - (board.games?.length || 0)), 0),
+          rejectionCounts,
+        },
+      });
+      // #endregion
       setBoards(boardsToShow);
     } catch (e) {
       console.error("Error fetching watchboards:", e);
@@ -364,9 +610,42 @@ export const WatchboardPreview = memo(function WatchboardPreview() {
 
   // Handle game click
   const handleGameClick = useCallback((game: GameData) => {
-    const sport = game.sport?.toLowerCase() || "nba";
+    const inferredSport = game.sport && game.sport !== "unknown"
+      ? game.sport
+      : inferSportFromGameId(game.game_id);
+    const sport = inferredSport?.toLowerCase() || "nba";
     navigate(toGameDetailPath(sport, game.game_id));
   }, [navigate]);
+
+  const handleDeleteBoard = useCallback(async (board: BoardWithGames) => {
+    if (!user?.id) return;
+    const confirmed = window.confirm(`Delete "${board.name}"?`);
+    if (!confirmed) return;
+    setBoards((prev) => prev.filter((b) => b.id !== board.id));
+    homeLockDevLog("watchboard optimistic action applied", {
+      action: "board:delete",
+      boardId: board.id,
+      source: "home-watchboard-preview",
+    });
+    try {
+      const res = await fetch(`/api/watchboards/${board.id}`, {
+        method: "DELETE",
+        headers: { "x-user-id": user.id.toString() },
+      });
+      if (!res.ok) throw new Error(`delete failed: ${res.status}`);
+      window.dispatchEvent(new CustomEvent("watchboards:changed", {
+        detail: {
+          source: "home-watchboard-preview",
+          action: "board:delete",
+          boardId: board.id,
+          afterCount: 0,
+        },
+      }));
+    } catch (err) {
+      console.error("Failed to delete watchboard from Home preview:", err);
+      fetchBoardsWithGames();
+    }
+  }, [fetchBoardsWithGames, user?.id]);
 
   // Don't render while loading
   if (isLoading) {
@@ -386,9 +665,9 @@ export const WatchboardPreview = memo(function WatchboardPreview() {
           </div>
           <Link
             to="/watchboard"
-            className="text-[11px] font-semibold text-primary/60 hover:text-primary transition-colors flex items-center gap-0.5 group"
+            className="text-[11px] font-bold text-primary/60 hover:text-primary transition-colors flex items-center gap-0.5 group"
           >
-            Manage
+            View All
             <ChevronRight className="w-3.5 h-3.5 group-hover:translate-x-0.5 transition-transform" />
           </Link>
         </div>
@@ -412,9 +691,9 @@ export const WatchboardPreview = memo(function WatchboardPreview() {
         </div>
         <Link
           to="/watchboard"
-          className="text-[11px] font-semibold text-primary/60 hover:text-primary transition-colors flex items-center gap-0.5 group"
+          className="text-[11px] font-bold text-primary/60 hover:text-primary transition-colors flex items-center gap-0.5 group"
         >
-          Manage All
+          View All
           <ChevronRight className="w-3.5 h-3.5 group-hover:translate-x-0.5 transition-transform" />
         </Link>
       </div>
@@ -426,6 +705,8 @@ export const WatchboardPreview = memo(function WatchboardPreview() {
             key={board.id}
             board={board}
             onGameClick={handleGameClick}
+            onDeleteBoard={handleDeleteBoard}
+            canDeleteBoard={Boolean(user?.id)}
           />
         ))}
       </div>
@@ -457,13 +738,86 @@ export const WatchboardPreview = memo(function WatchboardPreview() {
  */
 export const WatchboardPreviewHub = memo(function WatchboardPreviewHub() {
   const navigate = useNavigate();
-  const { boards, loading } = useDataHubWatchboards();
+  const { user } = useDemoAuth();
+  const { boards, loading, refresh } = useDataHubWatchboards();
+  const homeWatchboardLoggedRef = useRef(false);
+  const boardCount = boards.length;
+  const itemCounts = boards.map((board) => board.gameIds.length);
+  const ids = Array.from(new Set(
+    boards.flatMap((board) => board.gameIds.map((id) => String(id || "").trim()).filter(Boolean))
+  ));
 
   // Handle game click
   const handleGameClick = useCallback((game: GameData) => {
     const sport = game.sport?.toLowerCase() || "nba";
     navigate(toGameDetailPath(sport, game.game_id));
   }, [navigate]);
+
+  const handleDeleteBoard = useCallback(async (board: BoardWithGames) => {
+    if (!user?.id) return;
+    const confirmed = window.confirm(`Delete "${board.name}"?`);
+    if (!confirmed) return;
+    try {
+      const res = await fetch(`/api/watchboards/${board.id}`, {
+        method: "DELETE",
+        headers: { "x-user-id": user.id.toString() },
+      });
+      if (!res.ok) throw new Error(`delete failed: ${res.status}`);
+      window.dispatchEvent(new CustomEvent("watchboards:changed", {
+        detail: {
+          source: "home-watchboard-preview-hub",
+          action: "board:delete",
+          boardId: board.id,
+          afterCount: 0,
+        },
+      }));
+      homeLockDevLog("watchboard optimistic action applied", {
+        action: "board:delete",
+        boardId: board.id,
+        source: "home-watchboard-preview-hub",
+      });
+      await refresh();
+    } catch (err) {
+      console.error("Failed to delete watchboard from Home preview hub:", err);
+    }
+  }, [refresh, user?.id]);
+
+  useEffect(() => {
+    if (homeWatchboardLoggedRef.current) return;
+    const watchboardSource = (typeof window !== "undefined" ? (window as any).__GZ_WATCHBOARD_SOURCE_LAST__ : null) || null;
+    const source = String(watchboardSource?.source || "datahub:/api/watchboards/home-preview");
+    const emptyStateShown = !loading && boardCount === 0;
+    console.log("[HOME WATCHBOARD DATA]", {
+      source,
+      boardCount,
+      itemCounts,
+      ids,
+      emptyStateShown,
+    });
+    homeWatchboardLoggedRef.current = true;
+  }, [boardCount, ids, itemCounts, loading]);
+
+  useEffect(() => {
+    const unresolvedRows = boards.reduce((sum, board) => {
+      const existing = new Set((board.games || []).map((g) => String(g?.game_id || "").trim()));
+      return sum + (board.gameIds || []).filter((id) => !existing.has(String(id || "").trim())).length;
+    }, 0);
+    // #region agent log
+    sendDebugLog({
+      runId: "syncing-debug-run3",
+      hypothesisId: "H6",
+      location: "src/react-app/components/WatchboardPreview.tsx:WatchboardPreviewHub",
+      message: "hub boards state rendered",
+      data: {
+        loading,
+        boardCount: boards.length,
+        boardGameIds: boards.reduce((sum, board) => sum + (board.gameIds?.length || 0), 0),
+        boardGames: boards.reduce((sum, board) => sum + (board.games?.length || 0), 0),
+        unresolvedRows,
+      },
+    });
+    // #endregion
+  }, [boards, loading]);
 
   // Don't render while loading
   if (loading) {
@@ -483,9 +837,9 @@ export const WatchboardPreviewHub = memo(function WatchboardPreviewHub() {
           </div>
           <Link
             to="/watchboard"
-            className="text-[11px] font-semibold text-primary/60 hover:text-primary transition-colors flex items-center gap-0.5 group"
+            className="text-[11px] font-bold text-primary/60 hover:text-primary transition-colors flex items-center gap-0.5 group"
           >
-            Manage
+            View All
             <ChevronRight className="w-3.5 h-3.5 group-hover:translate-x-0.5 transition-transform" />
           </Link>
         </div>
@@ -518,9 +872,9 @@ export const WatchboardPreviewHub = memo(function WatchboardPreviewHub() {
         </div>
         <Link
           to="/watchboard"
-          className="text-[11px] font-semibold text-primary/60 hover:text-primary transition-colors flex items-center gap-0.5 group"
+          className="text-[11px] font-bold text-primary/60 hover:text-primary transition-colors flex items-center gap-0.5 group"
         >
-          Manage All
+          View All
           <ChevronRight className="w-3.5 h-3.5 group-hover:translate-x-0.5 transition-transform" />
         </Link>
       </div>
@@ -532,6 +886,8 @@ export const WatchboardPreviewHub = memo(function WatchboardPreviewHub() {
             key={board.id}
             board={board}
             onGameClick={handleGameClick}
+            onDeleteBoard={handleDeleteBoard}
+            canDeleteBoard={Boolean(user?.id)}
           />
         ))}
       </div>

@@ -2,6 +2,7 @@
  * Team Logos Utility
  * Provides logo URLs for NBA, NFL, MLB, NHL, and Soccer teams using ESPN's CDN
  */
+import { getEspnTeamLogo } from '@/react-app/lib/espnSoccer';
 
 // ESPN CDN base URLs for team logos
 const ESPN_NBA_LOGO_BASE = 'https://a.espncdn.com/i/teamlogos/nba/500';
@@ -214,6 +215,7 @@ const EPL_LOGO_MAP: Record<string, string> = {
   'AST': '362',    // Aston Villa
   'AVL': '362',    // Aston Villa (feed alias)
   'BHA': '331',    // Brighton & Hove Albion
+  'BRI': '331',    // Brighton & Hove Albion (SportsRadar alias)
   'BOR': '349',    // AFC Bournemouth
   'BOU': '349',    // AFC Bournemouth (feed alias)
   'BRE': '337',    // Brentford
@@ -310,6 +312,239 @@ const UCL_LOGO_MAP: Record<string, string> = {
   'POR': '134',    // Porto
   'BEN': '204',    // Benfica
 };
+
+// La Liga team abbreviation to ESPN ID mapping
+const LA_LIGA_LOGO_MAP: Record<string, string> = {
+  'RMA': '86',     // Real Madrid
+  'BAR': '83',     // Barcelona
+  'ATM': '1068',   // Atletico Madrid
+  'ATH': '93',     // Athletic Club
+  'BET': '244',    // Real Betis
+  'SEV': '243',    // Sevilla
+  'VAL': '94',     // Valencia
+  'VIL': '102',    // Villarreal
+  'RSO': '89',     // Real Sociedad
+  'GIR': '9812',   // Girona
+  'OSA': '97',     // Osasuna
+  'ALA': '96',     // Alaves
+  'ALV': '96',     // Alaves alias
+  'CEL': '85',     // Celta Vigo
+  'ESP': '88',     // Espanyol
+  'GET': '2922',   // Getafe
+  'LEG': '17500',  // Leganes
+  'MLL': '84',     // Mallorca
+  'MAL': '84',     // Mallorca (SportsRadar alias)
+  'RAY': '275',    // Rayo Vallecano
+  'RBB': '244',    // Real Betis (SportsRadar alias)
+  'VCF': '94',     // Valencia CF (SportsRadar alias)
+  'LEV': '1538',   // Levante
+  'ELC': '3751',   // Elche
+};
+
+// Ligue 1 team abbreviation to ESPN ID mapping
+const LIGUE_1_LOGO_MAP: Record<string, string> = {
+  'PSG': '160',    // Paris Saint-Germain
+  'FCN': '165',    // Nantes
+  'NAN': '165',    // Nantes (feed alias)
+  'OLM': '158',    // Marseille
+  'ASM': '148',    // Monaco
+  'LIL': '159',    // Lille
+  'LILL': '159',   // Lille (feed alias)
+  'LYO': '163',    // Lyon
+  'NIC': '161',    // Nice
+  'REN': '167',    // Rennes
+  'STR': '162',    // Strasbourg
+  'MONT': '166',   // Montpellier
+  'TOU': '168',    // Toulouse
+  'REI': '169',    // Reims
+  'BRE': '3058',   // Brest
+  'HAC': '170',    // Le Havre
+  'ANG': '3096',   // Angers
+  'AUX': '171',    // Auxerre
+  'STE': '172',    // Saint-Etienne
+};
+
+const SOCCER_LEAGUE_CODE_MAPS: Record<string, Record<string, string>> = {
+  EPL: EPL_LOGO_MAP,
+  MLS: MLS_LOGO_MAP,
+  UCL: UCL_LOGO_MAP,
+  LA_LIGA: LA_LIGA_LOGO_MAP,
+  LIGUE_1: LIGUE_1_LOGO_MAP,
+};
+
+const SOCCER_TEAM_LEAGUE_ALIASES: Record<string, string> = {
+  'EPL:BRI': 'BHA',
+  'EPL:CFC': 'CHE',
+  'LA_LIGA:RBB': 'BET',
+  'LA_LIGA:VCF': 'VAL',
+  'LA_LIGA:MAL': 'MLL',
+  'LA_LIGA:ALV': 'ALA',
+};
+
+const SOCCER_CODE_ALIAS_MAP: Record<string, string> = {
+  BRI: 'BHA',
+  CFC: 'CHE',
+  RBB: 'BET',
+  VCF: 'VAL',
+  MAL: 'MLL',
+  ALV: 'ALA',
+  ATMADRID: 'ATM',
+};
+
+const EPL_NAME_TO_CODE: Record<string, string> = {
+  ARSENAL: 'ARS',
+  ASTONVILLA: 'AVL',
+  BRIGHTONHOVEALBION: 'BHA',
+  BRIGHTON: 'BHA',
+  CHELSEAFC: 'CHE',
+  CHELSEA: 'CHE',
+  LIVERPOOL: 'LIV',
+  MANCHESTERCITY: 'MCI',
+  MANCHESTERUNITED: 'MUN',
+  NEWCASTLEUNITED: 'NEW',
+  TOTTENHAMHOTSPUR: 'TOT',
+  WESTHAMUNITED: 'WHU',
+  WOLVERHAMPTONWANDERERS: 'WOL',
+};
+
+const LA_LIGA_NAME_TO_CODE: Record<string, string> = {
+  GIRONAFC: 'GIR',
+  GIRONA: 'GIR',
+  REALBETISSEVILLE: 'BET',
+  REALBETIS: 'BET',
+  CAOSASUNA: 'OSA',
+  OSASUNA: 'OSA',
+  RCDMALLORCA: 'MLL',
+  MALLORCA: 'MLL',
+  VALENCIACF: 'VAL',
+  VALENCIA: 'VAL',
+  ATHLETICBILBAO: 'ATH',
+  ATHLETICCLUB: 'ATH',
+  DEPORTIVOALAVES: 'ALA',
+  ALAVES: 'ALA',
+  REALMADRID: 'RMA',
+  BARCELONA: 'BAR',
+  REALSOCIEDAD: 'RSO',
+  ELCHE: 'ELC',
+  ELCHECF: 'ELC',
+};
+
+const LIGUE_1_NAME_TO_CODE: Record<string, string> = {
+  PARISSAINTGERMAIN: 'PSG',
+  PSG: 'PSG',
+  NANTES: 'FCN',
+  FCNANTES: 'FCN',
+};
+
+const MLS_NAME_TO_CODE: Record<string, string> = {
+  INTERMIAMICF: 'MIA',
+  LOSANGELESFC: 'LAF',
+  LAGALAXY: 'LAG',
+  NEWYORKCITYFC: 'NYC',
+  NEWYORKREDBULLS: 'NYRB',
+  ATLANTAUNITEDFC: 'ATL',
+  SEATTLESOUNDERSFC: 'SEA',
+  PORTLANDTIMBERS: 'POR',
+};
+
+const UCL_NAME_TO_CODE: Record<string, string> = {
+  REALMADRID: 'RMA',
+  BARCELONA: 'BAR',
+  BAYERNMUNICH: 'BAY',
+  PARISSAINTGERMAIN: 'PSG',
+  JUVENTUS: 'JUV',
+  INTERMILAN: 'INT',
+  ACMILAN: 'ACM',
+  BORUSSIADORTMUND: 'DOR',
+  BENFICA: 'BEN',
+  PORTO: 'POR',
+};
+
+const SOCCER_LEAGUE_NAME_MAPS: Record<string, Record<string, string>> = {
+  EPL: EPL_NAME_TO_CODE,
+  LA_LIGA: LA_LIGA_NAME_TO_CODE,
+  MLS: MLS_NAME_TO_CODE,
+  UCL: UCL_NAME_TO_CODE,
+  LIGUE_1: LIGUE_1_NAME_TO_CODE,
+};
+
+const SOCCER_GLOBAL_NAME_TO_CODE: Record<string, string> = {
+  ...EPL_NAME_TO_CODE,
+  ...LA_LIGA_NAME_TO_CODE,
+  ...LIGUE_1_NAME_TO_CODE,
+  ...MLS_NAME_TO_CODE,
+  ...UCL_NAME_TO_CODE,
+};
+
+type SoccerLogoContext = {
+  teamName?: string;
+  homeTeam?: string;
+  awayTeam?: string;
+  homeCode?: string;
+  awayCode?: string;
+};
+
+function normalizeSoccerToken(value: string | null | undefined): string {
+  return String(value || '')
+    .toUpperCase()
+    .trim()
+    .replace(/[_\s]+/g, '')
+    .replace(/[^A-Z0-9]/g, '');
+}
+
+function normalizeSoccerLeagueKey(league?: string | null): string {
+  const raw = normalizeSoccerToken(league || '');
+  if (!raw) return 'SOCCER';
+  if (raw === 'EPL' || raw === 'PREMIERLEAGUE') return 'EPL';
+  if (raw === 'MLS' || raw === 'MAJORLEAGUESOCCER') return 'MLS';
+  if (raw === 'UCL' || raw === 'UEFACHAMPIONSLEAGUE' || raw === 'CHAMPIONSLEAGUE') return 'UCL';
+  if (raw === 'LALIGA' || raw === 'LALIGAEA' || raw === 'LALIGAEASPORTS' || raw === 'LALIGA1') return 'LA_LIGA';
+  if (raw === 'LIGUE1' || raw === 'LIGUEONE' || raw === 'LIGUEUN') return 'LIGUE_1';
+  return raw;
+}
+
+function makeSoccerLeagueFallbackCrest(label: string, primary: string, accent: string): string {
+  const svg = `<svg xmlns='http://www.w3.org/2000/svg' width='160' height='160' viewBox='0 0 160 160'>
+  <defs><linearGradient id='g' x1='0' x2='1' y1='0' y2='1'><stop offset='0%' stop-color='${primary}'/><stop offset='100%' stop-color='${accent}'/></linearGradient></defs>
+  <rect x='8' y='8' width='144' height='144' rx='28' fill='url(#g)'/>
+  <circle cx='80' cy='80' r='44' fill='rgba(10,18,30,0.30)'/>
+  <path d='M80 42l17 10v20l-17 10-17-10V52z' fill='rgba(255,255,255,0.95)'/>
+  <text x='80' y='122' text-anchor='middle' font-family='Inter,Arial,sans-serif' font-size='20' font-weight='700' fill='white'>${label}</text>
+</svg>`;
+  return `data:image/svg+xml;utf8,${encodeURIComponent(svg)}`;
+}
+
+const SOCCER_LEAGUE_FALLBACK_CRESTS: Record<string, string> = {
+  EPL: makeSoccerLeagueFallbackCrest('EPL', '#0E2A6B', '#21A1FF'),
+  LA_LIGA: makeSoccerLeagueFallbackCrest('LAL', '#7A1BC9', '#FD3A84'),
+  LIGUE_1: makeSoccerLeagueFallbackCrest('L1', '#102A56', '#4D79FF'),
+  MLS: makeSoccerLeagueFallbackCrest('MLS', '#C62828', '#1976D2'),
+  UCL: makeSoccerLeagueFallbackCrest('UCL', '#0B3CB2', '#26C6DA'),
+  SOCCER: makeSoccerLeagueFallbackCrest('SOC', '#13365D', '#2AB3A4'),
+};
+
+const SOCCER_LOGO_MISS_LOG_KEY = '__GZ_SOCCER_LOGO_MISS_LOGGED__';
+
+function logSoccerLogoMissOnce(league: string | null | undefined, context?: SoccerLogoContext): void {
+  if (typeof window === 'undefined') return;
+  const normalizedLeague = normalizeSoccerLeagueKey(league);
+  const homeTeam = String(context?.homeTeam || '').trim();
+  const awayTeam = String(context?.awayTeam || '').trim();
+  const homeCode = String(context?.homeCode || '').trim();
+  const awayCode = String(context?.awayCode || '').trim();
+  const key = `${normalizedLeague}:${homeCode}:${awayCode}:${homeTeam}:${awayTeam}`;
+  const bucket = ((window as any)[SOCCER_LOGO_MISS_LOG_KEY] ||= new Set<string>()) as Set<string>;
+  if (bucket.has(key)) return;
+  bucket.add(key);
+  console.log('[SOCCER LOGO MISS]', {
+    league: league || null,
+    homeTeam,
+    awayTeam,
+    homeCode,
+    awayCode,
+    normalizedLeague,
+  });
+}
 
 // NCAAB team abbreviation to ESPN ID mapping
 // ESPN uses numeric IDs for college teams
@@ -604,31 +839,51 @@ export function getNHLLogoUrl(abbr: string): string | null {
  * @param league League code (EPL, MLS, UCL)
  * @returns Logo URL or null if not found
  */
-export function getSoccerLogoUrl(abbr: string, league?: string | null): string | null {
-  if (!abbr) return null;
-  
-  const normalized = abbr.toUpperCase();
-  const normalizedLeague = league?.toUpperCase();
-  
-  let espnId: string | undefined;
-  
-  // Check league-specific maps first
-  if (normalizedLeague === 'EPL') {
-    espnId = EPL_LOGO_MAP[normalized];
-  } else if (normalizedLeague === 'MLS') {
-    espnId = MLS_LOGO_MAP[normalized];
-  } else if (normalizedLeague === 'UCL') {
-    espnId = UCL_LOGO_MAP[normalized];
+export function getSoccerLogoUrl(abbr: string, league?: string | null, context?: SoccerLogoContext): string | null {
+  const normalizedLeague = normalizeSoccerLeagueKey(league);
+  const normalizedCode = normalizeSoccerToken(abbr);
+  const normalizedName = normalizeSoccerToken(context?.teamName);
+
+  const leagueMap = SOCCER_LEAGUE_CODE_MAPS[normalizedLeague] || null;
+  const leagueNames = SOCCER_LEAGUE_NAME_MAPS[normalizedLeague] || null;
+
+  const fromExplicitAlias = SOCCER_TEAM_LEAGUE_ALIASES[`${normalizedLeague}:${normalizedCode}`];
+  const fromCodeAlias = SOCCER_CODE_ALIAS_MAP[normalizedCode];
+  const fromLeagueName = leagueNames?.[normalizedName || ''];
+  const fromGlobalName = SOCCER_GLOBAL_NAME_TO_CODE[normalizedName || ''];
+  const candidateCode =
+    fromExplicitAlias
+    || (normalizedCode && leagueMap?.[normalizedCode] ? normalizedCode : '')
+    || (fromCodeAlias && leagueMap?.[fromCodeAlias] ? fromCodeAlias : '')
+    || fromLeagueName
+    || fromGlobalName
+    || fromCodeAlias
+    || normalizedCode;
+
+  if (/^\d+$/.test(candidateCode)) {
+    return `${ESPN_SOCCER_LOGO_BASE}/${candidateCode}.png`;
   }
-  
-  // Fall back to checking all maps if not found
-  if (!espnId) {
-    espnId = EPL_LOGO_MAP[normalized] || MLS_LOGO_MAP[normalized] || UCL_LOGO_MAP[normalized];
+
+  const espnId =
+    (leagueMap && leagueMap[candidateCode])
+    || EPL_LOGO_MAP[candidateCode]
+    || MLS_LOGO_MAP[candidateCode]
+    || UCL_LOGO_MAP[candidateCode]
+    || LA_LIGA_LOGO_MAP[candidateCode];
+
+  if (espnId) {
+    return `${ESPN_SOCCER_LOGO_BASE}/${espnId}.png`;
   }
-  
-  if (!espnId) return null;
-  
-  return `${ESPN_SOCCER_LOGO_BASE}/${espnId}.png`;
+
+  // Global soccer fallback: resolve by team name via ESPN lookup so we are
+  // not limited to hardcoded league maps only.
+  const espnNameFallback = getEspnTeamLogo(undefined, context?.teamName || abbr);
+  if (espnNameFallback && !espnNameFallback.includes('default-team-logo')) {
+    return espnNameFallback;
+  }
+
+  logSoccerLogoMissOnce(league, context);
+  return SOCCER_LEAGUE_FALLBACK_CRESTS[normalizedLeague] || SOCCER_LEAGUE_FALLBACK_CRESTS.SOCCER;
 }
 
 /**
@@ -741,7 +996,12 @@ export function hasLogoSupport(sport: string): boolean {
  * @param sport Sport code (NBA, NFL, MLB, NHL, SOCCER, NCAAB, WBC, WORLD_CUP, etc.)
  * @param league Optional league code (EPL, MLS, UCL, WBC, WORLD_CUP)
  */
-export function getTeamLogoUrl(abbr: string, sport: string, league?: string | null): string | null {
+export function getTeamLogoUrl(
+  abbr: string,
+  sport: string,
+  league?: string | null,
+  options?: { teamName?: string; soccerContext?: SoccerLogoContext }
+): string | null {
   const normalizedSport = sport.toUpperCase();
 
   // World Baseball Classic or World Cup: use country flag
@@ -767,7 +1027,10 @@ export function getTeamLogoUrl(abbr: string, sport: string, league?: string | nu
   }
 
   if (normalizedSport === 'SOCCER') {
-    return getSoccerLogoUrl(abbr, league);
+    return getSoccerLogoUrl(abbr, league, {
+      teamName: options?.teamName,
+      ...(options?.soccerContext || {}),
+    });
   }
 
   if (normalizedSport === 'NCAAB' || normalizedSport === 'CBB') {
@@ -781,10 +1044,18 @@ export function getTeamLogoUrl(abbr: string, sport: string, league?: string | nu
  * Get team or country logo URL. For MLB/SOCCER, if no club logo is found,
  * tries country flag (so WBC/World Cup show flags even when league is not set).
  */
-export function getTeamOrCountryLogoUrl(abbr: string, sport: string, league?: string | null): string | null {
-  const url = getTeamLogoUrl(abbr, sport, league);
+export function getTeamOrCountryLogoUrl(
+  abbr: string,
+  sport: string,
+  league?: string | null,
+  options?: { teamName?: string; soccerContext?: SoccerLogoContext }
+): string | null {
+  const url = getTeamLogoUrl(abbr, sport, league, options);
   if (url) return url;
   if (sport?.toUpperCase() === 'MLB' || sport?.toUpperCase() === 'SOCCER') {
+    if (sport?.toUpperCase() === 'SOCCER') {
+      return SOCCER_LEAGUE_FALLBACK_CRESTS[normalizeSoccerLeagueKey(league)] || SOCCER_LEAGUE_FALLBACK_CRESTS.SOCCER;
+    }
     return getCountryFlagUrl(abbr);
   }
   return null;

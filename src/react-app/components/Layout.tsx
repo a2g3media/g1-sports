@@ -26,13 +26,11 @@ import {
   BarChart3,
   Ticket,
   TrendingUp,
-  Compass,
   Star,
 } from "lucide-react";
 import { useImpersonation } from "@/react-app/contexts/ImpersonationContext";
 import { ThemeToggle } from "@/react-app/components/ThemeToggle";
 import { UnifiedNotificationCenter } from "@/react-app/components/UnifiedNotificationCenter";
-import { useFeatureFlags } from "@/react-app/hooks/useFeatureFlags";
 import { fetchJsonCached } from "@/react-app/lib/fetchCache";
 import { buildPageDataGamesCacheKey, buildPageDataGamesUrl } from "@/react-app/lib/pageDataKeys";
 
@@ -45,11 +43,6 @@ interface LayoutProps {
   hideFooter?: boolean;
 }
 
-interface MarketplaceDiscoveryPool {
-  is_featured?: boolean;
-  state?: string | null;
-}
-
 const BRAND_LOGO_SRC = "/assets/g1-sports-logo-clean.png";
 const BRAND_LOGO_FALLBACK = "/assets/g1-sports-logo.png";
 
@@ -60,11 +53,8 @@ export function Layout({ children, hideFooter: _hideFooter }: LayoutProps) {
   const { effectiveRole } = useImpersonation();
   const [mounted, setMounted] = useState(false);
   const { hasCompletedOnboarding, isLoading: onboardingLoading } = useFavoriteSports();
-  const { flags } = useFeatureFlags();
   const [showOnboarding, setShowOnboarding] = useState(false);
   const [showWhyGZ, setShowWhyGZ] = useState(false);
-  const [featuredMarketplaceCount, setFeaturedMarketplaceCount] = useState(0);
-  const [liveMarketplaceCount, setLiveMarketplaceCount] = useState(0);
 
   const firstSession = useFirstSession();
   const { shouldShow: _shouldShowTour, complete: _completeTour } = useOnboarding();
@@ -126,48 +116,6 @@ export function Layout({ children, hideFooter: _hideFooter }: LayoutProps) {
       setShowOnboarding(true);
     }
   }, [onboardingLoading, hasCompletedOnboarding, user, isDemoMode]);
-
-  useEffect(() => {
-    let cancelled = false;
-
-    const loadMarketplaceSignal = async () => {
-      if (!flags.PUBLIC_POOLS || !flags.MARKETPLACE_ENABLED) {
-        if (!cancelled) {
-          setFeaturedMarketplaceCount(0);
-          setLiveMarketplaceCount(0);
-        }
-        return;
-      }
-      try {
-        const res = await fetch("/api/marketplace/pools", { credentials: "include" });
-        if (!res.ok) {
-          if (!cancelled) {
-            setFeaturedMarketplaceCount(0);
-            setLiveMarketplaceCount(0);
-          }
-          return;
-        }
-        const payload = await res.json() as { pools?: MarketplaceDiscoveryPool[] };
-        const pools = Array.isArray(payload?.pools) ? payload.pools : [];
-        const featuredCount = pools.filter((pool) => Boolean(pool?.is_featured)).length;
-        const liveCount = pools.filter((pool) => String(pool?.state || "").toLowerCase() === "live").length;
-        if (!cancelled) {
-          setFeaturedMarketplaceCount(featuredCount);
-          setLiveMarketplaceCount(liveCount);
-        }
-      } catch {
-        if (!cancelled) {
-          setFeaturedMarketplaceCount(0);
-          setLiveMarketplaceCount(0);
-        }
-      }
-    };
-
-    loadMarketplaceSignal();
-    return () => {
-      cancelled = true;
-    };
-  }, [flags.MARKETPLACE_ENABLED, flags.PUBLIC_POOLS]);
 
   // Navigation items - using centralized routes config
   // Order: Home, Games, Bet Builder (center), Odds, Pools, Coach G
@@ -241,7 +189,6 @@ export function Layout({ children, hideFooter: _hideFooter }: LayoutProps) {
   const showDevBanner = isDemoMode && (effectiveRole === 'super_admin' || effectiveRole === 'pool_admin') && 
     (location.pathname.startsWith('/admin') || location.pathname.startsWith('/pool-admin'));
   const isHomePage = location.pathname === "/" || location.pathname === "/home";
-  const showMarketplaceQuickJump = !location.pathname.startsWith("/pools");
 
   return (
     <div className="min-h-screen bg-background">
@@ -319,24 +266,6 @@ export function Layout({ children, hideFooter: _hideFooter }: LayoutProps) {
 
             {/* Right Actions */}
             <div className="flex items-center gap-2">
-              <Link
-                to="/pools#marketplace"
-                className="relative hidden md:flex items-center gap-1.5 px-2.5 py-1.5 rounded-full bg-white/[0.04] hover:bg-white/[0.08] border border-white/10 hover:border-blue-400/30 transition-colors"
-              >
-                <Compass className="h-3.5 w-3.5 text-blue-300" />
-                <span className="text-[11px] font-semibold text-white/75">Marketplace</span>
-                {liveMarketplaceCount > 0 && (
-                  <span className="inline-flex items-center gap-1 rounded-full bg-red-500/20 px-1.5 py-0.5 text-[10px] font-bold text-red-300">
-                    <span className="h-1.5 w-1.5 rounded-full bg-red-400 animate-pulse" />
-                    LIVE {liveMarketplaceCount > 9 ? "9+" : liveMarketplaceCount}
-                  </span>
-                )}
-                {featuredMarketplaceCount > 0 && (
-                  <span className="absolute -top-1 -right-1 min-w-4 h-4 px-1 rounded-full bg-emerald-500 text-[10px] leading-4 font-bold text-white text-center shadow-[0_0_10px_rgba(16,185,129,0.55)]">
-                    {featuredMarketplaceCount > 9 ? "9+" : featuredMarketplaceCount}
-                  </span>
-                )}
-              </Link>
               <UnifiedNotificationCenter />
               
               {/* Active Pools Badge - glass pill */}
@@ -564,41 +493,6 @@ export function Layout({ children, hideFooter: _hideFooter }: LayoutProps) {
       >
         {children}
       </main>
-
-      {/* Mobile quick jump to marketplace discovery */}
-      {showMarketplaceQuickJump && (
-        <Link
-          to="/pools#marketplace"
-          className={cn(
-            "fixed md:hidden right-4 bottom-[72px] z-50 relative",
-            "inline-flex items-center gap-1.5 px-3 py-2 rounded-full",
-            "bg-gradient-to-r from-blue-500 to-indigo-500 text-white",
-            "shadow-[0_8px_24px_rgba(59,130,246,0.35)] border border-white/20",
-            "hover:brightness-110 transition-all"
-          )}
-        >
-          <Compass className="h-4 w-4" />
-          <span className="text-xs font-semibold tracking-wide">Marketplace</span>
-          {liveMarketplaceCount > 0 && (
-            <span className="absolute -top-1 left-0 min-w-5 h-5 px-1 rounded-full bg-red-500 text-[10px] leading-5 font-bold text-white text-center shadow-[0_0_10px_rgba(239,68,68,0.6)]">
-              {liveMarketplaceCount > 9 ? "9+" : liveMarketplaceCount}
-            </span>
-          )}
-          {featuredMarketplaceCount > 0 && (
-            <span className="absolute -top-1 -right-1 min-w-5 h-5 px-1 rounded-full bg-emerald-500 text-[10px] leading-5 font-bold text-white text-center shadow-[0_0_10px_rgba(16,185,129,0.6)]">
-              {featuredMarketplaceCount > 9 ? "9+" : featuredMarketplaceCount}
-            </span>
-          )}
-          {(featuredMarketplaceCount > 0 || liveMarketplaceCount > 0) && (
-            <span
-              className={cn(
-                "absolute -top-1 -right-1 h-5 w-5 rounded-full animate-ping",
-                liveMarketplaceCount > 0 ? "bg-red-400/50" : "bg-emerald-400/50"
-              )}
-            />
-          )}
-        </Link>
-      )}
 
       {/* Fixed Bottom Navigation - ALWAYS at bottom on ALL screen sizes (no sidebar) */}
       <nav className="fixed bottom-0 left-0 right-0 z-50 bg-gradient-to-t from-[hsl(220,20%,5%)] to-[hsl(220,20%,7%)] border-t border-white/[0.04] safe-area-pb shadow-[0_-4px_20px_rgba(0,0,0,0.3)]">

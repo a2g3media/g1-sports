@@ -34,6 +34,9 @@ export default defineConfig({
   server: {
     allowedHosts: true,
     strictPort: false,
+    hmr: {
+      overlay: false,
+    },
   },
   build: {
     chunkSizeWarningLimit: 5000,

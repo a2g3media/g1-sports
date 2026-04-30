@@ -356,9 +356,9 @@ export function CoachGIntelligenceLayer({
           {safeTopSignalMessage && (
             <p className={cn(
               "mt-1 text-xs",
-              topSignal.importance === "high" ? "text-amber-300" : "text-slate-300"
+              topSignal?.importance === "high" ? "text-amber-300" : "text-slate-300"
             )}>
-              {(topSignal.icon || "📡")} {safeTopSignalMessage}
+              {(topSignal?.icon || "📡")} {safeTopSignalMessage}
             </p>
           )}
           {actionableItems.length > 0 && (
