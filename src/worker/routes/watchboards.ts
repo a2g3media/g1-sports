@@ -624,18 +624,19 @@ async function seedWatchboardPlaceholderSnapshot(
 ): Promise<void> {
   const providerGameId = String(gameId || "").trim();
   if (!providerGameId) return;
-  const parsed = parseWatchboardGameSummary(gameSummary);
-  const awayName = parsed.awayName || null;
-  const homeName = parsed.homeName || null;
-  const derivedCodes = deriveFallbackCodesFromGameId(providerGameId);
-  const awayCode = awayName ? toCodeFromName(awayName) : derivedCodes.awayCode;
-  const homeCode = homeName ? toCodeFromName(homeName) : derivedCodes.homeCode;
-  await db
-    .prepare("DELETE FROM sdio_games WHERE provider_game_id = ? AND sport = 'unknown'")
-    .bind(providerGameId)
-    .run();
-  await db
-    .prepare(`
+  try {
+    const parsed = parseWatchboardGameSummary(gameSummary);
+    const awayName = parsed.awayName || null;
+    const homeName = parsed.homeName || null;
+    const derivedCodes = deriveFallbackCodesFromGameId(providerGameId);
+    const awayCode = awayName ? toCodeFromName(awayName) : derivedCodes.awayCode;
+    const homeCode = homeName ? toCodeFromName(homeName) : derivedCodes.homeCode;
+    await db
+      .prepare("DELETE FROM sdio_games WHERE provider_game_id = ? AND sport = 'unknown'")
+      .bind(providerGameId)
+      .run();
+    await db
+      .prepare(`
       INSERT INTO sdio_games (
         provider_game_id,
         sport,
@@ -654,15 +655,45 @@ async function seedWatchboardPlaceholderSnapshot(
         updated_at
       ) VALUES (?, 'unknown', 'UNKNOWN', ?, ?, ?, ?, ?, 'SCHEDULED', NULL, NULL, NULL, NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
     `)
-    .bind(
+      .bind(
+        providerGameId,
+        homeCode,
+        awayCode,
+        homeName,
+        awayName,
+        new Date().toISOString()
+      )
+      .run();
+  } catch (error) {
+    console.warn("[Watchboards] placeholder snapshot seed failed (non-fatal)", {
       providerGameId,
-      homeCode,
-      awayCode,
-      homeName,
-      awayName,
-      new Date().toISOString()
-    )
-    .run();
+      error,
+    });
+  }
+}
+
+/** Hydration extras for home-preview join; must never fail the watchboard_games insert. */
+async function enrichWatchboardGameAfterAdd(
+  db: D1Database,
+  candidateGameIds: string[],
+  canonicalGameId: string,
+  rawGameId: string,
+  game_summary?: string
+): Promise<void> {
+  try {
+    await seedWatchboardGameSnapshot(db, candidateGameIds);
+    const isResolvable = await canHydrateWatchboardGameId(db, candidateGameIds);
+    if (!isResolvable) {
+      await seedWatchboardPlaceholderSnapshot(db, canonicalGameId || rawGameId, game_summary);
+    }
+  } catch (error) {
+    console.warn("[Watchboards] post-add enrichment failed (watchboard_games row already committed)", {
+      rawGameId,
+      canonicalGameId,
+      candidates: candidateGameIds.slice(0, 6),
+      error,
+    });
+  }
 }
 
 // Helper to get or create default watchboard for user
@@ -1271,11 +1302,18 @@ watchboardsRouter.post("/create-with-game", async (c) => {
         .first<{ max_order: number | null }>();
       const nextOrder = (maxOrder?.max_order ?? -1) + 1;
       orderIndex = nextOrder;
-      // Keep insert compatible with older local schemas that may not have added_from.
-      await db
-        .prepare("INSERT INTO watchboard_games (watchboard_id, game_id, order_index) VALUES (?, ?, ?)")
-        .bind(boardId, canonicalGameId, nextOrder)
+      const insertGameResult = await db
+        .prepare(
+          "INSERT INTO watchboard_games (watchboard_id, game_id, order_index, added_from) VALUES (?, ?, ?, ?)"
+        )
+        .bind(boardId, canonicalGameId, nextOrder, added_from ?? null)
         .run();
+      console.log("[Watchboards][create-with-game] DB insert watchboard_games", {
+        success: insertGameResult.success,
+        last_row_id: insertGameResult.meta?.last_row_id,
+        boardId,
+        stored_game_id: canonicalGameId,
+      });
     }
 
     await db
@@ -1287,11 +1325,7 @@ watchboardsRouter.post("/create-with-game", async (c) => {
       .prepare("SELECT * FROM watchboards WHERE id = ? AND user_id = ?")
       .bind(boardId, userId)
       .first<Watchboard>();
-    await seedWatchboardGameSnapshot(db, candidateGameIds);
-    const isResolvable = await canHydrateWatchboardGameId(db, candidateGameIds);
-    if (!isResolvable) {
-      await seedWatchboardPlaceholderSnapshot(db, canonicalGameId || normalizedGameId, game_summary);
-    }
+    await enrichWatchboardGameAfterAdd(db, candidateGameIds, canonicalGameId, normalizedGameId, game_summary);
     const durationMs = Date.now() - startedAt;
     console.info("[Watchboards][create-with-game]", {
       durationMs,
@@ -1335,10 +1369,12 @@ watchboardsRouter.post("/create-with-game", async (c) => {
 watchboardsRouter.post("/", async (c) => {
   const userId = c.req.header("x-user-id") || "guest";
   const db = c.env.DB;
-  const { name } = await c.req.json<{ name: string }>();
+  const body = await c.req.json<{ name?: string }>();
+  console.log("[Watchboards][POST /] create request body", { userId, body });
 
-  const normalizedName = normalizeBoardName(name);
+  const normalizedName = normalizeBoardName(body?.name);
   if (!normalizedName) {
+    console.log("[Watchboards][POST /] rejected empty name");
     return c.json({ error: "Board name is required" }, 400);
   }
 
@@ -1353,6 +1389,10 @@ watchboardsRouter.post("/", async (c) => {
       .bind(userId, normalizedName)
       .first<Watchboard>();
     if (existingBoard) {
+      console.log("[Watchboards][POST /] returning existing board", {
+        boardId: existingBoard.id,
+        existing: true,
+      });
       return c.json({ board: existingBoard, existing: true }, 200);
     }
 
@@ -1361,11 +1401,17 @@ watchboardsRouter.post("/", async (c) => {
       .bind(userId, normalizedName)
       .run();
 
+    console.log("[Watchboards][POST /] DB insert watchboards", {
+      success: result.success,
+      last_row_id: result.meta?.last_row_id,
+    });
+
     const newBoard = await db
       .prepare("SELECT * FROM watchboards WHERE id = ?")
       .bind(result.meta.last_row_id)
       .first<Watchboard>();
 
+    console.log("[Watchboards][POST /] response", { status: 201, board: newBoard });
     return c.json({ board: newBoard }, 201);
   } catch (error) {
     console.error("[Watchboards] Error creating board:", error);
@@ -1479,7 +1525,16 @@ watchboardsRouter.post("/games", async (c) => {
   const requestId = makeWatchboardRequestId(c.req.header("x-request-id"));
   const db = c.env.DB;
   const startedAt = Date.now();
-  const { game_id, added_from, board_id, client_mutation_id, game_summary } = await c.req.json<{ game_id: string; added_from?: string; board_id?: number; client_mutation_id?: string; game_summary?: string }>();
+  const body = await c.req.json<{
+    game_id?: string;
+    added_from?: string;
+    board_id?: number;
+    client_mutation_id?: string;
+    game_summary?: string;
+  }>();
+  console.log("[Watchboards][POST /games] add game request body", { userId, requestId, body });
+
+  const { game_id, added_from, board_id, client_mutation_id, game_summary } = body;
 
   if (!game_id) {
     return c.json({ error: "game_id is required", request_id: requestId }, 400);
@@ -1541,17 +1596,22 @@ watchboardsRouter.post("/games", async (c) => {
 
     const nextOrder = (maxOrder?.max_order ?? -1) + 1;
 
-    // Keep insert compatible with older local schemas that may not have added_from.
-    await db
-      .prepare("INSERT INTO watchboard_games (watchboard_id, game_id, order_index) VALUES (?, ?, ?)")
-      .bind(board.id, canonicalGameId, nextOrder)
+    const insertResult = await db
+      .prepare(
+        "INSERT INTO watchboard_games (watchboard_id, game_id, order_index, added_from) VALUES (?, ?, ?, ?)"
+      )
+      .bind(board.id, canonicalGameId, nextOrder, added_from ?? null)
       .run();
 
-    await seedWatchboardGameSnapshot(db, candidateGameIds);
-    const isResolvable = await canHydrateWatchboardGameId(db, candidateGameIds);
-    if (!isResolvable) {
-      await seedWatchboardPlaceholderSnapshot(db, canonicalGameId || game_id, game_summary);
-    }
+    console.log("[Watchboards][POST /games] DB insert watchboard_games", {
+      success: insertResult.success,
+      last_row_id: insertResult.meta?.last_row_id,
+      boardId: board.id,
+      stored_game_id: canonicalGameId,
+      raw_game_id: game_id,
+    });
+
+    await enrichWatchboardGameAfterAdd(db, candidateGameIds, canonicalGameId, game_id, game_summary);
     // #region agent log
     sendDebugLog({
       runId: "syncing-delay-run1",
@@ -1570,6 +1630,14 @@ watchboardsRouter.post("/games", async (c) => {
     });
     // #endregion
 
+    const jsonBody = {
+      success: true,
+      boardId: board.id,
+      boardName: board.name,
+      order_index: nextOrder,
+      request_id: requestId,
+    };
+    console.log("[Watchboards][POST /games] response", jsonBody);
     console.info("[Watchboards][add-game]", {
       requestId,
       boardId: board.id,
@@ -1578,7 +1646,7 @@ watchboardsRouter.post("/games", async (c) => {
       clientMutationId: client_mutation_id || null,
       durationMs: Date.now() - startedAt,
     });
-    return c.json({ success: true, boardId: board.id, boardName: board.name, order_index: nextOrder, request_id: requestId }, 201);
+    return c.json(jsonBody, 201);
   } catch (error) {
     console.error("[Watchboards] Error adding game:", {
       error,
