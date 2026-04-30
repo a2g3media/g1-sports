@@ -3,7 +3,7 @@
  * CRUD operations for watchboards and their games
  */
 
-import { Hono } from "hono";
+import { Hono, type Context } from "hono";
 import { fetchGameWithFallback } from "../services/providers";
 
 type Bindings = {
@@ -17,7 +17,6 @@ const watchboardsRouter = new Hono<{ Bindings: Bindings }>();
 let ensureWatchboardSchemaPromise: Promise<void> | null = null;
 let ensureWatchboardSchemaReady = false;
 const WATCHBOARD_HOME_PREVIEW_FALLBACK_LIMIT = 40;
-const WATCHBOARD_DETAIL_SEED_TIMEOUT_MS = 900;
 const DEBUG_LOG_ENDPOINT = "http://127.0.0.1:7738/ingest/3f0629af-a99a-4780-a8a2-f41a5bc25b15";
 const DEBUG_SESSION_ID = "05f1a6";
 const makeWatchboardRequestId = (incoming: string | null | undefined): string => {
@@ -25,6 +24,23 @@ const makeWatchboardRequestId = (incoming: string | null | undefined): string =>
   if (candidate) return candidate;
   return `wb_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
 };
+
+/** Non-blocking follow-up work after the mutation response is sent (e.g. touch parent row). */
+function scheduleWatchboardSideEffects(c: Context<{ Bindings: Bindings }>, task: () => Promise<void>): void {
+  const run = async () => {
+    try {
+      await task();
+    } catch {
+      // ignore
+    }
+  };
+  const execCtx = (c as unknown as { executionCtx?: ExecutionContext }).executionCtx;
+  if (execCtx?.waitUntil) {
+    execCtx.waitUntil(run());
+  } else {
+    void run();
+  }
+}
 
 function sendDebugLog(payload: {
   runId: string;
@@ -47,25 +63,6 @@ function sendDebugLog(payload: {
     }),
   }).catch(() => {});
   // #endregion
-}
-
-function pickNumber(value: unknown): number | null {
-  const n = Number(value);
-  return Number.isFinite(n) ? n : null;
-}
-
-function parseWatchboardGameSummary(summary: string | null | undefined): {
-  awayName: string | null;
-  homeName: string | null;
-} {
-  const raw = String(summary || "").trim();
-  if (!raw) return { awayName: null, homeName: null };
-  const normalized = raw.replace(/\s+vs\.?\s+/i, " @ ");
-  const [away, home] = normalized.split("@").map((v) => String(v || "").trim());
-  return {
-    awayName: away || null,
-    homeName: home || null,
-  };
 }
 
 function toCodeFromName(name: string | null | undefined): string {
@@ -420,42 +417,6 @@ async function lookupCanonicalProviderGameIdByCandidates(db: D1Database, candida
   return providerGameId || null;
 }
 
-async function canHydrateWatchboardGameId(db: D1Database, gameIdCandidates: string[]): Promise<boolean> {
-  const candidates = Array.from(
-    new Set((gameIdCandidates || []).map((id) => String(id || "").trim()).filter(Boolean))
-  );
-  if (candidates.length === 0) return false;
-  try {
-    const direct = await lookupProviderGameIdByCandidates(db, candidates);
-    if (direct) return true;
-    const canonical = await lookupCanonicalProviderGameIdByCandidates(db, candidates);
-    if (canonical) {
-      const canonicalHydrated = await lookupProviderGameIdByCandidates(db, [canonical]);
-      if (canonicalHydrated) return true;
-    }
-    for (const candidate of candidates.slice(0, 2)) {
-      const detail = await withTimeout(fetchGameWithFallback(candidate), 1200);
-      const sport = String(detail?.data?.game?.sport || "").trim().toLowerCase();
-      if (sport) return true;
-    }
-    // #region agent log
-    sendDebugLog({
-      runId: "syncing-debug-run2",
-      hypothesisId: "H4",
-      location: "src/worker/routes/watchboards.ts:canHydrateWatchboardGameId",
-      message: "canHydrate resolved false",
-      data: {
-        candidates: candidates.slice(0, 4),
-        hadCanonicalAlias: Boolean(canonical),
-      },
-    });
-    // #endregion
-    return false;
-  } catch {
-    return false;
-  }
-}
-
 async function resolveCanonicalWatchboardGameId(db: D1Database, gameId: string): Promise<string> {
   const normalized = String(gameId || "").trim();
   if (!normalized) return "";
@@ -519,180 +480,6 @@ async function resolveCanonicalWatchboardGameIdSafe(db: D1Database, gameId: stri
       error,
     });
     return normalized;
-  }
-}
-
-async function seedWatchboardGameSnapshot(
-  db: D1Database,
-  gameIdCandidates: string[]
-): Promise<void> {
-  const candidates = Array.from(
-    new Set((gameIdCandidates || []).map((id) => String(id || "").trim()).filter(Boolean))
-  );
-  if (candidates.length === 0) return;
-  try {
-    let detailGame: Record<string, unknown> | null = null;
-    for (const candidate of candidates) {
-      const detail = await withTimeout(fetchGameWithFallback(candidate), WATCHBOARD_DETAIL_SEED_TIMEOUT_MS);
-      const game = detail?.data?.game as Record<string, unknown> | undefined;
-      const sport = String(game?.sport || "").trim().toLowerCase();
-      if (game && sport) {
-        detailGame = game;
-        break;
-      }
-    }
-    if (!detailGame) return;
-    const sport = String(detailGame.sport || "").trim().toLowerCase();
-    if (!sport) return;
-
-    const homeTeamCode = String(detailGame.home_team_code || detailGame.home_team || "").trim() || "TBD";
-    const awayTeamCode = String(detailGame.away_team_code || detailGame.away_team || "").trim() || "TBD";
-    const homeTeamName = String(detailGame.home_team_name || "").trim() || null;
-    const awayTeamName = String(detailGame.away_team_name || "").trim() || null;
-    const status = String(detailGame.status || "SCHEDULED").trim() || "SCHEDULED";
-    const startTime = String(detailGame.start_time || "").trim() || new Date().toISOString();
-    const periodLabel = String(detailGame.period_label || detailGame.period || "").trim() || null;
-    const clock = String(detailGame.clock || "").trim() || null;
-    const scoreHome = pickNumber(detailGame.home_score);
-    const scoreAway = pickNumber(detailGame.away_score);
-
-    const providerFromDetail = String((detailGame as any).provider_game_id || "").trim();
-    const eventFromDetail = String((detailGame as any).event_id || "").trim();
-    const externalFromDetail = String(detailGame.external_id || "").trim();
-    const keysToSeed = Array.from(new Set([
-      ...candidates,
-      providerFromDetail,
-      eventFromDetail,
-      externalFromDetail ? `sr:sport_event:${externalFromDetail}` : "",
-      externalFromDetail ? `sr:match:${externalFromDetail}` : "",
-    ].map((v) => String(v || "").trim()).filter(Boolean)));
-
-    for (const providerGameId of keysToSeed) {
-      await db
-        .prepare("DELETE FROM sdio_games WHERE provider_game_id = ? AND sport = ?")
-        .bind(providerGameId, sport)
-        .run();
-      await db
-        .prepare(`
-          INSERT INTO sdio_games (
-            provider_game_id,
-            sport,
-            league,
-            home_team,
-            away_team,
-            home_team_name,
-            away_team_name,
-            start_time,
-            status,
-            score_home,
-            score_away,
-            period,
-            clock,
-            last_sync,
-            updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-        `)
-        .bind(
-          providerGameId,
-          sport,
-          sport.toUpperCase(),
-          homeTeamCode,
-          awayTeamCode,
-          homeTeamName,
-          awayTeamName,
-          startTime,
-          status,
-          scoreHome,
-          scoreAway,
-          periodLabel,
-          clock
-        )
-        .run();
-    }
-  } catch (error) {
-    console.warn("[Watchboards] seed snapshot failed", {
-      candidates,
-      error,
-    });
-  }
-}
-
-async function seedWatchboardPlaceholderSnapshot(
-  db: D1Database,
-  gameId: string,
-  gameSummary?: string
-): Promise<void> {
-  const providerGameId = String(gameId || "").trim();
-  if (!providerGameId) return;
-  try {
-    const parsed = parseWatchboardGameSummary(gameSummary);
-    const awayName = parsed.awayName || null;
-    const homeName = parsed.homeName || null;
-    const derivedCodes = deriveFallbackCodesFromGameId(providerGameId);
-    const awayCode = awayName ? toCodeFromName(awayName) : derivedCodes.awayCode;
-    const homeCode = homeName ? toCodeFromName(homeName) : derivedCodes.homeCode;
-    await db
-      .prepare("DELETE FROM sdio_games WHERE provider_game_id = ? AND sport = 'unknown'")
-      .bind(providerGameId)
-      .run();
-    await db
-      .prepare(`
-      INSERT INTO sdio_games (
-        provider_game_id,
-        sport,
-        league,
-        home_team,
-        away_team,
-        home_team_name,
-        away_team_name,
-        start_time,
-        status,
-        score_home,
-        score_away,
-        period,
-        clock,
-        last_sync,
-        updated_at
-      ) VALUES (?, 'unknown', 'UNKNOWN', ?, ?, ?, ?, ?, 'SCHEDULED', NULL, NULL, NULL, NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-    `)
-      .bind(
-        providerGameId,
-        homeCode,
-        awayCode,
-        homeName,
-        awayName,
-        new Date().toISOString()
-      )
-      .run();
-  } catch (error) {
-    console.warn("[Watchboards] placeholder snapshot seed failed (non-fatal)", {
-      providerGameId,
-      error,
-    });
-  }
-}
-
-/** Hydration extras for home-preview join; must never fail the watchboard_games insert. */
-async function enrichWatchboardGameAfterAdd(
-  db: D1Database,
-  candidateGameIds: string[],
-  canonicalGameId: string,
-  rawGameId: string,
-  game_summary?: string
-): Promise<void> {
-  try {
-    await seedWatchboardGameSnapshot(db, candidateGameIds);
-    const isResolvable = await canHydrateWatchboardGameId(db, candidateGameIds);
-    if (!isResolvable) {
-      await seedWatchboardPlaceholderSnapshot(db, canonicalGameId || rawGameId, game_summary);
-    }
-  } catch (error) {
-    console.warn("[Watchboards] post-add enrichment failed (watchboard_games row already committed)", {
-      rawGameId,
-      canonicalGameId,
-      candidates: candidateGameIds.slice(0, 6),
-      error,
-    });
   }
 }
 
@@ -793,6 +580,8 @@ watchboardsRouter.get("/home-preview", async (c) => {
   let queryCount = 0;
 
   try {
+    console.log("[watchboards API] start", "GET /home-preview", Date.now());
+
     // Get all boards for user
     queryCount += 1;
     const boards = await db
@@ -801,12 +590,65 @@ watchboardsRouter.get("/home-preview", async (c) => {
       .all<Watchboard>();
 
     if (boards.results.length === 0) {
+      console.log("[watchboards API] end", Date.now());
+      console.log("duration:", Date.now() - startedAt);
       return c.json({ boards: [] });
     }
 
     // Get games for all boards with full game data in one query
     const boardIds = boards.results.map(b => b.id);
     const placeholders = boardIds.map(() => "?").join(",");
+
+    // TEMP: ?fast=1 skips canonical remap / batched enrichment / external-heavy joins — ids + placeholder rows only.
+    if (fastMode) {
+      queryCount += 1;
+      const idsOnly = await db
+        .prepare(`
+          SELECT watchboard_id, game_id, order_index
+          FROM watchboard_games
+          WHERE watchboard_id IN (${placeholders})
+          ORDER BY order_index ASC
+        `)
+        .bind(...boardIds)
+        .all<{ watchboard_id: number; game_id: string; order_index: number }>();
+
+      const gamesByBoardFast: Record<number, { gameIds: string[]; games: ReturnType<typeof buildFallbackWatchboardRow>[] }> = {};
+      for (const bid of boardIds) {
+        gamesByBoardFast[bid] = { gameIds: [], games: [] };
+      }
+      for (const row of idsOnly.results || []) {
+        const bucket = gamesByBoardFast[row.watchboard_id];
+        if (!bucket) continue;
+        bucket.gameIds.push(row.game_id);
+        bucket.games.push(
+          buildFallbackWatchboardRow({
+            game_id: row.game_id,
+            status: "SCHEDULED",
+            start_time: new Date().toISOString(),
+          })
+        );
+      }
+
+      const boardsWithGamesFast = boards.results.map((board) => ({
+        id: board.id,
+        name: board.name,
+        gameIds: gamesByBoardFast[board.id]?.gameIds || [],
+        games: gamesByBoardFast[board.id]?.games || [],
+      }));
+
+      const durationFast = Date.now() - startedAt;
+      console.log("[watchboards API] end", Date.now());
+      console.log("duration:", durationFast);
+      return c.json({
+        boards: boardsWithGamesFast,
+        meta: {
+          durationMs: durationFast,
+          queryCount,
+          fast: true,
+          payloadBytes: JSON.stringify(boardsWithGamesFast).length,
+        },
+      });
+    }
     
     type HomePreviewRow = {
       watchboard_id: number;
@@ -1186,6 +1028,8 @@ watchboardsRouter.get("/home-preview", async (c) => {
 
     const durationMs = Date.now() - startedAt;
     const payloadBytes = JSON.stringify(boardsWithGames).length;
+    console.log("[watchboards API] end", Date.now());
+    console.log("duration:", durationMs);
     console.info("[Watchboards][home-preview][perf]", {
       durationMs,
       payloadBytes,
@@ -1225,6 +1069,8 @@ watchboardsRouter.get("/home-preview", async (c) => {
       },
     });
   } catch (error) {
+    console.log("[watchboards API] end", Date.now());
+    console.log("duration:", Date.now() - startedAt);
     console.error("[Watchboards] Error getting home preview:", error);
     return c.json({ error: "Failed to get watchboards preview" }, 500);
   }
@@ -1232,11 +1078,12 @@ watchboardsRouter.get("/home-preview", async (c) => {
 
 // POST /api/watchboards/create-with-game - Create board and add game in one request
 watchboardsRouter.post("/create-with-game", async (c) => {
+  console.log("[watchboards API] start", "POST /create-with-game", Date.now());
+  const start = Date.now();
   const userId = c.req.header("x-user-id") || "guest";
   const requestId = makeWatchboardRequestId(c.req.header("x-request-id"));
   const db = c.env.DB;
-  const startedAt = Date.now();
-  const { name, game_id, added_from, client_mutation_id, game_summary } = await c.req.json<{
+  const { name, game_id, added_from, client_mutation_id } = await c.req.json<{
     name: string;
     game_id: string;
     added_from?: string;
@@ -1247,18 +1094,19 @@ watchboardsRouter.post("/create-with-game", async (c) => {
   const normalizedName = normalizeBoardName(name);
   const normalizedGameId = String(game_id || "").trim();
   if (!normalizedName) {
+    console.log("[watchboards API] end", Date.now());
+    console.log("duration:", Date.now() - start);
     return c.json({ error: "Board name is required", request_id: requestId }, 400);
   }
   if (!normalizedGameId) {
+    console.log("[watchboards API] end", Date.now());
+    console.log("duration:", Date.now() - start);
     return c.json({ error: "game_id is required", request_id: requestId }, 400);
   }
 
   let boardId: number | null = null;
   let createdBoard = false;
   try {
-    const canonicalGameId = await resolveCanonicalWatchboardGameIdSafe(db, normalizedGameId);
-    const candidateGameIds = Array.from(new Set([normalizedGameId, canonicalGameId].filter(Boolean)));
-
     const existingBoard = await db
       .prepare(`
         SELECT * FROM watchboards
@@ -1268,8 +1116,11 @@ watchboardsRouter.post("/create-with-game", async (c) => {
       `)
       .bind(userId, normalizedName)
       .first<Watchboard>();
+
+    let boardNameOut = normalizedName;
     if (existingBoard) {
       boardId = existingBoard.id;
+      boardNameOut = existingBoard.name;
     } else {
       const created = await db
         .prepare("INSERT INTO watchboards (user_id, name, is_active) VALUES (?, ?, 0)")
@@ -1277,75 +1128,47 @@ watchboardsRouter.post("/create-with-game", async (c) => {
         .run();
       boardId = Number(created.meta.last_row_id || 0) || null;
       if (!boardId) {
+        console.log("[watchboards API] end", Date.now());
+        console.log("duration:", Date.now() - start);
         return c.json({ error: "Failed to create watchboard", request_id: requestId }, 500);
       }
       createdBoard = true;
     }
 
-    const duplicatePlaceholders = candidateGameIds.map(() => "?").join(",");
-    const alreadyHasGame = await db
-      .prepare(`
-        SELECT id, order_index
-        FROM watchboard_games
-        WHERE watchboard_id = ?
-          AND game_id IN (${duplicatePlaceholders})
-        ORDER BY id DESC
-        LIMIT 1
-      `)
-      .bind(boardId, ...candidateGameIds)
-      .first<{ id: number; order_index: number | null }>();
-    let orderIndex = Number(alreadyHasGame?.order_index ?? 0) || 0;
-    if (!alreadyHasGame) {
-      const maxOrder = await db
-        .prepare("SELECT MAX(order_index) as max_order FROM watchboard_games WHERE watchboard_id = ?")
-        .bind(boardId)
-        .first<{ max_order: number | null }>();
-      const nextOrder = (maxOrder?.max_order ?? -1) + 1;
-      orderIndex = nextOrder;
-      const insertGameResult = await db
-        .prepare(
-          "INSERT INTO watchboard_games (watchboard_id, game_id, order_index, added_from) VALUES (?, ?, ?, ?)"
-        )
-        .bind(boardId, canonicalGameId, nextOrder, added_from ?? null)
-        .run();
-      console.log("[Watchboards][create-with-game] DB insert watchboard_games", {
-        success: insertGameResult.success,
-        last_row_id: insertGameResult.meta?.last_row_id,
-        boardId,
-        stored_game_id: canonicalGameId,
-      });
-    }
+    const maxOrder = await db
+      .prepare("SELECT MAX(order_index) as max_order FROM watchboard_games WHERE watchboard_id = ?")
+      .bind(boardId)
+      .first<{ max_order: number | null }>();
+    const nextOrder = (maxOrder?.max_order ?? -1) + 1;
 
     await db
-      .prepare("UPDATE watchboards SET updated_at = CURRENT_TIMESTAMP WHERE id = ?")
-      .bind(boardId)
+      .prepare(
+        "INSERT OR IGNORE INTO watchboard_games (watchboard_id, game_id, order_index, added_from) VALUES (?, ?, ?, ?)"
+      )
+      .bind(boardId, normalizedGameId, nextOrder, added_from ?? null)
       .run();
 
-    const board = await db
-      .prepare("SELECT * FROM watchboards WHERE id = ? AND user_id = ?")
-      .bind(boardId, userId)
-      .first<Watchboard>();
-    await enrichWatchboardGameAfterAdd(db, candidateGameIds, canonicalGameId, normalizedGameId, game_summary);
-    const durationMs = Date.now() - startedAt;
-    console.info("[Watchboards][create-with-game]", {
-      durationMs,
-      boardId,
-      gameId: normalizedGameId,
-      canonicalGameId,
-      clientMutationId: client_mutation_id || null,
-      requestId,
+    console.log("[watchboards] insert complete, returning immediately");
+
+    scheduleWatchboardSideEffects(c, async () => {
+      await db.prepare("UPDATE watchboards SET updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(boardId!).run();
     });
-    return c.json({
-      success: true,
-      board,
-      boardId,
-      boardName: board?.name || normalizedName,
-      gameId: canonicalGameId,
-      order_index: orderIndex,
-      client_mutation_id: client_mutation_id || null,
-      request_id: requestId,
-    }, 201);
+
+    console.log("[watchboards API] end", Date.now());
+    console.log("duration:", Date.now() - start);
+    return c.json(
+      {
+        success: true,
+        boardId,
+        boardName: boardNameOut,
+        request_id: requestId,
+        client_mutation_id: client_mutation_id ?? null,
+      },
+      200
+    );
   } catch (error) {
+    console.log("[watchboards API] end", Date.now());
+    console.log("duration:", Date.now() - start);
     if (boardId && createdBoard) {
       try {
         await db.prepare("DELETE FROM watchboard_games WHERE watchboard_id = ?").bind(boardId).run();
@@ -1521,10 +1344,11 @@ watchboardsRouter.delete("/:id", async (c) => {
 
 // POST /api/watchboards/games - Add game to a specific board or active board
 watchboardsRouter.post("/games", async (c) => {
+  console.log("[watchboards API] start", "POST /games", Date.now());
+  const start = Date.now();
   const userId = c.req.header("x-user-id") || "guest";
   const requestId = makeWatchboardRequestId(c.req.header("x-request-id"));
   const db = c.env.DB;
-  const startedAt = Date.now();
   const body = await c.req.json<{
     game_id?: string;
     added_from?: string;
@@ -1532,63 +1356,37 @@ watchboardsRouter.post("/games", async (c) => {
     client_mutation_id?: string;
     game_summary?: string;
   }>();
-  console.log("[Watchboards][POST /games] add game request body", { userId, requestId, body });
 
-  const { game_id, added_from, board_id, client_mutation_id, game_summary } = body;
+  const { game_id, added_from, board_id, client_mutation_id } = body;
 
   if (!game_id) {
+    console.log("[watchboards API] end", Date.now());
+    console.log("duration:", Date.now() - start);
     return c.json({ error: "game_id is required", request_id: requestId }, 400);
   }
 
+  const rawGameId = String(game_id || "").trim();
+
   try {
     let board: Watchboard;
-    
+
     // If board_id specified, use that board (verify ownership)
     if (board_id) {
       const specificBoard = await db
         .prepare("SELECT * FROM watchboards WHERE id = ? AND user_id = ?")
         .bind(board_id, userId)
         .first<Watchboard>();
-      
+
       if (!specificBoard) {
+        console.log("[watchboards API] end", Date.now());
+        console.log("duration:", Date.now() - start);
         return c.json({ error: "Watchboard not found", request_id: requestId }, 404);
       }
       board = specificBoard;
     } else {
-      // Fallback to active board
       board = await getOrCreateDefaultWatchboard(db, userId);
     }
 
-    const canonicalGameId = await resolveCanonicalWatchboardGameIdSafe(db, game_id);
-    const candidateGameIds = Array.from(new Set([game_id, canonicalGameId].filter(Boolean)));
-    const duplicatePlaceholders = candidateGameIds.map(() => "?").join(",");
-
-    // Check if already exists in this board (including legacy/raw aliases).
-    const existing = await db
-      .prepare(`
-        SELECT id
-        FROM watchboard_games
-        WHERE watchboard_id = ?
-          AND game_id IN (${duplicatePlaceholders})
-        ORDER BY id DESC
-        LIMIT 1
-      `)
-      .bind(board.id, ...candidateGameIds)
-      .first();
-
-    if (existing) {
-      console.info("[Watchboards][add-game:already-exists]", {
-        requestId,
-        boardId: board.id,
-        gameId: game_id,
-        canonicalGameId,
-        clientMutationId: client_mutation_id || null,
-        durationMs: Date.now() - startedAt,
-      });
-      return c.json({ error: "Game already in watchboard", alreadyExists: true, boardName: board.name, request_id: requestId }, 400);
-    }
-
-    // Get max order_index
     const maxOrder = await db
       .prepare("SELECT MAX(order_index) as max_order FROM watchboard_games WHERE watchboard_id = ?")
       .bind(board.id)
@@ -1596,65 +1394,40 @@ watchboardsRouter.post("/games", async (c) => {
 
     const nextOrder = (maxOrder?.max_order ?? -1) + 1;
 
-    const insertResult = await db
+    await db
       .prepare(
-        "INSERT INTO watchboard_games (watchboard_id, game_id, order_index, added_from) VALUES (?, ?, ?, ?)"
+        "INSERT OR IGNORE INTO watchboard_games (watchboard_id, game_id, order_index, added_from) VALUES (?, ?, ?, ?)"
       )
-      .bind(board.id, canonicalGameId, nextOrder, added_from ?? null)
+      .bind(board.id, rawGameId, nextOrder, added_from ?? null)
       .run();
 
-    console.log("[Watchboards][POST /games] DB insert watchboard_games", {
-      success: insertResult.success,
-      last_row_id: insertResult.meta?.last_row_id,
-      boardId: board.id,
-      stored_game_id: canonicalGameId,
-      raw_game_id: game_id,
+    console.log("[watchboards] insert complete, returning immediately");
+
+    scheduleWatchboardSideEffects(c, async () => {
+      await db.prepare("UPDATE watchboards SET updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(board.id).run();
     });
 
-    await enrichWatchboardGameAfterAdd(db, candidateGameIds, canonicalGameId, game_id, game_summary);
-    // #region agent log
-    sendDebugLog({
-      runId: "syncing-delay-run1",
-      hypothesisId: "H8",
-      location: "src/worker/routes/watchboards.ts:POST /games",
-      message: "add-game mutation lifecycle",
-      data: {
-        requestId,
+    console.log("[watchboards API] end", Date.now());
+    console.log("duration:", Date.now() - start);
+    return c.json(
+      {
+        success: true,
         boardId: board.id,
-        gameId: game_id,
-        canonicalGameId,
-        isResolvable,
-        usedPlaceholderSeed: !isResolvable,
-        durationMs: Date.now() - startedAt,
+        boardName: board.name,
+        request_id: requestId,
+        client_mutation_id: client_mutation_id ?? null,
       },
-    });
-    // #endregion
-
-    const jsonBody = {
-      success: true,
-      boardId: board.id,
-      boardName: board.name,
-      order_index: nextOrder,
-      request_id: requestId,
-    };
-    console.log("[Watchboards][POST /games] response", jsonBody);
-    console.info("[Watchboards][add-game]", {
-      requestId,
-      boardId: board.id,
-      gameId: game_id,
-      canonicalGameId,
-      clientMutationId: client_mutation_id || null,
-      durationMs: Date.now() - startedAt,
-    });
-    return c.json(jsonBody, 201);
+      200
+    );
   } catch (error) {
+    console.log("[watchboards API] end", Date.now());
+    console.log("duration:", Date.now() - start);
     console.error("[Watchboards] Error adding game:", {
       error,
       requestId,
       gameId: game_id,
       boardId: board_id || null,
       clientMutationId: client_mutation_id || null,
-      durationMs: Date.now() - startedAt,
     });
     return c.json({ error: "Failed to add game to watchboard", request_id: requestId }, 500);
   }
